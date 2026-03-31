@@ -133,6 +133,23 @@ defmodule SymphonyElixir.CoreTest do
     assert :ok = Config.validate!()
   end
 
+  test "linear project slug resolves from LINEAR_PROJECT_SLUG env var" do
+    previous_linear_project_slug = System.get_env("LINEAR_PROJECT_SLUG")
+    env_project_slug = "test-linear-project"
+
+    on_exit(fn -> restore_env("LINEAR_PROJECT_SLUG", previous_linear_project_slug) end)
+    System.put_env("LINEAR_PROJECT_SLUG", env_project_slug)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      codex_command: "/bin/sh app-server"
+    )
+
+    assert Config.settings!().tracker.project_slug == env_project_slug
+    assert :ok = Config.validate!()
+  end
+
   test "linear assignee resolves from LINEAR_ASSIGNEE env var" do
     previous_linear_assignee = System.get_env("LINEAR_ASSIGNEE")
     env_assignee = "dev@example.com"

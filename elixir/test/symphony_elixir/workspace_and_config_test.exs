@@ -890,29 +890,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
+    project_slug_env_var = "SYMP_LINEAR_PROJECT_#{System.unique_integer([:positive])}"
     workspace_root = Path.join("/tmp", "symphony-workspace-root")
     api_key = "resolved-secret"
+    project_slug = "resolved-project"
     codex_bin = Path.join(["~", "bin", "codex"])
 
     previous_workspace_root = System.get_env(workspace_env_var)
     previous_api_key = System.get_env(api_key_env_var)
+    previous_project_slug = System.get_env(project_slug_env_var)
 
     System.put_env(workspace_env_var, workspace_root)
     System.put_env(api_key_env_var, api_key)
+    System.put_env(project_slug_env_var, project_slug)
 
     on_exit(fn ->
       restore_env(workspace_env_var, previous_workspace_root)
       restore_env(api_key_env_var, previous_api_key)
+      restore_env(project_slug_env_var, previous_project_slug)
     end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
+      tracker_project_slug: "$#{project_slug_env_var}",
       workspace_root: "$#{workspace_env_var}",
       codex_command: "#{codex_bin} app-server"
     )
 
     config = Config.settings!()
     assert config.tracker.api_key == api_key
+    assert config.tracker.project_slug == project_slug
     assert config.workspace.root == Path.expand(workspace_root)
     assert config.codex.command == "#{codex_bin} app-server"
   end
@@ -1008,32 +1015,44 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     missing_workspace_env = "SYMP_MISSING_WORKSPACE_#{System.unique_integer([:positive])}"
     empty_secret_env = "SYMP_EMPTY_SECRET_#{System.unique_integer([:positive])}"
     missing_secret_env = "SYMP_MISSING_SECRET_#{System.unique_integer([:positive])}"
+    empty_project_env = "SYMP_EMPTY_PROJECT_#{System.unique_integer([:positive])}"
+    missing_project_env = "SYMP_MISSING_PROJECT_#{System.unique_integer([:positive])}"
 
     previous_missing_workspace_env = System.get_env(missing_workspace_env)
     previous_empty_secret_env = System.get_env(empty_secret_env)
     previous_missing_secret_env = System.get_env(missing_secret_env)
+    previous_empty_project_env = System.get_env(empty_project_env)
+    previous_missing_project_env = System.get_env(missing_project_env)
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    previous_linear_project_slug = System.get_env("LINEAR_PROJECT_SLUG")
 
     System.delete_env(missing_workspace_env)
     System.put_env(empty_secret_env, "")
     System.delete_env(missing_secret_env)
+    System.put_env(empty_project_env, "")
+    System.delete_env(missing_project_env)
     System.put_env("LINEAR_API_KEY", "fallback-linear-token")
+    System.put_env("LINEAR_PROJECT_SLUG", "fallback-linear-project")
 
     on_exit(fn ->
       restore_env(missing_workspace_env, previous_missing_workspace_env)
       restore_env(empty_secret_env, previous_empty_secret_env)
       restore_env(missing_secret_env, previous_missing_secret_env)
+      restore_env(empty_project_env, previous_empty_project_env)
+      restore_env(missing_project_env, previous_missing_project_env)
       restore_env("LINEAR_API_KEY", previous_linear_api_key)
+      restore_env("LINEAR_PROJECT_SLUG", previous_linear_project_slug)
     end)
 
     assert {:ok, settings} =
              Schema.parse(%{
-               tracker: %{api_key: "$#{empty_secret_env}"},
+               tracker: %{api_key: "$#{empty_secret_env}", project_slug: "$#{empty_project_env}"},
                workspace: %{root: "$#{missing_workspace_env}"},
                codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
              })
 
     assert settings.tracker.api_key == nil
+    assert settings.tracker.project_slug == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
 
     assert settings.codex.approval_policy == %{
@@ -1042,11 +1061,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert {:ok, settings} =
              Schema.parse(%{
-               tracker: %{api_key: "$#{missing_secret_env}"},
+               tracker: %{api_key: "$#{missing_secret_env}", project_slug: "$#{missing_project_env}"},
                workspace: %{root: ""}
              })
 
     assert settings.tracker.api_key == "fallback-linear-token"
+    assert settings.tracker.project_slug == "fallback-linear-project"
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
   end
 
