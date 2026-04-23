@@ -55,6 +55,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
+      recent_codex_events: [],
       started_at: started_at
     }
 
@@ -99,6 +100,187 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+
+    assert snapshot_entry.recent_codex_events == [
+             %{
+               event: :session_started,
+               message: %{session_id: "thread-live-turn-live"},
+               timestamp: now
+             },
+             %{
+               event: :notification,
+               message: %{method: "some-event"},
+               timestamp: now
+             }
+           ]
+  end
+
+  test "orchestrator snapshot retains a bounded recent codex event history" do
+    issue_id = "issue-event-history"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-189",
+      title: "Event history test",
+      description: "Retain recent codex updates",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-189"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :EventHistoryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    for index <- 1..205 do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "codex/event/agent_message_delta",
+             "params" => %{"msg" => %{"payload" => %{"delta" => "event-#{index}"}}}
+           },
+           timestamp: DateTime.utc_now()
+         }}
+      )
+    end
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert length(snapshot_entry.recent_codex_events) == 200
+    assert hd(snapshot_entry.recent_codex_events).message["params"]["msg"]["payload"]["delta"] == "event-6"
+    assert List.last(snapshot_entry.recent_codex_events).message["params"]["msg"]["payload"]["delta"] == "event-205"
+  end
+
+  test "orchestrator writes codex session transcripts under the logs root" do
+    issue_id = "issue-transcript"
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-codex-transcript-#{System.unique_integer([:positive])}")
+    log_file = Path.join([test_root, "log", "symphony.log"])
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+
+    on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(test_root)
+    end)
+
+    Application.put_env(:symphony_elixir, :log_file, log_file)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-190",
+      title: "Transcript persistence test",
+      description: "Write codex transcript events to disk",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-190"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TranscriptOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      codex_session_logs: [],
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         session_id: "thread-log-turn-log",
+         timestamp: now
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/exec_command_begin",
+           "params" => %{"msg" => %{"command" => "mix test"}}
+         },
+         timestamp: now
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert [session_log] = snapshot_entry.codex_session_logs
+    assert session_log.session_id == "thread-log-turn-log"
+    assert File.exists?(session_log.path)
+    assert String.starts_with?(session_log.path, Path.join(test_root, "log/codex_sessions"))
+
+    lines =
+      session_log.path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&Jason.decode!/1)
+
+    assert Enum.map(lines, & &1["event"]) == ["session_started", "notification"]
+    assert Enum.all?(lines, &(&1["issue_id"] == issue_id))
+    assert Enum.all?(lines, &(&1["session_id"] == "thread-log-turn-log"))
+    assert List.last(lines)["summary"] == "mix test"
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

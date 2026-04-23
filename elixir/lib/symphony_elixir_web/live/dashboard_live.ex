@@ -12,7 +12,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
   def mount(_params, _session, socket) do
     socket =
       socket
-      |> assign(:payload, load_payload())
+      |> assign(:dashboard_payload, %{})
+      |> assign(:issue_payload, nil)
+      |> assign(:issue_identifier, nil)
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
@@ -21,6 +23,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
     end
 
     {:ok, socket}
+  end
+
+  @impl true
+  def handle_params(%{"issue_identifier" => issue_identifier}, _uri, socket) do
+    {:noreply, load_issue_page(socket, issue_identifier)}
+  end
+
+  def handle_params(_params, _uri, socket) do
+    {:noreply, load_dashboard_page(socket)}
   end
 
   @impl true
@@ -33,7 +44,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   def handle_info(:observability_updated, socket) do
     {:noreply,
      socket
-     |> assign(:payload, load_payload())
+     |> reload_current_page()
      |> assign(:now, DateTime.utc_now())}
   end
 
@@ -41,217 +52,410 @@ defmodule SymphonyElixirWeb.DashboardLive do
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
-      <header class="hero-card">
-        <div class="hero-grid">
-          <div>
-            <p class="eyebrow">
-              Symphony Observability
-            </p>
-            <h1 class="hero-title">
-              Operations Dashboard
-            </h1>
-            <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
-            </p>
-          </div>
+      <%= if @live_action == :issue do %>
+        <%= if @issue_payload[:error] do %>
+          <header class="hero-card">
+            <div class="hero-grid">
+              <div>
+                <p class="eyebrow">
+                  Symphony Observability
+                </p>
+                <h1 class="hero-title">
+                  <%= @issue_identifier %>
+                </h1>
+                <p class="hero-copy">
+                  Issue details are currently unavailable.
+                </p>
+              </div>
 
-          <div class="status-stack">
-            <span class="status-badge status-badge-live">
-              <span class="status-badge-dot"></span>
-              Live
-            </span>
-            <span class="status-badge status-badge-offline">
-              <span class="status-badge-dot"></span>
-              Offline
-            </span>
-          </div>
-        </div>
-      </header>
+              <div class="status-stack">
+                <.link class="subtle-button" navigate="/">
+                  Back to Dashboard
+                </.link>
+              </div>
+            </div>
+          </header>
 
-      <%= if @payload[:error] do %>
-        <section class="error-card">
-          <h2 class="error-title">
-            Snapshot unavailable
-          </h2>
-          <p class="error-copy">
-            <strong><%= @payload.error.code %>:</strong> <%= @payload.error.message %>
-          </p>
-        </section>
+          <section class="error-card">
+            <h2 class="error-title">
+              Issue unavailable
+            </h2>
+            <p class="error-copy">
+              <strong><%= @issue_payload.error.code %>:</strong> <%= @issue_payload.error.message %>
+            </p>
+          </section>
+        <% else %>
+          <header class="hero-card">
+            <div class="hero-grid">
+              <div>
+                <p class="eyebrow">
+                  Symphony Observability
+                </p>
+                <h1 class="hero-title">
+                  <%= @issue_payload.issue_identifier %>
+                </h1>
+                <p class="hero-copy">
+                  Live issue detail view with the latest reconstructed Codex transcript for this workspace.
+                </p>
+              </div>
+
+              <div class="status-stack">
+                <.link class="subtle-button" navigate="/">
+                  Back to Dashboard
+                </.link>
+                <a class="subtle-button" href={"/api/v1/#{@issue_payload.issue_identifier}"}>JSON details</a>
+              </div>
+            </div>
+          </header>
+
+          <section class="metric-grid">
+            <article class="metric-card">
+              <p class="metric-label">Status</p>
+              <p class="metric-value"><%= String.capitalize(@issue_payload.status) %></p>
+              <p class="metric-detail">
+                <%= if @issue_payload.running do %>
+                  <span class={state_badge_class(@issue_payload.running.state)}>
+                    <%= @issue_payload.running.state %>
+                  </span>
+                <% else %>
+                  Active retry window.
+                <% end %>
+              </p>
+            </article>
+
+            <article class="metric-card">
+              <p class="metric-label">Session</p>
+              <p class="metric-value">
+                <%= @issue_payload.transcript.session_id || @issue_payload.running && @issue_payload.running.session_id || "n/a" %>
+              </p>
+              <p class="metric-detail">
+                Turns: <%= @issue_payload.running && @issue_payload.running.turn_count || 0 %>
+              </p>
+            </article>
+
+            <article class="metric-card">
+              <p class="metric-label">Runtime</p>
+              <p class="metric-value numeric">
+                <%= issue_runtime(@issue_payload, @now) %>
+              </p>
+              <p class="metric-detail">
+                Started <%= issue_started_at(@issue_payload) || "n/a" %>
+              </p>
+            </article>
+
+            <article class="metric-card">
+              <p class="metric-label">Total tokens</p>
+              <p class="metric-value numeric"><%= issue_total_tokens(@issue_payload) %></p>
+              <p class="metric-detail numeric">
+                <%= issue_token_detail(@issue_payload) %>
+              </p>
+            </article>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Issue Context</h2>
+                <p class="section-copy">Current session and workspace metadata for this issue.</p>
+              </div>
+            </div>
+
+            <div class="detail-stack">
+              <div>
+                <span class="muted event-meta">Workspace</span>
+                <pre class="code-panel"><%= @issue_payload.workspace.path || "n/a" %></pre>
+              </div>
+              <div>
+                <span class="muted event-meta">Worker host</span>
+                <pre class="code-panel"><%= @issue_payload.workspace.host || "local" %></pre>
+              </div>
+              <div :if={@issue_payload.last_error}>
+                <span class="muted event-meta">Latest retry error</span>
+                <pre class="code-panel"><%= @issue_payload.last_error %></pre>
+              </div>
+            </div>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Codex Transcript</h2>
+                <p class="section-copy">
+                  Reconstructed assistant text, commands, and command output from the latest session transcript.
+                </p>
+              </div>
+            </div>
+
+            <%= if transcript_blocks(@issue_payload.transcript) == [] do %>
+              <p class="empty-state">
+                No transcript text is available yet.
+                <%= if @issue_payload.running && @issue_payload.running.last_message do %>
+                  Latest update: <%= @issue_payload.running.last_message %>
+                <% end %>
+              </p>
+            <% else %>
+              <div class="detail-stack">
+                <article :for={block <- transcript_blocks(@issue_payload.transcript)}>
+                  <div class="muted event-meta">
+                    <strong><%= transcript_kind_label(block.kind) %></strong>
+                    <%= if block.at do %>
+                      · <span class="mono numeric"><%= block.at %></span>
+                    <% end %>
+                  </div>
+                  <pre class="code-panel" style="white-space: pre-wrap; margin-top: 0.4rem;"><%= block.text %></pre>
+                </article>
+              </div>
+            <% end %>
+          </section>
+        <% end %>
       <% else %>
-        <section class="metric-grid">
-          <article class="metric-card">
-            <p class="metric-label">Running</p>
-            <p class="metric-value numeric"><%= @payload.counts.running %></p>
-            <p class="metric-detail">Active issue sessions in the current runtime.</p>
-          </article>
+        <header class="hero-card">
+          <div class="hero-grid">
+            <div>
+              <p class="eyebrow">
+                Symphony Observability
+              </p>
+              <h1 class="hero-title">
+                Operations Dashboard
+              </h1>
+              <p class="hero-copy">
+                Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
+              </p>
+            </div>
 
-          <article class="metric-card">
-            <p class="metric-label">Retrying</p>
-            <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
-            <p class="metric-detail">Issues waiting for the next retry window.</p>
-          </article>
+            <div class="status-stack">
+              <span class="status-badge status-badge-live">
+                <span class="status-badge-dot"></span>
+                Live
+              </span>
+              <span class="status-badge status-badge-offline">
+                <span class="status-badge-dot"></span>
+                Offline
+              </span>
+            </div>
+          </div>
+        </header>
 
-          <article class="metric-card">
-            <p class="metric-label">Total tokens</p>
-            <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
-            <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
+        <%= if @dashboard_payload[:error] do %>
+          <section class="error-card">
+            <h2 class="error-title">
+              Snapshot unavailable
+            </h2>
+            <p class="error-copy">
+              <strong><%= @dashboard_payload.error.code %>:</strong> <%= @dashboard_payload.error.message %>
             </p>
-          </article>
+          </section>
+        <% else %>
+          <section class="metric-grid">
+            <article class="metric-card">
+              <p class="metric-label">Running</p>
+              <p class="metric-value numeric"><%= @dashboard_payload.counts.running %></p>
+              <p class="metric-detail">Active issue sessions in the current runtime.</p>
+            </article>
 
-          <article class="metric-card">
-            <p class="metric-label">Runtime</p>
-            <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
-            <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
-          </article>
-        </section>
+            <article class="metric-card">
+              <p class="metric-label">Retrying</p>
+              <p class="metric-value numeric"><%= @dashboard_payload.counts.retrying %></p>
+              <p class="metric-detail">Issues waiting for the next retry window.</p>
+            </article>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+            <article class="metric-card">
+              <p class="metric-label">Total tokens</p>
+              <p class="metric-value numeric"><%= format_int(@dashboard_payload.codex_totals.total_tokens) %></p>
+              <p class="metric-detail numeric">
+                In <%= format_int(@dashboard_payload.codex_totals.input_tokens) %> / Out <%= format_int(@dashboard_payload.codex_totals.output_tokens) %>
+              </p>
+            </article>
+
+            <article class="metric-card">
+              <p class="metric-label">Runtime</p>
+              <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@dashboard_payload, @now)) %></p>
+              <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
+            </article>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Rate limits</h2>
+                <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+              </div>
             </div>
-          </div>
 
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
-        </section>
+            <pre class="code-panel"><%= pretty_value(@dashboard_payload.rate_limits) %></pre>
+          </section>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Running sessions</h2>
+                <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+              </div>
             </div>
-          </div>
 
-          <%= if @payload.running == [] do %>
-            <p class="empty-state">No active sessions.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table data-table-running">
-                <colgroup>
-                  <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
-                  <col />
-                  <col style="width: 10rem;" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Runtime / turns</th>
-                    <th>Codex update</th>
-                    <th>Tokens</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
-                      </span>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
-                          </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
-                      </div>
-                    </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
+            <%= if @dashboard_payload.running == [] do %>
+              <p class="empty-state">No active sessions.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table data-table-running">
+                  <colgroup>
+                    <col style="width: 14rem;" />
+                    <col style="width: 8rem;" />
+                    <col style="width: 7.5rem;" />
+                    <col style="width: 8.5rem;" />
+                    <col />
+                    <col style="width: 10rem;" />
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>State</th>
+                      <th>Session</th>
+                      <th>Runtime / turns</th>
+                      <th>Codex update</th>
+                      <th>Tokens</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @dashboard_payload.running}>
+                      <td>
+                        <div class="issue-stack">
+                          <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
+                            <%= entry.issue_identifier %>
+                          </.link>
+                          <.link class="issue-link" navigate={issue_path(entry.issue_identifier)}>
+                            Issue details
+                          </.link>
+                          <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        </div>
+                      </td>
+                      <td>
+                        <span class={state_badge_class(entry.state)}>
+                          <%= entry.state %>
                         </span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
+                      </td>
+                      <td>
+                        <div class="session-stack">
+                          <%= if entry.session_id do %>
+                            <button
+                              type="button"
+                              class="subtle-button"
+                              data-label="Copy ID"
+                              data-copy={entry.session_id}
+                              onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                            >
+                              Copy ID
+                            </button>
+                          <% else %>
+                            <span class="muted">n/a</span>
+                          <% end %>
+                        </div>
+                      </td>
+                      <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
+                      <td>
+                        <div class="detail-stack">
+                          <span
+                            class="event-text"
+                            title={entry.last_message || to_string(entry.last_event || "n/a")}
+                          ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
+                          <span class="muted event-meta">
+                            <%= entry.last_event || "n/a" %>
+                            <%= if entry.last_event_at do %>
+                              · <span class="mono numeric"><%= entry.last_event_at %></span>
+                            <% end %>
+                          </span>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="token-stack numeric">
+                          <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
+                          <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          </section>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Retry queue</h2>
+                <p class="section-copy">Issues waiting for the next retry window.</p>
+              </div>
             </div>
-          </div>
 
-          <%= if @payload.retrying == [] do %>
-            <p class="empty-state">No issues are currently backing off.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 680px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Attempt</th>
-                    <th>Due at</th>
-                    <th>Error</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.retrying}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td><%= entry.attempt %></td>
-                    <td class="mono"><%= entry.due_at || "n/a" %></td>
-                    <td><%= entry.error || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
+            <%= if @dashboard_payload.retrying == [] do %>
+              <p class="empty-state">No issues are currently backing off.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table" style="min-width: 680px;">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>Attempt</th>
+                      <th>Due at</th>
+                      <th>Error</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @dashboard_payload.retrying}>
+                      <td>
+                        <div class="issue-stack">
+                          <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
+                            <%= entry.issue_identifier %>
+                          </.link>
+                          <.link class="issue-link" navigate={issue_path(entry.issue_identifier)}>
+                            Issue details
+                          </.link>
+                          <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        </div>
+                      </td>
+                      <td><%= entry.attempt %></td>
+                      <td class="mono"><%= entry.due_at || "n/a" %></td>
+                      <td><%= entry.error || "n/a" %></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          </section>
+        <% end %>
       <% end %>
     </section>
     """
   end
 
-  defp load_payload do
-    Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
+  defp load_dashboard_page(socket) do
+    socket
+    |> assign(:dashboard_payload, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+    |> assign(:issue_payload, nil)
+    |> assign(:issue_identifier, nil)
   end
+
+  defp load_issue_page(socket, issue_identifier) when is_binary(issue_identifier) do
+    issue_payload =
+      case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
+        {:ok, payload} ->
+          payload
+
+        {:error, :issue_not_found} ->
+          %{error: %{code: "issue_not_found", message: "Issue not found"}}
+      end
+
+    socket
+    |> assign(:issue_payload, issue_payload)
+    |> assign(:issue_identifier, issue_identifier)
+  end
+
+  defp reload_current_page(%{assigns: %{live_action: :issue, issue_identifier: issue_identifier}} = socket)
+       when is_binary(issue_identifier) do
+    load_issue_page(socket, issue_identifier)
+  end
+
+  defp reload_current_page(socket), do: load_dashboard_page(socket)
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
@@ -271,6 +475,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
         total + runtime_seconds_from_started_at(entry.started_at, now)
       end)
   end
+
+  defp issue_runtime(%{running: %{started_at: started_at}}, now) do
+    runtime_seconds_from_started_at(started_at, now)
+    |> format_runtime_seconds()
+  end
+
+  defp issue_runtime(_issue_payload, _now), do: "n/a"
+
+  defp issue_started_at(%{running: %{started_at: started_at}}), do: started_at
+  defp issue_started_at(_issue_payload), do: nil
+
+  defp issue_total_tokens(%{running: %{tokens: %{total_tokens: total_tokens}}}), do: format_int(total_tokens)
+  defp issue_total_tokens(_issue_payload), do: "n/a"
+
+  defp issue_token_detail(%{running: %{tokens: %{input_tokens: input_tokens, output_tokens: output_tokens}}}) do
+    "In #{format_int(input_tokens)} / Out #{format_int(output_tokens)}"
+  end
+
+  defp issue_token_detail(_issue_payload), do: "n/a"
 
   defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"
@@ -320,6 +543,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> base
     end
   end
+
+  defp transcript_blocks(%{blocks: blocks}) when is_list(blocks), do: blocks
+  defp transcript_blocks(_transcript), do: []
+
+  defp transcript_kind_label("agent"), do: "Agent"
+  defp transcript_kind_label("command"), do: "Command"
+  defp transcript_kind_label("output"), do: "Output"
+  defp transcript_kind_label(_kind), do: "Event"
+
+  defp issue_path(issue_identifier) when is_binary(issue_identifier), do: "/issues/#{issue_identifier}"
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

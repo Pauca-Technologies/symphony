@@ -7,13 +7,15 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, LogFile, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @recent_codex_events_limit 200
+  @recent_codex_transcript_blocks_limit 80
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -140,7 +142,9 @@ defmodule SymphonyElixir.Orchestrator do
                 identifier: running_entry.identifier,
                 delay_type: :continuation,
                 worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
+                workspace_path: Map.get(running_entry, :workspace_path),
+                codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+                recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
               })
 
             _ ->
@@ -152,7 +156,9 @@ defmodule SymphonyElixir.Orchestrator do
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
+                workspace_path: Map.get(running_entry, :workspace_path),
+                codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+                recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
               })
           end
 
@@ -190,6 +196,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        updated_running_entry = persist_codex_update(updated_running_entry, update)
 
         state =
           state
@@ -711,6 +718,9 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
+            recent_codex_events: [],
+            recent_codex_transcript_blocks: [],
+            codex_session_logs: [],
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
@@ -782,6 +792,8 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    codex_session_logs = pick_retry_codex_session_logs(previous_retry, metadata)
+    recent_codex_transcript_blocks = pick_retry_codex_transcript_blocks(previous_retry, metadata)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -804,7 +816,9 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: identifier,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            codex_session_logs: codex_session_logs,
+            recent_codex_transcript_blocks: recent_codex_transcript_blocks
           })
     }
   end
@@ -816,7 +830,9 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          codex_session_logs: Map.get(retry_entry, :codex_session_logs, []),
+          recent_codex_transcript_blocks: Map.get(retry_entry, :recent_codex_transcript_blocks, [])
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -962,6 +978,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pick_retry_codex_session_logs(previous_retry, metadata) do
+    metadata[:codex_session_logs] || Map.get(previous_retry, :codex_session_logs) || []
+  end
+
+  defp pick_retry_codex_transcript_blocks(previous_retry, metadata) do
+    metadata[:recent_codex_transcript_blocks] ||
+      Map.get(previous_retry, :recent_codex_transcript_blocks) ||
+      []
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
@@ -1122,6 +1148,9 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          recent_codex_events: Map.get(metadata, :recent_codex_events, []),
+          recent_codex_transcript_blocks: Map.get(metadata, :recent_codex_transcript_blocks, []),
+          codex_session_logs: Map.get(metadata, :codex_session_logs, []),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1136,7 +1165,9 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry, :identifier),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          codex_session_logs: Map.get(retry, :codex_session_logs, []),
+          recent_codex_transcript_blocks: Map.get(retry, :recent_codex_transcript_blocks, [])
         }
       end)
 
@@ -1170,6 +1201,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
+    codex_message = summarize_codex_update(update)
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
@@ -1183,9 +1215,15 @@ defmodule SymphonyElixir.Orchestrator do
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
+        last_codex_message: codex_message,
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
+        recent_codex_events: append_recent_codex_event(Map.get(running_entry, :recent_codex_events, []), codex_message),
+        recent_codex_transcript_blocks:
+          append_recent_codex_transcript_block(
+            Map.get(running_entry, :recent_codex_transcript_blocks, []),
+            transcript_block_for_update(update)
+          ),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -1238,9 +1276,295 @@ defmodule SymphonyElixir.Orchestrator do
   defp summarize_codex_update(update) do
     %{
       event: update[:event],
-      message: update[:payload] || update[:raw],
+      message: summarized_codex_message(update),
       timestamp: update[:timestamp]
     }
+  end
+
+  defp append_recent_codex_event(events, event) when is_list(events) and is_map(event) do
+    events
+    |> Kernel.++([event])
+    |> Enum.take(-@recent_codex_events_limit)
+  end
+
+  defp append_recent_codex_event(_events, event) when is_map(event), do: [event]
+
+  defp append_recent_codex_transcript_block(blocks, nil) when is_list(blocks), do: blocks
+
+  defp append_recent_codex_transcript_block(blocks, %{kind: kind, text: text} = block)
+       when is_list(blocks) and is_binary(kind) and is_binary(text) do
+    merged_blocks =
+      case Enum.reverse(blocks) do
+        [%{kind: ^kind, text: existing_text} = previous | rest]
+        when kind in ["agent", "output"] ->
+          Enum.reverse([%{previous | text: existing_text <> text} | rest])
+
+        reversed_blocks ->
+          Enum.reverse([block | reversed_blocks])
+      end
+
+    Enum.take(merged_blocks, -@recent_codex_transcript_blocks_limit)
+  end
+
+  defp append_recent_codex_transcript_block(_blocks, block) when is_map(block), do: [block]
+
+  defp transcript_block_for_update(%{payload: %{} = payload, timestamp: timestamp}) do
+    method = Map.get(payload, "method") || Map.get(payload, :method)
+
+    cond do
+      method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
+        build_transcript_block("agent", timestamp, extract_transcript_text(payload, agent_text_paths()))
+
+      method in ["codex/event/exec_command_output_delta", "item/commandExecution/outputDelta"] ->
+        build_transcript_block("output", timestamp, extract_transcript_text(payload, output_text_paths()))
+
+      method == "codex/event/exec_command_begin" ->
+        build_transcript_block("command", timestamp, extract_transcript_command(payload))
+
+      true ->
+        nil
+    end
+  end
+
+  defp transcript_block_for_update(_update), do: nil
+
+  defp build_transcript_block(kind, timestamp, text) when is_binary(kind) and is_binary(text) do
+    case normalize_transcript_text(text) do
+      "" -> nil
+      normalized -> %{kind: kind, at: iso8601(timestamp), text: normalized}
+    end
+  end
+
+  defp build_transcript_block(_kind, _timestamp, _text), do: nil
+
+  defp agent_text_paths do
+    [
+      ["params", "msg", "content"],
+      ["params", "msg", "delta"],
+      ["params", "delta"],
+      ["params", "text"],
+      ["params", "content"]
+    ]
+  end
+
+  defp output_text_paths do
+    [
+      ["params", "msg", "content"],
+      ["params", "msg", "delta"],
+      ["params", "delta"],
+      ["params", "output"],
+      ["params", "content"]
+    ]
+  end
+
+  defp extract_transcript_text(payload, paths) when is_map(payload) and is_list(paths) do
+    Enum.find_value(paths, fn path ->
+      case string_path_value(payload, path) do
+        text when is_binary(text) -> text
+        _ -> nil
+      end
+    end)
+  end
+
+  defp extract_transcript_command(payload) when is_map(payload) do
+    [
+      ["params", "msg", "command"],
+      ["params", "command"],
+      ["params", "cmd"]
+    ]
+    |> Enum.find_value(fn path ->
+      case string_path_value(payload, path) do
+        command when is_binary(command) -> "$ #{String.trim(command)}"
+        _ -> nil
+      end
+    end)
+  end
+
+  defp normalize_transcript_text(text) when is_binary(text) do
+    text
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
+    |> String.replace(~r/\x1B\[[0-9;]*[A-Za-z]/, "")
+    |> String.replace(~r/\x1B./, "")
+    |> String.replace(~r/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/, "")
+  end
+
+  defp string_path_value(value, []), do: value
+
+  defp string_path_value(map, [key | rest]) when is_map(map) and is_binary(key) do
+    case Map.get(map, key) do
+      nil -> nil
+      nested -> string_path_value(nested, rest)
+    end
+  end
+
+  defp string_path_value(_map, _path), do: nil
+
+  defp persist_codex_update(running_entry, update) when is_map(running_entry) and is_map(update) do
+    case session_log_for_update(running_entry, update) do
+      {:ok, updated_entry, log_entry} ->
+        case append_codex_session_log(log_entry.path, codex_session_log_record(updated_entry, update)) do
+          :ok ->
+            updated_entry
+
+          {:error, reason} ->
+            Logger.warning(
+              "Failed to write Codex transcript issue_id=#{updated_entry.issue.id} issue_identifier=#{updated_entry.identifier} session_id=#{updated_entry.session_id || "n/a"} path=#{log_entry.path} reason=#{inspect(reason)}"
+            )
+
+            updated_entry
+        end
+
+      :skip ->
+        running_entry
+    end
+  end
+
+  defp session_log_for_update(running_entry, update) do
+    session_id = Map.get(running_entry, :session_id)
+
+    if is_binary(session_id) and String.trim(session_id) != "" do
+      timestamp = update[:timestamp] || DateTime.utc_now()
+      log_entry = existing_or_new_session_log(running_entry, session_id, timestamp)
+      updated_log_entry = refresh_session_log_entry(log_entry, running_entry, timestamp)
+      {:ok, put_session_log_entry(running_entry, updated_log_entry), updated_log_entry}
+    else
+      :skip
+    end
+  end
+
+  defp existing_or_new_session_log(running_entry, session_id, timestamp) do
+    Enum.find(Map.get(running_entry, :codex_session_logs, []), fn
+      %{session_id: ^session_id} -> true
+      _ -> false
+    end) ||
+      %{
+        session_id: session_id,
+        path: codex_session_log_path(running_entry.identifier, session_id),
+        started_at: timestamp
+      }
+  end
+
+  defp refresh_session_log_entry(log_entry, running_entry, timestamp) do
+    log_entry
+    |> Map.put(:started_at, Map.get(log_entry, :started_at, timestamp))
+    |> Map.put(:last_event_at, timestamp)
+    |> maybe_put_runtime_value(:worker_host, Map.get(running_entry, :worker_host))
+    |> maybe_put_runtime_value(:workspace_path, Map.get(running_entry, :workspace_path))
+  end
+
+  defp put_session_log_entry(running_entry, %{session_id: session_id} = log_entry) when is_binary(session_id) do
+    session_logs =
+      running_entry
+      |> Map.get(:codex_session_logs, [])
+      |> Enum.reject(fn
+        %{session_id: ^session_id} -> true
+        _ -> false
+      end)
+      |> Kernel.++([log_entry])
+
+    Map.put(running_entry, :codex_session_logs, session_logs)
+  end
+
+  defp put_session_log_entry(running_entry, _log_entry), do: running_entry
+
+  defp codex_session_log_path(issue_identifier, session_id)
+       when is_binary(issue_identifier) and is_binary(session_id) do
+    file_name =
+      "#{sanitize_session_log_component(issue_identifier)}--#{sanitize_session_log_component(session_id)}.ndjson"
+
+    codex_session_logs_dir()
+    |> Path.join(file_name)
+    |> Path.expand()
+  end
+
+  defp codex_session_logs_dir do
+    :symphony_elixir
+    |> Application.get_env(:log_file, LogFile.default_log_file())
+    |> Path.expand()
+    |> Path.dirname()
+    |> Path.join("codex_sessions")
+  end
+
+  defp sanitize_session_log_component(value) when is_binary(value) do
+    value
+    |> String.replace(~r/[^A-Za-z0-9._-]/, "_")
+    |> String.trim("_")
+    |> case do
+      "" -> "session"
+      sanitized -> sanitized
+    end
+  end
+
+  defp append_codex_session_log(path, record) when is_binary(path) and is_map(record) do
+    case File.mkdir_p(Path.dirname(path)) do
+      :ok ->
+        encoded = Jason.encode!(record) <> "\n"
+        File.write(path, encoded, [:append])
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    error in [File.Error] -> {:error, error}
+  end
+
+  defp codex_session_log_record(running_entry, update) when is_map(running_entry) and is_map(update) do
+    %{
+      at: iso8601(update[:timestamp]),
+      event: update[:event] |> to_string(),
+      issue_id: running_entry.issue.id,
+      issue_identifier: running_entry.identifier,
+      session_id: Map.get(running_entry, :session_id),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      codex_app_server_pid: Map.get(running_entry, :codex_app_server_pid),
+      summary:
+        StatusDashboard.humanize_codex_message(%{
+          event: update[:event],
+          message: summarized_codex_message(update)
+        }),
+      payload: update[:payload],
+      raw: update[:raw],
+      details: json_safe_value(update[:details]),
+      thread_id: update[:thread_id],
+      turn_id: update[:turn_id],
+      decision: update[:decision],
+      answer: update[:answer],
+      reason: json_safe_value(update[:reason])
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp json_safe_value(nil), do: nil
+  defp json_safe_value(%DateTime{} = value), do: iso8601(value)
+  defp json_safe_value(value) when is_binary(value) or is_number(value) or is_boolean(value), do: value
+  defp json_safe_value(value) when is_atom(value), do: Atom.to_string(value)
+  defp json_safe_value(value) when is_list(value), do: Enum.map(value, &json_safe_value/1)
+
+  defp json_safe_value(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, nested_value} -> {to_string(key), json_safe_value(nested_value)} end)
+    |> Map.new()
+  end
+
+  defp json_safe_value(value), do: inspect(value)
+
+  defp iso8601(%DateTime{} = timestamp), do: DateTime.to_iso8601(timestamp)
+  defp iso8601(_timestamp), do: nil
+
+  defp summarized_codex_message(update) when is_map(update) do
+    update[:payload] ||
+      update[:raw] ||
+      update
+      |> Map.take([:session_id, :thread_id, :turn_id, :reason, :decision, :answer])
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Map.new()
+      |> case do
+        empty when map_size(empty) == 0 -> nil
+        metadata -> metadata
+      end
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do

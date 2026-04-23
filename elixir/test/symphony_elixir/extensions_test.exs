@@ -356,6 +356,18 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
+                 "recent_events" => [
+                   %{
+                     "at" =>
+                       state_payload["running"]
+                       |> List.first()
+                       |> Map.fetch!("recent_events")
+                       |> List.first()
+                       |> Map.fetch!("at"),
+                     "event" => "notification",
+                     "message" => "mix test"
+                   }
+                 ],
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -401,11 +413,46 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
+               "recent_events" => [
+                 %{
+                   "at" =>
+                     issue_payload["running"]
+                     |> Map.fetch!("recent_events")
+                     |> List.first()
+                     |> Map.fetch!("at"),
+                   "event" => "notification",
+                   "message" => "mix test"
+                 }
+               ],
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
-             "logs" => %{"codex_session_logs" => []},
-             "recent_events" => [],
+             "logs" => %{
+               "codex_session_logs" => [
+                 %{
+                   "session_id" => "thread-http",
+                   "path" => "/tmp/symphony/log/codex_sessions/MT-HTTP--thread-http.ndjson",
+                   "started_at" => issue_payload["logs"]["codex_session_logs"] |> List.first() |> Map.fetch!("started_at"),
+                   "last_event_at" => issue_payload["logs"]["codex_session_logs"] |> List.first() |> Map.fetch!("last_event_at"),
+                   "worker_host" => nil,
+                   "workspace_path" => nil
+                 }
+               ]
+             },
+             "transcript" => %{
+               "session_id" => "thread-http",
+               "path" => "/tmp/symphony/log/codex_sessions/MT-HTTP--thread-http.ndjson",
+               "started_at" => issue_payload["transcript"]["started_at"],
+               "last_event_at" => issue_payload["transcript"]["last_event_at"],
+               "blocks" => []
+             },
+             "recent_events" => [
+               %{
+                 "at" => issue_payload["recent_events"] |> List.first() |> Map.fetch!("at"),
+                 "event" => "notification",
+                 "message" => "mix test"
+               }
+             ],
              "last_error" => nil,
              "tracked" => %{}
            }
@@ -520,9 +567,53 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert live_view_js =~ "var LiveView = (() => {"
   end
 
-  test "dashboard liveview renders and refreshes over pubsub" do
+  test "dashboard liveview keeps the list compact and renders transcript text on the issue page" do
     orchestrator_name = Module.concat(__MODULE__, :DashboardOrchestrator)
     snapshot = static_snapshot()
+
+    transcript_file =
+      write_transcript_fixture!([
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/agent_message_content_delta",
+            "params" => %{"msg" => %{"content" => "OLD-BEGINNING " <> String.duplicate("x", 300_000)}}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/agent_message_content_delta",
+            "params" => %{"msg" => %{"content" => "Investigating the failure"}}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/agent_message_content_delta",
+            "params" => %{"msg" => %{"content" => " and updating the fix."}}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/exec_command_begin",
+            "params" => %{"msg" => %{"command" => "mix test --cover"}}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/exec_command_output_delta",
+            "params" => %{"msg" => %{"content" => "Compiling 3 files\\n"}}
+          }
+        }
+      ])
 
     {:ok, orchestrator_pid} =
       StaticOrchestrator.start_link(
@@ -548,10 +639,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
-    refute html =~ "data-runtime-clock="
-    refute html =~ "setInterval(refreshRuntimeClocks"
-    refute html =~ "Refresh now"
-    refute html =~ "Transport"
+    assert html =~ "Issue details"
+    refute html =~ "mix test --cover"
+    refute html =~ "Investigating the failure"
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
 
@@ -578,6 +668,16 @@ defmodule SymphonyElixir.ExtensionsTest do
             }
           },
           last_codex_timestamp: DateTime.utc_now(),
+          codex_session_logs: [
+            %{
+              session_id: "thread-http",
+              path: transcript_file,
+              started_at: DateTime.utc_now(),
+              last_event_at: DateTime.utc_now(),
+              worker_host: nil,
+              workspace_path: nil
+            }
+          ],
           codex_input_tokens: 10,
           codex_output_tokens: 12,
           codex_total_tokens: 22,
@@ -592,7 +692,34 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      rendered = render(view)
+
+      rendered =~ "agent message content streaming: structured update" and
+        not String.contains?(rendered, "mix test --cover")
+    end)
+
+    {:ok, issue_view, issue_html} = live(build_conn(), "/issues/MT-HTTP")
+    assert issue_html =~ "Codex Transcript"
+    assert issue_html =~ "Investigating the failure and updating the fix."
+    assert issue_html =~ "$ mix test --cover"
+    assert issue_html =~ "Compiling 3 files"
+    refute issue_html =~ "OLD-BEGINNING"
+    refute issue_html =~ "agent message content streaming: structured update"
+
+    updated_issue_snapshot =
+      put_in(updated_snapshot.running, [
+        %{List.first(updated_snapshot.running) | last_codex_timestamp: DateTime.utc_now()}
+      ])
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      Keyword.put(state, :snapshot, updated_issue_snapshot)
+    end)
+
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      rendered = render(issue_view)
+      rendered =~ "Investigating the failure and updating the fix." and rendered =~ "$ mix test --cover"
     end)
   end
 
@@ -696,6 +823,26 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_message: "rendered",
           last_codex_timestamp: nil,
           last_codex_event: :notification,
+          recent_codex_events: [
+            %{
+              event: :notification,
+              message: %{
+                "method" => "codex/event/exec_command_begin",
+                "params" => %{"msg" => %{"command" => "mix test"}}
+              },
+              timestamp: DateTime.utc_now()
+            }
+          ],
+          codex_session_logs: [
+            %{
+              session_id: "thread-http",
+              path: "/tmp/symphony/log/codex_sessions/MT-HTTP--thread-http.ndjson",
+              started_at: DateTime.utc_now(),
+              last_event_at: DateTime.utc_now(),
+              worker_host: nil,
+              workspace_path: nil
+            }
+          ],
           codex_input_tokens: 4,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
@@ -714,6 +861,23 @@ defmodule SymphonyElixir.ExtensionsTest do
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
+  end
+
+  defp write_transcript_fixture!(entries) when is_list(entries) do
+    transcript_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-transcript-fixtures-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(transcript_root)
+    transcript_file = Path.join(transcript_root, "session.ndjson")
+
+    body =
+      Enum.map_join(entries, "\n", &Jason.encode!/1)
+
+    File.write!(transcript_file, body <> "\n")
+    transcript_file
   end
 
   defp wait_for_bound_port do
