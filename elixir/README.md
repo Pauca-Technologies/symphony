@@ -155,6 +155,8 @@ codex:
 - Codex session transcripts are written as NDJSON files under `./log/codex_sessions` by default,
   or under `<logs-root>/log/codex_sessions` when `--logs-root` is set. The issue JSON endpoint
   includes the current known transcript paths for that issue.
+- To render a transcript in a human-readable terminal format, run
+  `bin/codex-session-log log/codex_sessions/<session-file>.ndjson`.
 
 ## Web dashboard
 

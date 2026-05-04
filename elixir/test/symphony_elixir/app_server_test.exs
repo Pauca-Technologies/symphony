@@ -262,6 +262,100 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server sanitizes noise from sourced env files before startup" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-sourced-env-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-87")
+      env_dir = Path.join(workspace, ".artifacts/github-app-auth")
+      env_file = Path.join(env_dir, "session.env")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-sourced-env.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      File.mkdir_p!(env_dir)
+
+      File.write!(env_file, """
+      WARN Unsupported engine: wanted: {"node":">=24.0.0"} (current: {"node":"v22.22.2"})
+
+      > app@ github:bootstrap #{workspace}
+      export SYMPHONY_TEST_SOURCED_ENV='available'
+      """)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-sourced-env.trace}"
+      printf 'ENV:%s\\n' "$SYMPHONY_TEST_SOURCED_ENV" >> "$trace_file"
+
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-87"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-87"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "sh -lc '. .artifacts/github-app-auth/session.env && exec #{codex_binary} app-server'"
+      )
+
+      issue = %Issue{
+        id: "issue-sourced-env",
+        identifier: "MT-87",
+        title: "Sourced env contains command noise",
+        description: "Ensure generated env files can be sourced by the app-server command",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-87",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Use sanitized env", issue)
+      assert File.read!(trace_file) =~ "ENV:available"
+
+      sanitized_env = File.read!(env_file)
+      refute sanitized_env =~ "Unsupported engine"
+      refute sanitized_env =~ "github:bootstrap"
+      assert sanitized_env =~ "export SYMPHONY_TEST_SOURCED_ENV='available'"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server fails when command execution approval is required under safer defaults" do
     test_root =
       Path.join(

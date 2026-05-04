@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @source_env_pattern ~r/(?:^|[\s;&|('"])(?:\.|source)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/
 
   @type session :: %{
           port: port(),
@@ -41,6 +42,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         :ok <- prepare_sourced_env_files(expanded_workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
@@ -212,6 +214,81 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp start_port(workspace, worker_host) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+  end
+
+  defp prepare_sourced_env_files(workspace, nil) when is_binary(workspace) do
+    Config.settings!().codex.command
+    |> sourced_env_files(workspace)
+    |> Enum.each(&sanitize_sourced_env_file(&1, workspace))
+
+    :ok
+  end
+
+  defp prepare_sourced_env_files(_workspace, worker_host) when is_binary(worker_host), do: :ok
+
+  defp sourced_env_files(command, workspace) when is_binary(command) and is_binary(workspace) do
+    @source_env_pattern
+    |> Regex.scan(command)
+    |> Enum.map(fn [_match | captures] -> Enum.find(captures, &(&1 != "")) end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.filter(&String.ends_with?(&1, ".env"))
+    |> Enum.map(&Path.expand(&1, workspace))
+    |> Enum.uniq()
+    |> Enum.filter(&workspace_file?(&1, workspace))
+  end
+
+  defp sanitize_sourced_env_file(path, workspace) do
+    with true <- File.regular?(path),
+         {:ok, content} <- File.read(path),
+         {:ok, sanitized_content, removed_count} <- sanitize_shell_env_content(content),
+         true <- sanitized_content != content,
+         :ok <- File.write(path, sanitized_content) do
+      Logger.warning("Sanitized sourced env file before Codex startup workspace=#{workspace} path=#{path} removed_lines=#{removed_count}")
+    else
+      _ -> :ok
+    end
+  end
+
+  defp sanitize_shell_env_content(content) when is_binary(content) do
+    lines = String.split(content, "\n", trim: false)
+
+    {sanitized_lines, removed_count, assignment_count} =
+      Enum.reduce(lines, {[], 0, 0}, fn line, {kept, removed, assignments} ->
+        cond do
+          shell_env_assignment_line?(line) ->
+            {[line | kept], removed, assignments + 1}
+
+          shell_env_ignored_line?(line) ->
+            {[line | kept], removed, assignments}
+
+          true ->
+            {kept, removed + 1, assignments}
+        end
+      end)
+
+    if removed_count > 0 and assignment_count > 0 do
+      {:ok, sanitized_lines |> Enum.reverse() |> Enum.join("\n"), removed_count}
+    else
+      :skip
+    end
+  end
+
+  defp shell_env_assignment_line?(line) when is_binary(line) do
+    String.match?(line, ~r/^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=/)
+  end
+
+  defp shell_env_ignored_line?(line) when is_binary(line) do
+    trimmed = String.trim_leading(line)
+    trimmed == "" or String.starts_with?(trimmed, "#")
+  end
+
+  defp workspace_file?(path, workspace) do
+    with {:ok, canonical_path} <- PathSafety.canonicalize(path),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace) do
+      String.starts_with?(canonical_path <> "/", canonical_workspace <> "/")
+    else
+      _ -> false
+    end
   end
 
   defp remote_launch_command(workspace) when is_binary(workspace) do
