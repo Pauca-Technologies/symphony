@@ -3,9 +3,26 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.{HandoffGate, Linear.Client}
 
   @linear_graphql_tool "linear_graphql"
+  @issue_transition_query """
+  query SymphonyResolveIssueTransition($issueId: String!) {
+    issue(id: $issueId) {
+      state {
+        name
+      }
+      team {
+        states(first: 250) {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+  """
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
   """
@@ -57,11 +74,144 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
+         :ok <- maybe_run_before_handoff_gate(query, variables, opts, linear_client),
          {:ok, response} <- linear_client.(query, variables, []) do
       graphql_response(response)
     else
+      {:handoff_blocked, prompt, gates} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "before_handoff hook blocked the Linear status transition.",
+            "remediation" => prompt,
+            "gates" => gates
+          }
+        })
+
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp maybe_run_before_handoff_gate(query, variables, opts, linear_client) do
+    context = Keyword.get(opts, :handoff_gate_context)
+
+    cond do
+      !issue_update_mutation?(query) ->
+        :ok
+
+      !is_map(context) ->
+        :ok
+
+      true ->
+        resolve_and_run_before_handoff_gate(query, variables, context, linear_client)
+    end
+  end
+
+  defp resolve_and_run_before_handoff_gate(query, variables, context, linear_client) do
+    issue = Map.get(context, :issue) || Map.get(context, "issue")
+    workspace = Map.get(context, :workspace) || Map.get(context, "workspace")
+    worker_host = Map.get(context, :worker_host) || Map.get(context, "worker_host")
+
+    with %{id: context_issue_id} <- issue,
+         workspace when is_binary(workspace) <- workspace,
+         issue_id when is_binary(issue_id) <- transition_issue_id(query, variables),
+         true <- issue_id == context_issue_id,
+         {:ok, current_state, target_state} <-
+           resolve_transition_states(query, variables, issue, issue_id, linear_client),
+         true <- HandoffGate.handoff_transition?(current_state, target_state) do
+      case HandoffGate.run_before_handoff(workspace, issue, worker_host, target_state) do
+        :ok -> :ok
+        {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
+      end
+    else
+      _ -> :ok
+    end
+  end
+
+  defp issue_update_mutation?(query) when is_binary(query) do
+    String.contains?(query, "issueUpdate")
+  end
+
+  defp transition_issue_id(query, variables) do
+    variable_string(variables, ["issueId", "id"]) || literal_argument(query, "id")
+  end
+
+  defp resolve_transition_states(query, variables, issue, issue_id, linear_client) do
+    current_state = Map.get(issue, :state) || Map.get(issue, "state")
+    target_state = explicit_target_state(query, variables)
+
+    cond do
+      is_binary(target_state) ->
+        {:ok, current_state, target_state}
+
+      state_id = transition_state_id(query, variables) ->
+        resolve_state_id_transition(issue_id, state_id, current_state, linear_client)
+
+      true ->
+        {:error, :missing_target_state}
+    end
+  end
+
+  defp explicit_target_state(query, variables) do
+    variable_string(variables, ["stateName", "state", "status"]) ||
+      literal_argument(query, "stateName") ||
+      literal_argument(query, "state") ||
+      literal_argument(query, "status")
+  end
+
+  defp transition_state_id(query, variables) do
+    variable_string(variables, ["stateId"]) || literal_argument(query, "stateId")
+  end
+
+  defp resolve_state_id_transition(issue_id, state_id, fallback_current_state, linear_client) do
+    case linear_client.(@issue_transition_query, %{"issueId" => issue_id}, []) do
+      {:ok, response} ->
+        issue = get_in(response, ["data", "issue"]) || %{}
+        current_state = get_in(issue, ["state", "name"]) || fallback_current_state
+
+        target_state =
+          issue
+          |> get_in(["team", "states", "nodes"])
+          |> find_state_name(state_id)
+
+        if is_binary(target_state) do
+          {:ok, current_state, target_state}
+        else
+          {:error, :target_state_not_found}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp find_state_name(states, state_id) when is_list(states) and is_binary(state_id) do
+    Enum.find_value(states, fn
+      %{"id" => ^state_id, "name" => name} when is_binary(name) -> name
+      %{id: ^state_id, name: name} when is_binary(name) -> name
+      _ -> nil
+    end)
+  end
+
+  defp find_state_name(_states, _state_id), do: nil
+
+  defp variable_string(variables, keys) when is_map(variables) do
+    Enum.find_value(keys, fn key ->
+      case Map.get(variables, key) || Map.get(variables, String.to_atom(key)) do
+        value when is_binary(value) and value != "" -> value
+        _ -> nil
+      end
+    end)
+  end
+
+  defp variable_string(_variables, _keys), do: nil
+
+  defp literal_argument(query, field) when is_binary(query) and is_binary(field) do
+    pattern = ~r/#{Regex.escape(field)}\s*:\s*"([^"]+)"/
+
+    case Regex.run(pattern, query) do
+      [_match, value] -> value
+      _ -> nil
     end
   end
 

@@ -65,6 +65,94 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
   end
 
+  test "linear_graphql blocks In Progress to In Review issueUpdate when before_handoff hook fails" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-before-handoff-tool-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.dirname(workspace),
+      hook_before_handoff: """
+      printf '%s' '{"checks":[{"name":"landable-check","status":"failed","summary":"CI is not green","remediation":"wait for CI"}]}'
+      exit 2
+      """
+    )
+
+    handler_id = "before-handoff-tool-test-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      SymphonyElixir.HandoffGate.telemetry_event(),
+      fn event, measurements, metadata, recipient ->
+        send(recipient, {:before_handoff_telemetry, event, measurements, metadata})
+      end,
+      self()
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      File.rm_rf(workspace)
+    end)
+
+    issue = %Issue{
+      id: "issue-gate",
+      identifier: "UDPE-1",
+      title: "Gate handoff",
+      state: "In Progress"
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => "issue-gate", "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{issue: issue, workspace: workspace, worker_host: nil},
+        linear_client: fn
+          query, %{"issueId" => "issue-gate"}, [] ->
+            assert query =~ "SymphonyResolveIssueTransition"
+
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{
+                       "nodes" => [
+                         %{"id" => "state-review", "name" => "In Review"}
+                       ]
+                     }
+                   }
+                 }
+               }
+             }}
+
+          _query, _variables, [] ->
+            flunk("blocked handoff mutation should not be sent to Linear")
+        end
+      )
+
+    assert response["success"] == false
+
+    output = Jason.decode!(response["output"])
+    assert get_in(output, ["error", "message"]) =~ "before_handoff hook blocked"
+    assert get_in(output, ["error", "remediation"]) =~ "the following gates failed:"
+    assert get_in(output, ["error", "remediation"]) =~ "landable-check: CI is not green"
+
+    telemetry_event = [:symphony_elixir, :gate, :before_handoff]
+
+    assert_receive {:before_handoff_telemetry, ^telemetry_event, %{count: 1}, telemetry}
+    assert %{event: "gate.before_handoff", outcome: :failed, gates: gates} = telemetry
+
+    assert [%{name: "landable-check", passed: false}] = gates
+  end
+
   test "linear_graphql accepts a raw GraphQL query string" do
     test_pid = self()
 

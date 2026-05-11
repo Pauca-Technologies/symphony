@@ -23,6 +23,10 @@ hooks:
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
+  # before_handoff runs before a Linear issue moves from In Progress to In Review.
+  # Repositories can use it to block handoff until repo-local gates pass, for example:
+  # before_handoff: |
+  #   scripts/hooks/before-handoff.sh
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:

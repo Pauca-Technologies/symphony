@@ -116,6 +116,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_stall_timeout_ms: 300_000,
           hook_after_create: nil,
           hook_before_run: nil,
+          hook_before_handoff: nil,
           hook_after_run: nil,
           hook_before_remove: nil,
           hook_timeout_ms: 60_000,
@@ -153,6 +154,7 @@ defmodule SymphonyElixir.TestSupport do
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
+    hook_before_handoff = Keyword.get(config, :hook_before_handoff)
     hook_after_run = Keyword.get(config, :hook_after_run)
     hook_before_remove = Keyword.get(config, :hook_before_remove)
     hook_timeout_ms = Keyword.get(config, :hook_timeout_ms)
@@ -192,7 +194,14 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
-        hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
+        hooks_yaml(
+          hook_after_create,
+          hook_before_run,
+          hook_before_handoff,
+          hook_after_run,
+          hook_before_remove,
+          hook_timeout_ms
+        ),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
         "---",
@@ -225,14 +234,15 @@ defmodule SymphonyElixir.TestSupport do
 
   defp yaml_value(value), do: yaml_value(to_string(value))
 
-  defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
+  defp hooks_yaml(nil, nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
 
-  defp hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, timeout_ms) do
+  defp hooks_yaml(hook_after_create, hook_before_run, hook_before_handoff, hook_after_run, hook_before_remove, timeout_ms) do
     [
       "hooks:",
       "  timeout_ms: #{yaml_value(timeout_ms)}",
       hook_entry("after_create", hook_after_create),
       hook_entry("before_run", hook_before_run),
+      hook_entry("before_handoff", hook_before_handoff),
       hook_entry("after_run", hook_after_run),
       hook_entry("before_remove", hook_before_remove)
     ]

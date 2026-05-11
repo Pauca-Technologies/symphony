@@ -1382,6 +1382,143 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner feeds before_handoff remediation into the next turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-handoff-gate-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(test_root)
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-gate"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-gate-1"}}}'
+            printf '%s\\n' '{"method":"item/tool/call","id":"tool-gate","params":{"tool":"linear_graphql","arguments":{"query":"mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }","variables":{"issueId":"issue-gate-next","stateId":"state-review"}}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          6)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-gate-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 2,
+        hook_before_handoff: """
+        printf '%s' '{"checks":[{"name":"landable-check","status":"failed","summary":"Review threads remain open"}]}'
+        exit 2
+        """
+      )
+
+      parent = self()
+
+      state_fetcher = fn [_issue_id] ->
+        attempt = Process.get(:agent_handoff_fetch_count, 0) + 1
+        Process.put(:agent_handoff_fetch_count, attempt)
+        send(parent, {:issue_state_fetch, attempt})
+
+        {:ok,
+         [
+           %Issue{
+             id: "issue-gate-next",
+             identifier: "UDPE-2",
+             title: "Gate next turn",
+             description: "Retry after failed handoff",
+             state: if(attempt == 1, do: "In Progress", else: "Done")
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-gate-next",
+        identifier: "UDPE-2",
+        title: "Gate next turn",
+        description: "Retry after failed handoff",
+        state: "In Progress"
+      }
+
+      linear_client = fn
+        query, %{"issueId" => "issue-gate-next"}, [] ->
+          assert query =~ "SymphonyResolveIssueTransition"
+
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{
+                 "state" => %{"name" => "In Progress"},
+                 "team" => %{
+                   "states" => %{
+                     "nodes" => [
+                       %{"id" => "state-review", "name" => "In Review"}
+                     ]
+                   }
+                 }
+               }
+             }
+           }}
+
+        _query, _variables, [] ->
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher, linear_client: linear_client)
+      assert_receive {:issue_state_fetch, 1}
+      assert_receive {:issue_state_fetch, 2}
+
+      turn_texts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(fn payload ->
+          get_in(payload, ["params", "input"])
+          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+        end)
+
+      assert length(turn_texts) == 2
+      assert Enum.at(turn_texts, 1) =~ "the following gates failed:"
+      assert Enum.at(turn_texts, 1) =~ "landable-check: Review threads remain open"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner stops continuing once agent.max_turns is reached" do
     test_root =
       Path.join(

@@ -95,6 +95,8 @@ workspace:
 hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
+  before_handoff: |
+    scripts/hooks/before-handoff.sh
 agent:
   max_concurrent_agents: 10
   max_turns: 20
@@ -125,6 +127,9 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Use `hooks.before_handoff` to run a repo-local gate before an agent moves a Linear issue from
+  `In Progress` to a review handoff state such as `In Review`. A non-zero exit blocks the status
+  transition and the parsed gate remediation is included in the next agent turn.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

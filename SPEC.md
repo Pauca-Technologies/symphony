@@ -395,6 +395,10 @@ Fields:
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
   - Failure aborts the current attempt.
+- `before_handoff` (multiline shell script string, OPTIONAL)
+  - Runs before an agent-driven Linear status transition from `In Progress` to a review handoff
+    state such as `In Review`.
+  - Failure cancels the status transition and feeds hook remediation into the next agent turn.
 - `after_run` (multiline shell script string, OPTIONAL)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
@@ -583,6 +587,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
+- `hooks.before_handoff`: shell script or null
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
@@ -867,6 +872,7 @@ Supported hooks:
 
 - `hooks.after_create`
 - `hooks.before_run`
+- `hooks.before_handoff`
 - `hooks.after_run`
 - `hooks.before_remove`
 
@@ -878,11 +884,15 @@ Execution contract:
   conforming default.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
+- Emit `gate.before_handoff` telemetry when `before_handoff` fires, including the per-gate
+  pass/fail breakdown parsed from hook JSON output when available.
 
 Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
 - `before_run` failure or timeout is fatal to the current run attempt.
+- `before_handoff` failure or timeout cancels the attempted tracker state transition and provides
+  remediation to the next agent turn.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 

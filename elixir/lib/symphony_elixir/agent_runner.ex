@@ -4,10 +4,11 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.Codex.{AppServer, DynamicTool}
+  alias SymphonyElixir.{Config, Linear.Client, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
+  @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -91,15 +92,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    tool_executor = dynamic_tool_executor(issue, workspace, app_session.worker_host, opts)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue),
+             tool_executor: tool_executor
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      handoff_gate_prompt = pop_handoff_gate_prompt()
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
@@ -110,7 +114,7 @@ defmodule SymphonyElixir.AgentRunner do
             workspace,
             refreshed_issue,
             codex_update_recipient,
-            opts,
+            Keyword.put(opts, :handoff_gate_prompt, handoff_gate_prompt),
             issue_state_fetcher,
             turn_number + 1,
             max_turns
@@ -132,8 +136,11 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
+    handoff_gate_prompt = Keyword.get(opts, :handoff_gate_prompt)
+
     """
+    #{handoff_gate_prompt_section(handoff_gate_prompt)}
     Continuation guidance:
 
     - The previous Codex turn completed normally, but the Linear issue is still in an active state.
@@ -143,6 +150,50 @@ defmodule SymphonyElixir.AgentRunner do
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
   end
+
+  defp dynamic_tool_executor(issue, workspace, worker_host, opts) do
+    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+
+    fn tool, arguments ->
+      result =
+        DynamicTool.execute(tool, arguments,
+          linear_client: linear_client,
+          handoff_gate_context: %{
+            issue: issue,
+            workspace: workspace,
+            worker_host: worker_host
+          }
+        )
+
+      maybe_store_handoff_gate_prompt(result)
+      result
+    end
+  end
+
+  defp maybe_store_handoff_gate_prompt(%{"success" => false, "output" => output}) when is_binary(output) do
+    case Jason.decode(output) do
+      {:ok, %{"error" => %{"remediation" => remediation}}} when is_binary(remediation) ->
+        Process.put(@handoff_gate_prompt_key, remediation)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp maybe_store_handoff_gate_prompt(_result), do: :ok
+
+  defp pop_handoff_gate_prompt do
+    Process.delete(@handoff_gate_prompt_key)
+  end
+
+  defp handoff_gate_prompt_section(prompt) when is_binary(prompt) do
+    case String.trim(prompt) do
+      "" -> ""
+      trimmed -> trimmed <> "\n\n"
+    end
+  end
+
+  defp handoff_gate_prompt_section(_prompt), do: ""
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
