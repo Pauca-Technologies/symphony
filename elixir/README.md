@@ -95,6 +95,8 @@ workspace:
 hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
+  session_start: |
+    scripts/hooks/session-start.sh
 agent:
   max_concurrent_agents: 10
   max_turns: 20
@@ -125,6 +127,11 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Use `hooks.session_start` to run non-blocking repo-local startup discovery before every fresh or
+  resumed Codex session. Symphony captures generated Markdown links under
+  `docs/agent-workpad/<branch>/` and prepends them to the first turn as an advisory system message.
+  The hook emits `[:symphony_elixir, :gate, :session_start]` telemetry with total duration and any
+  per-script timings reported by the hook output.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
@@ -141,6 +148,10 @@ workspace:
 hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
+  session_start: |
+    if [ -x scripts/hooks/session-start.sh ]; then
+      scripts/hooks/session-start.sh
+    fi
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
 ```

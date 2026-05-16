@@ -388,6 +388,12 @@ Fields:
 - `after_create` (multiline shell script string, OPTIONAL)
   - Runs only when a workspace directory is newly created.
   - Failure aborts workspace creation.
+- `session_start` (multiline shell script string, OPTIONAL)
+  - Runs before each fresh or resumed coding-agent session after workspace preparation and before
+    launching the coding agent.
+  - Failure is logged and surfaced to the first turn but does not abort the current attempt.
+  - Implementations SHOULD surface generated Markdown links under `docs/agent-workpad/<branch>/` to
+    the first turn as advisory startup context.
 - `before_run` (multiline shell script string, OPTIONAL)
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
@@ -579,6 +585,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
+- `hooks.session_start`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
@@ -863,6 +870,7 @@ Failure handling:
 Supported hooks:
 
 - `hooks.after_create`
+- `hooks.session_start`
 - `hooks.before_run`
 - `hooks.after_run`
 - `hooks.before_remove`
@@ -879,6 +887,8 @@ Execution contract:
 Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
+- `session_start` failure or timeout is logged, emitted as telemetry, and surfaced as advisory
+  context; it is not fatal to the current run attempt.
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
@@ -1810,6 +1820,8 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if workspace failed:
     fail_worker("workspace error")
 
+  run_hook_best_effort("session_start", workspace.path)
+
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
@@ -1958,6 +1970,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   implementation policy)
 - OPTIONAL workspace population/synchronization errors are surfaced
 - `after_create` hook runs only on new workspace creation
+- `session_start` hook runs before each fresh or resumed agent session; failures are non-fatal and
+  produce advisory first-turn context plus `gate.session_start` telemetry
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
