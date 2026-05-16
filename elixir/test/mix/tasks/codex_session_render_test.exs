@@ -3,6 +3,8 @@ defmodule Mix.Tasks.Codex.Session.RenderTest do
 
   import ExUnit.CaptureIO
 
+  alias Mix.Tasks.Codex.Session.Render
+
   setup do
     Mix.Task.reenable("codex.session.render")
     :ok
@@ -25,7 +27,7 @@ defmodule Mix.Tasks.Codex.Session.RenderTest do
 
     output =
       capture_io(fn ->
-        Mix.Tasks.Codex.Session.Render.run(["--no-color", path])
+        Render.run(["--no-color", path])
       end)
 
     assert output =~ "Session: thread-2-turn-2"
@@ -34,7 +36,15 @@ defmodule Mix.Tasks.Codex.Session.RenderTest do
 
   test "raises with usage when no path is provided" do
     assert_raise Mix.Error, ~r/Usage: mix codex\.session\.render/, fn ->
-      Mix.Tasks.Codex.Session.Render.run([])
+      Render.run([])
+    end
+  end
+
+  test "raises when file cannot be read" do
+    missing = Path.join(System.tmp_dir!(), "missing-codex-session-render-#{System.unique_integer([:positive])}.ndjson")
+
+    assert_raise Mix.Error, ~r/Failed to render .*: :enoent/, fn ->
+      Render.run([missing])
     end
   end
 end

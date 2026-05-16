@@ -108,71 +108,49 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
     method = Map.get(payload, "method")
     at = Map.get(record, "at")
 
-    case method do
-      "item/started" ->
-        handle_item_started(state, at, payload)
-
-      "item/completed" ->
-        handle_item_completed(state, at, payload)
-
-      "item/agentMessage/delta" ->
-        buffer_agent_message(state, at, payload)
-
-      "codex/event/agent_message_delta" ->
-        buffer_agent_message(state, at, payload)
-
-      "codex/event/agent_message_content_delta" ->
-        buffer_agent_message(state, at, payload)
-
-      "item/reasoning/textDelta" ->
-        buffer_reasoning(state, at, payload)
-
-      "item/reasoning/summaryTextDelta" ->
-        buffer_reasoning(state, at, payload)
-
-      "item/reasoning/summaryPartAdded" ->
-        buffer_reasoning(state, at, payload)
-
-      "codex/event/agent_reasoning_delta" ->
-        buffer_reasoning(state, at, payload)
-
-      "codex/event/reasoning_content_delta" ->
-        buffer_reasoning(state, at, payload)
-
-      "codex/event/agent_reasoning" ->
-        buffer_reasoning(state, at, payload)
-
-      "item/commandExecution/outputDelta" ->
-        buffer_command_output(state, at, payload)
-
-      "codex/event/exec_command_output_delta" ->
-        buffer_command_output(state, at, payload)
-
-      "item/tool/requestUserInput" ->
-        append_entry(state, %{
-          kind: :event,
-          at: at,
-          label: "INPUT",
-          text: extract_tool_input_text(payload)
-        })
-
-      "tool/requestUserInput" ->
-        append_entry(state, %{
-          kind: :event,
-          at: at,
-          label: "INPUT",
-          text: extract_tool_input_text(payload)
-        })
-
-      "item/tool/call" ->
-        render_tool_call(state, at, Map.get(record, "event"), payload)
-
-      _ ->
-        state
-    end
+    dispatch_payload(method, state, at, payload, Map.get(record, "event"))
   end
 
   defp handle_payload(state, _record), do: state
+
+  defp dispatch_payload("item/started", state, at, payload, _event), do: handle_item_started(state, at, payload)
+  defp dispatch_payload("item/completed", state, at, payload, _event), do: handle_item_completed(state, at, payload)
+
+  defp dispatch_payload(method, state, at, payload, _event)
+       when method in [
+              "item/agentMessage/delta",
+              "codex/event/agent_message_delta",
+              "codex/event/agent_message_content_delta"
+            ],
+       do: buffer_agent_message(state, at, payload)
+
+  defp dispatch_payload(method, state, at, payload, _event)
+       when method in [
+              "item/reasoning/textDelta",
+              "item/reasoning/summaryTextDelta",
+              "item/reasoning/summaryPartAdded",
+              "codex/event/agent_reasoning_delta",
+              "codex/event/reasoning_content_delta",
+              "codex/event/agent_reasoning"
+            ],
+       do: buffer_reasoning(state, at, payload)
+
+  defp dispatch_payload(method, state, at, payload, _event)
+       when method in [
+              "item/commandExecution/outputDelta",
+              "codex/event/exec_command_output_delta"
+            ],
+       do: buffer_command_output(state, at, payload)
+
+  defp dispatch_payload(method, state, at, payload, _event)
+       when method in [
+              "item/tool/requestUserInput",
+              "tool/requestUserInput"
+            ],
+       do: append_input_required_entry(state, at, payload)
+
+  defp dispatch_payload("item/tool/call", state, at, payload, event), do: render_tool_call(state, at, event, payload)
+  defp dispatch_payload(_method, state, _at, _payload, _event), do: state
 
   defp handle_item_started(state, at, payload) do
     item = get_path(payload, ["params", "item"]) || %{}
@@ -220,41 +198,62 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
 
     case Map.get(item, "type") do
       "agentMessage" when is_binary(item_id) ->
-        {buffer, state} = pop_in(state, [:agent_messages, item_id])
-        text = Map.get(item, "text") || buffer_text(buffer)
-
-        append_entry(state, %{
-          kind: :agent,
-          at: at || buffer_at(buffer),
-          label: agent_label(Map.get(item, "phase") || buffer_phase(buffer), false),
-          text: text
-        })
+        complete_agent_message(state, at, item_id, item)
 
       "reasoning" when is_binary(item_id) ->
-        {buffer, state} = pop_in(state, [:reasoning, item_id])
-        text = extract_reasoning_item_text(item) || buffer_text(buffer)
-
-        append_entry(state, %{
-          kind: :reasoning,
-          at: at || buffer_at(buffer),
-          label: "REASONING",
-          text: text
-        })
+        complete_reasoning(state, at, item_id, item)
 
       "commandExecution" when is_binary(item_id) ->
         flush_completed_command(state, at, item_id, item)
 
       "userMessage" ->
-        append_entry(state, %{
-          kind: :user,
-          at: at,
-          label: "USER",
-          text: extract_user_message(item)
-        })
+        append_user_message(state, at, item)
 
       _ ->
         state
     end
+  end
+
+  defp complete_agent_message(state, at, item_id, item) do
+    {buffer, state} = pop_in(state, [:agent_messages, item_id])
+    text = Map.get(item, "text") || buffer_text(buffer)
+
+    append_entry(state, %{
+      kind: :agent,
+      at: at || buffer_at(buffer),
+      label: agent_label(Map.get(item, "phase") || buffer_phase(buffer), false),
+      text: text
+    })
+  end
+
+  defp complete_reasoning(state, at, item_id, item) do
+    {buffer, state} = pop_in(state, [:reasoning, item_id])
+    text = extract_reasoning_item_text(item) || buffer_text(buffer)
+
+    append_entry(state, %{
+      kind: :reasoning,
+      at: at || buffer_at(buffer),
+      label: "REASONING",
+      text: text
+    })
+  end
+
+  defp append_user_message(state, at, item) do
+    append_entry(state, %{
+      kind: :user,
+      at: at,
+      label: "USER",
+      text: extract_user_message(item)
+    })
+  end
+
+  defp append_input_required_entry(state, at, payload) do
+    append_entry(state, %{
+      kind: :event,
+      at: at,
+      label: "INPUT",
+      text: extract_tool_input_text(payload)
+    })
   end
 
   defp buffer_agent_message(state, at, payload) do
@@ -407,7 +406,7 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
   end
 
   defp flush_remaining_command_output(state) do
-    Enum.reduce(state.command_output, %{state | command_output: %{}, commands: %{}}, fn {item_id, output}, acc ->
+    Enum.reduce(state.command_output, %{state | command_output: %{}}, fn {item_id, output}, acc ->
       command_meta = Map.get(acc.commands, item_id, %{})
 
       acc
@@ -674,16 +673,19 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
 
   defp colorize(text, kind, true) do
     ansi =
-      case kind do
-        :agent -> IO.ANSI.cyan()
-        :reasoning -> IO.ANSI.yellow()
-        :command -> IO.ANSI.blue()
-        :output -> IO.ANSI.light_black()
-        :tool -> IO.ANSI.green()
-        :event -> IO.ANSI.red()
-        :user -> IO.ANSI.magenta()
-        _ -> IO.ANSI.default_color()
-      end
+      Map.get(
+        %{
+          agent: IO.ANSI.cyan(),
+          reasoning: IO.ANSI.yellow(),
+          command: IO.ANSI.blue(),
+          output: IO.ANSI.light_black(),
+          tool: IO.ANSI.green(),
+          event: IO.ANSI.red(),
+          user: IO.ANSI.magenta()
+        },
+        kind,
+        IO.ANSI.default_color()
+      )
 
     IO.iodata_to_binary([IO.ANSI.bright(), ansi, text, IO.ANSI.reset()])
   end

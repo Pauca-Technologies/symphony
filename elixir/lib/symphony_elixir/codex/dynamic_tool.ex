@@ -204,8 +204,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end)
   end
 
-  defp variable_string(_variables, _keys), do: nil
-
   defp literal_argument(query, field) when is_binary(query) and is_binary(field) do
     pattern = ~r/#{Regex.escape(field)}\s*:\s*"([^"]+)"/
 

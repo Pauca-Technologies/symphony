@@ -159,12 +159,7 @@ defmodule SymphonyElixir.HandoffGate do
 
   defp breakdown_from_report(%{"failures" => failures}, _hook_passed?) when is_list(failures) do
     Enum.map(failures, fn failure ->
-      %{
-        name: map_string(failure, ["name", "gate", "check"], "before_handoff"),
-        status: "failed",
-        passed: false,
-        detail: failure_detail(failure)
-      }
+      gate_from_failure(failure)
     end)
   end
 
@@ -188,6 +183,24 @@ defmodule SymphonyElixir.HandoffGate do
         detail: nil
       }
     ]
+  end
+
+  defp gate_from_failure(failure) when is_map(failure) do
+    %{
+      name: map_string(failure, ["name", "gate", "check"], "before_handoff"),
+      status: "failed",
+      passed: false,
+      detail: failure_detail(failure)
+    }
+  end
+
+  defp gate_from_failure(failure) do
+    %{
+      name: "before_handoff",
+      status: "failed",
+      passed: false,
+      detail: failure_detail(failure)
+    }
   end
 
   defp gate_from_map(gate, hook_passed?) when is_map(gate) do
@@ -224,6 +237,7 @@ defmodule SymphonyElixir.HandoffGate do
     map_string(value, ["detail", "summary", "message", "remediation", "reason"], nil)
   end
 
+  defp failure_detail(value) when is_binary(value), do: value
   defp failure_detail(value), do: inspect(value)
 
   defp map_string(map, keys, default) when is_map(map) do
