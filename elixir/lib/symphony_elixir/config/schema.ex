@@ -207,6 +207,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:after_create, :string)
+      field(:session_start, :string)
       field(:before_run, :string)
       field(:before_handoff, :string)
       field(:after_run, :string)
@@ -216,7 +217,15 @@ defmodule SymphonyElixir.Config.Schema do
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
-      hook_fields = [:after_create, :before_run, :before_handoff, :after_run, :before_remove, :timeout_ms]
+      hook_fields = [
+        :after_create,
+        :session_start,
+        :before_run,
+        :before_handoff,
+        :after_run,
+        :before_remove,
+        :timeout_ms
+      ]
 
       schema
       |> cast(attrs, hook_fields, empty_values: [])

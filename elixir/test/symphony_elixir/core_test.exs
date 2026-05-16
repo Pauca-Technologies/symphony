@@ -108,6 +108,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
+    assert Map.get(hooks, "session_start") =~ "scripts/hooks/session-start.sh"
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
 
     assert String.trim(prompt) != ""
@@ -1176,6 +1177,178 @@ defmodule SymphonyElixir.CoreTest do
                      500
 
       assert session_id == "thread-live-turn-live"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner runs session_start on fresh and resumed sessions and surfaces workpad links" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-session-start-hook-#{System.unique_integer([:positive])}"
+      )
+
+    handler_id = "session-start-test-#{System.unique_integer([:positive])}"
+    telemetry_event = SymphonyElixir.SessionStartHook.telemetry_event()
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      telemetry_event,
+      fn event, measurements, metadata, _config ->
+        send(parent, {:session_start_telemetry, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      System.delete_env("SYMP_TEST_CODEX_TRACE")
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      hook_count = Path.join(test_root, "session-start.count")
+
+      File.mkdir_p!(workspace_root)
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/session-start-codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-session-start"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-session-start"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_session_start: """
+        mkdir -p docs/agent-workpad/feature_session-start
+        printf 'call\\n' >> #{hook_count}
+        printf 'base hint\\n' > docs/agent-workpad/feature_session-start/base.md
+        printf '%s\\n' '{"scripts":[{"name":"session:check-base","duration_ms":12,"status":"passed"},{"name":"session:reuse-scan","duration_ms":7,"status":"passed"}]}'
+        """,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-session-start",
+        identifier: "MT-6070",
+        title: "Session start hook",
+        description: "Run session-start hook",
+        state: "In Progress",
+        branch_name: "feature/session-start",
+        url: "https://example.org/issues/MT-6070",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+
+      assert File.read!(hook_count) == "call\ncall\n"
+
+      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+
+      turn_texts =
+        lines
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(fn payload ->
+          get_in(payload, ["params", "input"])
+          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+        end)
+
+      assert length(turn_texts) == 2
+      assert Enum.all?(turn_texts, &String.contains?(&1, "System message:"))
+      assert Enum.all?(turn_texts, &String.contains?(&1, "session_start lifecycle hook ran"))
+      assert Enum.all?(turn_texts, &String.contains?(&1, "docs/agent-workpad/feature_session-start/base.md"))
+      assert Enum.all?(turn_texts, &String.contains?(&1, "You are an agent for this repository."))
+
+      assert_receive {:session_start_telemetry, ^telemetry_event, %{count: 1, duration_ms: duration_ms},
+                      %{
+                        event: "gate.session_start",
+                        outcome: :passed,
+                        workpad_files: ["docs/agent-workpad/feature_session-start/base.md"],
+                        script_timings: timings
+                      }},
+                     500
+
+      assert is_integer(duration_ms)
+      assert Enum.map(timings, & &1.name) == ["session:check-base", "session:reuse-scan"]
+      assert Enum.map(timings, & &1.duration_ms) == [12, 7]
+
+      assert_receive {:session_start_telemetry, ^telemetry_event, %{count: 1},
+                      %{
+                        event: "gate.session_start",
+                        outcome: :passed,
+                        workpad_files: ["docs/agent-workpad/feature_session-start/base.md"]
+                      }},
+                     500
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "session_start hook failures are informational" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-session-start-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-6070")
+
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_session_start: "printf '%s\\n' '{\"scripts\":[{\"name\":\"session:check-base\",\"duration_ms\":9,\"status\":\"failed\"}]}' && exit 17"
+      )
+
+      issue = %Issue{
+        id: "issue-session-start-failure",
+        identifier: "MT-6070",
+        title: "Session start hook failure",
+        state: "In Progress"
+      }
+
+      result = SymphonyElixir.SessionStartHook.run(workspace, issue)
+
+      assert result.outcome == :failed
+      assert result.prompt =~ "session_start lifecycle hook failed"
+      assert result.script_timings == [%{name: "session:check-base", duration_ms: 9, status: "failed"}]
     after
       File.rm_rf(test_root)
     end

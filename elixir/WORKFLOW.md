@@ -23,6 +23,13 @@ hooks:
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
+  # session_start runs before each Codex app-server session, including when an
+  # existing workspace/branch is resumed. It is informational: failures are
+  # logged and surfaced to the first turn but do not block the agent.
+  session_start: |
+    if [ -x scripts/hooks/session-start.sh ]; then
+      scripts/hooks/session-start.sh
+    fi
   # before_handoff runs before a Linear issue moves from In Progress to In Review.
   # Repositories can use it to block handoff until repo-local gates pass, for example:
   # before_handoff: |

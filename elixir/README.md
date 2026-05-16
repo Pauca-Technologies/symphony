@@ -95,6 +95,8 @@ workspace:
 hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
+  session_start: |
+    scripts/hooks/session-start.sh
   before_handoff: |
     scripts/hooks/before-handoff.sh
 agent:
@@ -127,6 +129,11 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Use `hooks.session_start` to run non-blocking repo-local startup discovery before every fresh or
+  resumed Codex session. Symphony captures generated Markdown links under
+  `docs/agent-workpad/<branch>/` and prepends them to the first turn as an advisory system message.
+  The hook emits `[:symphony_elixir, :gate, :session_start]` telemetry with total duration and any
+  per-script timings reported by the hook output.
 - Use `hooks.before_handoff` to run a repo-local gate before an agent moves a Linear issue from
   `In Progress` to a review handoff state such as `In Review`. A non-zero exit blocks the status
   transition and the parsed gate remediation is included in the next agent turn.
@@ -148,6 +155,10 @@ workspace:
 hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
+  session_start: |
+    if [ -x scripts/hooks/session-start.sh ]; then
+      scripts/hooks/session-start.sh
+    fi
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
 ```

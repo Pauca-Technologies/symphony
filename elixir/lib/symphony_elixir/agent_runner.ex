@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.{AppServer, DynamicTool}
-  alias SymphonyElixir.{Config, Linear.Client, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Client, Linear.Issue, PromptBuilder, SessionStartHook, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
   @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
@@ -33,6 +33,8 @@ defmodule SymphonyElixir.AgentRunner do
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        session_start = SessionStartHook.run(workspace, issue, worker_host)
+        opts = Keyword.put(opts, :session_start_prompt, session_start.prompt)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
@@ -134,7 +136,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns) do
+    session_start_prompt = Keyword.get(opts, :session_start_prompt)
+
+    [session_start_prompt, PromptBuilder.build_prompt(issue, opts)]
+    |> Enum.reject(&(is_nil(&1) or String.trim(&1) == ""))
+    |> Enum.join("\n\n")
+  end
 
   defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
     handoff_gate_prompt = Keyword.get(opts, :handoff_gate_prompt)
