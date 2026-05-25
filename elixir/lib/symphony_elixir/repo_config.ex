@@ -20,6 +20,10 @@ defmodule SymphonyElixir.RepoConfig do
         team_id: <udp-team-id-uuid-or-key>   # accepts a Linear team UUID
                                              # or a team key like "UDPE";
                                              # Linear.Client auto-detects
+        filter_label: udpagent               # optional opt-in label; when
+                                             # set, the team-scoped poll
+                                             # only returns issues that
+                                             # carry this label
       repos:
         - id: udp-dashboard-v2
           label: repo:dashboard-v2
@@ -55,7 +59,7 @@ defmodule SymphonyElixir.RepoConfig do
             poll_interval_seconds: pos_integer(),
             cardinality_enforced_from: Date.t() | nil
           },
-          linear: %{team_id: String.t() | nil},
+          linear: %{team_id: String.t() | nil, filter_label: String.t() | nil},
           repos: [repo_entry()],
           source: :file | :default,
           path: String.t() | nil
@@ -149,7 +153,7 @@ defmodule SymphonyElixir.RepoConfig do
         poll_interval_seconds: @default_poll_interval_seconds,
         cardinality_enforced_from: nil
       },
-      linear: %{team_id: nil},
+      linear: %{team_id: nil, filter_label: nil},
       repos: [],
       source: :default,
       path: nil
@@ -218,7 +222,13 @@ defmodule SymphonyElixir.RepoConfig do
         _ -> nil
       end
 
-    {:ok, %{team_id: team_id}}
+    filter_label =
+      case Map.get(raw, "filter_label") do
+        value when is_binary(value) and value != "" -> value
+        _ -> nil
+      end
+
+    {:ok, %{team_id: team_id, filter_label: filter_label}}
   end
 
   defp build_repos(raw) when is_list(raw) do

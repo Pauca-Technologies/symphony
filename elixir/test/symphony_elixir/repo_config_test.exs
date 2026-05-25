@@ -30,6 +30,7 @@ defmodule SymphonyElixir.RepoConfigTest do
       assert config.source == :default
       assert config.repos == []
       assert config.linear.team_id == nil
+      assert config.linear.filter_label == nil
       assert config.defaults.cardinality_enforced_from == nil
     end
 
@@ -42,6 +43,7 @@ defmodule SymphonyElixir.RepoConfigTest do
         cardinality_enforced_from: "2026-06-01"
       linear:
         team_id: udp-team-uuid
+        filter_label: udpagent
       repos:
         - id: udp-dashboard-v2
           label: repo:dashboard-v2
@@ -53,6 +55,7 @@ defmodule SymphonyElixir.RepoConfigTest do
       assert {:ok, config} = RepoConfig.load()
       assert config.source == :file
       assert config.linear.team_id == "udp-team-uuid"
+      assert config.linear.filter_label == "udpagent"
       assert config.defaults.cardinality_enforced_from == ~D[2026-06-01]
       assert config.defaults.max_concurrent_global == 6
       assert config.defaults.poll_interval_seconds == 30
@@ -65,6 +68,17 @@ defmodule SymphonyElixir.RepoConfigTest do
                  workflow_path: "WORKFLOW.md"
                }
              ] = config.repos
+    end
+
+    test "filter_label is optional and defaults to nil", %{path: path} do
+      File.write!(path, """
+      linear:
+        team_id: UDPE
+      """)
+
+      assert {:ok, config} = RepoConfig.load()
+      assert config.linear.team_id == "UDPE"
+      assert config.linear.filter_label == nil
     end
 
     test "errors on malformed YAML", %{path: path} do

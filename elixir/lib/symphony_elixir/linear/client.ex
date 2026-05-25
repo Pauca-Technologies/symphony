@@ -224,6 +224,154 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  # Variants of `@query_by_team` and `@query_by_team_key` that add a
+  # `labels: {some: {name: {eq: $filterLabel}}}` filter so the poll only
+  # surfaces issues carrying the operator-configured opt-in label
+  # (`linear.filter_label` in repos.yaml — e.g. "udpagent"). Two queries
+  # rather than one parameterized query because Linear's GraphQL IssueFilter
+  # treats `labels: null` ambiguously between "no constraint" and "match
+  # nothing" depending on schema version; using two queries removes the
+  # ambiguity.
+  @query_by_team_with_label """
+  query SymphonyLinearPollByTeamWithLabel($teamId: ID!, $stateNames: [String!]!, $filterLabel: String!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {id: {eq: $teamId}}, state: {name: {in: $stateNames}}, labels: {some: {name: {eq: $filterLabel}}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        team {
+          id
+        }
+        parent {
+          id
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            state {
+              name
+            }
+            labels {
+              nodes {
+                name
+              }
+            }
+          }
+        }
+        attachments(first: $relationFirst) {
+          nodes {
+            url
+          }
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
+  @query_by_team_key_with_label """
+  query SymphonyLinearPollByTeamKeyWithLabel($teamKey: String!, $stateNames: [String!]!, $filterLabel: String!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}, labels: {some: {name: {eq: $filterLabel}}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        team {
+          id
+        }
+        parent {
+          id
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            state {
+              name
+            }
+            labels {
+              nodes {
+                name
+              }
+            }
+          }
+        }
+        attachments(first: $relationFirst) {
+          nodes {
+            url
+          }
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
   @query_by_ids """
   query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!) {
     issues(filter: {id: {in: $ids}}, first: $first) {
@@ -302,6 +450,7 @@ defmodule SymphonyElixir.Linear.Client do
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
     team_identifier = configured_team_id()
+    filter_label = configured_filter_label()
     project_slug = tracker.project_slug
 
     cond do
@@ -311,14 +460,26 @@ defmodule SymphonyElixir.Linear.Client do
       # Audit §9.4 multi-repo Symphony: prefer team-scoped polling when a
       # team_id is configured in ~/.symphony/repos.yaml. The value can be a
       # Linear team UUID OR a team key (e.g. "UDPE") — auto-detected by
-      # shape. Falls back to project-slug polling for legacy single-repo
-      # deployments.
+      # shape. An optional `linear.filter_label` further narrows the poll
+      # so Symphony only sees issues that opt in to its scope (e.g. tagged
+      # "udpagent"). Falls back to project-slug polling for legacy
+      # single-repo deployments.
       is_binary(team_identifier) ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          if uuid_shaped?(team_identifier) do
-            do_fetch_by_team(team_identifier, tracker.active_states, assignee_filter)
-          else
-            do_fetch_by_team_key(team_identifier, tracker.active_states, assignee_filter)
+          team_is_uuid = uuid_shaped?(team_identifier)
+
+          case {team_is_uuid, filter_label} do
+            {true, nil} ->
+              do_fetch_by_team(team_identifier, tracker.active_states, assignee_filter)
+
+            {true, label} when is_binary(label) ->
+              do_fetch_by_team_with_label(team_identifier, tracker.active_states, label, assignee_filter)
+
+            {false, nil} ->
+              do_fetch_by_team_key(team_identifier, tracker.active_states, assignee_filter)
+
+            {false, label} when is_binary(label) ->
+              do_fetch_by_team_key_with_label(team_identifier, tracker.active_states, label, assignee_filter)
           end
         end
 
@@ -335,6 +496,13 @@ defmodule SymphonyElixir.Linear.Client do
   defp configured_team_id do
     case SymphonyElixir.RepoConfig.load() do
       {:ok, %{linear: %{team_id: team_id}}} when is_binary(team_id) -> team_id
+      _ -> nil
+    end
+  end
+
+  defp configured_filter_label do
+    case SymphonyElixir.RepoConfig.load() do
+      {:ok, %{linear: %{filter_label: label}}} when is_binary(label) -> label
       _ -> nil
     end
   end
@@ -514,6 +682,66 @@ defmodule SymphonyElixir.Linear.Client do
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
           do_fetch_by_team_key_page(team_key, state_names, assignee_filter, next_cursor, updated_acc)
+
+        :done ->
+          {:ok, finalize_paginated_issues(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp do_fetch_by_team_with_label(team_id, state_names, filter_label, assignee_filter) do
+    do_fetch_by_team_with_label_page(team_id, state_names, filter_label, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_by_team_with_label_page(team_id, state_names, filter_label, assignee_filter, after_cursor, acc_issues) do
+    with {:ok, body} <-
+           graphql(@query_by_team_with_label, %{
+             teamId: team_id,
+             stateNames: state_names,
+             filterLabel: filter_label,
+             first: @issue_page_size,
+             relationFirst: @issue_page_size,
+             after: after_cursor
+           }),
+         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
+      updated_acc = prepend_page_issues(issues, acc_issues)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_by_team_with_label_page(team_id, state_names, filter_label, assignee_filter, next_cursor, updated_acc)
+
+        :done ->
+          {:ok, finalize_paginated_issues(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp do_fetch_by_team_key_with_label(team_key, state_names, filter_label, assignee_filter) do
+    do_fetch_by_team_key_with_label_page(team_key, state_names, filter_label, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_by_team_key_with_label_page(team_key, state_names, filter_label, assignee_filter, after_cursor, acc_issues) do
+    with {:ok, body} <-
+           graphql(@query_by_team_key_with_label, %{
+             teamKey: team_key,
+             stateNames: state_names,
+             filterLabel: filter_label,
+             first: @issue_page_size,
+             relationFirst: @issue_page_size,
+             after: after_cursor
+           }),
+         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
+      updated_acc = prepend_page_issues(issues, acc_issues)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_by_team_key_with_label_page(team_key, state_names, filter_label, assignee_filter, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
