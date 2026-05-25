@@ -16,6 +16,13 @@ defmodule SymphonyElixir.Orchestrator do
   @poll_transition_render_delay_ms 20
   @recent_codex_events_limit 200
   @recent_codex_transcript_blocks_limit 80
+  # Dead-man's-switch heartbeat (audit §9.10). The orchestrator writes
+  # ~/.symphony/heartbeat every 60s with the current poll-loop state. A
+  # cron-driven check-heartbeat script reads the file and surfaces a local
+  # alert if the timestamp is stale. The interval is short enough that a
+  # 5-minute cron poll catches a hang within one cycle.
+  @heartbeat_interval_ms 60_000
+  @heartbeat_filename "heartbeat"
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -68,6 +75,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
+    schedule_heartbeat(0)
 
     {:ok, state}
   end
@@ -115,6 +123,12 @@ defmodule SymphonyElixir.Orchestrator do
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info(:write_heartbeat, state) do
+    write_heartbeat(state)
+    schedule_heartbeat(@heartbeat_interval_ms)
     {:noreply, state}
   end
 
@@ -1586,6 +1600,42 @@ defmodule SymphonyElixir.Orchestrator do
   defp schedule_poll_cycle_start do
     :timer.send_after(@poll_transition_render_delay_ms, self(), :run_poll_cycle)
     :ok
+  end
+
+  defp schedule_heartbeat(delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    Process.send_after(self(), :write_heartbeat, delay_ms)
+    :ok
+  end
+
+  defp write_heartbeat(%State{} = state) do
+    path = heartbeat_path()
+
+    body =
+      Jason.encode!(%{
+        ts: DateTime.to_iso8601(DateTime.utc_now()),
+        running: map_size(state.running),
+        claimed: MapSet.size(state.claimed),
+        completed_recent: MapSet.size(state.completed),
+        poll_check_in_progress: state.poll_check_in_progress,
+        poll_interval_ms: state.poll_interval_ms
+      })
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(path, body <> "\n") do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning("Orchestrator could not write heartbeat to #{path}: #{inspect(reason)}")
+        :error
+    end
+  end
+
+  defp heartbeat_path do
+    base =
+      System.get_env("SYMPHONY_HEARTBEAT_DIR") ||
+        Path.join(System.user_home!(), ".symphony")
+
+    Path.join(base, @heartbeat_filename)
   end
 
   defp next_poll_in_ms(nil, _now_ms), do: nil
