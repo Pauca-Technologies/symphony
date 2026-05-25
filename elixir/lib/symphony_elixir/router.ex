@@ -97,7 +97,7 @@ defmodule SymphonyElixir.Router do
   none of them map to a configured repo.
   """
   @spec warning_comment(Issue.t(), route_decision(), RepoConfig.t()) :: String.t()
-  def warning_comment(%Issue{} = issue, decision, %{} = config) do
+  def warning_comment(%Issue{} = _issue, decision, %{} = config) do
     body =
       case decision do
         {:skip, :no_label, _} ->

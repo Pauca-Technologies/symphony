@@ -287,6 +287,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
   # Audit §9.4 (Symphony multi-repo, sub-step 6): if the routed issue's
   # `repo:<name>` label disappears or changes during a run, finish the
   # current Codex turn cleanly and halt; do not reroute mid-flight.
@@ -302,8 +304,6 @@ defmodule SymphonyElixir.AgentRunner do
     |> Enum.filter(&String.starts_with?(&1, "repo:"))
     |> MapSet.new()
   end
-
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
