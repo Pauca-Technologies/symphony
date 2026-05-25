@@ -47,6 +47,25 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec add_label(String.t(), String.t()) :: :ok | {:error, :label_missing} | {:error, term()}
+  def add_label(issue_id, label_name) do
+    available = Application.get_env(:symphony_elixir, :memory_tracker_available_labels, :all)
+
+    cond do
+      available == :all ->
+        send_event({:memory_tracker_add_label, issue_id, label_name})
+        :ok
+
+      is_list(available) and label_name in available ->
+        send_event({:memory_tracker_add_label, issue_id, label_name})
+        :ok
+
+      is_list(available) ->
+        send_event({:memory_tracker_add_label_missing, issue_id, label_name})
+        {:error, :label_missing}
+    end
+  end
+
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end

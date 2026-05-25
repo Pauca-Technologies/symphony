@@ -10,6 +10,16 @@ defmodule SymphonyElixir.AgentRunner do
   @type worker_host :: String.t() | nil
   @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
 
+  # See T04 in /data/projects/coding-harness/implementation-plan.md and audit §5.1 O9.
+  # Symphony silently giving up on terminal failure is a trust-killer; we mark the
+  # issue Blocked, apply needs-human-input, and post one Linear comment when we
+  # give up. The same Linear label is reused across routing/cardinality/give-up
+  # warnings — its presence is the cross-condition idempotency marker.
+  @blocked_state "Blocked"
+  @needs_human_input_label "needs-human-input"
+  @idempotency_label "symphony:routing-warned"
+  @blocked_marker "<!-- symphony:blocked-on-giveup -->"
+
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
@@ -123,7 +133,14 @@ defmodule SymphonyElixir.AgentRunner do
           )
 
         {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; marking Blocked and returning control to orchestrator")
+
+          mark_blocked_on_giveup(refreshed_issue, %{
+            reason: :max_turns_exhausted,
+            turn_number: turn_number,
+            max_turns: max_turns,
+            workspace: workspace
+          })
 
           :ok
 
@@ -259,4 +276,115 @@ defmodule SymphonyElixir.AgentRunner do
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
+
+  @doc """
+  Mark an issue Blocked when the agent run terminally gives up (max_turns
+  exhausted or, in the future, all retries exhausted). Idempotent: skips work
+  if the issue already carries the routing-warned label. Best-effort on each
+  Linear write — logs and continues rather than raising, since this runs in
+  the failure path.
+  """
+  @spec mark_blocked_on_giveup(map(), map()) :: :ok
+  def mark_blocked_on_giveup(%Issue{id: issue_id} = issue, context)
+      when is_binary(issue_id) and is_map(context) do
+    if already_blocked?(issue) do
+      Logger.info(
+        "Skipping Blocked transition for #{issue_context(issue)}; idempotency label '#{@idempotency_label}' already present"
+      )
+
+      :ok
+    else
+      body = blocked_comment_body(issue, context)
+
+      case Tracker.create_comment(issue_id, body) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "Failed to post Blocked comment for #{issue_context(issue)}: #{inspect(reason)}"
+          )
+      end
+
+      add_label_best_effort(issue, @needs_human_input_label)
+      add_label_best_effort(issue, @idempotency_label)
+
+      case Tracker.update_issue_state(issue_id, @blocked_state) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "Failed to transition #{issue_context(issue)} to '#{@blocked_state}': #{inspect(reason)}"
+          )
+      end
+
+      :ok
+    end
+  end
+
+  def mark_blocked_on_giveup(_issue, _context), do: :ok
+
+  defp already_blocked?(%Issue{labels: labels}) when is_list(labels) do
+    @idempotency_label in labels
+  end
+
+  defp already_blocked?(_issue), do: false
+
+  defp add_label_best_effort(%Issue{id: issue_id} = issue, label_name) do
+    case Tracker.add_label(issue_id, label_name) do
+      :ok ->
+        :ok
+
+      {:error, :label_missing} ->
+        Logger.info(
+          "Skipping label '#{label_name}' on #{issue_context(issue)}; label not configured in workspace"
+        )
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to add label '#{label_name}' on #{issue_context(issue)}: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp blocked_comment_body(%Issue{} = issue, context) do
+    reason = Map.get(context, :reason, :unknown)
+    turn_number = Map.get(context, :turn_number)
+    max_turns = Map.get(context, :max_turns)
+    workspace = Map.get(context, :workspace)
+    error = Map.get(context, :error)
+
+    summary =
+      case reason do
+        :max_turns_exhausted ->
+          "Symphony reached agent.max_turns (#{turn_number}/#{max_turns}) without resolving the issue."
+
+        :retries_exhausted ->
+          "Symphony exhausted all agent-run retries on this issue."
+
+        other ->
+          "Symphony stopped working on this issue (reason: #{inspect(other)})."
+      end
+
+    details =
+      [
+        workspace && "Workspace: `#{workspace}`",
+        error && "Last error: `#{inspect_error(error)}`",
+        "Transcript: see Symphony logs for `#{issue.identifier}`",
+        "This issue has been moved to `#{@blocked_state}` and tagged `#{@needs_human_input_label}` for a human."
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\n")
+
+    """
+    #{@blocked_marker}
+    #{summary}
+
+    #{details}
+    """
+  end
+
+  defp inspect_error(error) when is_binary(error), do: error
+  defp inspect_error(error), do: inspect(error)
 end
