@@ -149,6 +149,81 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  # Sibling of `@query_by_team` that filters by the team's short key (e.g.
+  # "UDPE") instead of the GraphQL ID. Linear's TeamFilter supports both
+  # `id: IDComparator` and `key: StringComparator`, and team keys are unique
+  # within a workspace — so this is the operator-friendly path. `RepoConfig`
+  # auto-detects which to use based on the configured value's shape.
+  @query_by_team_key """
+  query SymphonyLinearPollByTeamKey($teamKey: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        team {
+          id
+        }
+        parent {
+          id
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            state {
+              name
+            }
+            labels {
+              nodes {
+                name
+              }
+            }
+          }
+        }
+        attachments(first: $relationFirst) {
+          nodes {
+            url
+          }
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
   @query_by_ids """
   query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!) {
     issues(filter: {id: {in: $ids}}, first: $first) {
@@ -226,7 +301,7 @@ defmodule SymphonyElixir.Linear.Client do
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
-    team_id = configured_team_id()
+    team_identifier = configured_team_id()
     project_slug = tracker.project_slug
 
     cond do
@@ -234,11 +309,17 @@ defmodule SymphonyElixir.Linear.Client do
         {:error, :missing_linear_api_token}
 
       # Audit §9.4 multi-repo Symphony: prefer team-scoped polling when a
-      # team_id is configured in ~/.symphony/repos.yaml. Falls back to
-      # project-slug polling for legacy single-repo deployments.
-      is_binary(team_id) ->
+      # team_id is configured in ~/.symphony/repos.yaml. The value can be a
+      # Linear team UUID OR a team key (e.g. "UDPE") — auto-detected by
+      # shape. Falls back to project-slug polling for legacy single-repo
+      # deployments.
+      is_binary(team_identifier) ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_team(team_id, tracker.active_states, assignee_filter)
+          if uuid_shaped?(team_identifier) do
+            do_fetch_by_team(team_identifier, tracker.active_states, assignee_filter)
+          else
+            do_fetch_by_team_key(team_identifier, tracker.active_states, assignee_filter)
+          end
         end
 
       is_nil(project_slug) ->
@@ -257,6 +338,15 @@ defmodule SymphonyElixir.Linear.Client do
       _ -> nil
     end
   end
+
+  # Linear team UUIDs look like "9cfb482a-…" (32 hex digits + 4 dashes).
+  # Anything else is treated as a team key (uppercase short identifier like
+  # "UDPE") and routed to the `team.key.eq` variant of the poll query.
+  defp uuid_shaped?(value) when is_binary(value) do
+    Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, value)
+  end
+
+  defp uuid_shaped?(_value), do: false
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(state_names) when is_list(state_names) do
@@ -395,6 +485,35 @@ defmodule SymphonyElixir.Linear.Client do
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
           do_fetch_by_team_page(team_id, state_names, assignee_filter, next_cursor, updated_acc)
+
+        :done ->
+          {:ok, finalize_paginated_issues(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp do_fetch_by_team_key(team_key, state_names, assignee_filter) do
+    do_fetch_by_team_key_page(team_key, state_names, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_by_team_key_page(team_key, state_names, assignee_filter, after_cursor, acc_issues) do
+    with {:ok, body} <-
+           graphql(@query_by_team_key, %{
+             teamKey: team_key,
+             stateNames: state_names,
+             first: @issue_page_size,
+             relationFirst: @issue_page_size,
+             after: after_cursor
+           }),
+         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
+      updated_acc = prepend_page_issues(issues, acc_issues)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_by_team_key_page(team_key, state_names, assignee_filter, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}

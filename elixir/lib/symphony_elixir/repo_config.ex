@@ -17,7 +17,9 @@ defmodule SymphonyElixir.RepoConfig do
         poll_interval_seconds: 30
         cardinality_enforced_from: "2026-06-01"
       linear:
-        team_id: <udp-team-id>
+        team_id: <udp-team-id-uuid-or-key>   # accepts a Linear team UUID
+                                             # or a team key like "UDPE";
+                                             # Linear.Client auto-detects
       repos:
         - id: udp-dashboard-v2
           label: repo:dashboard-v2
