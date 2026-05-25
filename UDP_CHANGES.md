@@ -36,6 +36,37 @@ In chronological order (oldest first), as of 2026-05-25:
 6. **928419ebe34cdbfe85195ee380fb9f53ccaacb69** — `test(elixir): restore udp validation gate` (2026-05-16)
    Restore the UDP validation test that upstream had removed.
 
+7. **a390490** — `feat(elixir): mark issues Blocked on terminal agent give-up` (2026-05-25)
+   T04: AgentRunner posts a marker-tagged comment, applies
+   needs-human-input + symphony:routing-warned labels, and transitions
+   to Blocked when an agent run terminally gives up. Idempotent via the
+   routing-warned label.
+
+8. **0b3b033** — `feat(orchestrator): write a periodic heartbeat for dead-man's switch` (2026-05-25)
+   T18: every minute, the orchestrator writes
+   ~/.symphony/heartbeat. A cron-driven check-heartbeat script
+   surfaces a local alert if the timestamp goes stale.
+
+9. **(this commit)** — `feat(elixir): multi-repo Symphony driver (T24)`
+   T24 + T26 from the audit:
+   - New `~/.symphony/repos.yaml` loader (`SymphonyElixir.RepoConfig`).
+   - Label-based routing (`SymphonyElixir.Router`) — `repo:<name>` is
+     the only routing key; fuzzy-match advisory + idempotent
+     `symphony:routing-warned` label.
+   - Cardinality gate (`SymphonyElixir.Cardinality`) using bulk-poll
+     fields: one repo per issue, parents have no repo/no PR, one PR
+     per issue. Cutover via `cardinality_enforced_from`.
+   - Extended `Linear.Client` query to fetch `team`, `parent`,
+     `children`, `attachments`. Added optional team-scoped poll path
+     for multi-repo mode.
+   - `mix symphony.cardinality --all --dry-run` for the T23 audit.
+   - JSONL telemetry (`SymphonyElixir.Telemetry`) +
+     `mix telemetry.report` for the T26 fleet CLI.
+   - `orchestrator_version_required` WORKFLOW.md gate.
+   - Label-drift mid-flight: AgentRunner finishes the current turn
+     cleanly and halts (no reroute) when the `repo:<name>` label
+     changes during a run.
+
 ## Upstream sync cadence
 
 Attempt `git fetch origin && git merge origin/main` into `udp` on the **first

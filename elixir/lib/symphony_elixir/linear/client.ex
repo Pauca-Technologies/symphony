@@ -26,6 +26,101 @@ defmodule SymphonyElixir.Linear.Client do
         assignee {
           id
         }
+        team {
+          id
+        }
+        parent {
+          id
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            state {
+              name
+            }
+            labels {
+              nodes {
+                name
+              }
+            }
+          }
+        }
+        attachments(first: $relationFirst) {
+          nodes {
+            url
+          }
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
+  @query_by_team """
+  query SymphonyLinearPollByTeam($teamId: ID!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {id: {eq: $teamId}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        team {
+          id
+        }
+        parent {
+          id
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            state {
+              name
+            }
+            labels {
+              nodes {
+                name
+              }
+            }
+          }
+        }
+        attachments(first: $relationFirst) {
+          nodes {
+            url
+          }
+        }
         labels {
           nodes {
             name
@@ -71,6 +166,31 @@ defmodule SymphonyElixir.Linear.Client do
         assignee {
           id
         }
+        team {
+          id
+        }
+        parent {
+          id
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            state {
+              name
+            }
+            labels {
+              nodes {
+                name
+              }
+            }
+          }
+        }
+        attachments(first: $relationFirst) {
+          nodes {
+            url
+          }
+        }
         labels {
           nodes {
             name
@@ -106,11 +226,20 @@ defmodule SymphonyElixir.Linear.Client do
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
+    team_id = configured_team_id()
     project_slug = tracker.project_slug
 
     cond do
       is_nil(tracker.api_key) ->
         {:error, :missing_linear_api_token}
+
+      # Audit §9.4 multi-repo Symphony: prefer team-scoped polling when a
+      # team_id is configured in ~/.symphony/repos.yaml. Falls back to
+      # project-slug polling for legacy single-repo deployments.
+      is_binary(team_id) ->
+        with {:ok, assignee_filter} <- routing_assignee_filter() do
+          do_fetch_by_team(team_id, tracker.active_states, assignee_filter)
+        end
 
       is_nil(project_slug) ->
         {:error, :missing_linear_project_slug}
@@ -119,6 +248,13 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
         end
+    end
+  end
+
+  defp configured_team_id do
+    case SymphonyElixir.RepoConfig.load() do
+      {:ok, %{linear: %{team_id: team_id}}} when is_binary(team_id) -> team_id
+      _ -> nil
     end
   end
 
@@ -238,6 +374,35 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
     do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_by_team(team_id, state_names, assignee_filter) do
+    do_fetch_by_team_page(team_id, state_names, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_by_team_page(team_id, state_names, assignee_filter, after_cursor, acc_issues) do
+    with {:ok, body} <-
+           graphql(@query_by_team, %{
+             teamId: team_id,
+             stateNames: state_names,
+             first: @issue_page_size,
+             relationFirst: @issue_page_size,
+             after: after_cursor
+           }),
+         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
+      updated_acc = prepend_page_issues(issues, acc_issues)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_by_team_page(team_id, state_names, assignee_filter, next_cursor, updated_acc)
+
+        :done ->
+          {:ok, finalize_paginated_issues(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
   end
 
   defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
@@ -458,8 +623,12 @@ defmodule SymphonyElixir.Linear.Client do
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
+      team_id: get_in(issue, ["team", "id"]),
+      parent_id: get_in(issue, ["parent", "id"]),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
+      children: extract_children(issue),
+      attachment_urls: extract_attachment_urls(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
@@ -546,6 +715,27 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_labels(_), do: []
+
+  defp extract_children(%{"children" => %{"nodes" => children}}) when is_list(children) do
+    Enum.map(children, fn child ->
+      %{
+        id: child["id"],
+        identifier: child["identifier"],
+        state: get_in(child, ["state", "name"]),
+        labels: extract_labels(child)
+      }
+    end)
+  end
+
+  defp extract_children(_), do: []
+
+  defp extract_attachment_urls(%{"attachments" => %{"nodes" => nodes}}) when is_list(nodes) do
+    nodes
+    |> Enum.map(& &1["url"])
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp extract_attachment_urls(_), do: []
 
   defp extract_blockers(%{"inverseRelations" => %{"nodes" => inverse_relations}})
        when is_list(inverse_relations) do

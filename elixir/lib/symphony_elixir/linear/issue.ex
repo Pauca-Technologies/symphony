@@ -13,12 +13,23 @@ defmodule SymphonyElixir.Linear.Issue do
     :branch_name,
     :url,
     :assignee_id,
+    :parent_id,
+    :team_id,
     blocked_by: [],
     labels: [],
+    children: [],
+    attachment_urls: [],
     assigned_to_worker: true,
     created_at: nil,
     updated_at: nil
   ]
+
+  @type child_summary :: %{
+          id: String.t() | nil,
+          identifier: String.t() | nil,
+          state: String.t() | nil,
+          labels: [String.t()]
+        }
 
   @type t :: %__MODULE__{
           id: String.t() | nil,
@@ -30,7 +41,11 @@ defmodule SymphonyElixir.Linear.Issue do
           branch_name: String.t() | nil,
           url: String.t() | nil,
           assignee_id: String.t() | nil,
+          parent_id: String.t() | nil,
+          team_id: String.t() | nil,
           labels: [String.t()],
+          children: [child_summary()],
+          attachment_urls: [String.t()],
           assigned_to_worker: boolean(),
           created_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil

@@ -5,7 +5,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.{AppServer, DynamicTool}
-  alias SymphonyElixir.{Config, Linear.Client, Linear.Issue, PromptBuilder, SessionStartHook, Tracker, Workspace}
+
+  alias SymphonyElixir.{
+    Config,
+    Linear.Client,
+    Linear.Issue,
+    PromptBuilder,
+    SessionStartHook,
+    Telemetry,
+    Tracker,
+    Workspace
+  }
 
   @type worker_host :: String.t() | nil
   @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
@@ -26,8 +36,26 @@ defmodule SymphonyElixir.AgentRunner do
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    started_at_ms = System.monotonic_time(:millisecond)
+    Telemetry.emit(:run_start, telemetry_issue_attrs(issue, worker_host))
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    result = run_on_worker_host(issue, codex_update_recipient, opts, worker_host)
+    duration_ms = System.monotonic_time(:millisecond) - started_at_ms
+
+    Telemetry.emit(
+      :run_end,
+      telemetry_issue_attrs(issue, worker_host)
+      |> Map.merge(%{
+        duration_ms: duration_ms,
+        outcome:
+          case result do
+            :ok -> "ok"
+            {:error, reason} -> "error:#{inspect(reason)}"
+          end
+      })
+    )
+
+    case result do
       :ok ->
         :ok
 
@@ -35,6 +63,19 @@ defmodule SymphonyElixir.AgentRunner do
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
+  end
+
+  defp telemetry_issue_attrs(%Issue{} = issue, worker_host) do
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      worker_host: worker_host || "local",
+      labels: issue.labels || []
+    }
+  end
+
+  defp telemetry_issue_attrs(_issue, worker_host) do
+    %{worker_host: worker_host || "local"}
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
@@ -223,10 +264,19 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
+        cond do
+          repo_label_drifted?(issue, refreshed_issue) ->
+            Logger.info(
+              "Label drift detected mid-flight for #{issue_context(refreshed_issue)}; finishing current turn cleanly and halting (no reroute)"
+            )
+
+            {:done, refreshed_issue}
+
+          active_issue_state?(refreshed_issue.state) ->
+            {:continue, refreshed_issue}
+
+          true ->
+            {:done, refreshed_issue}
         end
 
       {:ok, []} ->
@@ -235,6 +285,22 @@ defmodule SymphonyElixir.AgentRunner do
       {:error, reason} ->
         {:error, {:issue_state_refresh_failed, reason}}
     end
+  end
+
+  # Audit §9.4 (Symphony multi-repo, sub-step 6): if the routed issue's
+  # `repo:<name>` label disappears or changes during a run, finish the
+  # current Codex turn cleanly and halt; do not reroute mid-flight.
+  defp repo_label_drifted?(%Issue{labels: original}, %Issue{labels: refreshed})
+       when is_list(original) and is_list(refreshed) do
+    repo_label_set(original) != repo_label_set(refreshed)
+  end
+
+  defp repo_label_drifted?(_original, _refreshed), do: false
+
+  defp repo_label_set(labels) when is_list(labels) do
+    labels
+    |> Enum.filter(&String.starts_with?(&1, "repo:"))
+    |> MapSet.new()
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}

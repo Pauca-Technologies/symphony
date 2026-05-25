@@ -7,7 +7,20 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, LogFile, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Cardinality,
+    Config,
+    LogFile,
+    OrchestratorVersion,
+    RepoConfig,
+    Router,
+    StatusDashboard,
+    Telemetry,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -540,16 +553,134 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    repo_config = load_repo_config_or_default()
 
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+      with true <- should_dispatch_issue?(issue, state_acc, active_states, terminal_states),
+           :ok <- gate_routing_and_cardinality(issue, repo_config, active_states) do
         dispatch_issue(state_acc, issue)
       else
-        state_acc
+        _ -> state_acc
       end
     end)
+  end
+
+  defp load_repo_config_or_default do
+    case RepoConfig.load() do
+      {:ok, config} ->
+        config
+
+      {:error, reason} ->
+        Logger.warning("Failed to load ~/.symphony/repos.yaml; using legacy single-repo mode: #{inspect(reason)}")
+        RepoConfig.empty()
+    end
+  end
+
+  # Apply the multi-repo routing and cardinality gates before dispatch.
+  # When repos.yaml is unconfigured (`source == :default`), we run in
+  # legacy single-repo mode and skip both gates — preserves backwards
+  # compat for hosts that have not yet migrated to the multi-repo driver.
+  defp gate_routing_and_cardinality(%Issue{} = _issue, %{source: :default}, _active_states), do: :ok
+
+  defp gate_routing_and_cardinality(%Issue{} = issue, %{} = repo_config, %MapSet{} = active_states) do
+    with :ok <- gate_orchestrator_version(issue),
+         :ok <- gate_routing(issue, repo_config, active_states),
+         :ok <- gate_cardinality(issue, repo_config) do
+      :ok
+    end
+  end
+
+  defp gate_orchestrator_version(%Issue{} = issue) do
+    case OrchestratorVersion.check() do
+      :ok ->
+        :ok
+
+      {:incompatible, requirement, current_version} ->
+        unless Router.already_warned?(issue) do
+          body = OrchestratorVersion.incompatibility_comment(requirement, current_version)
+          _ = Tracker.create_comment(issue.id, body)
+          _ = Tracker.add_label(issue.id, Router.routing_warned_label())
+        end
+
+        Logger.warning(
+          "Orchestrator version gate: #{issue_context(issue)} requires=#{requirement} current=#{current_version}; skipping"
+        )
+
+        :skip
+
+      {:invalid_requirement, requirement} ->
+        Logger.error(
+          "Ignoring invalid orchestrator_version_required in WORKFLOW.md: #{inspect(requirement)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp gate_routing(%Issue{} = issue, %{} = repo_config, %MapSet{} = active_states) do
+    case Router.route(issue, repo_config) do
+      {:ok, _repo} ->
+        :ok
+
+      {:skip, :legacy_mode} ->
+        :ok
+
+      {:skip, reason, _ctx} = decision ->
+        maybe_emit_routing_warning(issue, decision, repo_config, active_states, reason)
+        :skip
+    end
+  end
+
+  defp gate_cardinality(%Issue{} = issue, %{} = repo_config) do
+    case Cardinality.check(issue, repo_config) do
+      :ok ->
+        :ok
+
+      {:not_enforced, _} ->
+        :ok
+
+      {:violations, violations} ->
+        maybe_emit_cardinality_warning(issue, violations)
+        :skip
+    end
+  end
+
+  defp maybe_emit_routing_warning(%Issue{} = issue, decision, %{} = repo_config, active_states, reason) do
+    if Router.eligible_for_warning?(issue, active_states) do
+      body = Router.warning_comment(issue, decision, repo_config)
+      _ = Tracker.create_comment(issue.id, body)
+      _ = Tracker.add_label(issue.id, Router.routing_warned_label())
+
+      Telemetry.emit(:routing_skip, %{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        reason: Atom.to_string(reason)
+      })
+
+      Logger.info(
+        "Routing skip: #{issue_context(issue)} reason=#{reason}; routing-warned label applied"
+      )
+    end
+  end
+
+  defp maybe_emit_cardinality_warning(%Issue{} = issue, violations) do
+    unless Router.already_warned?(issue) do
+      body = Cardinality.violation_comment(issue, violations)
+      _ = Tracker.create_comment(issue.id, body)
+      _ = Tracker.add_label(issue.id, Router.routing_warned_label())
+
+      Telemetry.emit(:cardinality_skip, %{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        violations: Enum.map(violations, &Atom.to_string/1)
+      })
+
+      Logger.info(
+        "Cardinality skip: #{issue_context(issue)} violations=#{inspect(violations)}"
+      )
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do

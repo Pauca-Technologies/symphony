@@ -38,11 +38,23 @@ defmodule SymphonyElixir.TestSupport do
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
 
+        # Isolate tests from the host's real ~/.symphony/repos.yaml and
+        # ~/.symphony/telemetry/ — the multi-repo driver (T24/T26) reads
+        # them on every dispatch tick.
+        repo_config_path = Path.join(workflow_root, "repos.yaml")
+        telemetry_dir = Path.join(workflow_root, "telemetry")
+        Application.put_env(:symphony_elixir, :repo_config_path, repo_config_path)
+        Application.put_env(:symphony_elixir, :telemetry_dir, telemetry_dir)
+        Application.put_env(:symphony_elixir, :telemetry_enabled, false)
+
         on_exit(fn ->
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :repo_config_path)
+          Application.delete_env(:symphony_elixir, :telemetry_dir)
+          Application.delete_env(:symphony_elixir, :telemetry_enabled)
           File.rm_rf(workflow_root)
         end)
 
