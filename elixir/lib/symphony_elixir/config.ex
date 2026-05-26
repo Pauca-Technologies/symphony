@@ -28,6 +28,32 @@ defmodule SymphonyElixir.Config do
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
+    # T27 follow-up: host-level Symphony config lives in
+    # `~/.symphony/config.yml` (or `repos.yaml` legacy alias). When that
+    # file is present and carries any host-level block (tracker/codex/
+    # polling/etc.), parse host settings from there. The host file does
+    # NOT have any hooks or prompt — those come per-repo from each
+    # consumer's own WORKFLOW.md, loaded by AgentRunner at dispatch.
+    #
+    # Falls back to WORKFLOW.md only for the legacy single-repo setup
+    # (no `~/.symphony/config.yml` and no host blocks in repos.yaml).
+    case SymphonyElixir.RepoConfig.load_yaml() do
+      {:ok, yaml} when is_map(yaml) ->
+        if SymphonyElixir.RepoConfig.host_config?(yaml) do
+          Schema.parse(yaml)
+        else
+          settings_from_workflow_md()
+        end
+
+      {:ok, nil} ->
+        settings_from_workflow_md()
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp settings_from_workflow_md do
     case Workflow.current() do
       {:ok, %{config: config}} when is_map(config) ->
         Schema.parse(config)

@@ -39,7 +39,16 @@ defmodule SymphonyElixir.RepoConfig do
 
   require Logger
 
-  @default_filename "repos.yaml"
+  # Canonical filename for the unified Symphony config. The file holds
+  # everything that isn't per-repo: tracker, polling, workspace.root,
+  # agent, codex, observability, plus the linear/team + repos[] blocks
+  # that used to live in repos.yaml.
+  @canonical_filename "config.yml"
+  # Legacy filename — older deployments shipped with a separate
+  # `repos.yaml` for repo registration and a host-level WORKFLOW.md at
+  # cwd. `RepoConfig.path/0` prefers config.yml when present, falls
+  # back to repos.yaml so existing setups keep loading.
+  @legacy_filename "repos.yaml"
   @default_poll_interval_seconds 30
   @default_max_concurrent_global 6
   @default_workspace_root_relative "symphony_workspaces"
@@ -68,9 +77,63 @@ defmodule SymphonyElixir.RepoConfig do
 
   @spec path() :: String.t()
   def path do
-    Application.get_env(:symphony_elixir, :repo_config_path) ||
-      Path.join([System.user_home!(), ".symphony", @default_filename])
+    Application.get_env(:symphony_elixir, :repo_config_path) || pick_canonical_path()
   end
+
+  defp pick_canonical_path do
+    home = System.user_home!() || ""
+    config = Path.join([home, ".symphony", @canonical_filename])
+    legacy = Path.join([home, ".symphony", @legacy_filename])
+
+    cond do
+      File.regular?(config) -> config
+      File.regular?(legacy) -> legacy
+      true -> config
+    end
+  end
+
+  @doc """
+  Return the raw decoded YAML from the config file (or `nil` when the
+  file is absent). Used by `SymphonyElixir.Config` to source host-level
+  settings (tracker, polling, workspace, agent, codex, observability)
+  from the same file that holds the multi-repo routing config.
+  """
+  @spec load_yaml() :: {:ok, map() | nil} | {:error, term()}
+  def load_yaml do
+    path = path()
+
+    case File.read(path) do
+      {:ok, content} ->
+        case YamlElixir.read_from_string(content) do
+          {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
+          {:ok, _other} -> {:error, {:repo_config_invalid, path, :not_a_map}}
+          {:error, reason} -> {:error, {:repo_config_invalid, path, reason}}
+        end
+
+      {:error, :enoent} ->
+        {:ok, nil}
+
+      {:error, reason} ->
+        {:error, {:repo_config_unreadable, path, reason}}
+    end
+  end
+
+  @doc """
+  True when the loaded YAML contains host-level configuration blocks
+  (tracker / codex / polling / workspace / agent / observability /
+  server). Used by `SymphonyElixir.Config` to decide whether to source
+  settings from `~/.symphony/config.yml` or fall back to a WORKFLOW.md
+  (legacy single-repo mode).
+  """
+  @spec host_config?(map() | nil) :: boolean()
+  def host_config?(yaml) when is_map(yaml) do
+    Enum.any?(
+      ~w(tracker polling workspace agent codex observability server worker),
+      &Map.has_key?(yaml, &1)
+    )
+  end
+
+  def host_config?(_), do: false
 
   @doc """
   Load the repo config. Returns an `{:ok, config}` tuple. If the file is
