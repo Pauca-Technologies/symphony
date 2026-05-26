@@ -83,24 +83,131 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
+    routed_repo = resolve_routed_repo(issue)
+
+    workspace_opts =
+      []
+      |> maybe_put(:routed_repo, routed_repo)
+
+    case Workspace.create_for_issue(issue, worker_host, workspace_opts) do
       {:ok, workspace} ->
+        # Once the worktree is populated we load the consumer repo's own
+        # WORKFLOW.md from <workspace>/<workflow_path> and use ITS hook
+        # commands for the rest of the lifecycle. This is what makes
+        # multi-repo dispatch actually multi-repo — each consumer owns
+        # its session_start / before_run / before_handoff / after_run.
+        repo_workflow = load_repo_workflow(workspace, routed_repo)
+        repo_hook_opts = repo_workflow_hook_opts(repo_workflow)
+
+        # When Symphony did the worktree clone (routed_repo present),
+        # we now run the per-repo after_create here. The legacy single-
+        # repo path already ran the host-level after_create inside
+        # Workspace.create_for_issue.
+        if routed_repo do
+          _ =
+            Workspace.run_after_create_hook(
+              workspace,
+              issue,
+              worker_host,
+              hook_command: Map.get(repo_hook_opts, :after_create)
+            )
+        end
+
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
-        session_start = SessionStartHook.run(workspace, issue, worker_host)
-        opts = Keyword.put(opts, :session_start_prompt, session_start.prompt)
+        session_start =
+          SessionStartHook.run(
+            workspace,
+            issue,
+            worker_host,
+            hook_command: Map.get(repo_hook_opts, :session_start)
+          )
+
+        opts =
+          opts
+          |> Keyword.put(:session_start_prompt, session_start.prompt)
+          |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with :ok <-
+                 Workspace.run_before_run_hook(
+                   workspace,
+                   issue,
+                   worker_host,
+                   hook_command: Map.get(repo_hook_opts, :before_run)
+                 ) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+          Workspace.run_after_run_hook(
+            workspace,
+            issue,
+            worker_host,
+            hook_command: Map.get(repo_hook_opts, :after_run)
+          )
         end
 
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp resolve_routed_repo(%Issue{} = issue) do
+    case RepoConfig.load() do
+      {:ok, config} ->
+        case Router.route(issue, config) do
+          {:ok, repo} -> repo
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp resolve_routed_repo(_issue), do: nil
+
+  # Load `<workspace>/<workflow_path>` after Symphony has populated the
+  # worktree. Returns nil when there's no routed_repo (legacy single-repo
+  # path) or when the consumer's WORKFLOW.md isn't readable — callers
+  # fall back to host-level hooks in those cases.
+  defp load_repo_workflow(workspace, %{workflow_path: workflow_path}) when is_binary(workflow_path) do
+    path = Path.join(workspace, workflow_path)
+
+    case SymphonyElixir.Workflow.load(path) do
+      {:ok, workflow} ->
+        Logger.info("Loaded per-repo workflow from #{path}")
+        workflow
+
+      {:error, reason} ->
+        Logger.warning(
+          "Falling back to host-level hooks; could not load per-repo workflow at #{path}: #{inspect(reason)}"
+        )
+
+        nil
+    end
+  end
+
+  defp load_repo_workflow(_workspace, _routed_repo), do: nil
+
+  defp repo_workflow_hook_opts(nil), do: %{}
+
+  defp repo_workflow_hook_opts(%{config: config}) when is_map(config) do
+    hooks = Map.get(config, "hooks", %{})
+
+    %{
+      before_run: Map.get(hooks, "before_run"),
+      after_run: Map.get(hooks, "after_run"),
+      session_start: Map.get(hooks, "session_start"),
+      before_handoff: Map.get(hooks, "before_handoff"),
+      after_create: Map.get(hooks, "after_create"),
+      before_remove: Map.get(hooks, "before_remove")
+    }
+  end
+
+  defp repo_workflow_hook_opts(_workflow), do: %{}
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
@@ -221,22 +328,26 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp dynamic_tool_executor(issue, workspace, worker_host, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+    per_repo_before_handoff = Keyword.get(opts, :per_repo_before_handoff)
+
+    handoff_context =
+      %{issue: issue, workspace: workspace, worker_host: worker_host}
+      |> maybe_put_map(:before_handoff_command, per_repo_before_handoff)
 
     fn tool, arguments ->
       result =
         DynamicTool.execute(tool, arguments,
           linear_client: linear_client,
-          handoff_gate_context: %{
-            issue: issue,
-            workspace: workspace,
-            worker_host: worker_host
-          }
+          handoff_gate_context: handoff_context
         )
 
       maybe_store_handoff_gate_prompt(result)
       result
     end
   end
+
+  defp maybe_put_map(map, _key, nil), do: map
+  defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_store_handoff_gate_prompt(%{"success" => false, "output" => output}) when is_binary(output) do
     case Jason.decode(output) do

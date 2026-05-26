@@ -49,6 +49,7 @@ defmodule SymphonyElixir.RepoConfig do
           label: String.t(),
           repo_url: String.t() | nil,
           workflow_path: String.t(),
+          base_branch: String.t(),
           max_concurrent: pos_integer()
         }
 
@@ -259,6 +260,7 @@ defmodule SymphonyElixir.RepoConfig do
         end
 
       workflow_path = string_or_default(entry, "workflow_path", "WORKFLOW.md")
+      base_branch = string_or_default(entry, "base_branch", "main")
       max_concurrent = pos_integer(entry, "max_concurrent", 1)
 
       {:ok,
@@ -267,6 +269,7 @@ defmodule SymphonyElixir.RepoConfig do
          label: label,
          repo_url: repo_url,
          workflow_path: workflow_path,
+         base_branch: base_branch,
          max_concurrent: max_concurrent
        }}
     else

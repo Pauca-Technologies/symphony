@@ -30,15 +30,22 @@ defmodule SymphonyElixir.HandoffGate do
 
   def handoff_transition?(_current_state, _target_state), do: false
 
-  @spec run_before_handoff(Path.t(), Issue.t(), term(), String.t()) :: result()
-  def run_before_handoff(workspace, %Issue{} = issue, worker_host, target_state)
+  @spec run_before_handoff(Path.t(), Issue.t(), term(), String.t(), keyword()) :: result()
+  def run_before_handoff(workspace, %Issue{} = issue, worker_host, target_state, opts \\ [])
       when is_binary(workspace) and is_binary(target_state) do
-    case Config.settings!().hooks.before_handoff do
+    # Per-repo workflow overrides (T27 multi-repo dispatch): when AgentRunner
+    # threads the consumer's WORKFLOW.md before_handoff command through, we
+    # use it; otherwise fall back to the host-level Config (legacy single-
+    # repo path).
+    override = Keyword.get(opts, :hook_command)
+    command = override || Config.settings!().hooks.before_handoff
+
+    case command do
       nil ->
         :ok
 
       _command ->
-        case Workspace.run_before_handoff_hook(workspace, issue, worker_host) do
+        case Workspace.run_before_handoff_hook(workspace, issue, worker_host, opts) do
           {:ok, output} ->
             breakdown = gate_breakdown(output, true)
             emit_telemetry(issue, target_state, :passed, breakdown)

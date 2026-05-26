@@ -111,6 +111,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     issue = Map.get(context, :issue) || Map.get(context, "issue")
     workspace = Map.get(context, :workspace) || Map.get(context, "workspace")
     worker_host = Map.get(context, :worker_host) || Map.get(context, "worker_host")
+    # AgentRunner threads the per-repo before_handoff hook command through
+    # the handoff_gate_context map when multi-repo dispatch is active. When
+    # absent, HandoffGate falls back to the host-level Config setting.
+    before_handoff_cmd =
+      Map.get(context, :before_handoff_command) || Map.get(context, "before_handoff_command")
+
+    handoff_opts =
+      if is_binary(before_handoff_cmd), do: [hook_command: before_handoff_cmd], else: []
 
     with %{id: context_issue_id} <- issue,
          workspace when is_binary(workspace) <- workspace,
@@ -119,7 +127,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          {:ok, current_state, target_state} <-
            resolve_transition_states(query, variables, issue, issue_id, linear_client),
          true <- HandoffGate.handoff_transition?(current_state, target_state) do
-      case HandoffGate.run_before_handoff(workspace, issue, worker_host, target_state) do
+      case HandoffGate.run_before_handoff(workspace, issue, worker_host, target_state, handoff_opts) do
         :ok -> :ok
         {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
       end

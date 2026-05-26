@@ -17,9 +17,16 @@ defmodule SymphonyElixir.SessionStartHook do
           script_timings: [map()]
         }
 
-  @spec run(Path.t(), Issue.t(), String.t() | nil) :: result()
-  def run(workspace, %Issue{} = issue, worker_host \\ nil) when is_binary(workspace) do
-    case Config.settings!().hooks.session_start do
+  @spec run(Path.t(), Issue.t(), String.t() | nil, keyword()) :: result()
+  def run(workspace, %Issue{} = issue, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
+    # When a per-repo workflow override is in play (T27 multi-repo
+    # dispatch), prefer its session_start command over the host-level
+    # Config. Falls back to the global setting when not provided.
+    override = Keyword.get(opts, :hook_command)
+    command = override || Config.settings!().hooks.session_start
+
+    case command do
       nil ->
         result(:skipped, "", [])
 
@@ -27,7 +34,7 @@ defmodule SymphonyElixir.SessionStartHook do
         started_at = System.monotonic_time()
 
         {outcome, output} =
-          case Workspace.run_session_start_hook(workspace, issue, worker_host) do
+          case Workspace.run_session_start_hook(workspace, issue, worker_host, opts) do
             {:ok, hook_output} ->
               {:passed, hook_output}
 

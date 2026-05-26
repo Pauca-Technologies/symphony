@@ -4,24 +4,43 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{BareClone, Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
   @type worker_host :: String.t() | nil
 
-  @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, Path.t()} | {:error, term()}
-  def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+  def create_for_issue(issue_or_identifier, worker_host \\ nil, opts \\ []) do
     issue_context = issue_context(issue_or_identifier)
+    routed_repo = Keyword.get(opts, :routed_repo)
+    after_create_override = Keyword.get(opts, :after_create_command)
 
     try do
       safe_id = safe_identifier(issue_context.issue_identifier)
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+           {:ok, workspace, created?} <-
+             ensure_workspace(workspace, worker_host, routed_repo, issue_or_identifier) do
+        # When a routed_repo is in play (multi-repo dispatch, T27), the
+        # caller (AgentRunner) is responsible for running after_create
+        # itself with the consumer repo's own WORKFLOW.md hook (which can
+        # only be read after the worktree exists). In the legacy single-
+        # repo path, we still run after_create here from the host-level
+        # Config so existing setups don't change.
+        if is_nil(routed_repo) do
+          :ok =
+            maybe_run_after_create_hook(
+              workspace,
+              issue_context,
+              created?,
+              worker_host,
+              after_create_override
+            )
+        end
+
         {:ok, workspace}
       end
     rescue
@@ -31,7 +50,58 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
+  @doc """
+  Run `after_create` against a workspace that's already populated.
+  Public because `AgentRunner` calls this with the per-repo workflow's
+  `after_create` command once the worktree exists and the consumer's
+  WORKFLOW.md has been loaded (T27 multi-repo dispatch).
+  """
+  @spec run_after_create_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
+          :ok | {:error, term()}
+  def run_after_create_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+    command = resolve_hook_command(:after_create, Keyword.get(opts, :hook_command))
+
+    case command do
+      nil ->
+        :ok
+
+      command ->
+        run_hook(command, workspace, issue_context, "after_create", worker_host)
+    end
+  end
+
+  # When the issue is routed to a configured repo (T24/T27), Symphony owns
+  # the cloning step: it lazy-creates a bare clone per repo and uses
+  # `git worktree add` per issue. Local path only — SSH/remote worktree
+  # support is a future task. When no routed_repo is given (legacy single-
+  # repo mode), fall through to the pre-T27 mkdir + after_create-hook
+  # clone behavior.
+  defp ensure_workspace(workspace, nil, %{repo_url: url} = routed_repo, issue_or_identifier)
+       when is_binary(url) do
+    workspace_root = Config.settings!().workspace.root
+    branch_name = resolve_worktree_branch_name(issue_or_identifier)
+    base_branch = Map.get(routed_repo, :base_branch, "main")
+
+    # If a prior dispatch left a stale dir at this path, remove it first
+    # so `git worktree add` doesn't fail with "already exists".
+    if File.exists?(workspace) and not git_worktree_dir?(workspace) do
+      File.rm_rf!(workspace)
+    end
+
+    with {:ok, bare_path} <- BareClone.ensure_and_fetch(workspace_root, routed_repo),
+         :ok <- maybe_remove_existing_worktree(bare_path, workspace),
+         :ok <- BareClone.create_worktree(bare_path, workspace, branch_name, base_branch) do
+      Logger.info(
+        "Workspace ready via worktree repo=#{routed_repo.id} bare=#{bare_path} workspace=#{workspace} branch=#{branch_name} base=#{base_branch}"
+      )
+
+      {:ok, workspace, true}
+    end
+  end
+
+  defp ensure_workspace(workspace, nil, _routed_repo, _issue) do
     cond do
       File.dir?(workspace) ->
         {:ok, workspace, false}
@@ -45,7 +115,36 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
+  defp ensure_workspace(workspace, worker_host, _routed_repo, _issue) when is_binary(worker_host) do
+    ensure_workspace_remote(workspace, worker_host)
+  end
+
+  defp maybe_remove_existing_worktree(bare_path, workspace) do
+    if File.exists?(workspace) and git_worktree_dir?(workspace) do
+      BareClone.remove_worktree(bare_path, workspace)
+    else
+      :ok
+    end
+  end
+
+  # A populated worktree always has a `.git` file (NOT a directory) that
+  # points back to the bare clone. We use that to distinguish "worktree
+  # we created last time" from "random debris left in this path."
+  defp git_worktree_dir?(workspace) when is_binary(workspace) do
+    git_marker = Path.join(workspace, ".git")
+    File.regular?(git_marker)
+  end
+
+  defp resolve_worktree_branch_name(%{branch_name: bn}) when is_binary(bn) and bn != "", do: bn
+
+  defp resolve_worktree_branch_name(%{identifier: id}) when is_binary(id) do
+    safe_identifier(id)
+  end
+
+  defp resolve_worktree_branch_name(id) when is_binary(id), do: safe_identifier(id)
+  defp resolve_worktree_branch_name(_), do: "symphony-worktree"
+
+  defp ensure_workspace_remote(workspace, worker_host) when is_binary(worker_host) do
     script =
       [
         "set -eu",
@@ -163,13 +262,14 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
-  @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
+  @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
           :ok | {:error, term()}
-  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = Config.settings!().hooks
+    command = resolve_hook_command(:before_run, Keyword.get(opts, :hook_command))
 
-    case hooks.before_run do
+    case command do
       nil ->
         :ok
 
@@ -178,13 +278,14 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  @spec run_session_start_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
+  @spec run_session_start_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
-  def run_session_start_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_session_start_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = Config.settings!().hooks
+    command = resolve_hook_command(:session_start, Keyword.get(opts, :hook_command))
 
-    case hooks.session_start do
+    case command do
       nil ->
         {:ok, ""}
 
@@ -193,13 +294,14 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  @spec run_before_handoff_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
+  @spec run_before_handoff_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
-  def run_before_handoff_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_before_handoff_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = Config.settings!().hooks
+    command = resolve_hook_command(:before_handoff, Keyword.get(opts, :hook_command))
 
-    case hooks.before_handoff do
+    case command do
       nil ->
         {:ok, ""}
 
@@ -208,12 +310,13 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
-  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) :: :ok
+  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
-    hooks = Config.settings!().hooks
+    command = resolve_hook_command(:after_run, Keyword.get(opts, :hook_command))
 
-    case hooks.after_run do
+    case command do
       nil ->
         :ok
 
@@ -237,21 +340,35 @@ defmodule SymphonyElixir.Workspace do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-    hooks = Config.settings!().hooks
+  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, override) do
+    command = resolve_hook_command(:after_create, override)
 
-    case created? do
-      true ->
-        case hooks.after_create do
-          nil ->
-            :ok
+    case {created?, command} do
+      {true, command} when is_binary(command) ->
+        run_hook(command, workspace, issue_context, "after_create", worker_host)
 
-          command ->
-            run_hook(command, workspace, issue_context, "after_create", worker_host)
-        end
-
-      false ->
+      _ ->
         :ok
+    end
+  end
+
+  # Pick the hook command at call time: an explicit per-call override
+  # (used by AgentRunner to thread the per-repo workflow's hooks once the
+  # worktree is loaded) takes precedence over the host-level Config
+  # settings. `:not_set` means "no override; fall back to global".
+  defp resolve_hook_command(hook_name, override) do
+    case override do
+      nil ->
+        Map.get(Config.settings!().hooks, hook_name)
+
+      :not_set ->
+        Map.get(Config.settings!().hooks, hook_name)
+
+      command when is_binary(command) ->
+        command
+
+      _ ->
+        Map.get(Config.settings!().hooks, hook_name)
     end
   end
 

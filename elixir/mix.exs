@@ -26,6 +26,7 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.StatusDashboard,
           SymphonyElixir.LogFile,
           SymphonyElixir.Workspace,
+          SymphonyElixir.BareClone,
           SymphonyElixir.Telemetry,
           SymphonyElixir.OrchestratorVersion,
           Mix.Tasks.Symphony.Cardinality,
