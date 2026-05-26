@@ -25,6 +25,13 @@ defmodule SymphonyElixir.Linear.Client do
         url
         assignee {
           id
+          displayName
+          email
+        }
+        creator {
+          id
+          displayName
+          email
         }
         team {
           id
@@ -95,6 +102,13 @@ defmodule SymphonyElixir.Linear.Client do
         url
         assignee {
           id
+          displayName
+          email
+        }
+        creator {
+          id
+          displayName
+          email
         }
         team {
           id
@@ -170,6 +184,13 @@ defmodule SymphonyElixir.Linear.Client do
         url
         assignee {
           id
+          displayName
+          email
+        }
+        creator {
+          id
+          displayName
+          email
         }
         team {
           id
@@ -248,6 +269,13 @@ defmodule SymphonyElixir.Linear.Client do
         url
         assignee {
           id
+          displayName
+          email
+        }
+        creator {
+          id
+          displayName
+          email
         }
         team {
           id
@@ -318,6 +346,13 @@ defmodule SymphonyElixir.Linear.Client do
         url
         assignee {
           id
+          displayName
+          email
+        }
+        creator {
+          id
+          displayName
+          email
         }
         team {
           id
@@ -388,6 +423,13 @@ defmodule SymphonyElixir.Linear.Client do
         url
         assignee {
           id
+          displayName
+          email
+        }
+        creator {
+          id
+          displayName
+          email
         }
         team {
           id
@@ -1118,6 +1160,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_issue(issue, assignee_filter) when is_map(issue) do
     assignee = issue["assignee"]
+    creator = issue["creator"]
 
     %Issue{
       id: issue["id"],
@@ -1128,7 +1171,12 @@ defmodule SymphonyElixir.Linear.Client do
       state: get_in(issue, ["state", "name"]),
       branch_name: issue["branchName"],
       url: issue["url"],
-      assignee_id: assignee_field(assignee, "id"),
+      assignee_id: user_field(assignee, "id"),
+      assignee_display_name: user_field(assignee, "displayName"),
+      assignee_email: user_field(assignee, "email"),
+      creator_id: user_field(creator, "id"),
+      creator_display_name: user_field(creator, "displayName"),
+      creator_email: user_field(creator, "email"),
       team_id: get_in(issue, ["team", "id"]),
       parent_id: get_in(issue, ["parent", "id"]),
       blocked_by: extract_blockers(issue),
@@ -1143,8 +1191,14 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_issue(_issue, _assignee_filter), do: nil
 
-  defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
-  defp assignee_field(_assignee, _field), do: nil
+  defp user_field(%{} = user, field) when is_binary(field) do
+    case user[field] do
+      value when is_binary(value) -> value
+      _ -> nil
+    end
+  end
+
+  defp user_field(_user, _field), do: nil
 
   defp assigned_to_worker?(_assignee, nil), do: true
 

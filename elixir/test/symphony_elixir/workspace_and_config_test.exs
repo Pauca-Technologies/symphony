@@ -318,7 +318,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       "branchName" => "mt-1",
       "url" => "https://example.org/issues/MT-1",
       "assignee" => %{
-        "id" => "user-1"
+        "id" => "user-1",
+        "displayName" => "raul",
+        "email" => "raul@pauca.co"
+      },
+      "creator" => %{
+        "id" => "user-9",
+        "displayName" => "someone-else",
+        "email" => "creator@example.org"
       },
       "labels" => %{"nodes" => [%{"name" => "Backend"}]},
       "inverseRelations" => %{
@@ -352,6 +359,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.priority == 2
     assert issue.state == "Todo"
     assert issue.assignee_id == "user-1"
+    assert issue.assignee_display_name == "raul"
+    assert issue.assignee_email == "raul@pauca.co"
+    assert issue.creator_id == "user-9"
+    assert issue.creator_display_name == "someone-else"
+    assert issue.creator_email == "creator@example.org"
     assert issue.assigned_to_worker
   end
 
