@@ -125,11 +125,24 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
+      # project_slug is only required for legacy single-repo polling. When
+      # `linear.team_id` is set in ~/.symphony/repos.yaml, Symphony uses the
+      # team-scoped poll path (Linear.Client) and never reads project_slug;
+      # the legacy validation here would otherwise block the dispatch loop
+      # on a config field the running code no longer consumes.
+      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) and
+          not multi_repo_configured?() ->
         {:error, :missing_linear_project_slug}
 
       true ->
         :ok
+    end
+  end
+
+  defp multi_repo_configured? do
+    case SymphonyElixir.RepoConfig.load() do
+      {:ok, %{linear: %{team_id: team_id}}} when is_binary(team_id) -> true
+      _ -> false
     end
   end
 
