@@ -1,29 +1,30 @@
 defmodule SymphonyElixir.BareClone do
   @moduledoc """
-  Lazy bare-clone + worktree machinery for the multi-repo Symphony driver
-  (audit §9.4, implementation plan T27).
+  Lazy repo-clone + worktree machinery for the multi-repo Symphony
+  driver (audit §9.4, implementation plan T27).
 
-  Architecture: one bare clone per configured repo, lazy-created on first
-  dispatch, fetched fresh on every issue, and used as the base for
-  per-issue `git worktree add`. Eliminates per-issue full clones and gives
-  Symphony control of the cloning step instead of delegating to the
-  consumer's `after_create` hook.
+  *(Module name is historical — it manages a regular clone now, not a
+  bare clone. The simpler model: one full clone per configured repo,
+  refreshed from origin before every dispatch; per-issue work happens
+  in `git worktree add` siblings of that clone.)*
 
   Layout:
 
       <workspace_root>/
-        _bare/
-          <repo_id>.git/        (one shared bare clone per configured repo)
+        _repos/
+          <repo_id>/             (one shared regular clone per repo)
+            .git/
+            … working tree (unused; we never modify it directly) …
         <safe-issue-identifier>/  (per-issue worktree)
 
-  All filesystem operations are guarded with file locks so concurrent
-  agent runs against the same repo don't race on the bare clone.
+  Operations are guarded by a file lock so concurrent agent runs
+  against the same repo don't race each other on the canonical clone.
   """
 
   require Logger
 
-  @lock_dir_relative "_bare/.locks"
-  @bare_dir_relative "_bare"
+  @lock_dir_relative "_repos/.locks"
+  @repos_dir_relative "_repos"
 
   @typedoc "Subset of RepoConfig.repo_entry the worktree pipeline needs."
   @type routed_repo :: %{
@@ -33,8 +34,9 @@ defmodule SymphonyElixir.BareClone do
         }
 
   @doc """
-  Ensure a bare clone exists for the given routed repo, then fetch.
-  Returns `{:ok, bare_path}` on success.
+  Ensure the canonical clone exists, then fetch from origin so
+  `origin/<base_branch>` reflects upstream's latest. Returns
+  `{:ok, clone_path}` on success.
   """
   @spec ensure_and_fetch(String.t(), routed_repo()) ::
           {:ok, Path.t()} | {:error, term()}
@@ -42,44 +44,44 @@ defmodule SymphonyElixir.BareClone do
     {:error, :missing_repo_url}
   end
 
-  def ensure_and_fetch(workspace_root, %{id: repo_id, repo_url: repo_url} = _routed)
+  def ensure_and_fetch(workspace_root, %{id: repo_id, repo_url: repo_url} = routed)
       when is_binary(workspace_root) and is_binary(repo_id) and is_binary(repo_url) do
-    bare_path = bare_path(workspace_root, repo_id)
-    File.mkdir_p!(Path.dirname(bare_path))
+    clone_path = clone_path(workspace_root, repo_id)
+    File.mkdir_p!(Path.dirname(clone_path))
 
     with_repo_lock(workspace_root, repo_id, fn ->
-      with :ok <- ensure_clone(bare_path, repo_url),
-           :ok <- fetch(bare_path) do
-        {:ok, bare_path}
+      with :ok <- ensure_clone(clone_path, repo_url),
+           :ok <- fetch(clone_path, Map.get(routed, :base_branch, "main")) do
+        {:ok, clone_path}
       end
     end)
   end
 
   @doc """
-  Create a worktree at `worktree_path` rooted at `base_branch` on a
-  branch named `branch_name`. The base branch is addressed by its bare
-  name (e.g. "develop") — bare clones store refs at `refs/heads/*` not
-  `refs/remotes/origin/*`, so the `origin/<branch>` form doesn't
-  resolve. `-B` creates or resets the per-issue branch so retries on
-  the same issue are idempotent. Caller must clean up any existing dir
-  at `worktree_path` first.
+  Create a worktree at `worktree_path` rooted at `origin/<base_branch>`
+  on a branch named `branch_name`. The canonical clone is a normal
+  (non-bare) clone, so remote-tracking refs at
+  `refs/remotes/origin/*` exist and the `origin/<branch>` form
+  resolves directly. `-B` creates or resets the per-issue branch so
+  retries on the same issue are idempotent. Caller must clean up any
+  existing dir at `worktree_path` first.
   """
   @spec create_worktree(Path.t(), Path.t(), String.t(), String.t()) ::
           :ok | {:error, term()}
-  def create_worktree(bare_path, worktree_path, branch_name, base_branch)
-      when is_binary(bare_path) and is_binary(worktree_path) and is_binary(branch_name) and
+  def create_worktree(clone_path, worktree_path, branch_name, base_branch)
+      when is_binary(clone_path) and is_binary(worktree_path) and is_binary(branch_name) and
              is_binary(base_branch) do
     File.mkdir_p!(Path.dirname(worktree_path))
 
     args = [
       "-C",
-      bare_path,
+      clone_path,
       "worktree",
       "add",
       "-B",
       branch_name,
       worktree_path,
-      base_branch
+      "origin/#{base_branch}"
     ]
 
     case System.cmd("git", args, stderr_to_stdout: true) do
@@ -97,10 +99,10 @@ defmodule SymphonyElixir.BareClone do
   worktree state.
   """
   @spec remove_worktree(Path.t(), Path.t()) :: :ok
-  def remove_worktree(bare_path, worktree_path)
-      when is_binary(bare_path) and is_binary(worktree_path) do
+  def remove_worktree(clone_path, worktree_path)
+      when is_binary(clone_path) and is_binary(worktree_path) do
     if File.exists?(worktree_path) do
-      args = ["-C", bare_path, "worktree", "remove", "--force", worktree_path]
+      args = ["-C", clone_path, "worktree", "remove", "--force", worktree_path]
 
       case System.cmd("git", args, stderr_to_stdout: true) do
         {_output, 0} ->
@@ -112,8 +114,8 @@ defmodule SymphonyElixir.BareClone do
           )
 
           _ = File.rm_rf(worktree_path)
-          # Best-effort prune any dangling refs in the bare clone.
-          _ = System.cmd("git", ["-C", bare_path, "worktree", "prune"], stderr_to_stdout: true)
+          # Best-effort prune any dangling refs in the canonical clone.
+          _ = System.cmd("git", ["-C", clone_path, "worktree", "prune"], stderr_to_stdout: true)
           :ok
       end
     else
@@ -122,79 +124,59 @@ defmodule SymphonyElixir.BareClone do
   end
 
   @doc """
-  Compute the bare-clone path for a given workspace root + repo id.
-  Public for tests + the Workspace module.
+  Compute the canonical-clone path for a given workspace root + repo
+  id. Public for tests + the Workspace module.
   """
   @spec bare_path(String.t(), String.t()) :: Path.t()
-  def bare_path(workspace_root, repo_id) when is_binary(workspace_root) and is_binary(repo_id) do
-    Path.join([workspace_root, @bare_dir_relative, "#{repo_id}.git"])
+  def bare_path(workspace_root, repo_id), do: clone_path(workspace_root, repo_id)
+
+  @doc false
+  @spec clone_path(String.t(), String.t()) :: Path.t()
+  def clone_path(workspace_root, repo_id) when is_binary(workspace_root) and is_binary(repo_id) do
+    Path.join([workspace_root, @repos_dir_relative, repo_id])
   end
 
-  defp ensure_clone(bare_path, repo_url) do
-    if bare_clone_present?(bare_path) do
-      ensure_fetch_refspec(bare_path)
+  defp ensure_clone(clone_path, repo_url) do
+    if clone_present?(clone_path) do
+      :ok
     else
-      # Clean any half-cloned remnants so `git clone --bare` doesn't fail
-      # on a pre-existing partial dir from a crashed earlier attempt.
-      _ = File.rm_rf(bare_path)
+      # Clean any half-cloned remnants so `git clone` doesn't fail on a
+      # pre-existing partial dir from a crashed earlier attempt.
+      _ = File.rm_rf(clone_path)
 
-      case System.cmd("git", ["clone", "--bare", repo_url, bare_path], stderr_to_stdout: true) do
+      case System.cmd("git", ["clone", repo_url, clone_path], stderr_to_stdout: true) do
         {_output, 0} ->
-          ensure_fetch_refspec(bare_path)
+          :ok
 
         {output, status} ->
-          {:error, {:bare_clone_failed, status, String.trim(IO.iodata_to_binary(output))}}
+          {:error, {:repo_clone_failed, status, String.trim(IO.iodata_to_binary(output))}}
       end
     end
   end
 
-  # `git clone --bare` does NOT set a default fetch refspec, so a later
-  # `git fetch origin` would silently do nothing. We explicitly configure
-  # `+refs/heads/*:refs/heads/*` so subsequent fetches pull updates from
-  # the remote into the bare clone's heads.
-  defp ensure_fetch_refspec(bare_path) do
-    case System.cmd(
-           "git",
-           [
-             "-C",
-             bare_path,
-             "config",
-             "remote.origin.fetch",
-             "+refs/heads/*:refs/heads/*"
-           ],
-           stderr_to_stdout: true
-         ) do
-      {_output, 0} ->
-        :ok
-
-      {output, status} ->
-        Logger.warning(
-          "Failed to set fetch refspec on #{bare_path} (status=#{status}): #{String.trim(IO.iodata_to_binary(output))}"
-        )
-
-        :ok
-    end
+  defp clone_present?(clone_path) do
+    # A populated clone has a `.git` entry (dir or, less common, file)
+    # and an objects directory under it. Either form resolves.
+    git_path = Path.join(clone_path, ".git")
+    File.dir?(git_path) or File.regular?(git_path)
   end
 
-  defp bare_clone_present?(bare_path) do
-    # A populated bare clone has a `HEAD` file and an `objects/` dir.
-    File.regular?(Path.join(bare_path, "HEAD")) and File.dir?(Path.join(bare_path, "objects"))
-  end
-
-  defp fetch(bare_path) do
-    # No `--prune`: Symphony creates per-issue branches in the bare clone
-    # (one for each `git worktree add`); those don't exist on origin, so
-    # `--prune` would delete them and yank the rug out from under active
-    # worktrees.
-    case System.cmd("git", ["-C", bare_path, "fetch", "origin"], stderr_to_stdout: true) do
+  defp fetch(clone_path, base_branch) do
+    # Fetch updates remote-tracking refs (refs/remotes/origin/*). We
+    # don't touch the canonical clone's working tree — per-issue work
+    # happens in worktrees that take `origin/<base_branch>` directly
+    # as their starting point, so the canonical clone's checked-out
+    # branch never matters.
+    case System.cmd("git", ["-C", clone_path, "fetch", "origin", base_branch], stderr_to_stdout: true) do
       {_output, 0} ->
         :ok
 
       {output, status} ->
         # A fetch failure isn't fatal — the existing pack might still cover the
-        # required base_branch. Log it and keep going.
+        # required base_branch (the initial clone fetched everything). Log it
+        # and keep going.
         Logger.warning(
-          "git fetch on bare clone #{bare_path} failed (status=#{status}); reusing existing pack: #{String.trim(IO.iodata_to_binary(output))}"
+          "git fetch on clone #{clone_path} failed (status=#{status}); reusing existing refs: #{String.trim(IO.iodata_to_binary(output))}"
         )
 
         :ok
@@ -215,7 +197,7 @@ defmodule SymphonyElixir.BareClone do
         end
 
       {:error, reason} ->
-        {:error, {:bare_clone_lock_failed, reason}}
+        {:error, {:repo_clone_lock_failed, reason}}
     end
   end
 
