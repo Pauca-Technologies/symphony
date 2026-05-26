@@ -20,31 +20,41 @@ defmodule SymphonyElixir.RouterTest do
 
   describe "route/2" do
     test "falls back to legacy_mode when no repos are configured" do
-      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["repo:dashboard-v2"]}
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["dashboard-v2"]}
       assert Router.route(issue, RepoConfig.empty()) == {:skip, :legacy_mode}
     end
 
-    test "ok when a single repo label matches a configured repo" do
+    test "ok when a single configured label matches a leaf label on the issue" do
       config = config_with_repos([repo("udp", "repo:dashboard-v2")])
-      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["bug", "repo:dashboard-v2"]}
+      # Linear stores grouped labels by leaf name only — the `repo:` prefix
+      # in repos.yaml is normalized away to match.
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["bug", "dashboard-v2"]}
       assert {:ok, %{id: "udp"}} = Router.route(issue, config)
     end
 
-    test "skip no_label when no repo: label is present" do
+    test "ok when the configured label includes no prefix and matches verbatim" do
+      config = config_with_repos([repo("udp", "udp-dashboard-v2")])
+      issue = %Issue{id: "1", labels: ["udp-dashboard-v2"]}
+      assert {:ok, %{id: "udp"}} = Router.route(issue, config)
+    end
+
+    test "skip no_match when no label matches a configured repo" do
       config = config_with_repos([repo("udp", "repo:dashboard-v2")])
       issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["bug"]}
-      assert Router.route(issue, config) == {:skip, :no_label, []}
+      assert Router.route(issue, config) == {:skip, :no_match, ["bug"]}
     end
 
-    test "skip no_match with the observed label included in the decision" do
+    test "no_match carries the observed labels" do
       config = config_with_repos([repo("udp", "repo:dashboard-v2")])
-      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["repo:typo"]}
-      assert Router.route(issue, config) == {:skip, :no_match, ["repo:typo"]}
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["typo", "bug"]}
+      assert Router.route(issue, config) == {:skip, :no_match, ["typo", "bug"]}
     end
 
-    test "skip ambiguous when multiple repo: labels point at multiple configured repos" do
+    test "skip ambiguous when an issue carries labels matching multiple configured repos" do
       config = config_with_repos([repo("a", "repo:a"), repo("b", "repo:b")])
-      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["repo:a", "repo:b"]}
+      # Linear's leaf names — both match because Router normalizes
+      # `repo:a` -> `a` and `repo:b` -> `b`.
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["a", "b"]}
 
       assert {:skip, :ambiguous, matches} = Router.route(issue, config)
       assert length(matches) == 2
@@ -88,12 +98,12 @@ defmodule SymphonyElixir.RouterTest do
   describe "warning_comment/3" do
     test "includes the routing-warned marker for idempotency" do
       config = config_with_repos([repo("udp", "repo:dashboard-v2")])
-      issue = %Issue{id: "1", labels: ["repo:typo"]}
-      decision = {:skip, :no_match, ["repo:typo"]}
+      issue = %Issue{id: "1", labels: ["typo"]}
+      decision = {:skip, :no_match, ["typo"]}
 
       body = Router.warning_comment(issue, decision, config)
       assert body =~ "symphony:routing-warned"
-      assert body =~ "repo:typo"
+      assert body =~ "typo"
     end
   end
 end

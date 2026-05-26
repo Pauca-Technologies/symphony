@@ -4,42 +4,61 @@ defmodule SymphonyElixir.CardinalityTest do
   alias SymphonyElixir.{Cardinality, RepoConfig}
   alias SymphonyElixir.Linear.Issue
 
-  defp config_with_cutover(date) do
+  defp repo(id, label) do
+    %{
+      id: id,
+      label: label,
+      repo_url: nil,
+      workflow_path: "WORKFLOW.md",
+      max_concurrent: 1
+    }
+  end
+
+  defp config_with_repos(repos) do
+    %{RepoConfig.empty() | source: :file, repos: repos}
+  end
+
+  defp config_with_cutover_and_repos(date, repos) do
     defaults = Map.put(RepoConfig.empty().defaults, :cardinality_enforced_from, date)
-    %{RepoConfig.empty() | defaults: defaults}
+    %{RepoConfig.empty() | defaults: defaults, repos: repos, source: :file}
   end
 
   describe "check/2" do
     test "ok for a routable single-repo issue with no PRs" do
+      config = config_with_repos([repo("udp", "repo:dashboard-v2")])
+
       issue = %Issue{
         id: "1",
         identifier: "UDPE-1",
-        labels: ["repo:dashboard-v2"]
+        labels: ["dashboard-v2"]
       }
 
-      assert Cardinality.check(issue, RepoConfig.empty()) == :ok
+      assert Cardinality.check(issue, config) == :ok
     end
 
-    test "multiple_repo_labels when two repo: labels are present" do
+    test "multiple_repo_labels when two configured-repo labels match" do
+      config = config_with_repos([repo("a", "repo:a"), repo("b", "repo:b")])
+
       issue = %Issue{
         id: "1",
         identifier: "UDPE-1",
-        labels: ["repo:a", "repo:b"]
+        labels: ["a", "b"]
       }
 
-      assert {:violations, [:multiple_repo_labels]} =
-               Cardinality.check(issue, RepoConfig.empty())
+      assert {:violations, [:multiple_repo_labels]} = Cardinality.check(issue, config)
     end
 
-    test "parent_with_repo_label when a parent (has children) carries a repo: label" do
+    test "parent_with_repo_label when a parent carries a configured-repo label" do
+      config = config_with_repos([repo("a", "repo:a")])
+
       issue = %Issue{
         id: "1",
         identifier: "UDPE-1",
-        labels: ["repo:a"],
+        labels: ["a"],
         children: [%{id: "2", identifier: "UDPE-2", state: "Todo", labels: []}]
       }
 
-      assert {:violations, list} = Cardinality.check(issue, RepoConfig.empty())
+      assert {:violations, list} = Cardinality.check(issue, config)
       assert :parent_with_repo_label in list
     end
 
@@ -57,29 +76,47 @@ defmodule SymphonyElixir.CardinalityTest do
     end
 
     test "multiple_prs when more than one PR URL is attached" do
+      config = config_with_repos([repo("a", "repo:a")])
+
       issue = %Issue{
         id: "1",
         identifier: "UDPE-1",
-        labels: ["repo:a"],
+        labels: ["a"],
         attachment_urls: [
           "https://github.com/x/y/pull/1",
           "https://github.com/x/y/pull/2"
         ]
       }
 
-      assert {:violations, list} = Cardinality.check(issue, RepoConfig.empty())
+      assert {:violations, list} = Cardinality.check(issue, config)
       assert :multiple_prs in list
+    end
+
+    test "ignores labels that don't match any configured repo" do
+      config = config_with_repos([repo("udp", "repo:dashboard-v2")])
+
+      issue = %Issue{
+        id: "1",
+        identifier: "UDPE-1",
+        labels: ["frontend", "backend", "chore"],
+        children: [%{id: "2", identifier: "UDPE-2", state: "Todo", labels: []}]
+      }
+
+      # No configured-repo label is set on this parent, so no violation
+      # — even though it has unrelated labels.
+      assert Cardinality.check(issue, config) == :ok
     end
   end
 
   describe "cutover" do
     test "issues created before cutover are not enforced" do
-      config = config_with_cutover(~D[2026-06-01])
+      config =
+        config_with_cutover_and_repos(~D[2026-06-01], [repo("a", "repo:a"), repo("b", "repo:b")])
 
       issue = %Issue{
         id: "1",
         identifier: "UDPE-1",
-        labels: ["repo:a", "repo:b"],
+        labels: ["a", "b"],
         created_at: ~U[2026-05-15 12:00:00Z]
       }
 
@@ -87,12 +124,13 @@ defmodule SymphonyElixir.CardinalityTest do
     end
 
     test "issues created on/after cutover are enforced" do
-      config = config_with_cutover(~D[2026-06-01])
+      config =
+        config_with_cutover_and_repos(~D[2026-06-01], [repo("a", "repo:a"), repo("b", "repo:b")])
 
       issue = %Issue{
         id: "1",
         identifier: "UDPE-1",
-        labels: ["repo:a", "repo:b"],
+        labels: ["a", "b"],
         created_at: ~U[2026-06-15 12:00:00Z]
       }
 
@@ -106,12 +144,12 @@ defmodule SymphonyElixir.CardinalityTest do
       issue = %Issue{
         id: "1",
         identifier: "UDPE-1",
-        labels: ["repo:a", "repo:b"]
+        labels: ["a", "b"]
       }
 
       body = Cardinality.violation_comment(issue, [:multiple_repo_labels])
       assert body =~ "symphony:routing-warned"
-      assert body =~ "Multiple `repo:<name>` labels"
+      assert body =~ "Multiple configured repo labels"
     end
   end
 end

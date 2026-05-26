@@ -11,6 +11,8 @@ defmodule SymphonyElixir.AgentRunner do
     Linear.Client,
     Linear.Issue,
     PromptBuilder,
+    RepoConfig,
+    Router,
     SessionStartHook,
     Telemetry,
     Tracker,
@@ -300,9 +302,24 @@ defmodule SymphonyElixir.AgentRunner do
   defp repo_label_drifted?(_original, _refreshed), do: false
 
   defp repo_label_set(labels) when is_list(labels) do
+    configured = configured_repo_label_set()
+
     labels
-    |> Enum.filter(&String.starts_with?(&1, "repo:"))
+    |> Enum.map(&Router.normalize/1)
+    |> Enum.filter(&MapSet.member?(configured, &1))
     |> MapSet.new()
+  end
+
+  defp configured_repo_label_set do
+    case RepoConfig.load() do
+      {:ok, %{repos: repos}} ->
+        repos
+        |> Enum.map(fn %{label: label} -> Router.normalize(label) end)
+        |> MapSet.new()
+
+      _ ->
+        MapSet.new()
+    end
   end
 
   defp active_issue_state?(state_name) when is_binary(state_name) do

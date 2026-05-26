@@ -5,11 +5,14 @@ defmodule SymphonyElixir.Cardinality do
   Per the audit (§9.4) and implementation plan T23/T24, every dispatchable
   Linear issue must satisfy:
 
-    1. Has at most one `repo:<name>` label. (Two PRs would target two repos.)
+    1. Has at most one configured-repo label. (Two repo labels would
+       target two repos.) "Configured-repo label" means a Linear label
+       whose normalized name matches one of the `label` values in
+       `~/.symphony/repos.yaml`.
     2. If it has children (Linear native sub-issues), it is a parent and
-       MUST NOT carry a `repo:<name>` label and MUST NOT have an attached
-       PR. Parents are cross-repo coordination; per-repo work is the
-       children.
+       MUST NOT carry a configured-repo label and MUST NOT have an
+       attached PR. Parents are cross-repo coordination; per-repo work
+       is the children.
     3. Has at most one attached PR. (Detected via attachment URLs that
        look like GitHub PR URLs.)
 
@@ -29,7 +32,7 @@ defmodule SymphonyElixir.Cardinality do
   date are gated normally.
   """
 
-  alias SymphonyElixir.{Linear.Issue, RepoConfig}
+  alias SymphonyElixir.{Linear.Issue, RepoConfig, Router}
 
   @type violation ::
           :multiple_repo_labels
@@ -48,21 +51,21 @@ defmodule SymphonyElixir.Cardinality do
   `{:not_enforced, :pre_cutover}`.
   """
   @spec check(Issue.t(), RepoConfig.t()) :: check_result()
-  def check(%Issue{} = issue, %{defaults: %{cardinality_enforced_from: cutover}} = _config) do
+  def check(%Issue{} = issue, %{defaults: %{cardinality_enforced_from: cutover}} = config) do
     if pre_cutover?(issue, cutover) do
       {:not_enforced, :pre_cutover}
     else
-      do_check(issue)
+      do_check(issue, configured_repo_labels(config))
     end
   end
 
-  def check(%Issue{} = issue, _config), do: do_check(issue)
+  def check(%Issue{} = issue, %{} = config), do: do_check(issue, configured_repo_labels(config))
 
-  defp do_check(%Issue{} = issue) do
+  defp do_check(%Issue{} = issue, %MapSet{} = configured_labels) do
     violations =
       []
-      |> maybe_add(repo_label_violation(issue))
-      |> maybe_add(parent_label_violation(issue))
+      |> maybe_add(repo_label_violation(issue, configured_labels))
+      |> maybe_add(parent_label_violation(issue, configured_labels))
       |> maybe_add(parent_pr_violation(issue))
       |> maybe_add(multi_pr_violation(issue))
 
@@ -71,6 +74,14 @@ defmodule SymphonyElixir.Cardinality do
       v -> {:violations, Enum.reverse(v)}
     end
   end
+
+  defp configured_repo_labels(%{repos: repos}) when is_list(repos) do
+    repos
+    |> Enum.map(fn %{label: label} -> Router.normalize(label) end)
+    |> MapSet.new()
+  end
+
+  defp configured_repo_labels(_), do: MapSet.new()
 
   @doc """
   Format a human-readable comment body explaining the violations.
@@ -112,21 +123,33 @@ defmodule SymphonyElixir.Cardinality do
 
   defp pre_cutover?(_issue, _cutover), do: false
 
-  defp repo_label_violation(%Issue{labels: labels}) when is_list(labels) do
-    case Enum.count(labels, &repo_label?/1) do
-      n when n > 1 -> :multiple_repo_labels
+  defp repo_label_violation(%Issue{labels: labels}, %MapSet{} = configured_labels)
+       when is_list(labels) do
+    matched =
+      labels
+      |> Enum.map(&Router.normalize/1)
+      |> Enum.filter(&MapSet.member?(configured_labels, &1))
+
+    case Enum.uniq(matched) do
+      [_, _ | _] -> :multiple_repo_labels
       _ -> nil
     end
   end
 
-  defp repo_label_violation(_issue), do: nil
+  defp repo_label_violation(_issue, _set), do: nil
 
-  defp parent_label_violation(%Issue{children: children, labels: labels})
-       when is_list(children) and length(children) > 0 do
-    if Enum.any?(labels, &repo_label?/1), do: :parent_with_repo_label, else: nil
+  defp parent_label_violation(%Issue{children: children, labels: labels}, %MapSet{} = configured_labels)
+       when is_list(children) and length(children) > 0 and is_list(labels) do
+    if Enum.any?(labels, fn label ->
+         MapSet.member?(configured_labels, Router.normalize(label))
+       end) do
+      :parent_with_repo_label
+    else
+      nil
+    end
   end
 
-  defp parent_label_violation(_issue), do: nil
+  defp parent_label_violation(_issue, _set), do: nil
 
   defp parent_pr_violation(%Issue{children: children} = issue)
        when is_list(children) and length(children) > 0 do
@@ -145,22 +168,16 @@ defmodule SymphonyElixir.Cardinality do
   defp maybe_add(list, nil), do: list
   defp maybe_add(list, item), do: [item | list]
 
-  defp repo_label?(label) when is_binary(label) do
-    String.starts_with?(String.downcase(String.trim(label)), "repo:")
-  end
-
-  defp repo_label?(_), do: false
-
   defp github_pr_url?(url) when is_binary(url), do: Regex.match?(@github_pr_pattern, url)
   defp github_pr_url?(_), do: false
 
   defp explain_violation(:multiple_repo_labels, %Issue{labels: labels}) do
-    repo_labels = labels |> Enum.filter(&repo_label?/1) |> Enum.join(", ")
-    "- Multiple `repo:<name>` labels detected (#{repo_labels}). Keep exactly one."
+    label_list = labels |> Enum.uniq() |> Enum.join(", ")
+    "- Multiple configured repo labels detected on the issue (#{label_list}). Keep exactly one."
   end
 
   defp explain_violation(:parent_with_repo_label, _issue) do
-    "- This issue has sub-issues (Linear parent) but also carries a `repo:<name>` label. Parents must not be routed; move per-repo work to children."
+    "- This issue has sub-issues (Linear parent) but also carries a configured repo label. Parents must not be routed; move per-repo work to children."
   end
 
   defp explain_violation(:parent_with_pr, _issue) do

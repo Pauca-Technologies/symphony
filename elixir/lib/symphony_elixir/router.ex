@@ -2,9 +2,14 @@ defmodule SymphonyElixir.Router do
   @moduledoc """
   Label-based per-issue routing for the multi-repo Symphony driver.
 
-  The audit (§9.4) settles on a single routing key: an explicit
-  `repo:<name>` Linear label on every dispatchable issue. Project,
-  team prefix, and assignee are NOT routing keys.
+  The audit (§9.4) settles on a single routing key: an opt-in Linear
+  label per repo. The `repo:<name>` convention is just an operator
+  hint — Linear stores `repo:foo` as a *grouped label* whose stored
+  `name` is `foo` (with `parent.name == "repo"` on the label record),
+  so the actual issue-label collection contains the leaf name only.
+  Matching here normalizes both sides by stripping a leading
+  `repo:` prefix so `label: repo:udp-dashboard-v2` in `repos.yaml`
+  matches an issue carrying the leaf-named `udp-dashboard-v2` label.
 
   Quiet mode: a routing warning is only posted when the issue is in an
   active state AND (assigned to Symphony OR labeled `symphony:pick-up`).
@@ -23,7 +28,6 @@ defmodule SymphonyElixir.Router do
 
   @type route_decision ::
           {:ok, RepoConfig.repo_entry()}
-          | {:skip, :no_label, [String.t()]}
           | {:skip, :no_match, [String.t()]}
           | {:skip, :ambiguous, [RepoConfig.repo_entry()]}
           | {:skip, :legacy_mode}
@@ -44,24 +48,17 @@ defmodule SymphonyElixir.Router do
   end
 
   def route(%Issue{labels: labels} = _issue, %{} = config) do
-    repo_labels = Enum.filter(labels, &repo_label?/1)
+    normalized_issue_labels = Enum.map(labels || [], &normalize/1) |> MapSet.new()
 
-    case repo_labels do
-      [] ->
-        {:skip, :no_label, []}
+    matches =
+      Enum.filter(config.repos, fn repo ->
+        MapSet.member?(normalized_issue_labels, normalize(repo.label))
+      end)
 
-      [single | _] ->
-        matches =
-          config.repos
-          |> Enum.filter(fn repo ->
-            normalize(repo.label) in Enum.map(repo_labels, &normalize/1)
-          end)
-
-        case matches do
-          [repo] -> {:ok, repo}
-          [] -> {:skip, :no_match, [single]}
-          [_, _ | _] = list -> {:skip, :ambiguous, list}
-        end
+    case matches do
+      [repo] -> {:ok, repo}
+      [] -> {:skip, :no_match, labels || []}
+      [_, _ | _] = list -> {:skip, :ambiguous, list}
     end
   end
 
@@ -93,26 +90,25 @@ defmodule SymphonyElixir.Router do
 
   @doc """
   Build the routing-warning comment body for the issue. Includes the
-  fuzzy-match advisory when one or more `repo:*` labels are present but
-  none of them map to a configured repo.
+  fuzzy-match advisory when one or more labels are present but none
+  map to a configured repo.
   """
   @spec warning_comment(Issue.t(), route_decision(), RepoConfig.t()) :: String.t()
   def warning_comment(%Issue{} = _issue, decision, %{} = config) do
     body =
       case decision do
-        {:skip, :no_label, _} ->
-          """
-          Symphony cannot route this issue: no `repo:<name>` label is set.
+        {:skip, :no_match, observed_labels} ->
+          suggestions = RepoConfig.fuzzy_suggestions(config, observed_labels)
 
-          To dispatch this issue, add one of: #{format_label_list(config.repos)}.
-          """
+          observed_summary =
+            case observed_labels do
+              [] -> "(no labels on issue)"
+              labels -> format_label_list_from_strings(labels)
+            end
 
-        {:skip, :no_match, [observed]} ->
-          suggestions = RepoConfig.fuzzy_suggestions(config, [observed])
-
           """
-          Symphony cannot route this issue: label `#{observed}` does not match any \
-          configured repo.
+          Symphony cannot route this issue: none of its labels (#{observed_summary}) \
+          matches a configured repo.
 
           Did you mean: #{format_label_list_from_strings(Enum.take(suggestions, 3))}?
 
@@ -123,7 +119,7 @@ defmodule SymphonyElixir.Router do
           labels = Enum.map(matches, & &1.label)
 
           """
-          Symphony cannot route this issue: multiple `repo:<name>` labels matched (#{Enum.join(labels, ", ")}).
+          Symphony cannot route this issue: multiple configured repo labels matched (#{Enum.join(labels, ", ")}).
 
           Cardinality requires exactly one routing label per issue. Remove all but one.
           """
@@ -142,17 +138,21 @@ defmodule SymphonyElixir.Router do
   @spec pickup_label() :: String.t()
   def pickup_label, do: @pickup_label
 
-  defp repo_label?(label) when is_binary(label) do
-    String.starts_with?(String.downcase(String.trim(label)), "repo:")
+  @doc false
+  @spec normalize(String.t() | nil) :: String.t()
+  def normalize(label) when is_binary(label) do
+    trimmed = label |> String.trim() |> String.downcase()
+    # Strip a leading "repo:" namespace prefix so operators can write
+    # either `repo:udp-dashboard-v2` (the convention) or
+    # `udp-dashboard-v2` (Linear's leaf-name form for grouped labels)
+    # in repos.yaml without functional difference.
+    case trimmed do
+      "repo:" <> rest -> rest
+      other -> other
+    end
   end
 
-  defp repo_label?(_), do: false
-
-  defp normalize(label) when is_binary(label) do
-    label |> String.trim() |> String.downcase()
-  end
-
-  defp normalize(_), do: ""
+  def normalize(_), do: ""
 
   defp active_issue_state?(state_name, %MapSet{} = active_states) when is_binary(state_name) do
     MapSet.member?(active_states, state_name |> String.trim() |> String.downcase())
