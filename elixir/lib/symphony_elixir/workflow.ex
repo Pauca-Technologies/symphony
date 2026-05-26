@@ -9,8 +9,40 @@ defmodule SymphonyElixir.Workflow do
 
   @spec workflow_file_path() :: Path.t()
   def workflow_file_path do
-    Application.get_env(:symphony_elixir, :workflow_file_path) ||
-      Path.join(File.cwd!(), @workflow_file_name)
+    cond do
+      # Test/programmatic override.
+      override = Application.get_env(:symphony_elixir, :workflow_file_path) ->
+        override
+
+      # Operator-facing env var. Lets you keep the host config in a stable
+      # location (e.g. ~/.symphony/WORKFLOW.md) and launch Symphony from
+      # any cwd — required for multi-repo dispatch since the symphony repo
+      # itself ships a WORKFLOW.md that would otherwise be picked up.
+      env = symphony_workflow_env() ->
+        env
+
+      # Canonical default for multi-repo mode: ~/.symphony/WORKFLOW.md. If
+      # that file exists, prefer it over cwd's WORKFLOW.md. This makes the
+      # right thing happen without requiring the env var for operators who
+      # adopt the canonical layout.
+      File.regular?(default_user_workflow_path()) ->
+        default_user_workflow_path()
+
+      # Legacy single-repo fallback: WORKFLOW.md in current working dir.
+      true ->
+        Path.join(File.cwd!(), @workflow_file_name)
+    end
+  end
+
+  defp symphony_workflow_env do
+    case System.get_env("SYMPHONY_WORKFLOW_FILE") do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
+  defp default_user_workflow_path do
+    Path.join([System.user_home!() || "", ".symphony", @workflow_file_name])
   end
 
   @spec set_workflow_file_path(Path.t()) :: :ok
