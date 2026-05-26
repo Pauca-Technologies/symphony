@@ -56,11 +56,13 @@ defmodule SymphonyElixir.BareClone do
   end
 
   @doc """
-  Create a worktree at `worktree_path` rooted at `origin/<base_branch>`
-  on a branch named `branch_name`. If the branch already exists in the
-  bare clone (a previous run on the same issue), the worktree is created
-  pointing at the existing branch rather than re-forking. The caller
-  must remove an existing dir at `worktree_path` first if present.
+  Create a worktree at `worktree_path` rooted at `base_branch` on a
+  branch named `branch_name`. The base branch is addressed by its bare
+  name (e.g. "develop") — bare clones store refs at `refs/heads/*` not
+  `refs/remotes/origin/*`, so the `origin/<branch>` form doesn't
+  resolve. `-B` creates or resets the per-issue branch so retries on
+  the same issue are idempotent. Caller must clean up any existing dir
+  at `worktree_path` first.
   """
   @spec create_worktree(Path.t(), Path.t(), String.t(), String.t()) ::
           :ok | {:error, term()}
@@ -74,11 +76,10 @@ defmodule SymphonyElixir.BareClone do
       bare_path,
       "worktree",
       "add",
-      # `-B` creates or resets the branch — safe for retries on the same issue.
       "-B",
       branch_name,
       worktree_path,
-      "origin/#{base_branch}"
+      base_branch
     ]
 
     case System.cmd("git", args, stderr_to_stdout: true) do
@@ -131,7 +132,7 @@ defmodule SymphonyElixir.BareClone do
 
   defp ensure_clone(bare_path, repo_url) do
     if bare_clone_present?(bare_path) do
-      :ok
+      ensure_fetch_refspec(bare_path)
     else
       # Clean any half-cloned remnants so `git clone --bare` doesn't fail
       # on a pre-existing partial dir from a crashed earlier attempt.
@@ -139,11 +140,39 @@ defmodule SymphonyElixir.BareClone do
 
       case System.cmd("git", ["clone", "--bare", repo_url, bare_path], stderr_to_stdout: true) do
         {_output, 0} ->
-          :ok
+          ensure_fetch_refspec(bare_path)
 
         {output, status} ->
           {:error, {:bare_clone_failed, status, String.trim(IO.iodata_to_binary(output))}}
       end
+    end
+  end
+
+  # `git clone --bare` does NOT set a default fetch refspec, so a later
+  # `git fetch origin` would silently do nothing. We explicitly configure
+  # `+refs/heads/*:refs/heads/*` so subsequent fetches pull updates from
+  # the remote into the bare clone's heads.
+  defp ensure_fetch_refspec(bare_path) do
+    case System.cmd(
+           "git",
+           [
+             "-C",
+             bare_path,
+             "config",
+             "remote.origin.fetch",
+             "+refs/heads/*:refs/heads/*"
+           ],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        Logger.warning(
+          "Failed to set fetch refspec on #{bare_path} (status=#{status}): #{String.trim(IO.iodata_to_binary(output))}"
+        )
+
+        :ok
     end
   end
 
@@ -153,7 +182,11 @@ defmodule SymphonyElixir.BareClone do
   end
 
   defp fetch(bare_path) do
-    case System.cmd("git", ["-C", bare_path, "fetch", "--prune", "origin"], stderr_to_stdout: true) do
+    # No `--prune`: Symphony creates per-issue branches in the bare clone
+    # (one for each `git worktree add`); those don't exist on origin, so
+    # `--prune` would delete them and yank the rug out from under active
+    # worktrees.
+    case System.cmd("git", ["-C", bare_path, "fetch", "origin"], stderr_to_stdout: true) do
       {_output, 0} ->
         :ok
 
