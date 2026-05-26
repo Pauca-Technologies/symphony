@@ -9,8 +9,22 @@ defmodule SymphonyElixir.PromptBuilder do
 
   @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
+    # When AgentRunner has loaded a per-repo workflow (multi-repo dispatch,
+    # T27), it threads the consumer's WORKFLOW.md through as
+    # `:per_repo_workflow`. That workflow's `prompt_template` wins so the
+    # agent sees the repo-specific instructions (UDP's "in a fresh clone
+    # of udp-dashboard-v2…") rather than the generic host prompt.
+    source =
+      case Keyword.get(opts, :per_repo_workflow) do
+        %{prompt_template: pt} = wf when is_binary(pt) ->
+          {:ok, wf}
+
+        _ ->
+          Workflow.current()
+      end
+
     template =
-      Workflow.current()
+      source
       |> prompt_template!()
       |> parse_template!()
 

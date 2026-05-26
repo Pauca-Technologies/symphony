@@ -126,6 +126,7 @@ defmodule SymphonyElixir.AgentRunner do
           opts
           |> Keyword.put(:session_start_prompt, session_start.prompt)
           |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
+          |> maybe_put(:per_repo_workflow, repo_workflow)
 
         try do
           with :ok <-
