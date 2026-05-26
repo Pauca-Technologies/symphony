@@ -18,7 +18,8 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard,
     Telemetry,
     Tracker,
-    Workspace
+    Workspace,
+    WorkspaceGc
   }
 
   alias SymphonyElixir.Linear.Issue
@@ -36,6 +37,12 @@ defmodule SymphonyElixir.Orchestrator do
   # 5-minute cron poll catches a hang within one cycle.
   @heartbeat_interval_ms 60_000
   @heartbeat_filename "heartbeat"
+  # Issue-state-driven worktree GC (T28). One pass at startup, then once
+  # every 24h. The GC asks Linear for issues that recently transitioned
+  # to a terminal state and runs `git worktree remove` (no --force) on
+  # each, preserving any worktree that still holds local changes a
+  # human added. See `SymphonyElixir.WorkspaceGc`.
+  @workspace_gc_interval_ms 86_400_000
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -89,6 +96,7 @@ defmodule SymphonyElixir.Orchestrator do
     run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
     schedule_heartbeat(0)
+    schedule_workspace_gc(0)
 
     {:ok, state}
   end
@@ -142,6 +150,20 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:write_heartbeat, state) do
     write_heartbeat(state)
     schedule_heartbeat(@heartbeat_interval_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:run_workspace_gc, state) do
+    unless workspace_gc_disabled?() do
+      try do
+        WorkspaceGc.run_pass()
+      rescue
+        error ->
+          Logger.warning("WorkspaceGc pass crashed: #{Exception.message(error)}")
+      end
+    end
+
+    schedule_workspace_gc(@workspace_gc_interval_ms)
     {:noreply, state}
   end
 
@@ -1041,19 +1063,37 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
   defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
-      {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
+    if multi_repo_configured?() do
+      # In multi-repo mode (T24/T27), the issue-state-driven WorkspaceGc
+      # (T28) owns terminal-workspace cleanup — it uses a non-forcing
+      # `git worktree remove` to preserve any uncommitted work a human
+      # added. This legacy startup path uses `File.rm_rf` underneath,
+      # which is destructive, AND its underlying tracker query
+      # (`fetch_issues_by_states/1`) requires `project_slug` and so
+      # always fails under multi-repo. Skip silently.
+      :ok
+    else
+      case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
+        {:ok, issues} ->
+          issues
+          |> Enum.each(fn
+            %Issue{identifier: identifier} when is_binary(identifier) ->
+              cleanup_issue_workspace(identifier)
 
-          _ ->
-            :ok
-        end)
+            _ ->
+              :ok
+          end)
 
-      {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+      end
+    end
+  end
+
+  defp multi_repo_configured? do
+    case RepoConfig.load() do
+      {:ok, %{linear: %{team_id: team_id}}} when is_binary(team_id) -> true
+      _ -> false
     end
   end
 
@@ -1736,6 +1776,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp schedule_heartbeat(delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     Process.send_after(self(), :write_heartbeat, delay_ms)
     :ok
+  end
+
+  defp schedule_workspace_gc(delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    Process.send_after(self(), :run_workspace_gc, delay_ms)
+    :ok
+  end
+
+  defp workspace_gc_disabled? do
+    System.get_env("SYMPHONY_WORKSPACE_GC_DISABLED") == "1" or
+      Application.get_env(:symphony_elixir, :workspace_gc_disabled, false) == true
   end
 
   defp write_heartbeat(%State{} = state) do

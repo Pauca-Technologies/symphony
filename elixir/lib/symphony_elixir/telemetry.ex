@@ -25,6 +25,9 @@ defmodule SymphonyElixir.Telemetry do
           | :gate
           | :routing_skip
           | :cardinality_skip
+          | :gc_removed
+          | :gc_skipped
+          | :gc_pass_summary
 
   @spec root_dir() :: String.t()
   def root_dir do

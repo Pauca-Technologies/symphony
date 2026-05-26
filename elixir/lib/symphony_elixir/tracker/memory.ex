@@ -35,6 +35,15 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec recently_terminal_issues(pos_integer()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def recently_terminal_issues(_lookback_days) do
+    # Tests configure this list directly under
+    # `:memory_tracker_recently_terminal_issues` (defaults to []), so
+    # the GC pass under WorkspaceGc gets a deterministic input without
+    # the Memory adapter having to model `updatedAt` windows.
+    {:ok, Application.get_env(:symphony_elixir, :memory_tracker_recently_terminal_issues, [])}
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})

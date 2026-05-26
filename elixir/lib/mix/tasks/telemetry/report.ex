@@ -8,6 +8,7 @@ defmodule Mix.Tasks.Telemetry.Report do
     * Symphony run completion rate (`run_start` vs `run_end` matched).
     * Cycle time per issue (median, p90 from `duration_ms`).
     * Routing/cardinality skip rate.
+    * Workspace GC (T28): per-pass scanned/removed/skipped totals.
 
   Usage:
 
@@ -56,6 +57,9 @@ defmodule Mix.Tasks.Telemetry.Report do
     ends = Map.get(grouped, "run_end", [])
     skips_routing = Map.get(grouped, "routing_skip", [])
     skips_card = Map.get(grouped, "cardinality_skip", [])
+    gc_passes = Map.get(grouped, "gc_pass_summary", [])
+    gc_removed = Map.get(grouped, "gc_removed", [])
+    gc_skipped = Map.get(grouped, "gc_skipped", [])
 
     completion_rate =
       case length(starts) do
@@ -83,7 +87,12 @@ defmodule Mix.Tasks.Telemetry.Report do
       duration_ms_p90: percentile(durations, 0.9),
       routing_skips: length(skips_routing),
       cardinality_skips: length(skips_card),
-      outcomes: tally_outcomes(ends)
+      outcomes: tally_outcomes(ends),
+      gc: %{
+        passes: length(gc_passes),
+        removed: length(gc_removed),
+        skipped: length(gc_skipped)
+      }
     }
   end
 
@@ -127,6 +136,14 @@ defmodule Mix.Tasks.Telemetry.Report do
       Enum.each(s.outcomes, fn {outcome, count} ->
         Mix.shell().info("  #{outcome}: #{count}")
       end)
+    end
+
+    if s.gc.passes > 0 or s.gc.removed > 0 or s.gc.skipped > 0 do
+      Mix.shell().info("")
+      Mix.shell().info("Workspace GC (T28):")
+      Mix.shell().info("  Passes:   #{s.gc.passes}")
+      Mix.shell().info("  Removed:  #{s.gc.removed}")
+      Mix.shell().info("  Skipped:  #{s.gc.skipped}")
     end
   end
 

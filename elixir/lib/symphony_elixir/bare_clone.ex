@@ -124,6 +124,50 @@ defmodule SymphonyElixir.BareClone do
   end
 
   @doc """
+  Plain (non-forcing) `git worktree remove`. Returns `:ok` on success,
+  `{:error, reason}` otherwise.
+
+  Unlike `remove_worktree/2`, this NEVER falls back to `rm -rf`: if the
+  worktree has uncommitted changes a human added, the call fails and the
+  caller (WorkspaceGc, T28) preserves the work for human inspection.
+  Resolves the parent clone via the worktree's own `.git` file linkage,
+  so callers don't have to know which configured repo a worktree belongs
+  to.
+
+  Failure reasons surfaced:
+    * `:worktree_missing` — the path doesn't exist on disk.
+    * `:not_a_worktree` — the path exists but isn't a git worktree
+      (e.g. a legacy plain-mkdir workspace, or random debris).
+    * `{:worktree_remove_failed, status, message}` — git's own refusal
+      (typically a dirty worktree or unmerged changes).
+  """
+  @spec remove_worktree_safe(Path.t()) :: :ok | {:error, term()}
+  def remove_worktree_safe(worktree_path) when is_binary(worktree_path) do
+    cond do
+      not File.exists?(worktree_path) ->
+        {:error, :worktree_missing}
+
+      # A populated worktree always has a `.git` file (NOT a directory)
+      # that points back to its parent clone. Mirrors the discriminator
+      # `Workspace.git_worktree_dir?/1` uses for dispatch.
+      not File.regular?(Path.join(worktree_path, ".git")) ->
+        {:error, :not_a_worktree}
+
+      true ->
+        args = ["-C", worktree_path, "worktree", "remove", worktree_path]
+
+        case System.cmd("git", args, stderr_to_stdout: true) do
+          {_output, 0} ->
+            :ok
+
+          {output, status} ->
+            {:error,
+             {:worktree_remove_failed, status, String.trim(IO.iodata_to_binary(output))}}
+        end
+    end
+  end
+
+  @doc """
   Compute the canonical-clone path for a given workspace root + repo
   id. Public for tests + the Workspace module.
   """

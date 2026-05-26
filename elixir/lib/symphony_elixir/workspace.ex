@@ -336,6 +336,21 @@ defmodule SymphonyElixir.Workspace do
     {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
   end
 
+  @doc """
+  Compute the local workspace path Symphony would use for a given issue
+  identifier. Public so `SymphonyElixir.WorkspaceGc` (T28) can locate a
+  worktree from a Linear issue identifier without duplicating the
+  `safe_identifier` + workspace-root logic. Returns nil when the
+  identifier is empty or non-binary.
+  """
+  @spec workspace_path_for_identifier(term()) :: Path.t() | nil
+  def workspace_path_for_identifier(identifier) when is_binary(identifier) and identifier != "" do
+    safe_id = safe_identifier(identifier)
+    Path.join(Config.settings!().workspace.root, safe_id)
+  end
+
+  def workspace_path_for_identifier(_identifier), do: nil
+
   defp safe_identifier(identifier) do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
   end

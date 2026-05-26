@@ -273,6 +273,30 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Gc do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      # Lookback window (in days) for the issue-state-driven worktree
+      # GC (T28). On each pass Symphony asks Linear for issues that
+      # transitioned to a terminal state (Done/Cancelled) within this
+      # window and reaps their worktrees. Default of 7 covers the
+      # nominal daily cadence with a one-week safety margin in case the
+      # orchestrator is offline for a stretch.
+      field(:lookback_days, :integer, default: 7)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:lookback_days], empty_values: [])
+      |> validate_number(:lookback_days, greater_than: 0)
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -283,6 +307,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:gc, Gc, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -375,6 +400,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:gc, with: &Gc.changeset/2)
   end
 
   defp finalize_settings(settings) do

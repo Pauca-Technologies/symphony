@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
+  @callback recently_terminal_issues(pos_integer()) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   @callback add_label(String.t(), String.t()) :: :ok | {:error, :label_missing} | {:error, term()}
@@ -20,6 +21,17 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issues_by_states(states) do
     adapter().fetch_issues_by_states(states)
+  end
+
+  @doc """
+  Return tracker issues that transitioned to a terminal state within
+  the last `lookback_days` days. Backs the issue-state-driven worktree
+  GC (T28); see `SymphonyElixir.WorkspaceGc`.
+  """
+  @spec recently_terminal_issues(pos_integer()) :: {:ok, [term()]} | {:error, term()}
+  def recently_terminal_issues(lookback_days)
+      when is_integer(lookback_days) and lookback_days > 0 do
+    adapter().recently_terminal_issues(lookback_days)
   end
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}

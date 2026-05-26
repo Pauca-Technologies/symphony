@@ -446,6 +446,71 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  # Issue-state-driven worktree GC (T28). Returns terminal-state issues
+  # within a lookback window so we can reap their worktrees. NOTE: we do
+  # NOT apply `linear.filter_label` here — the dispatcher uses it to
+  # decide what to PICK UP, but the GC needs to find worktrees Symphony
+  # may have left behind, including for issues whose label was removed
+  # after dispatch. Over-fetch is harmless; missing a worktree would
+  # leak disk.
+  @query_terminal_by_team_since """
+  query SymphonyLinearTerminalByTeamSince($teamId: ID!, $stateNames: [String!]!, $since: DateTimeOrDuration!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {id: {eq: $teamId}}, state: {name: {in: $stateNames}}, updatedAt: {gte: $since}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        state {
+          name
+        }
+        team {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
+  @query_terminal_by_team_key_since """
+  query SymphonyLinearTerminalByTeamKeySince($teamKey: String!, $stateNames: [String!]!, $since: DateTimeOrDuration!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}, updatedAt: {gte: $since}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        state {
+          name
+        }
+        team {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
@@ -550,6 +615,40 @@ defmodule SymphonyElixir.Linear.Client do
       ids ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, assignee_filter)
+        end
+    end
+  end
+
+  @doc """
+  Return terminal-state issues that transitioned within the last
+  `lookback_days` days. Backs the issue-state-driven worktree GC
+  (T28); see `SymphonyElixir.WorkspaceGc`.
+
+  Requires a `linear.team_id` in `~/.symphony/config.yml` (the GC is a
+  multi-repo feature — legacy single-repo deployments don't need it
+  because their startup cleanup path still works). Returns
+  `{:error, :missing_linear_team_id}` if no team is configured.
+  """
+  @spec recently_terminal_issues(pos_integer()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def recently_terminal_issues(lookback_days)
+      when is_integer(lookback_days) and lookback_days > 0 do
+    tracker = Config.settings!().tracker
+    team_identifier = configured_team_id()
+
+    cond do
+      is_nil(tracker.api_key) ->
+        {:error, :missing_linear_api_token}
+
+      is_nil(team_identifier) ->
+        {:error, :missing_linear_team_id}
+
+      true ->
+        since = DateTime.utc_now() |> DateTime.add(-lookback_days * 86_400, :second) |> DateTime.to_iso8601()
+
+        if uuid_shaped?(team_identifier) do
+          do_fetch_terminal_by_team(team_identifier, tracker.terminal_states, since)
+        else
+          do_fetch_terminal_by_team_key(team_identifier, tracker.terminal_states, since)
         end
     end
   end
@@ -742,6 +841,66 @@ defmodule SymphonyElixir.Linear.Client do
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
           do_fetch_by_team_key_with_label_page(team_key, state_names, filter_label, assignee_filter, next_cursor, updated_acc)
+
+        :done ->
+          {:ok, finalize_paginated_issues(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp do_fetch_terminal_by_team(team_id, state_names, since) do
+    do_fetch_terminal_by_team_page(team_id, state_names, since, nil, [])
+  end
+
+  defp do_fetch_terminal_by_team_page(team_id, state_names, since, after_cursor, acc_issues) do
+    with {:ok, body} <-
+           graphql(@query_terminal_by_team_since, %{
+             teamId: team_id,
+             stateNames: state_names,
+             since: since,
+             first: @issue_page_size,
+             relationFirst: @issue_page_size,
+             after: after_cursor
+           }),
+         {:ok, issues, page_info} <- decode_linear_page_response(body, nil) do
+      updated_acc = prepend_page_issues(issues, acc_issues)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_terminal_by_team_page(team_id, state_names, since, next_cursor, updated_acc)
+
+        :done ->
+          {:ok, finalize_paginated_issues(updated_acc)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp do_fetch_terminal_by_team_key(team_key, state_names, since) do
+    do_fetch_terminal_by_team_key_page(team_key, state_names, since, nil, [])
+  end
+
+  defp do_fetch_terminal_by_team_key_page(team_key, state_names, since, after_cursor, acc_issues) do
+    with {:ok, body} <-
+           graphql(@query_terminal_by_team_key_since, %{
+             teamKey: team_key,
+             stateNames: state_names,
+             since: since,
+             first: @issue_page_size,
+             relationFirst: @issue_page_size,
+             after: after_cursor
+           }),
+         {:ok, issues, page_info} <- decode_linear_page_response(body, nil) do
+      updated_acc = prepend_page_issues(issues, acc_issues)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} ->
+          do_fetch_terminal_by_team_key_page(team_key, state_names, since, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
