@@ -78,6 +78,26 @@ defmodule SymphonyElixir.Router do
   def eligible_for_warning?(_issue, _active_states), do: false
 
   @doc """
+  Policy gate combining the route decision with the eligibility predicate.
+  `:no_match` is treated as silent in all cases: an issue lacking any
+  `repo:*` label is simply not Symphony's concern, and the operator does
+  not want a Linear comment on every such ticket (in setups where
+  `tracker.assignee` is unset, `assigned_to_worker` defaults to true for
+  every issue and would otherwise make `eligible_for_warning?` fire on
+  every poll-eligible ticket — pure noise). `:ambiguous` still warns
+  when eligible, because two `repo:*` labels on one issue IS a real
+  operator misconfiguration worth surfacing.
+  """
+  @spec should_warn?(route_decision(), Issue.t(), MapSet.t()) :: boolean()
+  def should_warn?({:skip, :no_match, _observed_labels}, _issue, _active_states), do: false
+
+  def should_warn?({:skip, :ambiguous, _matches}, %Issue{} = issue, %MapSet{} = active_states) do
+    eligible_for_warning?(issue, active_states)
+  end
+
+  def should_warn?(_decision, _issue, _active_states), do: false
+
+  @doc """
   Already-warned check is the cross-condition idempotency marker — the
   same label is reused for routing, cardinality, and give-up warnings.
   """

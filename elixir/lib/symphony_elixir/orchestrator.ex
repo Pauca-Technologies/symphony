@@ -698,7 +698,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_emit_routing_warning(%Issue{} = issue, decision, %{} = repo_config, active_states, reason) do
-    if Router.eligible_for_warning?(issue, active_states) do
+    if Router.should_warn?(decision, issue, active_states) do
       body = Router.warning_comment(issue, decision, repo_config)
       _ = Tracker.create_comment(issue.id, body)
       _ = Tracker.add_label(issue.id, Router.routing_warned_label())

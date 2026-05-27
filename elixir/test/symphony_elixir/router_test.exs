@@ -95,6 +95,67 @@ defmodule SymphonyElixir.RouterTest do
     end
   end
 
+  describe "should_warn?/3" do
+    setup do
+      %{active_states: MapSet.new(["todo", "in progress"])}
+    end
+
+    test "false on :no_match even when issue is active and assigned-to-worker", %{active_states: active} do
+      # Regression: when `tracker.assignee` is unset, `assigned_to_worker`
+      # defaults to true for every issue, which previously made
+      # eligible_for_warning?/2 fire on every poll-eligible ticket missing
+      # a `repo:*` label — pure noise that the operator does not want.
+      # :no_match is silent in all cases now.
+      issue = %Issue{state: "Todo", assigned_to_worker: true, labels: ["udpagent"]}
+      decision = {:skip, :no_match, ["udpagent"]}
+
+      assert Router.should_warn?(decision, issue, active) == false
+    end
+
+    test "false on :no_match even when issue carries the explicit symphony:pick-up label",
+         %{active_states: active} do
+      issue = %Issue{state: "Todo", assigned_to_worker: false, labels: ["symphony:pick-up"]}
+      decision = {:skip, :no_match, ["symphony:pick-up"]}
+
+      assert Router.should_warn?(decision, issue, active) == false
+    end
+
+    test "true on :ambiguous when otherwise eligible", %{active_states: active} do
+      # Multi-repo label collision is a real operator misconfiguration, not
+      # noise: the operator deliberately tagged the issue for both repos.
+      issue = %Issue{state: "Todo", assigned_to_worker: true, labels: ["a", "b"]}
+      decision = {:skip, :ambiguous, [%{id: "a", label: "repo:a"}, %{id: "b", label: "repo:b"}]}
+
+      assert Router.should_warn?(decision, issue, active) == true
+    end
+
+    test "false on :ambiguous when issue already carries the routing-warned label",
+         %{active_states: active} do
+      issue = %Issue{
+        state: "Todo",
+        assigned_to_worker: true,
+        labels: ["a", "b", "symphony:routing-warned"]
+      }
+
+      decision = {:skip, :ambiguous, [%{id: "a", label: "repo:a"}, %{id: "b", label: "repo:b"}]}
+
+      assert Router.should_warn?(decision, issue, active) == false
+    end
+
+    test "false on :ambiguous when state is non-active", %{active_states: active} do
+      issue = %Issue{state: "Done", assigned_to_worker: true, labels: ["a", "b"]}
+      decision = {:skip, :ambiguous, [%{id: "a", label: "repo:a"}, %{id: "b", label: "repo:b"}]}
+
+      assert Router.should_warn?(decision, issue, active) == false
+    end
+
+    test "false on any other decision shape", %{active_states: active} do
+      issue = %Issue{state: "Todo", assigned_to_worker: true, labels: []}
+      assert Router.should_warn?({:skip, :legacy_mode}, issue, active) == false
+      assert Router.should_warn?({:ok, %{id: "udp"}}, issue, active) == false
+    end
+  end
+
   describe "warning_comment/3" do
     test "includes the routing-warned marker for idempotency" do
       config = config_with_repos([repo("udp", "repo:dashboard-v2")])
