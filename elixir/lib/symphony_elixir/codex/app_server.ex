@@ -203,7 +203,13 @@ defmodule SymphonyElixir.Codex.AppServer do
             :stderr_to_stdout,
             args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
             cd: String.to_charlist(workspace),
-            line: @port_line_bytes
+            line: @port_line_bytes,
+            # Mark this process as the inner agent so consumer-repo hooks can
+            # tell "Symphony is running me as the agent" from "Symphony is
+            # running me as an outer hook". UDP's before-handoff Stop hook
+            # reads both vars and skips when SYMPHONY_RUN=1 AND SYMPHONY_AGENT=1.
+            # See docs/symphony.md in the consumer repo.
+            env: agent_env()
           ]
         )
 
@@ -214,6 +220,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp start_port(workspace, worker_host) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+  end
+
+  defp agent_env do
+    [
+      {~c"SYMPHONY_RUN", ~c"1"},
+      {~c"SYMPHONY_AGENT", ~c"1"}
+    ]
   end
 
   defp prepare_sourced_env_files(workspace, nil) when is_binary(workspace) do
@@ -292,8 +305,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp remote_launch_command(workspace) when is_binary(workspace) do
+    # SSH does not forward our local env, so the inner-agent markers have to
+    # be inlined into the remote shell command. Matches `agent_env/0` for the
+    # local Port.open path.
     [
       "cd #{shell_escape(workspace)}",
+      "export SYMPHONY_RUN=1",
+      "export SYMPHONY_AGENT=1",
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.join(" && ")

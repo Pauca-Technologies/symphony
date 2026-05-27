@@ -93,9 +93,7 @@ defmodule SymphonyElixir.Workspace do
     with {:ok, bare_path} <- BareClone.ensure_and_fetch(workspace_root, routed_repo),
          :ok <- maybe_remove_existing_worktree(bare_path, workspace),
          :ok <- BareClone.create_worktree(bare_path, workspace, branch_name, base_branch) do
-      Logger.info(
-        "Workspace ready via worktree repo=#{routed_repo.id} bare=#{bare_path} workspace=#{workspace} branch=#{branch_name} base=#{base_branch}"
-      )
+      Logger.info("Workspace ready via worktree repo=#{routed_repo.id} bare=#{bare_path} workspace=#{workspace} branch=#{branch_name} base=#{base_branch}")
 
       {:ok, workspace, true}
     end
@@ -464,7 +462,12 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        # SYMPHONY_RUN=1 marks this as a Symphony-spawned outer hook so the
+        # consumer repo's gates (e.g. UDP's pr:check-scope-conformance and
+        # .claude/hooks/github-app-session-start.sh) can gate on it. We
+        # intentionally do NOT set SYMPHONY_AGENT here — that var is reserved
+        # for inner codex/claude agent processes in Codex.AppServer.
+        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true, env: hook_env())
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -486,7 +489,11 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    case run_remote_command(
+           worker_host,
+           "cd #{shell_escape(workspace)} && export SYMPHONY_RUN=1 && #{command}",
+           timeout_ms
+         ) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name, capture_output?)
 
@@ -622,6 +629,10 @@ defmodule SymphonyElixir.Workspace do
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
+
+  defp hook_env do
+    [{"SYMPHONY_RUN", "1"}]
   end
 
   defp worker_host_for_log(nil), do: "local"
