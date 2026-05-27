@@ -64,9 +64,6 @@ Title: {{ issue.title }}
 Current status: {{ issue.state }}
 Labels: {{ issue.labels }}
 URL: {{ issue.url }}
-Owner (request as PR reviewer):
-- displayName: {{ issue.assignee_display_name | default: issue.creator_display_name }}
-- email: {{ issue.assignee_email | default: issue.creator_email }}
 
 Description:
 {% if issue.description %}
@@ -231,7 +228,6 @@ Use this only when completion is blocked by missing required tools or missing au
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
     - Ensure the GitHub PR has label `symphony` (add it if missing).
-    - Request review from the issue owner (see the `Owner` block at the top of this prompt). Prefer `assignee_display_name`; fall back to `creator_display_name`. If the local part of the email is a more reliable GitHub-login mapping, use that instead. Apply with `gh pr edit <pr> --add-reviewer <login>`. After every subsequent push that addresses prior review feedback, re-request the same reviewer with `gh api -X POST repos/<owner>/<repo>/pulls/<pr>/requested_reviewers -f 'reviewers[]=<login>'` so GitHub re-notifies them.
 9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
 10. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.

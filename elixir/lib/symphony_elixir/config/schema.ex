@@ -273,6 +273,29 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule LinearGithubMapping do
+    @moduledoc """
+    One entry in `linear_to_github`: maps a Linear user (by email — Linear's
+    User type does not expose a GitHub handle anywhere) to the GitHub login
+    that should be requested as PR reviewer on issues owned by that user.
+    """
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:linear_email, :string)
+      field(:github_login, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:linear_email, :github_login], empty_values: [])
+      |> validate_required([:linear_email, :github_login])
+    end
+  end
+
   defmodule Gc do
     @moduledoc false
     use Ecto.Schema
@@ -308,6 +331,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
     embeds_one(:gc, Gc, on_replace: :update, defaults_to_struct: true)
+    embeds_many(:linear_to_github, LinearGithubMapping, on_replace: :delete)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -401,6 +425,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
     |> cast_embed(:gc, with: &Gc.changeset/2)
+    |> cast_embed(:linear_to_github, with: &LinearGithubMapping.changeset/2)
   end
 
   defp finalize_settings(settings) do

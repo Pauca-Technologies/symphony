@@ -22,7 +22,20 @@ defmodule SymphonyElixir.Orchestrator do
     WorkspaceGc
   }
 
+  alias SymphonyElixir.Github.ReviewerRequest
   alias SymphonyElixir.Linear.Issue
+
+  # States we treat as "the agent handed off to a human reviewer" — the
+  # moment an issue lands in any of these, request the issue owner as PR
+  # reviewer. Lowercased here because we normalize before membership-check.
+  # Not configurable on purpose: every consumer repo uses the same Linear
+  # convention for these state names, so a hardcoded set keeps config flat.
+  @review_states_set MapSet.new([
+                       "human review",
+                       "in review",
+                       "merging",
+                       "ready to merge"
+                     ])
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -418,11 +431,26 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
+        maybe_request_owner_review(issue)
         terminate_running_issue(state, issue.id, false)
     end
   end
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  # Idempotent on the GitHub side (re-POSTing an already-requested reviewer
+  # is a no-op), so we do not persist "we already asked for this" — calling
+  # on every poll where the issue sits in a review state is fine.
+  defp maybe_request_owner_review(%Issue{state: state_name} = issue) when is_binary(state_name) do
+    if MapSet.member?(@review_states_set, String.downcase(state_name)) do
+      mapping = Config.settings!().linear_to_github || []
+      ReviewerRequest.request_for_issue(issue, mapping)
+    else
+      :ok
+    end
+  end
+
+  defp maybe_request_owner_review(_issue), do: :ok
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
