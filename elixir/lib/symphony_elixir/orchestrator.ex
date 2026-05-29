@@ -636,9 +636,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp gate_routing_and_cardinality(%Issue{} = issue, %{} = repo_config, %MapSet{} = active_states) do
     with :ok <- gate_orchestrator_version(issue),
-         :ok <- gate_routing(issue, repo_config, active_states),
-         :ok <- gate_cardinality(issue, repo_config) do
-      :ok
+         :ok <- gate_routing(issue, repo_config, active_states) do
+      gate_cardinality(issue, repo_config)
     end
   end
 
@@ -654,16 +653,12 @@ defmodule SymphonyElixir.Orchestrator do
           _ = Tracker.add_label(issue.id, Router.routing_warned_label())
         end
 
-        Logger.warning(
-          "Orchestrator version gate: #{issue_context(issue)} requires=#{requirement} current=#{current_version}; skipping"
-        )
+        Logger.warning("Orchestrator version gate: #{issue_context(issue)} requires=#{requirement} current=#{current_version}; skipping")
 
         :skip
 
       {:invalid_requirement, requirement} ->
-        Logger.error(
-          "Ignoring invalid orchestrator_version_required in WORKFLOW.md: #{inspect(requirement)}"
-        )
+        Logger.error("Ignoring invalid orchestrator_version_required in WORKFLOW.md: #{inspect(requirement)}")
 
         :ok
     end
@@ -709,9 +704,7 @@ defmodule SymphonyElixir.Orchestrator do
         reason: Atom.to_string(reason)
       })
 
-      Logger.info(
-        "Routing skip: #{issue_context(issue)} reason=#{reason}; routing-warned label applied"
-      )
+      Logger.info("Routing skip: #{issue_context(issue)} reason=#{reason}; routing-warned label applied")
     end
   end
 
@@ -727,9 +720,7 @@ defmodule SymphonyElixir.Orchestrator do
         violations: Enum.map(violations, &Atom.to_string/1)
       })
 
-      Logger.info(
-        "Cardinality skip: #{issue_context(issue)} violations=#{inspect(violations)}"
-      )
+      Logger.info("Cardinality skip: #{issue_context(issue)} violations=#{inspect(violations)}")
     end
   end
 
@@ -1103,20 +1094,19 @@ defmodule SymphonyElixir.Orchestrator do
     else
       case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
         {:ok, issues} ->
-          issues
-          |> Enum.each(fn
-            %Issue{identifier: identifier} when is_binary(identifier) ->
-              cleanup_issue_workspace(identifier)
-
-            _ ->
-              :ok
-          end)
+          Enum.each(issues, &cleanup_terminal_issue_workspace/1)
 
         {:error, reason} ->
           Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
       end
     end
   end
+
+  defp cleanup_terminal_issue_workspace(%Issue{identifier: identifier}) when is_binary(identifier) do
+    cleanup_issue_workspace(identifier)
+  end
+
+  defp cleanup_terminal_issue_workspace(_issue), do: :ok
 
   defp multi_repo_configured? do
     case RepoConfig.load() do

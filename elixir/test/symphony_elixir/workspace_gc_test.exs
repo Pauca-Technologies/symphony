@@ -122,6 +122,42 @@ defmodule SymphonyElixir.WorkspaceGcTest do
       assert File.exists?(worktree)
     end
 
+    test "silently skips when the workspace path lookup returns nil" do
+      Application.put_env(
+        :symphony_elixir,
+        :memory_tracker_recently_terminal_issues,
+        [issue("UDPE-nopath")]
+      )
+
+      summary =
+        WorkspaceGc.run_pass(
+          workspace_path_fn: fn _ -> nil end,
+          remove_fn: fn _ -> :ok end
+        )
+
+      assert summary.scanned == 0
+      assert summary.removed == 0
+      assert summary.skipped == 0
+    end
+
+    test "silently skips issues whose identifier is not a binary" do
+      Application.put_env(
+        :symphony_elixir,
+        :memory_tracker_recently_terminal_issues,
+        [%Issue{id: "x", identifier: nil, state: "Done", labels: []}]
+      )
+
+      summary =
+        WorkspaceGc.run_pass(
+          workspace_path_fn: fn _ -> "/tmp/should-not-be-used" end,
+          remove_fn: fn _ -> :ok end
+        )
+
+      assert summary.scanned == 0
+      assert summary.removed == 0
+      assert summary.skipped == 0
+    end
+
     test "returns a zeroed summary when the tracker fetch fails" do
       summary = WorkspaceGc.run_pass(tracker: FailingTracker)
 
@@ -134,7 +170,7 @@ defmodule SymphonyElixir.WorkspaceGcTest do
       tmp = make_tmp_dir!()
       ok_path = Path.join(tmp, "UDPE-ok")
       dirty_path = Path.join(tmp, "UDPE-dirty")
-      missing_path = Path.join(tmp, "UDPE-missing")
+      _missing_path = Path.join(tmp, "UDPE-missing")
       File.mkdir_p!(ok_path)
       File.mkdir_p!(dirty_path)
 

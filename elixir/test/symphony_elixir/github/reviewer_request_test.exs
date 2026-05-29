@@ -182,7 +182,126 @@ defmodule SymphonyElixir.Github.ReviewerRequestTest do
 
       assert :ok = ReviewerRequest.request_for_issue(issue, mapping, runner: failing_runner)
     end
+
+    test "the 2-arity helper is a no-op when there is no owner email" do
+      issue = %Issue{id: "i", identifier: "UDPE-0", assignee_email: nil, creator_email: nil, attachment_urls: []}
+      assert :ok = ReviewerRequest.request_for_issue(issue, [])
+    end
+
+    test "no-op for a non-Issue argument" do
+      assert :ok = ReviewerRequest.request_for_issue(:not_an_issue, [], [])
+    end
+
+    test "skips when the matched mapping entry has no github login" do
+      runner_calls = capture_runner_calls()
+
+      issue = %Issue{
+        id: "i",
+        identifier: "UDPE-10",
+        assignee_email: "raul@pauca.co",
+        attachment_urls: ["https://github.com/o/r/pull/1"]
+      }
+
+      mapping = [%{linear_email: "raul@pauca.co"}]
+
+      assert :ok = ReviewerRequest.request_for_issue(issue, mapping, runner: runner_fn(runner_calls))
+      assert recorded_calls(runner_calls) == []
+    end
+
+    test "ignores malformed mapping entries (non-map, non-binary email, missing email)" do
+      runner_calls = capture_runner_calls()
+
+      issue = %Issue{
+        id: "i",
+        identifier: "UDPE-11",
+        assignee_email: "raul@pauca.co",
+        attachment_urls: ["https://github.com/o/r/pull/1"]
+      }
+
+      mapping = [:not_a_map, %{linear_email: 123}, %{github_login: "x"}]
+
+      assert :ok = ReviewerRequest.request_for_issue(issue, mapping, runner: runner_fn(runner_calls))
+      assert recorded_calls(runner_calls) == []
+    end
+
+    test "skips when owner maps but attachment_urls is not a list" do
+      runner_calls = capture_runner_calls()
+
+      issue = %Issue{
+        id: "i",
+        identifier: "UDPE-12",
+        assignee_email: "raul@pauca.co",
+        attachment_urls: nil
+      }
+
+      mapping = [%{linear_email: "raul@pauca.co", github_login: "raulmt"}]
+
+      assert :ok = ReviewerRequest.request_for_issue(issue, mapping, runner: runner_fn(runner_calls))
+      assert recorded_calls(runner_calls) == []
+    end
+
+    test "ignores non-binary entries in attachment_urls" do
+      runner_calls = capture_runner_calls()
+
+      issue = %Issue{
+        id: "i",
+        identifier: "UDPE-13",
+        assignee_email: "raul@pauca.co",
+        attachment_urls: [123, "https://github.com/o/r/pull/5"]
+      }
+
+      mapping = [%{linear_email: "raul@pauca.co", github_login: "raulmt"}]
+
+      assert :ok = ReviewerRequest.request_for_issue(issue, mapping, runner: runner_fn(runner_calls))
+      assert [{"gh", _args}] = recorded_calls(runner_calls)
+    end
+
+    test "the default runner shells out to gh found on PATH" do
+      shim_dir = Path.join(System.tmp_dir!(), "gh-shim-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(shim_dir)
+      gh = Path.join(shim_dir, "gh")
+      File.write!(gh, "#!/bin/sh\nexit 0\n")
+      File.chmod!(gh, 0o755)
+
+      original_path = System.get_env("PATH")
+
+      on_exit(fn ->
+        restore_path(original_path)
+        File.rm_rf(shim_dir)
+      end)
+
+      System.put_env("PATH", shim_dir <> ":" <> (original_path || ""))
+
+      issue = %Issue{
+        id: "i",
+        identifier: "UDPE-14",
+        assignee_email: "raul@pauca.co",
+        attachment_urls: ["https://github.com/o/r/pull/1"]
+      }
+
+      mapping = [%{linear_email: "raul@pauca.co", github_login: "raulmt"}]
+
+      # No :runner opt -> exercises the default System.cmd-based runner.
+      assert :ok = ReviewerRequest.request_for_issue(issue, mapping)
+    end
+
+    test "swallows and truncates non-binary gh output" do
+      issue = %Issue{
+        id: "i",
+        identifier: "UDPE-15",
+        assignee_email: "raul@pauca.co",
+        attachment_urls: ["https://github.com/o/r/pull/1"]
+      }
+
+      mapping = [%{linear_email: "raul@pauca.co", github_login: "raulmt"}]
+      failing_runner = fn _cmd, _args -> {~c"charlist output", 1} end
+
+      assert :ok = ReviewerRequest.request_for_issue(issue, mapping, runner: failing_runner)
+    end
   end
+
+  defp restore_path(nil), do: System.delete_env("PATH")
+  defp restore_path(value), do: System.put_env("PATH", value)
 
   defp capture_runner_calls do
     {:ok, agent} = Agent.start_link(fn -> [] end)

@@ -56,25 +56,23 @@ defmodule SymphonyElixir.Telemetry do
   def emit(_kind, _attrs), do: :ok
 
   defp do_emit(kind, attrs) do
-    try do
-      payload =
-        attrs
-        |> Map.put(:ts, DateTime.utc_now() |> DateTime.to_iso8601())
-        |> Map.put(:event, Atom.to_string(kind))
+    payload =
+      attrs
+      |> Map.put(:ts, DateTime.utc_now() |> DateTime.to_iso8601())
+      |> Map.put(:event, Atom.to_string(kind))
 
-      case Jason.encode(payload) do
-        {:ok, encoded} ->
-          path = today_path()
-          File.mkdir_p(Path.dirname(path))
-          File.write(path, encoded <> "\n", [:append])
+    case Jason.encode(payload) do
+      {:ok, encoded} ->
+        path = today_path()
+        File.mkdir_p(Path.dirname(path))
+        File.write(path, encoded <> "\n", [:append])
 
-        {:error, reason} ->
-          Logger.debug("Telemetry encode failed: #{inspect(reason)}")
-      end
-    rescue
-      err ->
-        Logger.debug("Telemetry write failed: #{inspect(err)}")
+      {:error, reason} ->
+        Logger.debug("Telemetry encode failed: #{inspect(reason)}")
     end
+  rescue
+    err ->
+      Logger.debug("Telemetry write failed: #{inspect(err)}")
   end
 
   defp today_path do
@@ -137,15 +135,17 @@ defmodule SymphonyElixir.Telemetry do
       {:ok, content} ->
         content
         |> String.split("\n", trim: true)
-        |> Enum.flat_map(fn line ->
-          case Jason.decode(line) do
-            {:ok, decoded} -> [decoded]
-            _ -> []
-          end
-        end)
+        |> Enum.flat_map(&decode_jsonl_line/1)
 
       _ ->
         []
+    end
+  end
+
+  defp decode_jsonl_line(line) do
+    case Jason.decode(line) do
+      {:ok, decoded} -> [decoded]
+      _ -> []
     end
   end
 end

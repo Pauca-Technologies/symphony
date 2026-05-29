@@ -79,18 +79,14 @@ defmodule SymphonyElixir.WorkspaceGc do
           process_issues(issues, workspace_path_fn, remove_fn)
 
         {:error, reason} ->
-          Logger.warning(
-            "WorkspaceGc skipped: failed to fetch terminal issues: #{inspect(reason)}"
-          )
+          Logger.warning("WorkspaceGc skipped: failed to fetch terminal issues: #{inspect(reason)}")
 
           {0, 0, 0}
       end
 
     duration_ms = System.monotonic_time(:millisecond) - started_at_ms
 
-    Logger.info(
-      "WorkspaceGc pass complete scanned=#{scanned} removed=#{removed} skipped=#{skipped} duration_ms=#{duration_ms} lookback_days=#{lookback_days}"
-    )
+    Logger.info("WorkspaceGc pass complete scanned=#{scanned} removed=#{removed} skipped=#{skipped} duration_ms=#{duration_ms} lookback_days=#{lookback_days}")
 
     Telemetry.emit(:gc_pass_summary, %{
       scanned: scanned,
@@ -129,12 +125,10 @@ defmodule SymphonyElixir.WorkspaceGc do
         :missing
 
       worktree_path ->
-        cond do
-          not File.exists?(worktree_path) ->
-            :missing
-
-          true ->
-            attempt_remove(issue, worktree_path, remove_fn)
+        if File.exists?(worktree_path) do
+          attempt_remove(issue, worktree_path, remove_fn)
+        else
+          :missing
         end
     end
   end
@@ -144,9 +138,7 @@ defmodule SymphonyElixir.WorkspaceGc do
   defp attempt_remove(%Issue{} = issue, worktree_path, remove_fn) do
     case remove_fn.(worktree_path) do
       :ok ->
-        Logger.info(
-          "WorkspaceGc removed worktree identifier=#{issue.identifier} path=#{worktree_path}"
-        )
+        Logger.info("WorkspaceGc removed worktree identifier=#{issue.identifier} path=#{worktree_path}")
 
         Telemetry.emit(:gc_removed, %{
           issue_identifier: issue.identifier,
@@ -158,9 +150,7 @@ defmodule SymphonyElixir.WorkspaceGc do
         :removed
 
       {:error, reason} ->
-        Logger.warning(
-          "WorkspaceGc skipped worktree identifier=#{issue.identifier} path=#{worktree_path} reason=#{inspect(reason)}"
-        )
+        Logger.warning("WorkspaceGc skipped worktree identifier=#{issue.identifier} path=#{worktree_path} reason=#{inspect(reason)}")
 
         Telemetry.emit(:gc_skipped, %{
           issue_identifier: issue.identifier,
@@ -174,10 +164,9 @@ defmodule SymphonyElixir.WorkspaceGc do
     end
   end
 
+  # The config schema guarantees gc.lookback_days is a positive integer
+  # (default 7, validated `greater_than: 0`), so we can read it directly.
   defp configured_lookback_days do
-    case Config.settings!() do
-      %{gc: %{lookback_days: days}} when is_integer(days) and days > 0 -> days
-      _ -> 7
-    end
+    Config.settings!().gc.lookback_days
   end
 end

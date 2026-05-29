@@ -24,7 +24,7 @@ defmodule Mix.Tasks.Symphony.Cardinality do
 
   use Mix.Task
 
-  alias SymphonyElixir.{Cardinality, RepoConfig, Tracker, Linear.Issue}
+  alias SymphonyElixir.{Cardinality, Linear.Issue, RepoConfig, Tracker}
 
   @shortdoc "Run the cardinality gate against all visible issues (dry-run)"
 
@@ -38,9 +38,7 @@ defmodule Mix.Tasks.Symphony.Cardinality do
       )
 
     if !Keyword.get(opts, :dry_run, false) do
-      Mix.shell().error(
-        "Refusing to run without --dry-run. This task only supports dry-run mode (T23)."
-      )
+      Mix.shell().error("Refusing to run without --dry-run. This task only supports dry-run mode (T23).")
 
       System.halt(2)
     end
@@ -114,9 +112,7 @@ defmodule Mix.Tasks.Symphony.Cardinality do
     Mix.shell().info("==========================")
     Mix.shell().info("Repos configured: #{length(repo_config.repos)}")
 
-    Mix.shell().info(
-      "Cutover date: #{report.cardinality_enforced_from || "(not set — gate is open)"}"
-    )
+    Mix.shell().info("Cutover date: #{report.cardinality_enforced_from || "(not set — gate is open)"}")
 
     Mix.shell().info("Issues scanned: #{report.total_issues}")
     Mix.shell().info("Total violations: #{report.total_violations}")
@@ -125,10 +121,12 @@ defmodule Mix.Tasks.Symphony.Cardinality do
     if report.total_violations == 0 do
       Mix.shell().info("No violations — safe to enable enforcement.")
     else
-      Enum.each(report.by_type, fn {kind, %{count: count, examples: examples}} ->
-        Mix.shell().info("#{kind}: #{count}")
-        Enum.each(examples, fn id -> Mix.shell().info("  - #{id}") end)
-      end)
+      Enum.each(report.by_type, &print_violation_type/1)
     end
+  end
+
+  defp print_violation_type({kind, %{count: count, examples: examples}}) do
+    Mix.shell().info("#{kind}: #{count}")
+    Enum.each(examples, fn id -> Mix.shell().info("  - #{id}") end)
   end
 end

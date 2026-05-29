@@ -1,8 +1,8 @@
 defmodule SymphonyElixir.RouterTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{RepoConfig, Router}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.{RepoConfig, Router}
 
   defp config_with_repos(repos) do
     %{RepoConfig.empty() | source: :file, repos: repos}
@@ -156,6 +156,48 @@ defmodule SymphonyElixir.RouterTest do
     end
   end
 
+  describe "route/2 edge cases" do
+    test "falls back to legacy_mode when a file-sourced config has an empty repo list" do
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["dashboard-v2"]}
+      assert Router.route(issue, config_with_repos([])) == {:skip, :legacy_mode}
+    end
+  end
+
+  describe "eligible_for_warning?/2 fallbacks" do
+    test "false for a non-Issue argument" do
+      assert Router.eligible_for_warning?(:not_an_issue, MapSet.new(["todo"])) == false
+    end
+
+    test "false when the issue state is not a binary" do
+      issue = %Issue{state: nil, assigned_to_worker: true, labels: []}
+      assert Router.eligible_for_warning?(issue, MapSet.new(["todo"])) == false
+    end
+  end
+
+  describe "already_warned?/1" do
+    test "true when the routing-warned label is present" do
+      assert Router.already_warned?(%Issue{labels: ["symphony:routing-warned"]}) == true
+    end
+
+    test "false when labels is not a list" do
+      assert Router.already_warned?(%Issue{labels: nil}) == false
+    end
+  end
+
+  describe "normalize/1" do
+    test "returns an empty string for a non-binary value" do
+      assert Router.normalize(nil) == ""
+      assert Router.normalize(123) == ""
+    end
+  end
+
+  describe "label accessors" do
+    test "expose the well-known label names" do
+      assert Router.routing_warned_label() == "symphony:routing-warned"
+      assert Router.pickup_label() == "symphony:pick-up"
+    end
+  end
+
   describe "warning_comment/3" do
     test "includes the routing-warned marker for idempotency" do
       config = config_with_repos([repo("udp", "repo:dashboard-v2")])
@@ -165,6 +207,30 @@ defmodule SymphonyElixir.RouterTest do
       body = Router.warning_comment(issue, decision, config)
       assert body =~ "symphony:routing-warned"
       assert body =~ "typo"
+    end
+
+    test "summarizes no labels when the issue has none and no repos are configured" do
+      issue = %Issue{id: "1", labels: []}
+      body = Router.warning_comment(issue, {:skip, :no_match, []}, config_with_repos([]))
+
+      assert body =~ "(no labels on issue)"
+      assert body =~ "(none configured)"
+    end
+
+    test "lists the matched labels for an ambiguous decision" do
+      config = config_with_repos([repo("a", "repo:a"), repo("b", "repo:b")])
+      matches = [repo("a", "repo:a"), repo("b", "repo:b")]
+      body = Router.warning_comment(%Issue{id: "1"}, {:skip, :ambiguous, matches}, config)
+
+      assert body =~ "multiple configured repo labels matched"
+      assert body =~ "repo:a, repo:b"
+    end
+
+    test "falls back to a generic message for any other decision shape" do
+      config = config_with_repos([repo("udp", "repo:dashboard-v2")])
+      body = Router.warning_comment(%Issue{id: "1"}, {:ok, repo("udp", "repo:x")}, config)
+
+      assert body =~ "Symphony cannot route this issue."
     end
   end
 end

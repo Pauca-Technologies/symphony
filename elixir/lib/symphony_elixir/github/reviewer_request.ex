@@ -39,9 +39,7 @@ defmodule SymphonyElixir.Github.ReviewerRequest do
       :ok
     else
       {:skip, reason} ->
-        Logger.debug(
-          "ReviewerRequest skipped: reason=#{inspect(reason)} issue=#{issue_context(issue)}"
-        )
+        Logger.debug("ReviewerRequest skipped: reason=#{inspect(reason)} issue=#{issue_context(issue)}")
 
         :ok
     end

@@ -118,6 +118,7 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+
         session_start =
           SessionStartHook.run(
             workspace,
@@ -188,9 +189,7 @@ defmodule SymphonyElixir.AgentRunner do
         workflow
 
       {:error, reason} ->
-        Logger.warning(
-          "Falling back to host-level hooks; could not load per-repo workflow at #{path}: #{inspect(reason)}"
-        )
+        Logger.warning("Falling back to host-level hooks; could not load per-repo workflow at #{path}: #{inspect(reason)}")
 
         nil
     end
@@ -203,14 +202,12 @@ defmodule SymphonyElixir.AgentRunner do
   # the legacy single-repo path (routed_repo nil -> default filename in the
   # cloned worktree). A missing file means the reviewer feature is off, so we
   # stay quiet; only a present-but-unreadable/empty file warns.
-  defp load_repo_review_workflow(workspace, routed_repo) when is_binary(workspace) do
+  defp load_repo_review_workflow(workspace, routed_repo) do
     path = Path.join(workspace, review_workflow_path(routed_repo))
 
     # Missing file == reviewer feature off; stay quiet.
     if File.regular?(path), do: load_review_workflow_file(path)
   end
-
-  defp load_repo_review_workflow(_workspace, _routed_repo), do: nil
 
   defp load_review_workflow_file(path) do
     case SymphonyElixir.Workflow.load(path) do
@@ -250,8 +247,6 @@ defmodule SymphonyElixir.AgentRunner do
       before_remove: Map.get(hooks, "before_remove")
     }
   end
-
-  defp repo_workflow_hook_opts(_workflow), do: %{}
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
@@ -425,9 +420,7 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         cond do
           repo_label_drifted?(issue, refreshed_issue) ->
-            Logger.info(
-              "Label drift detected mid-flight for #{issue_context(refreshed_issue)}; finishing current turn cleanly and halting (no reroute)"
-            )
+            Logger.info("Label drift detected mid-flight for #{issue_context(refreshed_issue)}; finishing current turn cleanly and halting (no reroute)")
 
             {:done, refreshed_issue}
 
@@ -458,6 +451,11 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp repo_label_drifted?(_original, _refreshed), do: false
 
+  # `MapSet.member?/2` on a MapSet built and consumed in the same module trips
+  # a Dialyzer opacity false-positive (the set's success typing is seen as the
+  # bare struct, not the opaque MapSet.t()). The usage is correct, so suppress
+  # opacity warnings for this function only.
+  @dialyzer {:no_opaque, repo_label_set: 1}
   defp repo_label_set(labels) when is_list(labels) do
     configured = configured_repo_label_set()
 
@@ -528,9 +526,7 @@ defmodule SymphonyElixir.AgentRunner do
   def mark_blocked_on_giveup(%Issue{id: issue_id} = issue, context)
       when is_binary(issue_id) and is_map(context) do
     if already_blocked?(issue) do
-      Logger.info(
-        "Skipping Blocked transition for #{issue_context(issue)}; idempotency label '#{@idempotency_label}' already present"
-      )
+      Logger.info("Skipping Blocked transition for #{issue_context(issue)}; idempotency label '#{@idempotency_label}' already present")
 
       :ok
     else
@@ -541,9 +537,7 @@ defmodule SymphonyElixir.AgentRunner do
           :ok
 
         {:error, reason} ->
-          Logger.warning(
-            "Failed to post Blocked comment for #{issue_context(issue)}: #{inspect(reason)}"
-          )
+          Logger.warning("Failed to post Blocked comment for #{issue_context(issue)}: #{inspect(reason)}")
       end
 
       add_label_best_effort(issue, @needs_human_input_label)
@@ -554,9 +548,7 @@ defmodule SymphonyElixir.AgentRunner do
           :ok
 
         {:error, reason} ->
-          Logger.warning(
-            "Failed to transition #{issue_context(issue)} to '#{@blocked_state}': #{inspect(reason)}"
-          )
+          Logger.warning("Failed to transition #{issue_context(issue)} to '#{@blocked_state}': #{inspect(reason)}")
       end
 
       :ok
@@ -577,14 +569,10 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, :label_missing} ->
-        Logger.info(
-          "Skipping label '#{label_name}' on #{issue_context(issue)}; label not configured in workspace"
-        )
+        Logger.info("Skipping label '#{label_name}' on #{issue_context(issue)}; label not configured in workspace")
 
       {:error, reason} ->
-        Logger.warning(
-          "Failed to add label '#{label_name}' on #{issue_context(issue)}: #{inspect(reason)}"
-        )
+        Logger.warning("Failed to add label '#{label_name}' on #{issue_context(issue)}: #{inspect(reason)}")
     end
   end
 

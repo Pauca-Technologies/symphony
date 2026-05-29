@@ -109,9 +109,7 @@ defmodule SymphonyElixir.BareClone do
           :ok
 
         {output, status} ->
-          Logger.warning(
-            "git worktree remove failed (status=#{status}, falling back to rm -rf): #{String.trim(IO.iodata_to_binary(output))}"
-          )
+          Logger.warning("git worktree remove failed (status=#{status}, falling back to rm -rf): #{String.trim(IO.iodata_to_binary(output))}")
 
           _ = File.rm_rf(worktree_path)
           # Best-effort prune any dangling refs in the canonical clone.
@@ -161,8 +159,7 @@ defmodule SymphonyElixir.BareClone do
             :ok
 
           {output, status} ->
-            {:error,
-             {:worktree_remove_failed, status, String.trim(IO.iodata_to_binary(output))}}
+            {:error, {:worktree_remove_failed, status, String.trim(IO.iodata_to_binary(output))}}
         end
     end
   end
@@ -219,9 +216,7 @@ defmodule SymphonyElixir.BareClone do
         # A fetch failure isn't fatal — the existing pack might still cover the
         # required base_branch (the initial clone fetched everything). Log it
         # and keep going.
-        Logger.warning(
-          "git fetch on clone #{clone_path} failed (status=#{status}); reusing existing refs: #{String.trim(IO.iodata_to_binary(output))}"
-        )
+        Logger.warning("git fetch on clone #{clone_path} failed (status=#{status}); reusing existing refs: #{String.trim(IO.iodata_to_binary(output))}")
 
         :ok
     end

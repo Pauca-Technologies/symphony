@@ -85,14 +85,22 @@ defmodule SymphonyElixir.RepoConfig do
   end
 
   defp pick_canonical_path do
-    home = System.user_home!() || ""
+    home = System.user_home!()
     config = Path.join([home, ".symphony", @canonical_filename])
     legacy = Path.join([home, ".symphony", @legacy_filename])
+    resolve_config_path(config, legacy)
+  end
 
+  @doc false
+  # Selection logic split out so it can be exercised with explicit candidate
+  # paths in tests — `System.user_home!/0` is fixed at VM boot and can't be
+  # redirected at runtime.
+  @spec resolve_config_path(String.t(), String.t()) :: String.t()
+  def resolve_config_path(config_path, legacy_path) do
     cond do
-      File.regular?(config) -> config
-      File.regular?(legacy) -> legacy
-      true -> config
+      File.regular?(config_path) -> config_path
+      File.regular?(legacy_path) -> legacy_path
+      true -> config_path
     end
   end
 
@@ -270,11 +278,9 @@ defmodule SymphonyElixir.RepoConfig do
       {:ok, cutover} ->
         {:ok,
          %{
-           max_concurrent_global:
-             pos_integer(raw, "max_concurrent_global", @default_max_concurrent_global),
+           max_concurrent_global: pos_integer(raw, "max_concurrent_global", @default_max_concurrent_global),
            workspace_root: string_or_default(raw, "workspace_root", default_workspace_root()),
-           poll_interval_seconds:
-             pos_integer(raw, "poll_interval_seconds", @default_poll_interval_seconds),
+           poll_interval_seconds: pos_integer(raw, "poll_interval_seconds", @default_poll_interval_seconds),
            cardinality_enforced_from: cutover
          }}
 
@@ -359,7 +365,8 @@ defmodule SymphonyElixir.RepoConfig do
     end
   end
 
-  defp parse_cutover_date(%Date{} = date), do: {:ok, date}
+  # The cutover value always arrives as a YAML scalar (string/number/nil),
+  # never a %Date{} — YamlElixir does not decode timestamps to Date structs.
   defp parse_cutover_date(other), do: {:error, {:unsupported_date_value, other}}
 
   defp pos_integer(map, key, default) do

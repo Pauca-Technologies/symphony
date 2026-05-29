@@ -573,21 +573,7 @@ defmodule SymphonyElixir.Linear.Client do
       # single-repo deployments.
       is_binary(team_identifier) ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          team_is_uuid = uuid_shaped?(team_identifier)
-
-          case {team_is_uuid, filter_label} do
-            {true, nil} ->
-              do_fetch_by_team(team_identifier, tracker.active_states, assignee_filter)
-
-            {true, label} when is_binary(label) ->
-              do_fetch_by_team_with_label(team_identifier, tracker.active_states, label, assignee_filter)
-
-            {false, nil} ->
-              do_fetch_by_team_key(team_identifier, tracker.active_states, assignee_filter)
-
-            {false, label} when is_binary(label) ->
-              do_fetch_by_team_key_with_label(team_identifier, tracker.active_states, label, assignee_filter)
-          end
+          dispatch_team_fetch(team_identifier, filter_label, tracker.active_states, assignee_filter)
         end
 
       is_nil(project_slug) ->
@@ -597,6 +583,24 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
         end
+    end
+  end
+
+  # team_identifier may be a Linear team UUID or a team key (e.g. "UDPE"),
+  # auto-detected by shape; filter_label optionally narrows the poll.
+  defp dispatch_team_fetch(team_identifier, filter_label, active_states, assignee_filter) do
+    case {uuid_shaped?(team_identifier), filter_label} do
+      {true, nil} ->
+        do_fetch_by_team(team_identifier, active_states, assignee_filter)
+
+      {true, label} when is_binary(label) ->
+        do_fetch_by_team_with_label(team_identifier, active_states, label, assignee_filter)
+
+      {false, nil} ->
+        do_fetch_by_team_key(team_identifier, active_states, assignee_filter)
+
+      {false, label} when is_binary(label) ->
+        do_fetch_by_team_key_with_label(team_identifier, active_states, label, assignee_filter)
     end
   end
 

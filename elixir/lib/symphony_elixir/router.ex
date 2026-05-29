@@ -189,8 +189,6 @@ defmodule SymphonyElixir.Router do
   defp format_label_list_from_strings([]), do: "(none configured)"
 
   defp format_label_list_from_strings(labels) when is_list(labels) do
-    labels
-    |> Enum.map(&"`#{&1}`")
-    |> Enum.join(", ")
+    Enum.map_join(labels, ", ", &"`#{&1}`")
   end
 end

@@ -61,7 +61,7 @@ defmodule SymphonyElixir.Cardinality do
 
   def check(%Issue{} = issue, %{} = config), do: do_check(issue, configured_repo_labels(config))
 
-  defp do_check(%Issue{} = issue, %MapSet{} = configured_labels) do
+  defp do_check(%Issue{} = issue, configured_labels) do
     violations =
       []
       |> maybe_add(repo_label_violation(issue, configured_labels))
@@ -123,7 +123,12 @@ defmodule SymphonyElixir.Cardinality do
 
   defp pre_cutover?(_issue, _cutover), do: false
 
-  defp repo_label_violation(%Issue{labels: labels}, %MapSet{} = configured_labels)
+  # `MapSet.member?/2` on a MapSet built and consumed in the same module trips
+  # a Dialyzer opacity false-positive (the set's success typing is seen as the
+  # bare struct, not the opaque MapSet.t()). The usage is correct, so suppress
+  # opacity warnings for these two helpers only.
+  @dialyzer {:no_opaque, [repo_label_violation: 2, parent_label_violation: 2]}
+  defp repo_label_violation(%Issue{labels: labels}, configured_labels)
        when is_list(labels) do
     matched =
       labels
@@ -138,8 +143,8 @@ defmodule SymphonyElixir.Cardinality do
 
   defp repo_label_violation(_issue, _set), do: nil
 
-  defp parent_label_violation(%Issue{children: children, labels: labels}, %MapSet{} = configured_labels)
-       when is_list(children) and length(children) > 0 and is_list(labels) do
+  defp parent_label_violation(%Issue{children: children, labels: labels}, configured_labels)
+       when is_list(children) and children != [] and is_list(labels) do
     if Enum.any?(labels, fn label ->
          MapSet.member?(configured_labels, Router.normalize(label))
        end) do
@@ -152,7 +157,7 @@ defmodule SymphonyElixir.Cardinality do
   defp parent_label_violation(_issue, _set), do: nil
 
   defp parent_pr_violation(%Issue{children: children} = issue)
-       when is_list(children) and length(children) > 0 do
+       when is_list(children) and children != [] do
     if pr_urls(issue) != [], do: :parent_with_pr, else: nil
   end
 

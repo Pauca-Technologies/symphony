@@ -139,6 +139,46 @@ defmodule SymphonyElixir.CardinalityTest do
     end
   end
 
+  describe "check/2 with config maps that omit cardinality defaults" do
+    test "checks a config without a cardinality_enforced_from default" do
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: []}
+      assert Cardinality.check(issue, %{repos: []}) == :ok
+    end
+
+    test "treats a config without a repos list as having no configured labels" do
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["a"]}
+      assert Cardinality.check(issue, %{}) == :ok
+    end
+
+    test "tolerates an issue whose labels field is not a list" do
+      config = config_with_repos([repo("a", "repo:a")])
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: nil, attachment_urls: []}
+      assert Cardinality.check(issue, config) == :ok
+    end
+
+    test "does not enforce when a cutover is set but the issue has no created_at" do
+      config = config_with_cutover_and_repos(~D[2026-06-01], [repo("a", "repo:a"), repo("b", "repo:b")])
+      issue = %Issue{id: "1", identifier: "UDPE-1", labels: ["a", "b"], created_at: nil}
+
+      assert {:violations, list} = Cardinality.check(issue, config)
+      assert :multiple_repo_labels in list
+    end
+  end
+
+  describe "pr_urls/1" do
+    test "returns [] when attachment_urls is not a list" do
+      assert Cardinality.pr_urls(%Issue{attachment_urls: nil}) == []
+    end
+
+    test "keeps only GitHub PR URLs and ignores non-binary entries" do
+      issue = %Issue{
+        attachment_urls: [123, "https://example.com/not-a-pr", "https://github.com/x/y/pull/7"]
+      }
+
+      assert Cardinality.pr_urls(issue) == ["https://github.com/x/y/pull/7"]
+    end
+  end
+
   describe "violation_comment/2" do
     test "includes the routing-warned marker for idempotency and explains each violation" do
       issue = %Issue{
@@ -150,6 +190,28 @@ defmodule SymphonyElixir.CardinalityTest do
       body = Cardinality.violation_comment(issue, [:multiple_repo_labels])
       assert body =~ "symphony:routing-warned"
       assert body =~ "Multiple configured repo labels"
+    end
+
+    test "explains parent, multi-PR, and unknown violations" do
+      issue = %Issue{
+        id: "1",
+        identifier: "UDPE-1",
+        labels: ["a"],
+        attachment_urls: ["https://github.com/x/y/pull/1", "https://github.com/x/y/pull/2"]
+      }
+
+      body =
+        Cardinality.violation_comment(issue, [
+          :parent_with_repo_label,
+          :parent_with_pr,
+          :multiple_prs,
+          :some_future_violation
+        ])
+
+      assert body =~ "Parents must not be routed"
+      assert body =~ "Parents must not have PRs"
+      assert body =~ "Multiple PRs attached"
+      assert body =~ "Unknown violation: :some_future_violation"
     end
   end
 end

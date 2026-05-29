@@ -23,24 +23,16 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <-
-             ensure_workspace(workspace, worker_host, routed_repo, issue_or_identifier) do
-        # When a routed_repo is in play (multi-repo dispatch, T27), the
-        # caller (AgentRunner) is responsible for running after_create
-        # itself with the consumer repo's own WORKFLOW.md hook (which can
-        # only be read after the worktree exists). In the legacy single-
-        # repo path, we still run after_create here from the host-level
-        # Config so existing setups don't change.
-        if is_nil(routed_repo) do
-          :ok =
-            maybe_run_after_create_hook(
-              workspace,
-              issue_context,
-              created?,
-              worker_host,
-              after_create_override
-            )
-        end
-
+             ensure_workspace(workspace, worker_host, routed_repo, issue_or_identifier),
+           :ok <-
+             maybe_run_host_after_create_hook(
+               routed_repo,
+               workspace,
+               issue_context,
+               created?,
+               worker_host,
+               after_create_override
+             ) do
         {:ok, workspace}
       end
     rescue
@@ -351,6 +343,20 @@ defmodule SymphonyElixir.Workspace do
 
   defp safe_identifier(identifier) do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
+  end
+
+  # When a routed_repo is in play (multi-repo dispatch, T27), the caller
+  # (AgentRunner) is responsible for running after_create itself with the
+  # consumer repo's own WORKFLOW.md hook (which can only be read after the
+  # worktree exists), so we skip it here. In the legacy single-repo path we
+  # still run after_create from the host-level Config so existing setups
+  # don't change.
+  defp maybe_run_host_after_create_hook(routed_repo, _workspace, _issue_context, _created?, _worker_host, _override)
+       when not is_nil(routed_repo),
+       do: :ok
+
+  defp maybe_run_host_after_create_hook(_routed_repo, workspace, issue_context, created?, worker_host, override) do
+    maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, override)
   end
 
   defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host, override) do

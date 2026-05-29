@@ -899,6 +899,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
+  test "parses a gc lookback_days override and rejects a non-positive value" do
+    assert {:ok, settings} = Schema.parse(%{"gc" => %{"lookback_days" => 14}})
+    assert settings.gc.lookback_days == 14
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{"gc" => %{"lookback_days" => 0}})
+
+    assert message =~ "lookback_days"
+  end
+
+  test "gc lookback_days defaults to 7 when unset" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.gc.lookback_days == 7
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
