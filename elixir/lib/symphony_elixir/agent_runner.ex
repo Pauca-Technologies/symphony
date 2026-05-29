@@ -98,6 +98,10 @@ defmodule SymphonyElixir.AgentRunner do
         # its session_start / before_run / before_handoff / after_run.
         repo_workflow = load_repo_workflow(workspace, routed_repo)
         repo_hook_opts = repo_workflow_hook_opts(repo_workflow)
+        # Optional reviewer agent: when the consumer repo ships a
+        # WORKFLOW_REVIEW.md, ReviewGate runs it at the In Progress ->
+        # In Review handoff. Absent file == feature off (legacy behavior).
+        review_workflow = load_repo_review_workflow(workspace, routed_repo)
 
         # When Symphony did the worktree clone (routed_repo present),
         # we now run the per-repo after_create here. The legacy single-
@@ -127,6 +131,7 @@ defmodule SymphonyElixir.AgentRunner do
           |> Keyword.put(:session_start_prompt, session_start.prompt)
           |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
           |> maybe_put(:per_repo_workflow, repo_workflow)
+          |> maybe_put(:per_repo_review_workflow, review_workflow)
 
         try do
           with :ok <-
@@ -192,6 +197,44 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp load_repo_workflow(_workspace, _routed_repo), do: nil
+
+  # Load `<workspace>/<review_workflow_path>` (default WORKFLOW_REVIEW.md).
+  # Works in both multi-repo dispatch (path from the routed repo entry) and
+  # the legacy single-repo path (routed_repo nil -> default filename in the
+  # cloned worktree). A missing file means the reviewer feature is off, so we
+  # stay quiet; only a present-but-unreadable/empty file warns.
+  defp load_repo_review_workflow(workspace, routed_repo) when is_binary(workspace) do
+    path = Path.join(workspace, review_workflow_path(routed_repo))
+
+    # Missing file == reviewer feature off; stay quiet.
+    if File.regular?(path), do: load_review_workflow_file(path)
+  end
+
+  defp load_repo_review_workflow(_workspace, _routed_repo), do: nil
+
+  defp load_review_workflow_file(path) do
+    case SymphonyElixir.Workflow.load(path) do
+      {:ok, %{prompt_template: prompt} = workflow} when is_binary(prompt) ->
+        use_review_workflow_if_nonempty(path, workflow, prompt)
+
+      {:error, reason} ->
+        Logger.warning("Ignoring per-repo review workflow at #{path}: #{inspect(reason)}")
+        nil
+    end
+  end
+
+  defp use_review_workflow_if_nonempty(path, workflow, prompt) do
+    if String.trim(prompt) == "" do
+      Logger.warning("Ignoring per-repo review workflow at #{path}: empty review prompt")
+      nil
+    else
+      Logger.info("Loaded per-repo review workflow from #{path}")
+      workflow
+    end
+  end
+
+  defp review_workflow_path(%{review_workflow_path: path}) when is_binary(path) and path != "", do: path
+  defp review_workflow_path(_routed_repo), do: "WORKFLOW_REVIEW.md"
 
   defp repo_workflow_hook_opts(nil), do: %{}
 
@@ -330,10 +373,12 @@ defmodule SymphonyElixir.AgentRunner do
   defp dynamic_tool_executor(issue, workspace, worker_host, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
     per_repo_before_handoff = Keyword.get(opts, :per_repo_before_handoff)
+    per_repo_review_workflow = Keyword.get(opts, :per_repo_review_workflow)
 
     handoff_context =
       %{issue: issue, workspace: workspace, worker_host: worker_host}
       |> maybe_put_map(:before_handoff_command, per_repo_before_handoff)
+      |> maybe_put_map(:review_workflow, per_repo_review_workflow)
 
     fn tool, arguments ->
       result =

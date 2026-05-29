@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{HandoffGate, Linear.Client}
+  alias SymphonyElixir.{HandoffGate, Linear.Client, ReviewGate}
 
   @linear_graphql_tool "linear_graphql"
   @issue_transition_query """
@@ -87,6 +87,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           }
         })
 
+      {:review_blocked, prompt, findings} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "Automated reviewer requested changes before the In Review handoff.",
+            "remediation" => prompt,
+            "findings" => findings
+          }
+        })
+
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
     end
@@ -128,11 +137,37 @@ defmodule SymphonyElixir.Codex.DynamicTool do
            resolve_transition_states(query, variables, issue, issue_id, linear_client),
          true <- HandoffGate.handoff_transition?(current_state, target_state) do
       case HandoffGate.run_before_handoff(workspace, issue, worker_host, target_state, handoff_opts) do
-        :ok -> :ok
+        :ok -> run_review_gate(workspace, issue, worker_host, context, linear_client)
         {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
       end
     else
       _ -> :ok
+    end
+  end
+
+  # After the deterministic before_handoff shell hook passes, run the full
+  # reviewer agent when the consumer repo ships a WORKFLOW_REVIEW.md
+  # (AgentRunner threads the loaded review workflow through the gate context).
+  # A request-changes verdict blocks the handoff with the reviewer's comments
+  # as remediation, reusing the same loop the shell hook uses.
+  defp run_review_gate(workspace, issue, worker_host, context, linear_client) do
+    case Map.get(context, :review_workflow) || Map.get(context, "review_workflow") do
+      review_workflow when is_map(review_workflow) ->
+        # `:review_opts` is an optional passthrough (test/extensibility seam):
+        # the gate always pins `linear_client`; callers may add a custom
+        # session_runner / comment_fn.
+        review_opts =
+          context
+          |> Map.get(:review_opts, [])
+          |> Keyword.put(:linear_client, linear_client)
+
+        case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
+          :ok -> :ok
+          {:blocked, prompt, findings} -> {:review_blocked, prompt, findings}
+        end
+
+      _ ->
+        :ok
     end
   end
 

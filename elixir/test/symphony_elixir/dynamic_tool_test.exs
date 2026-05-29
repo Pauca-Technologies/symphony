@@ -153,6 +153,147 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert [%{name: "landable-check", passed: false}] = gates
   end
 
+  test "linear_graphql runs the reviewer gate after before_handoff and blocks on request_changes" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-review-gate-tool-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    review_workflow = %{
+      config: %{"review" => %{"max_iterations" => 3}},
+      prompt: "Review {{ issue.identifier }}",
+      prompt_template: "Review {{ issue.identifier }}"
+    }
+
+    # Stand-in reviewer session: writes a request_changes verdict to the
+    # gate-provided path instead of launching Codex.
+    session_runner = fn ctx ->
+      File.mkdir_p!(Path.dirname(ctx.verdict_path))
+
+      File.write!(
+        ctx.verdict_path,
+        Jason.encode!(%{
+          "verdict" => "request_changes",
+          "summary" => "missing test",
+          "comments" => [%{"severity" => "major", "file" => "app/x.ts", "body" => "add a test"}]
+        })
+      )
+
+      {:ok, %{}}
+    end
+
+    issue = %Issue{id: "issue-review", identifier: "UDPE-2", title: "Review me", state: "In Progress"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => "issue-review", "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{
+          issue: issue,
+          workspace: workspace,
+          worker_host: nil,
+          review_workflow: review_workflow,
+          review_opts: [session_runner: session_runner]
+        },
+        linear_client: fn
+          _query, %{"issueId" => "issue-review"}, [] ->
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                   }
+                 }
+               }
+             }}
+
+          _query, _variables, [] ->
+            flunk("the issue transition mutation must not reach Linear when the reviewer blocks")
+        end
+      )
+
+    assert response["success"] == false
+
+    output = Jason.decode!(response["output"])
+    assert get_in(output, ["error", "message"]) =~ "Automated reviewer requested changes"
+    assert get_in(output, ["error", "remediation"]) =~ "requested changes (review pass 1 of 3)"
+    assert get_in(output, ["error", "remediation"]) =~ "app/x.ts"
+    assert [%{"severity" => "major"}] = get_in(output, ["error", "findings"])
+  end
+
+  test "linear_graphql lets the transition through when the reviewer approves" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-review-gate-approve-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    review_workflow = %{
+      config: %{"review" => %{}},
+      prompt: "Review {{ issue.identifier }}",
+      prompt_template: "Review {{ issue.identifier }}"
+    }
+
+    session_runner = fn ctx ->
+      File.mkdir_p!(Path.dirname(ctx.verdict_path))
+      File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve", "comments" => []}))
+      {:ok, %{}}
+    end
+
+    issue = %Issue{id: "issue-ok", identifier: "UDPE-3", title: "Ship it", state: "In Progress"}
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => "issue-ok", "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{
+          issue: issue,
+          workspace: workspace,
+          worker_host: nil,
+          review_workflow: review_workflow,
+          review_opts: [session_runner: session_runner]
+        },
+        linear_client: fn
+          query, %{"issueId" => "issue-ok"}, [] ->
+            if query =~ "SymphonyResolveIssueTransition" do
+              {:ok,
+               %{
+                 "data" => %{
+                   "issue" => %{
+                     "state" => %{"name" => "In Progress"},
+                     "team" => %{
+                       "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                     }
+                   }
+                 }
+               }}
+            else
+              send(test_pid, :mutation_sent)
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+            end
+        end
+      )
+
+    assert response["success"] == true
+    assert_received :mutation_sent
+  end
+
   test "linear_graphql accepts a raw GraphQL query string" do
     test_pid = self()
 

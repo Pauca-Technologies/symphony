@@ -29,6 +29,9 @@ defmodule SymphonyElixir.RepoConfig do
           label: repo:dashboard-v2
           repo_url: git@github.com:Pauca-Technologies/udp-dashboard-v2.git
           workflow_path: WORKFLOW.md
+          review_workflow_path: WORKFLOW_REVIEW.md   # optional; reviewer
+                                                     # agent prompt. Absent
+                                                     # file -> reviewer off.
           max_concurrent: 3
 
   This module never raises on a missing file: when `~/.symphony/repos.yaml`
@@ -58,6 +61,7 @@ defmodule SymphonyElixir.RepoConfig do
           label: String.t(),
           repo_url: String.t() | nil,
           workflow_path: String.t(),
+          review_workflow_path: String.t(),
           base_branch: String.t(),
           max_concurrent: pos_integer()
         }
@@ -323,6 +327,7 @@ defmodule SymphonyElixir.RepoConfig do
         end
 
       workflow_path = string_or_default(entry, "workflow_path", "WORKFLOW.md")
+      review_workflow_path = string_or_default(entry, "review_workflow_path", "WORKFLOW_REVIEW.md")
       base_branch = string_or_default(entry, "base_branch", "main")
       max_concurrent = pos_integer(entry, "max_concurrent", 1)
 
@@ -332,6 +337,7 @@ defmodule SymphonyElixir.RepoConfig do
          label: label,
          repo_url: repo_url,
          workflow_path: workflow_path,
+         review_workflow_path: review_workflow_path,
          base_branch: base_branch,
          max_concurrent: max_concurrent
        }}
