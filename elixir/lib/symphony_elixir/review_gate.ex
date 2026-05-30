@@ -30,15 +30,44 @@ defmodule SymphonyElixir.ReviewGate do
   run process (the same place the handoff-gate prompt is stashed), so it
   persists across the run's turns and resets when the orchestrator picks the
   issue up again in a fresh run.
+
+  ## Human-review PR section
+
+  Beyond the gate verdict, the reviewer also classifies the change's regression
+  risk (`risk: "safe" | "skim" | "medium" | "high"` in the verdict JSON) and
+  writes `human_review` markdown. `Github.PrReviewSection` upserts that, as a
+  deterministic marker-delimited section with an enum-rendered risk badge, onto
+  the GitHub PR body — overwriting it in place on every pass. `risk` is
+  orthogonal to the verdict: a high-risk change can still `approve`. On budget
+  exhaustion the section is refreshed to "did not converge → elevated risk" so
+  the riskiest case never ships stale guidance.
+
+  ## Configuration (the consumer repo's `WORKFLOW_REVIEW.md` front matter)
+
+      review:
+        max_iterations: 3                  # request-changes passes before allowing the handoff
+        verdict_path: .artifacts/symphony-review/verdict.json
+        require_pr: true                   # no PR at handoff -> skip the reviewer entirely
+        pr_section_enabled: true           # write the human-review PR section
+        section_heading: "## 🤖 How to review this PR"
   """
 
   require Logger
 
-  alias SymphonyElixir.{Codex.AppServer, Codex.DynamicTool, Linear.Client, Linear.Issue, PromptBuilder, Tracker}
+  alias SymphonyElixir.{
+    Codex.AppServer,
+    Codex.DynamicTool,
+    Github.PrReviewSection,
+    Linear.Client,
+    Linear.Issue,
+    PromptBuilder,
+    Tracker
+  }
 
   @telemetry_event [:symphony_elixir, :gate, :review]
   @default_max_iterations 3
   @default_verdict_path ".artifacts/symphony-review/verdict.json"
+  @default_section_heading "## 🤖 How to review this PR"
 
   @iteration_key {__MODULE__, :iteration}
   @budget_noted_key {__MODULE__, :budget_noted}
@@ -47,7 +76,14 @@ defmodule SymphonyElixir.ReviewGate do
   @budget_marker "<!-- symphony:review-budget-exhausted -->"
   @skip_marker "<!-- symphony:review-skipped -->"
 
-  @type verdict :: %{verdict: :approve | :request_changes, summary: String.t(), comments: [map()]}
+  @type risk :: :safe | :skim | :medium | :high
+  @type verdict :: %{
+          verdict: :approve | :request_changes,
+          summary: String.t(),
+          risk: risk(),
+          human_review: String.t(),
+          comments: [map()]
+        }
   @type result :: :ok | {:blocked, String.t(), [map()]}
 
   @doc """
@@ -71,12 +107,30 @@ defmodule SymphonyElixir.ReviewGate do
     settings = review_settings(review_workflow)
     iteration = current_iteration(issue_id)
 
-    if iteration >= settings.max_iterations do
-      note_budget_exhausted(issue, iteration, opts)
-      emit_telemetry(issue, iteration, :budget_exhausted, 0)
-      :ok
-    else
-      run_iteration(workspace, issue, worker_host, review_workflow, settings, iteration, opts)
+    case PrReviewSection.resolve_pr(workspace, opts) do
+      {:skip, reason} when settings.require_pr ->
+        # No PR at the In Review handoff: skip the reviewer entirely (product
+        # decision). The whole feature — review + PR annotation — is PR-centric
+        # here; set `require_pr: false` to review on the diff anyway and just
+        # no-op the annotation.
+        note_review_skipped(issue, {:no_pr, reason}, opts)
+        emit_telemetry(issue, iteration, :skipped, 0, nil)
+        :ok
+
+      pr_result ->
+        pr = pr_or_nil(pr_result)
+
+        if iteration >= settings.max_iterations do
+          # Budget spent: allow the handoff, but refresh the human-facing
+          # section to "did not converge -> elevated risk" so the riskiest case
+          # is never described by stale request-changes prose.
+          maybe_write_section(workspace, pr, :high, budget_human_review(iteration), settings, opts)
+          note_budget_exhausted(issue, iteration, opts)
+          emit_telemetry(issue, iteration, :budget_exhausted, 0, :high)
+          :ok
+        else
+          run_iteration(workspace, issue, worker_host, review_workflow, settings, iteration, pr, opts)
+        end
     end
   end
 
@@ -86,7 +140,10 @@ defmodule SymphonyElixir.ReviewGate do
   @spec telemetry_event() :: [atom()]
   def telemetry_event, do: @telemetry_event
 
-  defp run_iteration(workspace, %Issue{} = issue, worker_host, review_workflow, settings, iteration, opts) do
+  defp pr_or_nil({:ok, pr}), do: pr
+  defp pr_or_nil(_pr_result), do: nil
+
+  defp run_iteration(workspace, %Issue{} = issue, worker_host, review_workflow, settings, iteration, pr, opts) do
     verdict_path = Path.join(workspace, settings.verdict_path)
     prepare_verdict_path(verdict_path)
 
@@ -102,7 +159,7 @@ defmodule SymphonyElixir.ReviewGate do
         }
 
         case run_review_session(ctx, opts) do
-          {:ok, _session} -> evaluate_verdict(verdict_path, issue, settings, iteration, opts)
+          {:ok, _session} -> evaluate_verdict(workspace, verdict_path, issue, settings, iteration, pr, opts)
           {:error, reason} -> fail_open(issue, iteration, {:review_session_failed, reason}, opts)
         end
 
@@ -111,22 +168,53 @@ defmodule SymphonyElixir.ReviewGate do
     end
   end
 
-  defp evaluate_verdict(verdict_path, %Issue{} = issue, settings, iteration, opts) do
+  # On both verdicts we refresh the PR's human-review section from the reviewer's
+  # risk tier + prose (risk is orthogonal to the verdict — a high-risk PR can
+  # still approve). Keeping it fresh through the request_changes loop means the
+  # final pass's assessment wins.
+  defp evaluate_verdict(workspace, verdict_path, %Issue{} = issue, settings, iteration, pr, opts) do
     case read_verdict(verdict_path) do
-      {:ok, %{verdict: :approve, comments: comments}} ->
-        emit_telemetry(issue, iteration, :approve, length(comments))
+      {:ok, %{verdict: :approve} = verdict} ->
+        maybe_write_section(workspace, pr, verdict.risk, verdict.human_review, settings, opts)
+        emit_telemetry(issue, iteration, :approve, length(verdict.comments), verdict.risk)
         :ok
 
       {:ok, %{verdict: :request_changes} = verdict} ->
         next_iteration = iteration + 1
         put_iteration(issue.id, next_iteration)
-        emit_telemetry(issue, iteration, :request_changes, length(verdict.comments))
+        maybe_write_section(workspace, pr, verdict.risk, verdict.human_review, settings, opts)
+        emit_telemetry(issue, iteration, :request_changes, length(verdict.comments), verdict.risk)
         {:blocked, remediation_prompt(verdict, next_iteration, settings.max_iterations), verdict.comments}
 
       {:error, reason} ->
         fail_open(issue, iteration, {:verdict_unreadable, reason}, opts)
     end
   end
+
+  # --- PR human-review section ---------------------------------------------
+
+  defp maybe_write_section(_workspace, nil, _risk, _human_review, _settings, _opts), do: :ok
+
+  defp maybe_write_section(workspace, pr, risk, human_review, settings, opts) do
+    if settings.pr_section_enabled do
+      write_opts = Keyword.put(opts, :section_heading, settings.section_heading)
+      outcome = PrReviewSection.upsert(workspace, pr, risk, human_review, write_opts)
+      Logger.info("review.gate pr-section pr=##{pr.number} risk=#{risk} outcome=#{outcome}")
+      outcome
+    else
+      :ok
+    end
+  end
+
+  defp budget_human_review(iterations) do
+    """
+    Automated review ran #{iterations} change-request #{pluralize(iterations, "pass", "passes")} without converging, so this PR was allowed through **without a clean approval**. Treat it as elevated risk and review carefully end-to-end. The latest unresolved reviewer findings are in the run transcript and the `## Codex Workpad` comment on the linked issue.
+    """
+    |> String.trim()
+  end
+
+  defp pluralize(1, singular, _plural), do: singular
+  defp pluralize(_n, _singular, plural), do: plural
 
   # --- reviewer session ----------------------------------------------------
 
@@ -203,6 +291,8 @@ defmodule SymphonyElixir.ReviewGate do
          %{
            verdict: verdict_atom,
            summary: string_or_default(Map.get(decoded, "summary"), ""),
+           risk: normalize_risk(Map.get(decoded, "risk")),
+           human_review: string_or_default(Map.get(decoded, "human_review"), ""),
            comments: normalize_comments(Map.get(decoded, "comments"))
          }}
 
@@ -212,6 +302,26 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp normalize_verdict(_decoded), do: {:error, :verdict_not_a_map}
+
+  # `risk` is human-facing and never blocks: absent -> :medium silently; present
+  # but unknown -> :medium with a log. Never downgrade to :safe by accident.
+  defp normalize_risk(value) when is_binary(value) do
+    case value |> String.trim() |> String.downcase() do
+      v when v in ["safe", "none", "no_review", "no-review"] -> :safe
+      v when v in ["skim", "light"] -> :skim
+      v when v in ["medium", "moderate"] -> :medium
+      v when v in ["high", "risky", "danger", "dangerous"] -> :high
+      other -> log_unknown_risk(other)
+    end
+  end
+
+  defp normalize_risk(nil), do: :medium
+  defp normalize_risk(other), do: log_unknown_risk(other)
+
+  defp log_unknown_risk(value) do
+    Logger.warning("review.gate unknown risk tier #{inspect(value)}; defaulting to :medium")
+    :medium
+  end
 
   defp normalize_verdict_value(value) when is_binary(value) do
     case value |> String.trim() |> String.downcase() do
@@ -295,7 +405,7 @@ defmodule SymphonyElixir.ReviewGate do
   defp fail_open(%Issue{} = issue, iteration, reason, opts) do
     Logger.warning("review.gate fail-open #{issue_context(issue)} reason=#{inspect(reason)}; allowing handoff")
     note_review_skipped(issue, reason, opts)
-    emit_telemetry(issue, iteration, :skipped, 0)
+    emit_telemetry(issue, iteration, :skipped, 0, nil)
     :ok
   end
 
@@ -359,17 +469,26 @@ defmodule SymphonyElixir.ReviewGate do
 
     %{
       max_iterations: positive_integer(raw, "max_iterations", @default_max_iterations),
-      verdict_path: string_or_default(Map.get(raw, "verdict_path"), @default_verdict_path)
+      verdict_path: string_or_default(Map.get(raw, "verdict_path"), @default_verdict_path),
+      require_pr: boolean_or_default(raw, "require_pr", true),
+      pr_section_enabled: boolean_or_default(raw, "pr_section_enabled", true),
+      section_heading: string_or_default(Map.get(raw, "section_heading"), @default_section_heading)
     }
   end
 
   defp review_settings(_review_workflow) do
-    %{max_iterations: @default_max_iterations, verdict_path: @default_verdict_path}
+    %{
+      max_iterations: @default_max_iterations,
+      verdict_path: @default_verdict_path,
+      require_pr: true,
+      pr_section_enabled: true,
+      section_heading: @default_section_heading
+    }
   end
 
   # --- telemetry -----------------------------------------------------------
 
-  defp emit_telemetry(%Issue{} = issue, iteration, outcome, comment_count) do
+  defp emit_telemetry(%Issue{} = issue, iteration, outcome, comment_count, risk) do
     :telemetry.execute(
       @telemetry_event,
       %{count: 1, iteration: iteration, comments: comment_count},
@@ -379,11 +498,12 @@ defmodule SymphonyElixir.ReviewGate do
         issue_identifier: issue.identifier,
         from_state: issue.state,
         iteration: iteration,
-        outcome: outcome
+        outcome: outcome,
+        risk: risk
       }
     )
 
-    Logger.info("gate.review #{issue_context(issue)} iteration=#{iteration} outcome=#{outcome} comments=#{comment_count}")
+    Logger.info("gate.review #{issue_context(issue)} iteration=#{iteration} outcome=#{outcome} comments=#{comment_count} risk=#{inspect(risk)}")
   end
 
   # --- small helpers -------------------------------------------------------
@@ -391,6 +511,13 @@ defmodule SymphonyElixir.ReviewGate do
   defp positive_integer(map, key, default) do
     case Map.get(map, key) do
       value when is_integer(value) and value > 0 -> value
+      _ -> default
+    end
+  end
+
+  defp boolean_or_default(map, key, default) do
+    case Map.get(map, key) do
+      value when is_boolean(value) -> value
       _ -> default
     end
   end

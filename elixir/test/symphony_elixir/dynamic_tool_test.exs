@@ -3,6 +3,15 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool
 
+  # Stub `gh` so ReviewGate's PR resolution finds a PR (and accepts the
+  # human-review section edit) without shelling real gh.
+  defp stub_pr_runner do
+    fn
+      ["pr", "view" | _], _cwd -> {Jason.encode!(%{"number" => 7, "body" => "Body."}), 0}
+      ["pr", "edit" | _], _cwd -> {"", 0}
+    end
+  end
+
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
              %{
@@ -200,7 +209,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           workspace: workspace,
           worker_host: nil,
           review_workflow: review_workflow,
-          review_opts: [session_runner: session_runner]
+          review_opts: [session_runner: session_runner, pr_runner: stub_pr_runner()]
         },
         linear_client: fn
           _query, %{"issueId" => "issue-review"}, [] ->
@@ -267,7 +276,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           workspace: workspace,
           worker_host: nil,
           review_workflow: review_workflow,
-          review_opts: [session_runner: session_runner]
+          review_opts: [session_runner: session_runner, pr_runner: stub_pr_runner()]
         },
         linear_client: fn
           query, %{"issueId" => "issue-ok"}, [] ->

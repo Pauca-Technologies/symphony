@@ -121,7 +121,13 @@ defmodule Mix.Tasks.PrBody.Check do
   end
 
   defp check_no_placeholders(errors, body) do
-    if String.contains?(body, "<!--") do
+    # `symphony:`-namespaced markers (e.g. the reviewer's
+    # `<!-- symphony:review:start -->` section anchors) are intentional machine
+    # anchors, not unfilled template stubs — strip them before flagging the
+    # rest. See SymphonyElixir.Github.PrReviewSection.
+    stripped = Regex.replace(~r/<!--\s*symphony:[^>]*-->/, body, "")
+
+    if String.contains?(stripped, "<!--") do
       errors ++ ["PR description still contains template placeholder comments (<!-- ... -->)."]
     else
       errors
