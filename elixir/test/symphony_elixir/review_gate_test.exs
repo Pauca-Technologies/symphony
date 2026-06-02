@@ -235,7 +235,7 @@ defmodule SymphonyElixir.ReviewGateTest do
     runner =
       verdict_runner(%{
         "verdict" => "approve",
-        "risk" => "skim",
+        "review_effort" => "skim",
         "human_review" => "Mostly skimmable; focus on `lib/foo.ex`.",
         "comments" => []
       })
@@ -272,7 +272,7 @@ defmodule SymphonyElixir.ReviewGateTest do
   end
 
   test "reviews on the diff but skips the annotation when require_pr is false", %{workspace: workspace} do
-    runner = verdict_runner(%{"verdict" => "approve", "risk" => "safe", "comments" => []})
+    runner = verdict_runner(%{"verdict" => "approve", "review_effort" => "none", "comments" => []})
 
     pr_runner = fn
       ["pr", "view" | _], _cwd -> {"no pull requests found", 1}
@@ -291,7 +291,7 @@ defmodule SymphonyElixir.ReviewGateTest do
     runner =
       verdict_runner(%{
         "verdict" => "request_changes",
-        "risk" => "medium",
+        "review_effort" => "focused",
         "human_review" => "needs another pass",
         "comments" => [%{"body" => "fix"}]
       })
@@ -302,12 +302,12 @@ defmodule SymphonyElixir.ReviewGateTest do
     # Pass 1: request_changes -> section reflects the reviewer's medium tier.
     assert {:blocked, _, _} = ReviewGate.run(workspace, issue(), nil, wf, opts)
     assert_received {:pr_edit, first_body}
-    assert first_body =~ "🟠 **Medium risk**"
+    assert first_body =~ "🟠 **Focused**"
 
     # Pass 2: budget spent -> section is overwritten to high / did-not-converge.
     assert :ok = ReviewGate.run(workspace, issue(), nil, wf, opts)
     assert_received {:pr_edit, second_body}
-    assert second_body =~ "🔴 **High risk**"
+    assert second_body =~ "🔴 **Thorough**"
     assert second_body =~ "without converging"
   end
 

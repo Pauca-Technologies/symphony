@@ -4,17 +4,17 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   agent's verdict drives onto the GitHub PR body.
 
   The reviewer agent is Linear-read-only and never edits the PR itself; instead
-  it emits a `risk` tier (`:safe | :skim | :medium | :high`) and free-form
-  `human_review` markdown in its verdict JSON. `ReviewGate` hands those to this
-  module, which renders a marker-delimited section and upserts it into the PR
-  body via `gh pr edit`.
+  it emits a `review_effort` tier (`:none | :skim | :focused | :thorough` — how
+  hard a human should review the change) and free-form `human_review` markdown
+  in its verdict JSON. `ReviewGate` hands those to this module, which renders a
+  marker-delimited section and upserts it into the PR body via `gh pr edit`.
 
   Determinism lives here, not in the LLM:
 
     * the section markers (`<!-- symphony:review:start/end -->`) and heading are
       fixed, so the region is overwritten in place every run instead of
       appended/duplicated;
-    * the 🟢/🔵/🟠/🔴 risk badge is rendered from the enum, not the model;
+    * the 🟢/🔵/🟠/🔴 review-effort badge is rendered from the enum, not the model;
     * when the freshly-rendered block is byte-identical to what is already on
       the PR, no write happens (the "overwrite only if it thinks differently"
       contract).
@@ -31,13 +31,13 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   @default_heading "## 🤖 How to review this PR"
 
   @badges %{
-    safe: "🟢 **Safe** — no human review required",
-    skim: "🔵 **Skim** — broadly safe; a few highlights need a closer look",
-    medium: "🟠 **Medium risk** — review the risky changes below",
-    high: "🔴 **High risk** — focused review required; risks listed below"
+    none: "🟢 **None** — safe to merge, no human review needed",
+    skim: "🔵 **Skim** — a light skim is enough",
+    focused: "🟠 **Focused** — review the called-out areas closely",
+    thorough: "🔴 **Thorough** — deep, focused review; highest risk"
   }
 
-  @type risk :: :safe | :skim | :medium | :high
+  @type effort :: :none | :skim | :focused | :thorough
   @type pr :: %{number: pos_integer(), body: String.t()}
   # (gh args, cwd) -> {output, exit_status}; mirrors Github.ReviewerRequest.
   @type runner :: ([String.t()], Path.t() -> {String.t(), non_neg_integer()})
@@ -66,10 +66,10 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   matched, no write), or `:skipped` (no PR, or the `gh` edit failed). Never
   raises.
   """
-  @spec upsert(Path.t(), pr() | nil, risk(), String.t(), keyword()) :: :written | :unchanged | :skipped
-  def upsert(workspace, %{number: number, body: body}, risk, human_review, opts)
+  @spec upsert(Path.t(), pr() | nil, effort(), String.t(), keyword()) :: :written | :unchanged | :skipped
+  def upsert(workspace, %{number: number, body: body}, effort, human_review, opts)
       when is_binary(workspace) and is_integer(number) do
-    block = render(risk, human_review, opts)
+    block = render(effort, human_review, opts)
 
     case apply_to_body(body, block) do
       :unchanged -> :unchanged
@@ -83,10 +83,10 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   Render the marker-delimited section block: markers + heading + badge +
   the reviewer's prose. Pure; the reviewer supplies only the prose.
   """
-  @spec render(risk(), String.t(), keyword()) :: String.t()
-  def render(risk, human_review, opts \\ []) do
+  @spec render(effort(), String.t(), keyword()) :: String.t()
+  def render(effort, human_review, opts \\ []) do
     heading = Keyword.get(opts, :section_heading) || @default_heading
-    badge = Map.get(@badges, risk, @badges.medium)
+    badge = Map.get(@badges, effort, @badges.focused)
     prose = prose_or_fallback(human_review)
 
     """

@@ -5,53 +5,53 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
 
   describe "render/3" do
     test "wraps heading, badge, and prose in stable markers" do
-      block = PrReviewSection.render(:safe, "Look at `lib/foo.ex`.")
+      block = PrReviewSection.render(:none, "Look at `lib/foo.ex`.")
 
       assert block =~ "<!-- symphony:review:start -->"
       assert block =~ "<!-- symphony:review:end -->"
       assert block =~ "## 🤖 How to review this PR"
-      assert block =~ "🟢 **Safe**"
+      assert block =~ "🟢 **None**"
       assert block =~ "Look at `lib/foo.ex`."
     end
 
-    test "renders the badge from the risk enum" do
+    test "renders the badge from the review_effort enum" do
       assert PrReviewSection.render(:skim, "") =~ "🔵 **Skim**"
-      assert PrReviewSection.render(:medium, "") =~ "🟠 **Medium risk**"
-      assert PrReviewSection.render(:high, "") =~ "🔴 **High risk**"
+      assert PrReviewSection.render(:focused, "") =~ "🟠 **Focused**"
+      assert PrReviewSection.render(:thorough, "") =~ "🔴 **Thorough**"
     end
 
     test "falls back when the reviewer gave no prose" do
-      assert PrReviewSection.render(:safe, "") =~ "did not provide written guidance"
-      assert PrReviewSection.render(:safe, "   ") =~ "did not provide written guidance"
+      assert PrReviewSection.render(:none, "") =~ "did not provide written guidance"
+      assert PrReviewSection.render(:none, "   ") =~ "did not provide written guidance"
     end
 
     test "honors a custom heading" do
-      assert PrReviewSection.render(:safe, "x", section_heading: "## Reviewer notes") =~ "## Reviewer notes"
+      assert PrReviewSection.render(:none, "x", section_heading: "## Reviewer notes") =~ "## Reviewer notes"
     end
   end
 
   describe "apply_to_body/2" do
     test "appends the block when no region is present" do
-      block = PrReviewSection.render(:safe, "a")
+      block = PrReviewSection.render(:none, "a")
       assert {:changed, body} = PrReviewSection.apply_to_body("Existing body.", block)
       assert body =~ "Existing body."
       assert body =~ block
     end
 
     test "replaces an existing region in place (no duplication)" do
-      first = PrReviewSection.render(:safe, "a")
+      first = PrReviewSection.render(:none, "a")
       {:changed, body} = PrReviewSection.apply_to_body("Top.", first)
 
-      second = PrReviewSection.render(:high, "b")
+      second = PrReviewSection.render(:thorough, "b")
       {:changed, body2} = PrReviewSection.apply_to_body(body, second)
 
-      refute body2 =~ "🟢 **Safe**"
-      assert body2 =~ "🔴 **High risk**"
+      refute body2 =~ "🟢 **None**"
+      assert body2 =~ "🔴 **Thorough**"
       assert length(Regex.scan(~r/symphony:review:start/, body2)) == 1
     end
 
     test "is a no-op when the region already matches" do
-      block = PrReviewSection.render(:medium, "unchanged")
+      block = PrReviewSection.render(:focused, "unchanged")
       {:changed, body} = PrReviewSection.apply_to_body("Top.", block)
       assert :unchanged = PrReviewSection.apply_to_body(body, block)
     end
@@ -96,40 +96,40 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
       end
 
       assert :written =
-               PrReviewSection.upsert("/tmp", %{number: 7, body: "Body."}, :high, "watch out", pr_runner: runner)
+               PrReviewSection.upsert("/tmp", %{number: 7, body: "Body."}, :thorough, "watch out", pr_runner: runner)
 
       assert_received {:edited, body}
       assert body =~ "Body."
-      assert body =~ "🔴 **High risk**"
+      assert body =~ "🔴 **Thorough**"
       assert body =~ "watch out"
     end
 
     test "does not write when the section is unchanged" do
-      block = PrReviewSection.render(:safe, "hi")
+      block = PrReviewSection.render(:none, "hi")
       body = "Top.\n\n" <> block <> "\n"
       runner = fn _args, _cwd -> flunk("must not edit when unchanged") end
 
       assert :unchanged =
-               PrReviewSection.upsert("/tmp", %{number: 7, body: body}, :safe, "hi", pr_runner: runner)
+               PrReviewSection.upsert("/tmp", %{number: 7, body: body}, :none, "hi", pr_runner: runner)
     end
 
     test "skips when there is no PR" do
-      assert :skipped = PrReviewSection.upsert("/tmp", nil, :safe, "x", [])
+      assert :skipped = PrReviewSection.upsert("/tmp", nil, :none, "x", [])
     end
 
     test "skips when gh edit fails" do
       runner = fn ["pr", "edit" | _], _cwd -> {"boom", 1} end
-      assert :skipped = PrReviewSection.upsert("/tmp", %{number: 7, body: "b"}, :safe, "x", pr_runner: runner)
+      assert :skipped = PrReviewSection.upsert("/tmp", %{number: 7, body: "b"}, :none, "x", pr_runner: runner)
     end
 
     test "skips (does not raise) when the gh edit runner crashes" do
       runner = fn ["pr", "edit" | _], _cwd -> raise "gh exploded" end
-      assert :skipped = PrReviewSection.upsert("/tmp", %{number: 7, body: "b"}, :safe, "x", pr_runner: runner)
+      assert :skipped = PrReviewSection.upsert("/tmp", %{number: 7, body: "b"}, :none, "x", pr_runner: runner)
     end
 
     test "swallows and truncates non-binary gh output" do
       runner = fn ["pr", "edit" | _], _cwd -> {~c"charlist output", 1} end
-      assert :skipped = PrReviewSection.upsert("/tmp", %{number: 7, body: "b"}, :safe, "x", pr_runner: runner)
+      assert :skipped = PrReviewSection.upsert("/tmp", %{number: 7, body: "b"}, :none, "x", pr_runner: runner)
     end
   end
 
@@ -152,7 +152,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
 
       # No :pr_runner opt -> exercises the default System.cmd-based runner.
       assert {:ok, %{number: 1, body: "b"} = pr} = PrReviewSection.resolve_pr(shim_dir)
-      assert :written = PrReviewSection.upsert(shim_dir, pr, :safe, "x", [])
+      assert :written = PrReviewSection.upsert(shim_dir, pr, :none, "x", [])
     end
   end
 

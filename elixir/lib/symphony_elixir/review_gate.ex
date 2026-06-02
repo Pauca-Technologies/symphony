@@ -33,14 +33,15 @@ defmodule SymphonyElixir.ReviewGate do
 
   ## Human-review PR section
 
-  Beyond the gate verdict, the reviewer also classifies the change's regression
-  risk (`risk: "safe" | "skim" | "medium" | "high"` in the verdict JSON) and
-  writes `human_review` markdown. `Github.PrReviewSection` upserts that, as a
-  deterministic marker-delimited section with an enum-rendered risk badge, onto
-  the GitHub PR body — overwriting it in place on every pass. `risk` is
-  orthogonal to the verdict: a high-risk change can still `approve`. On budget
-  exhaustion the section is refreshed to "did not converge → elevated risk" so
-  the riskiest case never ships stale guidance.
+  Beyond the gate verdict, the reviewer also sets a `review_effort` tier
+  (`review_effort: "none" | "skim" | "focused" | "thorough"` in the verdict
+  JSON — how hard a human should review the change) and writes `human_review`
+  markdown. `Github.PrReviewSection` upserts that, as a deterministic
+  marker-delimited section with an enum-rendered badge, onto the GitHub PR body
+  — overwriting it in place on every pass. `review_effort` is orthogonal to the
+  verdict: a change needing a `thorough` review can still `approve`. On budget
+  exhaustion the section is refreshed to `thorough` / "did not converge ->
+  elevated risk" so the riskiest case never ships stale guidance.
 
   ## Configuration (the consumer repo's `WORKFLOW_REVIEW.md` front matter)
 
@@ -76,11 +77,11 @@ defmodule SymphonyElixir.ReviewGate do
   @budget_marker "<!-- symphony:review-budget-exhausted -->"
   @skip_marker "<!-- symphony:review-skipped -->"
 
-  @type risk :: :safe | :skim | :medium | :high
+  @type review_effort :: :none | :skim | :focused | :thorough
   @type verdict :: %{
           verdict: :approve | :request_changes,
           summary: String.t(),
-          risk: risk(),
+          review_effort: review_effort(),
           human_review: String.t(),
           comments: [map()]
         }
@@ -124,9 +125,9 @@ defmodule SymphonyElixir.ReviewGate do
           # Budget spent: allow the handoff, but refresh the human-facing
           # section to "did not converge -> elevated risk" so the riskiest case
           # is never described by stale request-changes prose.
-          maybe_write_section(workspace, pr, :high, budget_human_review(iteration), settings, opts)
+          maybe_write_section(workspace, pr, :thorough, budget_human_review(iteration), settings, opts)
           note_budget_exhausted(issue, iteration, opts)
-          emit_telemetry(issue, iteration, :budget_exhausted, 0, :high)
+          emit_telemetry(issue, iteration, :budget_exhausted, 0, :thorough)
           :ok
         else
           run_iteration(workspace, issue, worker_host, review_workflow, settings, iteration, pr, opts)
@@ -169,21 +170,21 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   # On both verdicts we refresh the PR's human-review section from the reviewer's
-  # risk tier + prose (risk is orthogonal to the verdict — a high-risk PR can
-  # still approve). Keeping it fresh through the request_changes loop means the
-  # final pass's assessment wins.
+  # review_effort tier + prose (effort is orthogonal to the verdict — a change
+  # needing a thorough review can still approve). Keeping it fresh through the
+  # request_changes loop means the final pass's assessment wins.
   defp evaluate_verdict(workspace, verdict_path, %Issue{} = issue, settings, iteration, pr, opts) do
     case read_verdict(verdict_path) do
       {:ok, %{verdict: :approve} = verdict} ->
-        maybe_write_section(workspace, pr, verdict.risk, verdict.human_review, settings, opts)
-        emit_telemetry(issue, iteration, :approve, length(verdict.comments), verdict.risk)
+        maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
+        emit_telemetry(issue, iteration, :approve, length(verdict.comments), verdict.review_effort)
         :ok
 
       {:ok, %{verdict: :request_changes} = verdict} ->
         next_iteration = iteration + 1
         put_iteration(issue.id, next_iteration)
-        maybe_write_section(workspace, pr, verdict.risk, verdict.human_review, settings, opts)
-        emit_telemetry(issue, iteration, :request_changes, length(verdict.comments), verdict.risk)
+        maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
+        emit_telemetry(issue, iteration, :request_changes, length(verdict.comments), verdict.review_effort)
         {:blocked, remediation_prompt(verdict, next_iteration, settings.max_iterations), verdict.comments}
 
       {:error, reason} ->
@@ -193,13 +194,13 @@ defmodule SymphonyElixir.ReviewGate do
 
   # --- PR human-review section ---------------------------------------------
 
-  defp maybe_write_section(_workspace, nil, _risk, _human_review, _settings, _opts), do: :ok
+  defp maybe_write_section(_workspace, nil, _effort, _human_review, _settings, _opts), do: :ok
 
-  defp maybe_write_section(workspace, pr, risk, human_review, settings, opts) do
+  defp maybe_write_section(workspace, pr, effort, human_review, settings, opts) do
     if settings.pr_section_enabled do
       write_opts = Keyword.put(opts, :section_heading, settings.section_heading)
-      outcome = PrReviewSection.upsert(workspace, pr, risk, human_review, write_opts)
-      Logger.info("review.gate pr-section pr=##{pr.number} risk=#{risk} outcome=#{outcome}")
+      outcome = PrReviewSection.upsert(workspace, pr, effort, human_review, write_opts)
+      Logger.info("review.gate pr-section pr=##{pr.number} review_effort=#{effort} outcome=#{outcome}")
       outcome
     else
       :ok
@@ -291,7 +292,7 @@ defmodule SymphonyElixir.ReviewGate do
          %{
            verdict: verdict_atom,
            summary: string_or_default(Map.get(decoded, "summary"), ""),
-           risk: normalize_risk(Map.get(decoded, "risk")),
+           review_effort: normalize_effort(Map.get(decoded, "review_effort") || Map.get(decoded, "risk")),
            human_review: string_or_default(Map.get(decoded, "human_review"), ""),
            comments: normalize_comments(Map.get(decoded, "comments"))
          }}
@@ -303,24 +304,25 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp normalize_verdict(_decoded), do: {:error, :verdict_not_a_map}
 
-  # `risk` is human-facing and never blocks: absent -> :medium silently; present
-  # but unknown -> :medium with a log. Never downgrade to :safe by accident.
-  defp normalize_risk(value) when is_binary(value) do
+  # `review_effort` is human-facing and never blocks: absent -> :focused
+  # silently; present but unknown -> :focused with a log. Never downgrade to
+  # :none by accident. Legacy "safe/medium/high" values are still accepted.
+  defp normalize_effort(value) when is_binary(value) do
     case value |> String.trim() |> String.downcase() do
-      v when v in ["safe", "none", "no_review", "no-review"] -> :safe
+      v when v in ["none", "safe", "no_review", "no-review"] -> :none
       v when v in ["skim", "light"] -> :skim
-      v when v in ["medium", "moderate"] -> :medium
-      v when v in ["high", "risky", "danger", "dangerous"] -> :high
-      other -> log_unknown_risk(other)
+      v when v in ["focused", "medium", "moderate", "careful"] -> :focused
+      v when v in ["thorough", "high", "deep", "risky", "danger", "dangerous"] -> :thorough
+      other -> log_unknown_effort(other)
     end
   end
 
-  defp normalize_risk(nil), do: :medium
-  defp normalize_risk(other), do: log_unknown_risk(other)
+  defp normalize_effort(nil), do: :focused
+  defp normalize_effort(other), do: log_unknown_effort(other)
 
-  defp log_unknown_risk(value) do
-    Logger.warning("review.gate unknown risk tier #{inspect(value)}; defaulting to :medium")
-    :medium
+  defp log_unknown_effort(value) do
+    Logger.warning("review.gate unknown review_effort tier #{inspect(value)}; defaulting to :focused")
+    :focused
   end
 
   defp normalize_verdict_value(value) when is_binary(value) do
@@ -488,7 +490,7 @@ defmodule SymphonyElixir.ReviewGate do
 
   # --- telemetry -----------------------------------------------------------
 
-  defp emit_telemetry(%Issue{} = issue, iteration, outcome, comment_count, risk) do
+  defp emit_telemetry(%Issue{} = issue, iteration, outcome, comment_count, review_effort) do
     :telemetry.execute(
       @telemetry_event,
       %{count: 1, iteration: iteration, comments: comment_count},
@@ -499,11 +501,11 @@ defmodule SymphonyElixir.ReviewGate do
         from_state: issue.state,
         iteration: iteration,
         outcome: outcome,
-        risk: risk
+        review_effort: review_effort
       }
     )
 
-    Logger.info("gate.review #{issue_context(issue)} iteration=#{iteration} outcome=#{outcome} comments=#{comment_count} risk=#{inspect(risk)}")
+    Logger.info("gate.review #{issue_context(issue)} iteration=#{iteration} outcome=#{outcome} comments=#{comment_count} review_effort=#{inspect(review_effort)}")
   end
 
   # --- small helpers -------------------------------------------------------
