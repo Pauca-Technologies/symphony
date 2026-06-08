@@ -407,6 +407,115 @@ pre,
   font-size: 0.9rem;
 }
 
+.transcript-stack {
+  display: grid;
+  gap: 0.95rem;
+  margin-top: 1rem;
+}
+
+.transcript-stack article {
+  min-width: 0;
+  padding: 0.9rem 0 0;
+  border-top: 1px solid var(--line);
+}
+
+.transcript-stack article:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.transcript-markdown {
+  margin-top: 0.45rem;
+  color: #2f3237;
+  font-size: 0.95rem;
+  line-height: 1.62;
+  overflow-wrap: anywhere;
+}
+
+.transcript-markdown > :first-child {
+  margin-top: 0;
+}
+
+.transcript-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.transcript-markdown h1,
+.transcript-markdown h2,
+.transcript-markdown h3,
+.transcript-markdown h4 {
+  margin: 0.95rem 0 0.35rem;
+  color: var(--ink);
+  font-size: 1rem;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.transcript-markdown p,
+.transcript-markdown ul,
+.transcript-markdown ol,
+.transcript-markdown blockquote,
+.transcript-markdown pre {
+  margin: 0.65rem 0;
+}
+
+.transcript-markdown ul,
+.transcript-markdown ol {
+  padding-left: 1.35rem;
+}
+
+.transcript-markdown li + li {
+  margin-top: 0.22rem;
+}
+
+.transcript-markdown a {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.transcript-markdown blockquote {
+  padding-left: 0.85rem;
+  border-left: 3px solid var(--line-strong);
+  color: var(--muted);
+}
+
+.transcript-markdown code {
+  padding: 0.1rem 0.28rem;
+  border-radius: 6px;
+  background: #ededf3;
+  color: #24262b;
+  font-size: 0.88em;
+}
+
+.transcript-markdown pre {
+  overflow-x: auto;
+  padding: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #202123;
+  color: #f5f5f7;
+  white-space: pre;
+}
+
+.transcript-markdown pre code {
+  display: block;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+
+.transcript-code {
+  margin-top: 0.45rem;
+  border-radius: 10px;
+}
+
+.transcript-code code {
+  display: block;
+}
+
 .empty-state {
   margin: 1rem 0 0;
   color: var(--muted);

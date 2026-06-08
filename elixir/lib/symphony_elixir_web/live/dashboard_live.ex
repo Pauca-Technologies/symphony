@@ -194,7 +194,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <% end %>
               </p>
             <% else %>
-              <div class="detail-stack">
+              <div class="transcript-stack">
                 <article :for={block <- transcript_blocks(@issue_payload.transcript)}>
                   <div class="muted event-meta">
                     <strong><%= transcript_kind_label(block.kind) %></strong>
@@ -202,7 +202,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       · <span class="mono numeric"><%= block.at %></span>
                     <% end %>
                   </div>
-                  <pre class="code-panel" style="white-space: pre-wrap; margin-top: 0.4rem;"><%= block.text %></pre>
+                  <%= if markdown_transcript_kind?(block.kind) do %>
+                    <div class="transcript-markdown"><%= Phoenix.HTML.raw(markdown_to_html(block.text)) %></div>
+                  <% else %>
+                    <pre class="code-panel transcript-code"><code><%= block.text %></code></pre>
+                  <% end %>
                 </article>
               </div>
             <% end %>
@@ -551,6 +555,208 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp transcript_kind_label("command"), do: "Command"
   defp transcript_kind_label("output"), do: "Output"
   defp transcript_kind_label(_kind), do: "Event"
+
+  defp markdown_transcript_kind?(kind), do: kind in ["agent", "user"]
+
+  defp markdown_to_html(text) when is_binary(text) do
+    text
+    |> normalize_markdown_text()
+    |> String.split("\n", trim: false)
+    |> markdown_blocks_to_html([])
+    |> Enum.reverse()
+    |> Enum.join("\n")
+  end
+
+  defp markdown_to_html(_text), do: ""
+
+  defp markdown_blocks_to_html([], acc), do: acc
+
+  defp markdown_blocks_to_html([line | rest], acc) do
+    cond do
+      String.trim(line) == "" ->
+        markdown_blocks_to_html(rest, acc)
+
+      fence_line?(line) ->
+        {language, code_lines, remaining} = collect_fenced_code(rest, fence_language(line), [])
+        markdown_blocks_to_html(remaining, [render_fenced_code(language, code_lines) | acc])
+
+      heading_line?(line) ->
+        markdown_blocks_to_html(rest, [render_heading(line) | acc])
+
+      unordered_list_line?(line) ->
+        {items, remaining} = collect_list(rest, [list_item_text(line, :unordered)], :unordered)
+        markdown_blocks_to_html(remaining, [render_list(:unordered, items) | acc])
+
+      ordered_list_line?(line) ->
+        {items, remaining} = collect_list(rest, [list_item_text(line, :ordered)], :ordered)
+        markdown_blocks_to_html(remaining, [render_list(:ordered, items) | acc])
+
+      blockquote_line?(line) ->
+        {lines, remaining} = collect_blockquote(rest, [blockquote_text(line)])
+        markdown_blocks_to_html(remaining, [render_blockquote(lines) | acc])
+
+      true ->
+        {lines, remaining} = collect_paragraph(rest, [line])
+        markdown_blocks_to_html(remaining, [render_paragraph(lines) | acc])
+    end
+  end
+
+  defp collect_fenced_code([], language, acc), do: {language, Enum.reverse(acc), []}
+
+  defp collect_fenced_code([line | rest], language, acc) do
+    if fence_line?(line) do
+      {language, Enum.reverse(acc), rest}
+    else
+      collect_fenced_code(rest, language, [line | acc])
+    end
+  end
+
+  defp collect_list([], acc, _kind), do: {Enum.reverse(acc), []}
+
+  defp collect_list([line | rest], acc, :unordered) do
+    cond do
+      unordered_list_line?(line) -> collect_list(rest, [list_item_text(line, :unordered) | acc], :unordered)
+      String.trim(line) == "" -> {Enum.reverse(acc), rest}
+      true -> {Enum.reverse(acc), [line | rest]}
+    end
+  end
+
+  defp collect_list([line | rest], acc, :ordered) do
+    cond do
+      ordered_list_line?(line) -> collect_list(rest, [list_item_text(line, :ordered) | acc], :ordered)
+      String.trim(line) == "" -> {Enum.reverse(acc), rest}
+      true -> {Enum.reverse(acc), [line | rest]}
+    end
+  end
+
+  defp collect_blockquote([], acc), do: {Enum.reverse(acc), []}
+
+  defp collect_blockquote([line | rest], acc) do
+    cond do
+      blockquote_line?(line) -> collect_blockquote(rest, [blockquote_text(line) | acc])
+      String.trim(line) == "" -> {Enum.reverse(acc), rest}
+      true -> {Enum.reverse(acc), [line | rest]}
+    end
+  end
+
+  defp collect_paragraph([], acc), do: {Enum.reverse(acc), []}
+
+  defp collect_paragraph([line | rest], acc) do
+    cond do
+      String.trim(line) == "" ->
+        {Enum.reverse(acc), rest}
+
+      markdown_block_start?(line) ->
+        {Enum.reverse(acc), [line | rest]}
+
+      true ->
+        collect_paragraph(rest, [line | acc])
+    end
+  end
+
+  defp markdown_block_start?(line) do
+    fence_line?(line) or heading_line?(line) or unordered_list_line?(line) or ordered_list_line?(line) or
+      blockquote_line?(line)
+  end
+
+  defp render_fenced_code(language, lines) do
+    class =
+      case language do
+        "" -> ""
+        language -> " class=\"language-#{escape_attr(language)}\""
+      end
+
+    "<pre><code#{class}>#{escape_html(Enum.join(lines, "\n"))}</code></pre>"
+  end
+
+  defp render_heading(line) do
+    [markers, text] = Regex.run(~r/^\s{0,3}([#]{1,6})\s+(.+?)\s*#*\s*$/, line, capture: :all_but_first)
+    level = markers |> String.length() |> min(4)
+    "<h#{level}>#{inline_markdown_to_html(text)}</h#{level}>"
+  end
+
+  defp render_list(:unordered, items) do
+    "<ul>#{Enum.map_join(items, "", &"<li>#{inline_markdown_to_html(&1)}</li>")}</ul>"
+  end
+
+  defp render_list(:ordered, items) do
+    "<ol>#{Enum.map_join(items, "", &"<li>#{inline_markdown_to_html(&1)}</li>")}</ol>"
+  end
+
+  defp render_blockquote(lines) do
+    "<blockquote>#{render_paragraph(lines)}</blockquote>"
+  end
+
+  defp render_paragraph(lines) do
+    "<p>#{lines |> Enum.map_join("\n", &String.trim/1) |> inline_markdown_to_html()}</p>"
+  end
+
+  defp inline_markdown_to_html(text) do
+    text
+    |> String.split("`")
+    |> Enum.with_index()
+    |> Enum.map_join(fn {segment, index} ->
+      if rem(index, 2) == 1 do
+        "<code>#{escape_html(segment)}</code>"
+      else
+        segment
+        |> escape_html()
+        |> render_inline_links()
+        |> render_inline_strong()
+        |> String.replace("\n", "<br>")
+      end
+    end)
+  end
+
+  defp render_inline_links(text) do
+    Regex.replace(~r/\[([^\]\n]+)\]\(([^)\s]+)\)/, text, fn _match, label, href ->
+      if safe_href?(href) do
+        "<a href=\"#{escape_attr(href)}\" rel=\"noreferrer\">#{label}</a>"
+      else
+        label
+      end
+    end)
+  end
+
+  defp render_inline_strong(text) do
+    Regex.replace(~r/\*\*([^*\n]+)\*\*/, text, "<strong>\\1</strong>")
+  end
+
+  defp fence_line?(line), do: String.match?(line, ~r/^\s*```/)
+  defp fence_language(line), do: line |> String.replace(~r/^\s*```\s*/, "") |> String.trim() |> sanitize_language()
+  defp heading_line?(line), do: String.match?(line, ~r/^\s{0,3}[#]{1,6}\s+\S/)
+  defp unordered_list_line?(line), do: String.match?(line, ~r/^\s{0,3}[-*+]\s+\S/)
+  defp ordered_list_line?(line), do: String.match?(line, ~r/^\s{0,3}\d+[.)]\s+\S/)
+  defp blockquote_line?(line), do: String.match?(line, ~r/^\s{0,3}>\s?/)
+
+  defp list_item_text(line, :unordered), do: String.replace(line, ~r/^\s{0,3}[-*+]\s+/, "")
+  defp list_item_text(line, :ordered), do: String.replace(line, ~r/^\s{0,3}\d+[.)]\s+/, "")
+  defp blockquote_text(line), do: String.replace(line, ~r/^\s{0,3}>\s?/, "")
+
+  defp safe_href?(href) do
+    String.starts_with?(href, ["http://", "https://", "mailto:", "/", "#"])
+  end
+
+  defp sanitize_language(language) do
+    language
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9_+-]/, "")
+  end
+
+  defp normalize_markdown_text(text) do
+    text
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
+    |> String.trim()
+  end
+
+  defp escape_html(value) when is_binary(value) do
+    value
+    |> Phoenix.HTML.html_escape()
+    |> Phoenix.HTML.safe_to_string()
+  end
+
+  defp escape_attr(value) when is_binary(value), do: escape_html(value)
 
   defp issue_path(issue_identifier) when is_binary(issue_identifier), do: "/issues/#{issue_identifier}"
 

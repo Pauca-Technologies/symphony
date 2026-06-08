@@ -594,7 +594,12 @@ defmodule SymphonyElixir.ExtensionsTest do
           "event" => "notification",
           "payload" => %{
             "method" => "codex/event/agent_message_content_delta",
-            "params" => %{"msg" => %{"content" => " and updating the fix."}}
+            "params" => %{
+              "msg" => %{
+                "content" =>
+                  " and updating the fix.\n\n```elixir\nassert {:ok, view} = live(conn, \"/\")\n```\n\n- renders `code`\n- links [docs](https://example.com/docs)\n\n<script>alert(1)</script>"
+              }
+            }
           }
         },
         %{
@@ -701,10 +706,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, issue_view, issue_html} = live(build_conn(), "/issues/MT-HTTP")
     assert issue_html =~ "Codex Transcript"
     assert issue_html =~ "Investigating the failure and updating the fix."
+    assert issue_html =~ "<pre><code class=\"language-elixir\">assert {:ok, view} = live(conn, &quot;/&quot;)</code></pre>"
+    assert issue_html =~ "<li>renders <code>code</code></li>"
+    assert issue_html =~ "<a href=\"https://example.com/docs\" rel=\"noreferrer\">docs</a>"
+    assert issue_html =~ "&lt;script&gt;alert(1)&lt;/script&gt;"
     assert issue_html =~ "$ mix test --cover"
     assert issue_html =~ "Compiling 3 files"
     refute issue_html =~ "OLD-BEGINNING"
     refute issue_html =~ "agent message content streaming: structured update"
+    refute issue_html =~ "<script>alert(1)</script>"
 
     updated_issue_snapshot =
       put_in(updated_snapshot.running, [
