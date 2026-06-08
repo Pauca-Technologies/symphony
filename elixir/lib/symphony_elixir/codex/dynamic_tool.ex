@@ -129,10 +129,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     handoff_opts =
       if is_binary(before_handoff_cmd), do: [hook_command: before_handoff_cmd], else: []
 
-    with %{id: context_issue_id} <- issue,
+    with %{id: context_issue_id} when is_binary(context_issue_id) <- issue,
          workspace when is_binary(workspace) <- workspace,
          issue_id when is_binary(issue_id) <- transition_issue_id(query, variables),
-         true <- issue_id == context_issue_id,
+         true <- transition_matches_context_issue?(issue, issue_id),
          {:ok, current_state, target_state} <-
            resolve_transition_states(query, variables, issue, issue_id, linear_client),
          true <- HandoffGate.handoff_transition?(current_state, target_state) do
@@ -143,6 +143,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     else
       _ -> :ok
     end
+  end
+
+  defp transition_matches_context_issue?(issue, issue_id) when is_binary(issue_id) do
+    issue_id in [
+      Map.get(issue, :id) || Map.get(issue, "id"),
+      Map.get(issue, :identifier) || Map.get(issue, "identifier")
+    ]
   end
 
   # After the deterministic before_handoff shell hook passes, run the full

@@ -162,6 +162,68 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert [%{name: "landable-check", passed: false}] = gates
   end
 
+  test "linear_graphql runs handoff gates when issueUpdate uses the issue identifier" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-identifier-handoff-tool-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.dirname(workspace),
+      hook_before_handoff: """
+      printf '%s' '{"checks":[{"name":"review-required","status":"failed","detail":"review gate should run"}]}'
+      exit 2
+      """
+    )
+
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    issue = %Issue{
+      id: "ecd8bdb3-fa08-4a5f-b4b9-3026ab8be294",
+      identifier: "UDPE-6085",
+      title: "Identifier handoff",
+      state: "In Progress"
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation UpdateIssueState($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }",
+          "variables" => %{"id" => "UDPE-6085", "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{issue: issue, workspace: workspace, worker_host: nil},
+        linear_client: fn
+          query, %{"issueId" => "UDPE-6085"}, [] ->
+            assert query =~ "SymphonyResolveIssueTransition"
+
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                   }
+                 }
+               }
+             }}
+
+          _query, _variables, [] ->
+            flunk("blocked identifier handoff mutation should not be sent to Linear")
+        end
+      )
+
+    assert response["success"] == false
+
+    output = Jason.decode!(response["output"])
+    assert get_in(output, ["error", "message"]) =~ "before_handoff hook blocked"
+    assert get_in(output, ["error", "remediation"]) =~ "review-required: review gate should run"
+  end
+
   test "linear_graphql runs the reviewer gate after before_handoff and blocks on request_changes" do
     workspace =
       Path.join(
