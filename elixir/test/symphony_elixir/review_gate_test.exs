@@ -150,7 +150,9 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_attempt, 1, first_prompt}
     assert first_prompt =~ "Review UDPE-1"
     assert first_prompt =~ "Symphony automated-review runtime guard"
-    assert first_prompt =~ "Do not spawn sub-agents"
+    assert first_prompt =~ "you may"
+    assert first_prompt =~ "sub-agents"
+    refute first_prompt =~ "Do not spawn sub-agents"
     assert_received {:review_attempt, 2, retry_prompt}
     assert retry_prompt =~ "Symphony retry guard"
     assert retry_prompt =~ "review_session_failed"
@@ -259,7 +261,9 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_attempt, 1, first_prompt}
     assert first_prompt =~ "Review UDPE-1"
     assert first_prompt =~ "Symphony automated-review runtime guard"
-    assert first_prompt =~ "Do not spawn sub-agents"
+    assert first_prompt =~ "you may"
+    assert first_prompt =~ "sub-agents"
+    refute first_prompt =~ "Do not spawn sub-agents"
     assert first_prompt =~ "Do not run package-manager validation commands"
     assert first_prompt =~ "Symphony review tool-output guard"
     assert first_prompt =~ "Symphony verdict reliability guard"

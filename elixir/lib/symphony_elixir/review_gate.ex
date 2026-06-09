@@ -346,10 +346,11 @@ defmodule SymphonyElixir.ReviewGate do
 
     ## Symphony automated-review runtime guard
 
-    This review is running inside an unattended Symphony gate. Complete the review directly in this
-    Codex turn. Do not spawn sub-agents, delegate lenses to other agents, or use multi-agent tools,
-    even if the repository review workflow asks for that pattern. Cover the required lenses yourself
-    with concise file/diff inspection.
+    This review is running inside an unattended Symphony gate. Complete the review within this
+    Codex turn. If the repository review workflow asks for sub-agents or delegated lenses, you may
+    use those tools when they are available and expected to complete promptly. You remain
+    responsible for reconciling their findings and writing the final verdict file before your final
+    message.
 
     Do not run package-manager validation commands such as `pnpm test`, `pnpm lint`, `pnpm
     typecheck`, or app/browser checks during this automated gate unless the command is essential to
@@ -422,10 +423,11 @@ defmodule SymphonyElixir.ReviewGate do
     mkdir -p #{Path.dirname(verdict_path)}
     ```
 
-    Complete a concise direct review under the original instructions above, then write valid JSON
-    to `#{verdict_path}` before your final message. Do not spawn sub-agents on this retry, and do
-    not start long-running checks unless they are essential to decide the verdict. If remaining
-    uncertainty meets the severity bar, use `"request_changes"` rather than ending without a verdict.
+    Complete a concise review under the original instructions above, then write valid JSON
+    to `#{verdict_path}` before your final message. You may use workflow-authorized sub-agents if
+    they are available and expected to finish within this retry, but do not start long-running
+    checks unless they are essential to decide the verdict. If remaining uncertainty meets the
+    severity bar, use `"request_changes"` rather than ending without a verdict.
     """
   end
 
