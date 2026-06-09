@@ -354,7 +354,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            "method" => "thread/tokenUsage/updated",
            "params" => %{
              "tokenUsage" => %{
-               "total" => %{"inputTokens" => 12, "outputTokens" => 4, "totalTokens" => 16}
+               "total" => %{"inputTokens" => 12, "outputTokens" => 4, "totalTokens" => 16},
+               "last" => %{"inputTokens" => 9, "outputTokens" => 4, "totalTokens" => 13},
+               "model_context_window" => 1_000_000
              }
            }
          },
@@ -369,6 +371,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_input_tokens == 12
     assert snapshot_entry.codex_output_tokens == 4
     assert snapshot_entry.codex_total_tokens == 16
+    assert snapshot_entry.codex_context_tokens == 9
+    assert snapshot_entry.codex_context_window == 1_000_000
     assert snapshot_entry.turn_count == 1
     assert is_integer(snapshot_entry.runtime_seconds)
 
@@ -379,6 +383,92 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert completed_state.codex_totals.output_tokens == 4
     assert completed_state.codex_totals.total_tokens == 16
     assert is_integer(completed_state.codex_totals.seconds_running)
+  end
+
+  test "orchestrator context occupancy tracks the main thread and ignores subagents" do
+    issue_id = "issue-context-occupancy"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-211",
+      title: "Context occupancy test",
+      description: "Track main-thread context fill",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-211"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ContextOccupancyOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    main_thread = "11111111-1111-1111-1111-111111111111"
+    subagent_thread = "99999999-9999-9999-9999-999999999999"
+    session_id = main_thread <> "-22222222-2222-2222-2222-222222222222"
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: session_id,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_context_tokens: 0,
+      codex_context_window: nil,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    token_usage_update = fn thread_id, input, window ->
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{
+             "thread_id" => thread_id,
+             "tokenUsage" => %{
+               "total" => %{"inputTokens" => input, "outputTokens" => 4, "totalTokens" => input + 4},
+               "last" => %{"inputTokens" => input, "outputTokens" => 4, "totalTokens" => input + 4},
+               "model_context_window" => window
+             }
+           }
+         },
+         timestamp: now
+       }}
+    end
+
+    send(pid, token_usage_update.(main_thread, 100, 500_000))
+    send(pid, token_usage_update.(subagent_thread, 999_999, 200_000))
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_context_tokens == 100
+    assert snapshot_entry.codex_context_window == 500_000
   end
 
   test "orchestrator snapshot tracks turn completed usage when present" do

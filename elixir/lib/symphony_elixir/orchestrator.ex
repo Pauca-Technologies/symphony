@@ -914,6 +914,8 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            codex_context_tokens: 0,
+            codex_context_window: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -1356,6 +1358,8 @@ defmodule SymphonyElixir.Orchestrator do
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
+          codex_context_tokens: Map.get(metadata, :codex_context_tokens, 0),
+          codex_context_window: Map.get(metadata, :codex_context_window),
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -1427,6 +1431,9 @@ defmodule SymphonyElixir.Orchestrator do
     turn_count = Map.get(running_entry, :turn_count, 0)
     resolved_session_id = session_id_for_update(running_entry.session_id, update)
     parent_thread_id = parent_thread_from_session_id(resolved_session_id)
+    {context_tokens, context_window} = extract_main_context(update, parent_thread_id)
+    prev_context_tokens = Map.get(running_entry, :codex_context_tokens, 0)
+    prev_context_window = Map.get(running_entry, :codex_context_window)
 
     {
       Map.merge(running_entry, %{
@@ -1447,6 +1454,8 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_context_tokens: positive_or_keep(context_tokens, prev_context_tokens),
+        codex_context_window: positive_or_keep(context_window, prev_context_window),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -2138,6 +2147,102 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp turn_completed_usage_from_payload(_payload), do: nil
+
+  # Current context occupancy of the *main* agent thread: the input (prompt) size
+  # of the most recent request, divided later against the model context window.
+  # Unlike the accumulated token totals (cumulative thread spend), this is a
+  # momentary reading — it tracks up as context grows and down after compaction.
+  # `last_token_usage`/`tokenUsage.last` is the only non-cumulative signal Codex
+  # gives us; subagent threads are excluded so the gauge reflects the main agent.
+  defp extract_main_context(update, parent_thread_id) do
+    payload = update[:payload] || Map.get(update, "payload") || Map.get(update, :payload)
+
+    if main_thread_update?(payload, parent_thread_id) do
+      {extract_context_tokens(update), extract_context_window(update)}
+    else
+      {nil, nil}
+    end
+  end
+
+  defp main_thread_update?(payload, parent_thread_id) when is_map(payload),
+    do: not subagent_thread?(event_thread_id(payload), parent_thread_id)
+
+  defp main_thread_update?(_payload, _parent_thread_id), do: false
+
+  defp extract_context_tokens(update) do
+    case find_map_at_paths(context_payload_roots(update), last_usage_paths()) do
+      last when is_map(last) -> get_token_usage(last, :input)
+      _ -> nil
+    end
+  end
+
+  defp extract_context_window(update) do
+    roots = context_payload_roots(update)
+
+    Enum.find_value(roots, fn root ->
+      Enum.find_value(context_window_paths(), fn path -> integer_like(map_at_path(root, path)) end)
+    end)
+  end
+
+  defp context_payload_roots(update) do
+    [
+      update[:payload],
+      Map.get(update, "payload"),
+      Map.get(update, :payload),
+      update[:usage],
+      Map.get(update, "usage"),
+      update
+    ]
+    |> Enum.filter(&is_map/1)
+  end
+
+  defp find_map_at_paths(roots, paths) do
+    Enum.find_value(roots, fn root ->
+      Enum.find_value(paths, fn path ->
+        case map_at_path(root, path) do
+          value when is_map(value) -> value
+          _ -> nil
+        end
+      end)
+    end)
+  end
+
+  defp last_usage_paths do
+    [
+      ["params", "msg", "payload", "info", "last_token_usage"],
+      [:params, :msg, :payload, :info, :last_token_usage],
+      ["params", "msg", "info", "last_token_usage"],
+      [:params, :msg, :info, :last_token_usage],
+      ["params", "tokenUsage", "last"],
+      [:params, :tokenUsage, :last],
+      ["tokenUsage", "last"],
+      [:tokenUsage, :last]
+    ]
+  end
+
+  defp context_window_paths do
+    [
+      ["params", "msg", "payload", "info", "model_context_window"],
+      [:params, :msg, :payload, :info, :model_context_window],
+      ["params", "msg", "info", "model_context_window"],
+      [:params, :msg, :info, :model_context_window],
+      ["params", "tokenUsage", "model_context_window"],
+      [:params, :tokenUsage, :model_context_window],
+      ["params", "tokenUsage", "modelContextWindow"],
+      [:params, :tokenUsage, :modelContextWindow],
+      ["tokenUsage", "model_context_window"],
+      [:tokenUsage, :model_context_window],
+      ["tokenUsage", "modelContextWindow"],
+      [:tokenUsage, :modelContextWindow],
+      ["model_context_window"],
+      [:model_context_window],
+      ["modelContextWindow"],
+      [:modelContextWindow]
+    ]
+  end
+
+  defp positive_or_keep(value, _fallback) when is_integer(value) and value > 0, do: value
+  defp positive_or_keep(_value, fallback), do: fallback
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
     direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)

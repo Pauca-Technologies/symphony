@@ -157,6 +157,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <%= issue_token_detail(@issue_payload) %>
               </p>
             </article>
+
+            <article class="metric-card">
+              <p class="metric-label">Context filled</p>
+              <p class="metric-value numeric"><%= issue_context_fill(@issue_payload) %></p>
+              <p class="metric-detail numeric">
+                <%= issue_context_detail(@issue_payload) %>
+              </p>
+            </article>
           </section>
 
           <section class="section-card">
@@ -424,6 +432,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <div class="token-stack numeric">
                           <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                           <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                          <span class="muted" title={context_fill_title(entry.context)}>Ctx <%= context_fill_label(entry.context) %></span>
                         </div>
                       </td>
                     </tr>
@@ -557,6 +566,26 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp issue_token_detail(_issue_payload), do: "n/a"
+
+  defp issue_context_fill(%{running: %{context: context}}), do: context_fill_label(context)
+  defp issue_context_fill(_issue_payload), do: "n/a"
+
+  defp issue_context_detail(%{running: %{context: context}}), do: context_fill_title(context)
+  defp issue_context_detail(_issue_payload), do: "n/a"
+
+  # Main-agent context window occupancy (current prompt tokens / model window).
+  defp context_fill_label(%{fill_ratio: ratio}) when is_float(ratio) do
+    "#{Float.round(ratio * 100, 1)}%"
+  end
+
+  defp context_fill_label(_context), do: "n/a"
+
+  defp context_fill_title(%{tokens: tokens, window: window})
+       when is_integer(tokens) and is_integer(window) and window > 0 do
+    "#{format_int(tokens)} / #{format_int(window)} tokens"
+  end
+
+  defp context_fill_title(_context), do: "n/a"
 
   defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"

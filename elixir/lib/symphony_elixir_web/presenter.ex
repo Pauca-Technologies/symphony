@@ -122,7 +122,8 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
-      }
+      },
+      context: context_payload(entry)
     }
   end
 
@@ -155,9 +156,28 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
-      }
+      },
+      context: context_payload(running)
     }
   end
+
+  defp context_payload(entry) do
+    tokens = Map.get(entry, :codex_context_tokens, 0)
+    window = Map.get(entry, :codex_context_window)
+
+    %{
+      tokens: tokens,
+      window: window,
+      fill_ratio: context_fill_ratio(tokens, window)
+    }
+  end
+
+  defp context_fill_ratio(tokens, window)
+       when is_integer(tokens) and is_integer(window) and window > 0 do
+    Float.round(min(tokens / window, 1.0), 4)
+  end
+
+  defp context_fill_ratio(_tokens, _window), do: nil
 
   defp retry_issue_payload(retry) do
     %{
