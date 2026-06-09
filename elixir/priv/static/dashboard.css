@@ -177,6 +177,13 @@ pre,
   letter-spacing: -0.04em;
 }
 
+.hero-subtitle {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  font-family: "Sohne Mono", "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", monospace;
+}
+
 .hero-copy {
   margin: 0.75rem 0 0;
   max-width: 46rem;
@@ -386,11 +393,34 @@ pre,
 .issue-id {
   font-weight: 600;
   letter-spacing: -0.01em;
+  font-family: "Sohne Mono", "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", monospace;
+}
+
+.issue-title {
+  color: var(--ink);
+  font-size: 0.88rem;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.issue-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.1rem;
 }
 
 .issue-link {
   color: var(--muted);
   font-size: 0.86rem;
+}
+
+.event-time-stamp {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+  text-decoration: underline dotted var(--line-strong);
+  text-underline-offset: 0.18em;
 }
 
 .muted {
@@ -413,15 +443,144 @@ pre,
   margin-top: 1rem;
 }
 
-.transcript-stack article {
+.transcript-block {
   min-width: 0;
-  padding: 0.9rem 0 0;
-  border-top: 1px solid var(--line);
+  padding: 0.8rem 0.95rem;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 12px;
+  background: var(--page-soft);
 }
 
-.transcript-stack article:first-child {
-  padding-top: 0;
-  border-top: 0;
+.transcript-block-agent {
+  border-left-color: var(--accent);
+}
+
+.transcript-block-command {
+  border-left-color: #3b82f6;
+}
+
+.transcript-block-output {
+  border-left-color: var(--line-strong);
+}
+
+.transcript-block-tool {
+  border-left-color: #8b5cf6;
+}
+
+.transcript-block-reasoning {
+  border-left-color: #d97706;
+}
+
+.transcript-block-event,
+.transcript-block-user {
+  border-left-color: var(--muted);
+}
+
+.transcript-block-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.45rem;
+}
+
+.transcript-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  background: var(--card-muted);
+  color: var(--muted);
+}
+
+.transcript-chip-agent {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.transcript-chip-command {
+  background: #e8f0fe;
+  color: #1d4ed8;
+}
+
+.transcript-chip-output {
+  background: #eceef3;
+  color: #4b5563;
+}
+
+.transcript-chip-tool {
+  background: #f1e9fe;
+  color: #6d28d9;
+}
+
+.transcript-chip-reasoning {
+  background: #fef3e2;
+  color: #b45309;
+}
+
+.transcript-block-time {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+  text-decoration: underline dotted var(--line-strong);
+  text-underline-offset: 0.18em;
+}
+
+.transcript-collapsible {
+  margin: 0;
+}
+
+.transcript-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.transcript-summary::-webkit-details-marker {
+  display: none;
+}
+
+.transcript-summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 0.72rem;
+  transition: transform 120ms ease;
+}
+
+.transcript-collapsible[open] > .transcript-summary::before {
+  transform: rotate(90deg);
+}
+
+.transcript-summary-text {
+  min-width: 0;
+  flex: 1;
+  color: var(--muted);
+  font-size: 0.84rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.transcript-summary .transcript-block-time {
+  flex: none;
+}
+
+.transcript-empty {
+  margin: 0.55rem 0 0;
+  font-size: 0.85rem;
+}
+
+.transcript-collapsible .transcript-code {
+  margin-top: 0.6rem;
 }
 
 .transcript-markdown {
@@ -519,6 +678,37 @@ pre,
 .empty-state {
   margin: 1rem 0 0;
   color: var(--muted);
+}
+
+.rate-limit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.rate-limit-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--page-soft);
+}
+
+.rate-limit-label {
+  color: var(--muted);
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.rate-limit-value {
+  color: var(--ink);
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .error-card {

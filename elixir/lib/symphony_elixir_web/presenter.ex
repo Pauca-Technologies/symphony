@@ -67,6 +67,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_identifier: issue_identifier,
       issue_id: issue_id_from_entries(running, retry),
+      title: title_from_entries(running, retry),
       status: issue_status(running, retry),
       workspace: %{
         path: workspace_path(issue_identifier, running, retry),
@@ -91,6 +92,9 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_id_from_entries(running, retry),
     do: (running && running.issue_id) || (retry && retry.issue_id)
 
+  defp title_from_entries(running, retry),
+    do: (running && Map.get(running, :title)) || (retry && Map.get(retry, :title))
+
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
@@ -103,6 +107,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      title: Map.get(entry, :title),
       state: entry.state,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -125,6 +130,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      title: Map.get(entry, :title),
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
       error: entry.error,
@@ -341,12 +347,23 @@ defmodule SymphonyElixirWeb.Presenter do
       method == "codex/event/exec_command_begin" ->
         build_text_fragment("command", at, extract_command(payload))
 
+      method in reasoning_methods() ->
+        build_text_fragment("reasoning", at, extract_text(payload, reasoning_text_paths()))
+
+      method == "item/tool/call" ->
+        build_tool_fragment(at, payload)
+
       true ->
         nil
     end
   end
 
   defp transcript_fragment(_record), do: nil
+
+  defp build_tool_fragment(at, payload) when is_map(payload) do
+    {name, args_text} = extract_tool(payload)
+    %{kind: "tool", at: at, title: name, text: normalize_transcript_text(args_text)}
+  end
 
   defp build_text_fragment(kind, at, text) when is_binary(kind) and is_binary(text) do
     case normalize_transcript_text(text) do
@@ -362,7 +379,7 @@ defmodule SymphonyElixirWeb.Presenter do
     |> Enum.reduce([], fn fragment, acc ->
       case acc do
         [%{kind: kind, text: existing_text} = previous | rest]
-        when kind == fragment.kind and kind in ["agent", "output"] ->
+        when kind == fragment.kind and kind in ["agent", "output", "reasoning"] ->
           [%{previous | text: existing_text <> fragment.text} | rest]
 
         _ ->
@@ -392,6 +409,27 @@ defmodule SymphonyElixirWeb.Presenter do
     ]
   end
 
+  defp reasoning_methods do
+    [
+      "codex/event/agent_reasoning_delta",
+      "codex/event/reasoning_content_delta",
+      "codex/event/agent_reasoning",
+      "item/reasoning/textDelta",
+      "item/reasoning/summaryTextDelta"
+    ]
+  end
+
+  defp reasoning_text_paths do
+    [
+      ["params", "textDelta"],
+      ["params", "summaryText"],
+      ["params", "delta"],
+      ["params", "msg", "content"],
+      ["params", "text"],
+      ["params", "content"]
+    ]
+  end
+
   defp extract_text(payload, paths) when is_map(payload) and is_list(paths) do
     Enum.find_value(paths, fn path ->
       case map_value(payload, path) do
@@ -413,6 +451,39 @@ defmodule SymphonyElixirWeb.Presenter do
         _ -> nil
       end
     end)
+  end
+
+  defp extract_tool(payload) when is_map(payload) do
+    name =
+      tool_name_value(map_value(payload, ["params", "tool"])) ||
+        tool_name_value(map_value(payload, ["params", "name"])) ||
+        "tool"
+
+    args_text =
+      case map_value(payload, ["params", "arguments"]) do
+        nil -> ""
+        args -> format_tool_arguments(args)
+      end
+
+    {name, args_text}
+  end
+
+  defp tool_name_value(name) when is_binary(name), do: name
+  defp tool_name_value(_name), do: nil
+
+  defp format_tool_arguments(args) when is_binary(args), do: truncate_tool_text(args)
+  defp format_tool_arguments(args) when is_map(args) and map_size(args) == 0, do: ""
+
+  defp format_tool_arguments(args),
+    do: args |> inspect(pretty: true, limit: :infinity, width: 100) |> truncate_tool_text()
+
+  @max_tool_argument_chars 4_000
+  defp truncate_tool_text(text) when is_binary(text) do
+    if String.length(text) > @max_tool_argument_chars do
+      String.slice(text, 0, @max_tool_argument_chars) <> "\n… [truncated]"
+    else
+      text
+    end
   end
 
   defp normalize_transcript_text(text) when is_binary(text) do

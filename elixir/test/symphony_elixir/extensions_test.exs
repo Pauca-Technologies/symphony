@@ -347,6 +347,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
+                 "title" => "Wire up the HTTP server",
                  "state" => "In Progress",
                  "worker_host" => nil,
                  "workspace_path" => nil,
@@ -375,6 +376,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-retry",
                  "issue_identifier" => "MT-RETRY",
+                 "title" => "Retry the flaky migration",
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
@@ -397,6 +399,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_payload == %{
              "issue_identifier" => "MT-HTTP",
              "issue_id" => "issue-http",
+             "title" => "Wire up the HTTP server",
              "status" => "running",
              "workspace" => %{
                "path" => Path.join(Config.settings!().workspace.root, "MT-HTTP"),
@@ -617,6 +620,14 @@ defmodule SymphonyElixir.ExtensionsTest do
             "method" => "codex/event/exec_command_output_delta",
             "params" => %{"msg" => %{"content" => "Compiling 3 files\\n"}}
           }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "tool_call_completed",
+          "payload" => %{
+            "method" => "item/tool/call",
+            "params" => %{"tool" => "linear.get_issue", "arguments" => %{"id" => "UDPE-1"}}
+          }
         }
       ])
 
@@ -649,12 +660,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Investigating the failure"
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
+    assert html =~ "Wire up the HTTP server"
+    assert html =~ "Retry the flaky migration"
+    assert html =~ "11 left"
+    refute html =~ ~s(%{&quot;primary&quot;)
 
     updated_snapshot =
       put_in(snapshot.running, [
         %{
           issue_id: "issue-http",
           identifier: "MT-HTTP",
+          title: "Wire up the HTTP server",
           state: "In Progress",
           session_id: "thread-http",
           turn_count: 8,
@@ -715,6 +731,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute issue_html =~ "OLD-BEGINNING"
     refute issue_html =~ "agent message content streaming: structured update"
     refute issue_html =~ "<script>alert(1)</script>"
+    assert issue_html =~ "Wire up the HTTP server"
+    assert issue_html =~ "linear.get_issue"
+    assert issue_html =~ "transcript-block-tool"
 
     updated_issue_snapshot =
       put_in(updated_snapshot.running, [
@@ -826,6 +845,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-http",
           identifier: "MT-HTTP",
+          title: "Wire up the HTTP server",
           state: "In Progress",
           session_id: "thread-http",
           turn_count: 7,
@@ -863,6 +883,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         %{
           issue_id: "issue-retry",
           identifier: "MT-RETRY",
+          title: "Retry the flaky migration",
           attempt: 2,
           due_in_ms: 2_000,
           error: "boom"

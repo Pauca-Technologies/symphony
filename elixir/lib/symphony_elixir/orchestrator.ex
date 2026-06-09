@@ -975,6 +975,7 @@ defmodule SymphonyElixir.Orchestrator do
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
+    title = pick_retry_title(previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
@@ -1000,6 +1001,7 @@ defmodule SymphonyElixir.Orchestrator do
             retry_token: retry_token,
             due_at_ms: due_at_ms,
             identifier: identifier,
+            title: title,
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path,
@@ -1171,6 +1173,13 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:identifier] || Map.get(previous_retry, :identifier) || issue_id
   end
 
+  defp pick_retry_title(previous_retry, metadata) do
+    metadata[:title] || title_from_issue(metadata[:issue]) || Map.get(previous_retry, :title)
+  end
+
+  defp title_from_issue(%Issue{title: title}) when is_binary(title), do: title
+  defp title_from_issue(_issue), do: nil
+
   defp pick_retry_error(previous_retry, metadata) do
     metadata[:error] || Map.get(previous_retry, :error)
   end
@@ -1338,6 +1347,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
+          title: metadata.issue.title,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
@@ -1366,6 +1376,7 @@ defmodule SymphonyElixir.Orchestrator do
           attempt: attempt,
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
+          title: Map.get(retry, :title),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
           workspace_path: Map.get(retry, :workspace_path),
@@ -1499,7 +1510,7 @@ defmodule SymphonyElixir.Orchestrator do
     merged_blocks =
       case Enum.reverse(blocks) do
         [%{kind: ^kind, text: existing_text} = previous | rest]
-        when kind in ["agent", "output"] ->
+        when kind in ["agent", "output", "reasoning"] ->
           Enum.reverse([%{previous | text: existing_text <> text} | rest])
 
         reversed_blocks ->
@@ -1524,6 +1535,12 @@ defmodule SymphonyElixir.Orchestrator do
       method == "codex/event/exec_command_begin" ->
         build_transcript_block("command", timestamp, extract_transcript_command(payload))
 
+      method in reasoning_methods() ->
+        build_transcript_block("reasoning", timestamp, extract_transcript_text(payload, reasoning_text_paths()))
+
+      method == "item/tool/call" ->
+        build_transcript_tool_block(timestamp, payload)
+
       true ->
         nil
     end
@@ -1539,6 +1556,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp build_transcript_block(_kind, _timestamp, _text), do: nil
+
+  defp build_transcript_tool_block(timestamp, payload) do
+    {name, args_text} = extract_transcript_tool(payload)
+    %{kind: "tool", at: iso8601(timestamp), title: name, text: normalize_transcript_text(args_text)}
+  end
 
   defp agent_text_paths do
     [
@@ -1556,6 +1578,27 @@ defmodule SymphonyElixir.Orchestrator do
       ["params", "msg", "delta"],
       ["params", "delta"],
       ["params", "output"],
+      ["params", "content"]
+    ]
+  end
+
+  defp reasoning_methods do
+    [
+      "codex/event/agent_reasoning_delta",
+      "codex/event/reasoning_content_delta",
+      "codex/event/agent_reasoning",
+      "item/reasoning/textDelta",
+      "item/reasoning/summaryTextDelta"
+    ]
+  end
+
+  defp reasoning_text_paths do
+    [
+      ["params", "textDelta"],
+      ["params", "summaryText"],
+      ["params", "delta"],
+      ["params", "msg", "content"],
+      ["params", "text"],
       ["params", "content"]
     ]
   end
@@ -1581,6 +1624,36 @@ defmodule SymphonyElixir.Orchestrator do
         _ -> nil
       end
     end)
+  end
+
+  defp extract_transcript_tool(payload) when is_map(payload) do
+    name =
+      string_path_value(payload, ["params", "tool"]) ||
+        string_path_value(payload, ["params", "name"]) ||
+        "tool"
+
+    args_text =
+      case string_path_value(payload, ["params", "arguments"]) do
+        nil -> ""
+        args -> format_tool_arguments(args)
+      end
+
+    {to_string(name), args_text}
+  end
+
+  defp format_tool_arguments(args) when is_binary(args), do: truncate_tool_text(args)
+  defp format_tool_arguments(args) when is_map(args) and map_size(args) == 0, do: ""
+
+  defp format_tool_arguments(args),
+    do: args |> inspect(pretty: true, limit: :infinity, width: 100) |> truncate_tool_text()
+
+  @max_tool_argument_chars 4_000
+  defp truncate_tool_text(text) when is_binary(text) do
+    if String.length(text) > @max_tool_argument_chars do
+      String.slice(text, 0, @max_tool_argument_chars) <> "\n… [truncated]"
+    else
+      text
+    end
   end
 
   defp normalize_transcript_text(text) when is_binary(text) do

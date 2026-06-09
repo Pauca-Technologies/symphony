@@ -92,8 +92,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   Symphony Observability
                 </p>
                 <h1 class="hero-title">
-                  <%= @issue_payload.issue_identifier %>
+                  <%= @issue_payload.title || @issue_payload.issue_identifier %>
                 </h1>
+                <p :if={@issue_payload.title} class="hero-subtitle mono">
+                  <%= @issue_payload.issue_identifier %>
+                </p>
                 <p class="hero-copy">
                   Live issue detail view with the latest reconstructed Codex transcript for this workspace.
                 </p>
@@ -139,7 +142,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <%= issue_runtime(@issue_payload, @now) %>
               </p>
               <p class="metric-detail">
-                Started <%= issue_started_at(@issue_payload) || "n/a" %>
+                <%= if started = issue_started_at(@issue_payload) do %>
+                  Started <time datetime={started} title={full_time(started)}><%= relative_time(started, @now) %></time>
+                <% else %>
+                  Started n/a
+                <% end %>
               </p>
             </article>
 
@@ -195,17 +202,33 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </p>
             <% else %>
               <div class="transcript-stack">
-                <article :for={block <- transcript_blocks(@issue_payload.transcript)}>
-                  <div class="muted event-meta">
-                    <strong><%= transcript_kind_label(block.kind) %></strong>
-                    <%= if block.at do %>
-                      · <span class="mono numeric"><%= block.at %></span>
-                    <% end %>
-                  </div>
-                  <%= if markdown_transcript_kind?(block.kind) do %>
-                    <div class="transcript-markdown"><%= Phoenix.HTML.raw(markdown_to_html(block.text)) %></div>
-                  <% else %>
-                    <pre class="code-panel transcript-code"><code><%= block.text %></code></pre>
+                <article :for={block <- transcript_blocks(@issue_payload.transcript)} class={transcript_block_class(block.kind)}>
+                  <%= cond do %>
+                    <% markdown_transcript_kind?(block.kind) -> %>
+                      <div class="transcript-block-head">
+                        <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
+                        <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
+                      </div>
+                      <div class="transcript-markdown"><%= Phoenix.HTML.raw(markdown_to_html(block.text)) %></div>
+                    <% collapsible_transcript_kind?(block.kind) -> %>
+                      <details class="transcript-collapsible">
+                        <summary class="transcript-summary">
+                          <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
+                          <span class="transcript-summary-text mono"><%= transcript_preview(block) %></span>
+                          <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
+                        </summary>
+                        <%= if block.text == "" do %>
+                          <p class="transcript-empty muted">No arguments.</p>
+                        <% else %>
+                          <pre class="code-panel transcript-code"><code><%= block.text %></code></pre>
+                        <% end %>
+                      </details>
+                    <% true -> %>
+                      <div class="transcript-block-head">
+                        <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
+                        <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
+                      </div>
+                      <pre class="code-panel transcript-code transcript-command"><code><%= block.text %></code></pre>
                   <% end %>
                 </article>
               </div>
@@ -286,7 +309,28 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </div>
             </div>
 
-            <pre class="code-panel"><%= pretty_value(@dashboard_payload.rate_limits) %></pre>
+            <%= if rate_limits_present?(@dashboard_payload.rate_limits) do %>
+              <div class="rate-limit-grid">
+                <div class="rate-limit-tile">
+                  <span class="rate-limit-label">Window</span>
+                  <span class="rate-limit-value"><%= rate_limit_window(@dashboard_payload.rate_limits) %></span>
+                </div>
+                <div class="rate-limit-tile">
+                  <span class="rate-limit-label">Primary</span>
+                  <span class="rate-limit-value"><%= rate_limit_bucket(@dashboard_payload.rate_limits, "primary") %></span>
+                </div>
+                <div class="rate-limit-tile">
+                  <span class="rate-limit-label">Secondary</span>
+                  <span class="rate-limit-value"><%= rate_limit_bucket(@dashboard_payload.rate_limits, "secondary") %></span>
+                </div>
+                <div class="rate-limit-tile">
+                  <span class="rate-limit-label">Credits</span>
+                  <span class="rate-limit-value"><%= rate_limit_credits(@dashboard_payload.rate_limits) %></span>
+                </div>
+              </div>
+            <% else %>
+              <p class="empty-state">No rate-limit snapshot available yet.</p>
+            <% end %>
           </section>
 
           <section class="section-card">
@@ -327,10 +371,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
                             <%= entry.issue_identifier %>
                           </.link>
-                          <.link class="issue-link" navigate={issue_path(entry.issue_identifier)}>
-                            Issue details
-                          </.link>
-                          <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          <span :if={entry.title} class="issue-title"><%= entry.title %></span>
+                          <div class="issue-links">
+                            <.link class="issue-link" navigate={issue_path(entry.issue_identifier)}>
+                              Issue details
+                            </.link>
+                            <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          </div>
                         </div>
                       </td>
                       <td>
@@ -365,7 +412,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <span class="muted event-meta">
                             <%= entry.last_event || "n/a" %>
                             <%= if entry.last_event_at do %>
-                              · <span class="mono numeric"><%= entry.last_event_at %></span>
+                              · <time class="event-time-stamp" datetime={entry.last_event_at} title={full_time(entry.last_event_at)}><%= relative_time(entry.last_event_at, @now) %></time>
                             <% end %>
                           </span>
                         </div>
@@ -411,14 +458,23 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
                             <%= entry.issue_identifier %>
                           </.link>
-                          <.link class="issue-link" navigate={issue_path(entry.issue_identifier)}>
-                            Issue details
-                          </.link>
-                          <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          <span :if={entry.title} class="issue-title"><%= entry.title %></span>
+                          <div class="issue-links">
+                            <.link class="issue-link" navigate={issue_path(entry.issue_identifier)}>
+                              Issue details
+                            </.link>
+                            <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          </div>
                         </div>
                       </td>
                       <td><%= entry.attempt %></td>
-                      <td class="mono"><%= entry.due_at || "n/a" %></td>
+                      <td>
+                        <%= if entry.due_at do %>
+                          <time class="event-time-stamp" datetime={entry.due_at} title={full_time(entry.due_at)}><%= relative_time(entry.due_at, @now) %></time>
+                        <% else %>
+                          <span class="muted">n/a</span>
+                        <% end %>
+                      </td>
                       <td><%= entry.error || "n/a" %></td>
                     </tr>
                   </tbody>
@@ -554,9 +610,40 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp transcript_kind_label("agent"), do: "Agent"
   defp transcript_kind_label("command"), do: "Command"
   defp transcript_kind_label("output"), do: "Output"
+  defp transcript_kind_label("tool"), do: "Tool"
+  defp transcript_kind_label("reasoning"), do: "Reasoning"
+  defp transcript_kind_label("user"), do: "User"
   defp transcript_kind_label(_kind), do: "Event"
 
   defp markdown_transcript_kind?(kind), do: kind in ["agent", "user"]
+
+  defp collapsible_transcript_kind?(kind), do: kind in ["output", "tool", "reasoning"]
+
+  defp transcript_block_class(kind), do: "transcript-block transcript-block-#{transcript_kind_slug(kind)}"
+
+  defp transcript_chip_class(kind), do: "transcript-chip transcript-chip-#{transcript_kind_slug(kind)}"
+
+  defp transcript_kind_slug(kind) when kind in ["agent", "command", "output", "tool", "reasoning", "user"], do: kind
+  defp transcript_kind_slug(_kind), do: "event"
+
+  defp transcript_preview(block) when is_map(block) do
+    case Map.get(block, :title) do
+      title when is_binary(title) and title != "" -> title
+      _ -> block |> Map.get(:text, "") |> first_line_preview()
+    end
+  end
+
+  defp first_line_preview(text) when is_binary(text) do
+    text
+    |> String.split("\n", trim: true)
+    |> List.first()
+    |> case do
+      nil -> "(empty)"
+      line -> String.slice(line, 0, 100)
+    end
+  end
+
+  defp first_line_preview(_text), do: "(empty)"
 
   defp markdown_to_html(text) when is_binary(text) do
     text
@@ -764,6 +851,106 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
 
-  defp pretty_value(nil), do: "n/a"
-  defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+  defp relative_time(iso, %DateTime{} = now) when is_binary(iso) do
+    case DateTime.from_iso8601(iso) do
+      {:ok, datetime, _offset} -> humanize_relative(DateTime.diff(now, datetime, :second))
+      _ -> iso
+    end
+  end
+
+  defp relative_time(_iso, _now), do: "n/a"
+
+  defp humanize_relative(seconds) when is_integer(seconds) do
+    abs_seconds = abs(seconds)
+    suffix = if seconds < 0, do: "from now", else: "ago"
+
+    cond do
+      abs_seconds < 5 -> "just now"
+      abs_seconds < 60 -> "#{abs_seconds}s #{suffix}"
+      abs_seconds < 3600 -> "#{div(abs_seconds, 60)}m #{suffix}"
+      abs_seconds < 86_400 -> "#{div(abs_seconds, 3600)}h #{suffix}"
+      true -> "#{div(abs_seconds, 86_400)}d #{suffix}"
+    end
+  end
+
+  defp full_time(iso) when is_binary(iso) do
+    case DateTime.from_iso8601(iso) do
+      {:ok, datetime, _offset} -> Calendar.strftime(datetime, "%Y-%m-%d %H:%M:%S UTC")
+      _ -> iso
+    end
+  end
+
+  defp full_time(_iso), do: "n/a"
+
+  defp rate_limits_present?(rate_limits) when is_map(rate_limits), do: map_size(rate_limits) > 0
+  defp rate_limits_present?(_rate_limits), do: false
+
+  defp rate_limit_window(rate_limits) do
+    case rl_value(rate_limits, ["limit_id", "limit_name"]) do
+      value when is_binary(value) and value != "" -> value
+      _ -> "default"
+    end
+  end
+
+  defp rate_limit_bucket(rate_limits, key) do
+    case rl_value(rate_limits, [key]) do
+      bucket when is_map(bucket) -> format_rate_limit_bucket(bucket)
+      _ -> "n/a"
+    end
+  end
+
+  defp format_rate_limit_bucket(bucket) do
+    remaining = rl_value(bucket, ["remaining"])
+    limit = rl_value(bucket, ["limit"])
+
+    reset =
+      rl_value(bucket, ["reset_in_seconds", "resetInSeconds", "reset_at", "resetAt", "resets_at", "resetsAt"])
+
+    base =
+      cond do
+        is_number(remaining) and is_number(limit) -> "#{format_int(round(remaining))} / #{format_int(round(limit))} left"
+        is_number(remaining) -> "#{format_int(round(remaining))} left"
+        is_number(limit) -> "limit #{format_int(round(limit))}"
+        true -> "n/a"
+      end
+
+    if is_nil(reset), do: base, else: "#{base} · resets #{format_reset_value(reset)}"
+  end
+
+  defp format_reset_value(value) when is_integer(value), do: "#{value}s"
+  defp format_reset_value(value) when is_binary(value), do: value
+  defp format_reset_value(value), do: to_string(value)
+
+  defp rate_limit_credits(rate_limits) do
+    case rl_value(rate_limits, ["credits"]) do
+      credits when is_map(credits) ->
+        balance = rl_value(credits, ["balance"])
+
+        cond do
+          rl_value(credits, ["unlimited"]) == true -> "Unlimited"
+          is_number(balance) -> format_int(round(balance))
+          rl_value(credits, ["has_credits"]) == true -> "Available"
+          true -> "None"
+        end
+
+      _ ->
+        "n/a"
+    end
+  end
+
+  defp rl_value(map, keys) when is_map(map) and is_list(keys), do: Enum.find_value(keys, &rl_get(map, &1))
+  defp rl_value(_map, _keys), do: nil
+
+  defp rl_get(map, key) when is_binary(key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> value
+      :error -> atom_key_get(map, key)
+    end
+  end
+
+  defp atom_key_get(map, key) do
+    Map.get(map, String.to_existing_atom(key))
+  rescue
+    ArgumentError -> nil
+  end
 end

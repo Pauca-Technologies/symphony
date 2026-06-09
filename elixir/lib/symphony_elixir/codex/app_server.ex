@@ -560,6 +560,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp foreign_turn_terminal_event?(_decoded, _turn_id), do: false
 
+  # NOTE: only *terminal* foreign-turn events are routed here. A subagent's
+  # non-terminal events (agent-message/tool/output deltas) still flow through the
+  # normal `dispatch_incoming/8` path tagged with the parent `turn_id`, so the
+  # observability transcript currently renders subagent text inline as ordinary
+  # agent messages with no way to tell them apart. Distinguishing subagent turns
+  # would require tagging each emitted event with its originating turn id here and
+  # threading that through the orchestrator + presenter; deferred for now.
   defp handle_foreign_turn_event({:ok, payload}, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests) do
     method = Map.get(payload, "method")
     event_turn_id = get_in(payload, ["params", "turn", "id"])

@@ -15,7 +15,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @throughput_graph_window_ms 10 * 60 * 1000
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-  @running_id_width 8
+  @running_id_width 14
   @running_stage_width 14
   @running_pid_width 8
   @running_age_width 12
