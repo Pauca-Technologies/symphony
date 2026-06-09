@@ -1854,4 +1854,111 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "subagent turn/completed on the shared connection does not end the parent turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-subagent-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-77")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-subagent.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_SUBAGENT_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_SUBAGENT_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_SUBAGENT_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_SUBAGENT_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      # A reviewer-style session that spawns subagents. The subagents run as
+      # child threads multiplexed onto the same app-server connection, so the
+      # first subagent's `turn/completed` (turn-subagent) arrives on this
+      # connection *before* the parent's own completion (turn-parent). The fake
+      # emits both, subagent first; the parent turn must win.
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_SUBAGENT_TRACE:-/tmp/codex-subagent.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-parent"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-parent"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-subagent","status":{"type":"completed"}}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-parent","status":{"type":"completed"}}}}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-subagent-turn",
+        identifier: "MT-77",
+        title: "Subagent completion must not end the parent turn",
+        description: "Reviewer-style session that spawns subagents on the shared connection",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-77",
+        labels: ["backend"]
+      }
+
+      {:ok, collector} = Agent.start_link(fn -> [] end)
+      on_exit(fn -> if Process.alive?(collector), do: Agent.stop(collector) end)
+      on_message = fn message -> Agent.update(collector, &[message | &1]) end
+
+      assert {:ok, result} =
+               AppServer.run(workspace, "review the diff", issue, on_message: on_message)
+
+      # The turn that completed the run is the parent's, not the subagent's.
+      assert result.turn_id == "turn-parent"
+
+      events = collector |> Agent.get(& &1) |> Enum.reverse()
+
+      # The subagent's terminal event is surfaced as a foreign-turn event and the
+      # receive loop keeps waiting. Pre-fix, this first `turn/completed` was
+      # mistaken for the parent and ended the session before turn-parent ever
+      # completed.
+      assert [%{turn_id: "turn-subagent", method: "turn/completed"}] =
+               Enum.filter(events, &(&1[:event] == :subagent_turn_event))
+
+      # The run still terminates on the parent turn's completion.
+      assert Enum.any?(events, &(&1[:event] == :turn_completed))
+
+      # ...and only after the subagent event was observed.
+      assert Enum.find_index(events, &(&1[:event] == :subagent_turn_event)) <
+               Enum.find_index(events, &(&1[:event] == :turn_completed))
+    after
+      File.rm_rf(test_root)
+    end
+  end
 end

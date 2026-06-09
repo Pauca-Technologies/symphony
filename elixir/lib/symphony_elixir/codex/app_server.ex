@@ -22,6 +22,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     "turn/aborted",
     "turn/interrupted"
   ]
+  # Methods that end a turn. A terminal event whose turn id differs from the
+  # turn we started belongs to a subagent thread multiplexed onto the same
+  # app-server connection — see `handle_incoming/7`.
+  @turn_terminal_methods [
+    "turn/completed",
+    "turn/failed",
+    "turn/cancelled",
+    "turn/aborted",
+    "turn/interrupted"
+  ]
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @linear_save_issue_denial_tool "save issue"
   @source_env_pattern ~r/(?:^|[\s;&|('"])(?:\.|source)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/
@@ -123,7 +133,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, turn_id, tool_executor, auto_approve_requests) do
           {:ok, result} ->
             handle_turn_success(
               result,
@@ -481,10 +491,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, turn_id, tool_executor, auto_approve_requests) do
     receive_loop(
       port,
       on_message,
+      turn_id,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
@@ -492,16 +503,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  # `turn_id` is the id of the turn this loop started (`turn/start` response).
+  # Subagents spawned by the agent run as child threads multiplexed onto the
+  # same app-server connection, so their `turn/{completed,failed,cancelled}`
+  # notifications arrive here too. We only terminate on a terminal event for
+  # *our* turn — see `handle_incoming/7` — so the first subagent to finish is
+  # not mistaken for the parent turn completing.
+  defp receive_loop(port, on_message, turn_id, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, turn_id, complete_line, timeout_ms, tool_executor, auto_approve_requests)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
           port,
           on_message,
+          turn_id,
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
@@ -516,10 +534,50 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, turn_id, data, timeout_ms, tool_executor, auto_approve_requests) do
     payload_string = to_string(data)
+    decoded = Jason.decode(payload_string)
 
-    case Jason.decode(payload_string) do
+    if foreign_turn_terminal_event?(decoded, turn_id) do
+      # A subagent thread finished on the shared connection. Stream it for
+      # observability, but keep waiting for our own turn rather than tearing the
+      # session down on the first subagent to complete.
+      handle_foreign_turn_event(decoded, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests)
+    else
+      dispatch_incoming(decoded, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests)
+    end
+  end
+
+  # A turn-terminal event whose turn id differs from the one we started: it
+  # belongs to a subagent thread on the shared connection, not our turn.
+  defp foreign_turn_terminal_event?(
+         {:ok, %{"method" => method, "params" => %{"turn" => %{"id" => event_turn_id}}}},
+         turn_id
+       )
+       when is_binary(turn_id) and is_binary(event_turn_id) do
+    event_turn_id != turn_id and method in @turn_terminal_methods
+  end
+
+  defp foreign_turn_terminal_event?(_decoded, _turn_id), do: false
+
+  defp handle_foreign_turn_event({:ok, payload}, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests) do
+    method = Map.get(payload, "method")
+    event_turn_id = get_in(payload, ["params", "turn", "id"])
+
+    Logger.debug("Codex foreign-turn #{method} ignored (subagent) turn_id=#{event_turn_id} parent_turn_id=#{turn_id}")
+
+    emit_message(
+      on_message,
+      :subagent_turn_event,
+      %{payload: payload, raw: payload_string, method: method, turn_id: event_turn_id},
+      metadata_from_message(port, payload)
+    )
+
+    receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
+  end
+
+  defp dispatch_incoming(decoded, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests) do
+    case decoded do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         handle_turn_completed(on_message, payload, payload_string, port)
 
@@ -568,9 +626,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         handle_turn_method(
           port,
           on_message,
+          turn_id,
           payload,
           payload_string,
-          method,
           timeout_ms,
           tool_executor,
           auto_approve_requests
@@ -587,7 +645,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -604,7 +662,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
     end
   end
 
@@ -649,13 +707,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp handle_turn_method(
          port,
          on_message,
+         turn_id,
          payload,
          payload_string,
-         method,
          timeout_ms,
          tool_executor,
          auto_approve_requests
        ) do
+    method = Map.get(payload, "method")
     metadata = metadata_from_message(port, payload)
 
     case maybe_handle_approval_request(
@@ -679,7 +738,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
 
       :approval_required ->
         emit_message(
@@ -695,6 +754,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         handle_unhandled_turn_method(%{
           port: port,
           on_message: on_message,
+          turn_id: turn_id,
           payload: payload,
           payload_string: payload_string,
           method: method,
@@ -732,6 +792,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp handle_unhandled_notification(%{
          port: port,
          on_message: on_message,
+         turn_id: turn_id,
          payload: payload,
          payload_string: payload_string,
          method: method,
@@ -756,7 +817,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
         Logger.debug("Codex notification: #{inspect(method)}")
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
     end
   end
 
