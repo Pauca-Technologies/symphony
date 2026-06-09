@@ -556,7 +556,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server auto-approves MCP tool approval prompts when approval policy is never" do
+  test "app server auto-approves generic MCP tool approval prompts when approval policy is never" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -600,7 +600,7 @@ defmodule SymphonyElixir.AppServerTest do
             ;;
           4)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-717\"}}}'
-            printf '%s\\n' '{\"id\":110,\"method\":\"item/tool/requestUserInput\",\"params\":{\"itemId\":\"call-717\",\"questions\":[{\"header\":\"Approve app tool call?\",\"id\":\"mcp_tool_call_approval_call-717\",\"isOther\":false,\"isSecret\":false,\"options\":[{\"description\":\"Run the tool and continue.\",\"label\":\"Approve Once\"},{\"description\":\"Run the tool and remember this choice for this session.\",\"label\":\"Approve this Session\"},{\"description\":\"Decline this tool call and continue.\",\"label\":\"Deny\"},{\"description\":\"Cancel this tool call\",\"label\":\"Cancel\"}],\"question\":\"The linear MCP server wants to run the tool \\\"Save issue\\\", which may modify or delete data. Allow this action?\"}],\"threadId\":\"thread-717\",\"turnId\":\"turn-717\"}}'
+            printf '%s\\n' '{\"id\":110,\"method\":\"item/tool/requestUserInput\",\"params\":{\"itemId\":\"call-717\",\"questions\":[{\"header\":\"Approve app tool call?\",\"id\":\"mcp_tool_call_approval_call-717\",\"isOther\":false,\"isSecret\":false,\"options\":[{\"description\":\"Run the tool and continue.\",\"label\":\"Approve Once\"},{\"description\":\"Run the tool and remember this choice for this session.\",\"label\":\"Approve this Session\"},{\"description\":\"Decline this tool call and continue.\",\"label\":\"Deny\"},{\"description\":\"Cancel this tool call\",\"label\":\"Cancel\"}],\"question\":\"The linear MCP server wants to run the tool \\\"Save comment\\\", which may modify or delete data. Allow this action?\"}],\"threadId\":\"thread-717\",\"turnId\":\"turn-717\"}}'
             ;;
           5)
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
@@ -646,6 +646,105 @@ defmodule SymphonyElixir.AppServerTest do
                  payload["id"] == 110 and
                    get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-717", "answers"]) ==
                      ["Approve this Session"]
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server denies native Linear save_issue approval prompts when approval policy is never" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-linear-save-issue-deny-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-719")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-linear-save-issue-deny.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-linear-save-issue-deny.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-719"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-719"}}}'
+            printf '%s\\n' '{"id":110,"method":"item/tool/requestUserInput","params":{"itemId":"call-719","questions":[{"header":"Approve app tool call?","id":"mcp_tool_call_approval_call-719","isOther":false,"isSecret":false,"options":[{"description":"Run the tool and continue.","label":"Approve Once"},{"description":"Run the tool and remember this choice for this session.","label":"Approve this Session"},{"description":"Decline this tool call and continue.","label":"Deny"},{"description":"Cancel this tool call","label":"Cancel"}],"question":"The linear MCP server wants to run the tool \\"Save issue\\", which may modify or delete data. Allow this action?"}],"threadId":"thread-719","turnId":"turn-719"}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-linear-save-issue-deny",
+        identifier: "MT-719",
+        title: "Deny native save_issue",
+        description: "Ensure native Linear save_issue cannot bypass handoff gates",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-719",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Handle tool approval prompt", issue)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 110 and
+                   get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-719", "answers"]) ==
+                     ["Deny"]
                else
                  false
                end
@@ -1294,6 +1393,260 @@ defmodule SymphonyElixir.AppServerTest do
       assert_received {:app_server_message, %{event: :turn_completed}}
       refute_received {:app_server_message, %{event: :malformed}}
       assert log =~ "Codex turn stream output: warning: this is stderr noise"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server treats aborted command item output as a turn error" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-interruption-signal-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-94")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-94"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-94"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"item/completed","params":{"item":{"type":"function_call_output","output":"aborted by user after 10.0s"},"threadId":"thread-94","turnId":"turn-94"}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-interruption-signal",
+        identifier: "MT-94",
+        title: "Capture interruption signal",
+        description: "Ensure aborted command output is surfaced to the orchestrator",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-94",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:turn_interruption_signal, %{summary: error_summary}}} =
+                   AppServer.run(workspace, "Capture interruption signal", issue, on_message: on_message)
+
+          assert error_summary =~ "aborted by user after 10.0s"
+        end)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :turn_interruption_signal,
+                         summary: summary,
+                         payload: %{"method" => "item/completed"}
+                       }}
+
+      assert summary =~ "item/completed"
+      assert summary =~ "aborted by user after 10.0s"
+      refute_received {:app_server_message, %{event: :turn_completed}}
+      assert log =~ "Codex interruption signal method=\"item/completed\""
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server treats interrupted turn completed payloads as errors" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-interrupted-completion-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-95")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-95"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-95"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-95","status":{"type":"interrupted","reason":"user_interrupted"}}}}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-interrupted-completion",
+        identifier: "MT-95",
+        title: "Classify interrupted completion",
+        description: "Ensure interrupted terminal payloads are not treated as successful turns",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-95",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error, {:turn_completed_abnormally, %{status_type: "interrupted"}}} =
+               AppServer.run(workspace, "Classify interrupted completion", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :turn_interruption_signal,
+                         payload: %{"method" => "turn/completed"}
+                       }}
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :turn_completed_abnormally,
+                         details: %{status_type: "interrupted"}
+                       }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server treats JSONL turn_aborted after completed stream as an error" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-jsonl-turn-aborted-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-96")
+      codex_binary = Path.join(test_root, "fake-codex")
+      session_log = Path.join(test_root, "sessions/thread-96.jsonl")
+      previous_session_log = System.get_env("SYMP_TEST_CODEX_SESSION_LOG")
+
+      on_exit(fn ->
+        if is_binary(previous_session_log) do
+          System.put_env("SYMP_TEST_CODEX_SESSION_LOG", previous_session_log)
+        else
+          System.delete_env("SYMP_TEST_CODEX_SESSION_LOG")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_SESSION_LOG", session_log)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      session_log="${SYMP_TEST_CODEX_SESSION_LOG}"
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '{"id":2,"result":{"thread":{"id":"thread-96","path":"%s"}}}\\n' "$session_log"
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-96"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            sleep 0.35
+            mkdir -p "$(dirname "$session_log")"
+            printf '%s\\n' '{"timestamp":"2026-06-08T22:38:32.961Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-96","reason":"interrupted","duration_ms":128425}}' > "$session_log"
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-jsonl-turn-aborted",
+        identifier: "MT-96",
+        title: "Classify JSONL turn abort",
+        description: "Ensure JSONL-only turn_aborted events are not treated as successful turns",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-96",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error, {:turn_aborted, %{"reason" => "interrupted", "turn_id" => "turn-96"}}} =
+               AppServer.run(workspace, "Classify JSONL turn abort", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :turn_ended_with_error,
+                         reason: {:turn_aborted, %{"reason" => "interrupted", "turn_id" => "turn-96"}}
+                       }}
     after
       File.rm_rf(test_root)
     end

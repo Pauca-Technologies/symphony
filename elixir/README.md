@@ -21,7 +21,15 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+skills can make raw Linear GraphQL calls. Handoff state changes must use this gated tool; Symphony
+does not auto-approve native Linear MCP `save_issue` calls because they cannot run
+`hooks.before_handoff` or the automated review gate.
+
+When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
+`In Progress` to review-state handoffs. The handoff tool call records the requested Linear
+mutation, the active implementor turn closes, and Symphony runs the reviewer before applying that
+mutation. If the Linear issue has an attached GitHub PR URL, the review gate uses that PR directly
+for the human-review section; otherwise it falls back to the current workspace branch's PR.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -137,6 +145,9 @@ Notes:
 - Use `hooks.before_handoff` to run a repo-local gate before an agent moves a Linear issue from
   `In Progress` to a review handoff state such as `In Review`. A non-zero exit blocks the status
   transition and the parsed gate remediation is included in the next agent turn.
+- If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
+  implementor turn that requested the handoff has closed, and applies the captured Linear
+  transition only after the reviewer approves or the configured review budget is exhausted.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

@@ -51,16 +51,18 @@ defmodule SymphonyElixir.ReviewGateTest do
   defp pr_runner(test_pid \\ nil) do
     fn
       ["pr", "view" | _], _cwd ->
-        {Jason.encode!(%{"number" => 7, "body" => "Existing PR body."}), 0}
+        {Jason.encode!(%{"id" => "PR_7", "number" => 7, "body" => "Existing PR body."}), 0}
 
-      ["pr", "edit" | _] = args, _cwd ->
-        if test_pid, do: send(test_pid, {:pr_edit, edited_body(args)})
+      ["api", "graphql" | _] = args, _cwd ->
+        if test_pid, do: send(test_pid, {:pr_edit, graphql_body_arg(args)})
         {"", 0}
     end
   end
 
-  defp edited_body(args) do
-    args |> Enum.drop_while(&(&1 != "--body-file")) |> Enum.at(1) |> File.read!()
+  defp graphql_body_arg(args) do
+    args
+    |> Enum.find(&String.starts_with?(&1, "body="))
+    |> String.replace_prefix("body=", "")
   end
 
   test "approve verdict allows the handoff", %{workspace: workspace} do
@@ -130,7 +132,13 @@ defmodule SymphonyElixir.ReviewGateTest do
 
   test "fails open and notes when the reviewer session errors", %{workspace: workspace} do
     test_pid = self()
-    runner = fn _ctx -> {:error, :boom} end
+
+    runner = fn ctx ->
+      attempt = Process.get(:review_attempt, 0) + 1
+      Process.put(:review_attempt, attempt)
+      send(test_pid, {:review_attempt, attempt, ctx.prompt})
+      {:error, :boom}
+    end
 
     assert :ok =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
@@ -139,9 +147,59 @@ defmodule SymphonyElixir.ReviewGateTest do
                pr_runner: pr_runner()
              )
 
+    assert_received {:review_attempt, 1, first_prompt}
+    assert first_prompt =~ "Review UDPE-1"
+    assert first_prompt =~ "Symphony automated-review runtime guard"
+    assert first_prompt =~ "Do not spawn sub-agents"
+    assert_received {:review_attempt, 2, retry_prompt}
+    assert retry_prompt =~ "Symphony retry guard"
+    assert retry_prompt =~ "review_session_failed"
     assert_received {:review_comment, "issue-1", body}
     assert body =~ "symphony:review-skipped"
     assert body =~ "review_session_failed"
+  end
+
+  test "retries once when the reviewer session fails before producing a verdict", %{workspace: workspace} do
+    test_pid = self()
+
+    runner = fn ctx ->
+      attempt = Process.get(:review_session_attempt, 0) + 1
+      Process.put(:review_session_attempt, attempt)
+      send(test_pid, {:review_session_attempt, attempt, ctx.prompt})
+
+      if attempt == 1 do
+        {:error, {:turn_aborted, %{"reason" => "interrupted", "turn_id" => "turn-1"}}}
+      else
+        File.mkdir_p!(Path.dirname(ctx.verdict_path))
+
+        File.write!(
+          ctx.verdict_path,
+          Jason.encode!(%{
+            "verdict" => "approve",
+            "review_effort" => "focused",
+            "human_review" => "Session retry completed the review.",
+            "comments" => []
+          })
+        )
+
+        {:ok, %{}}
+      end
+    end
+
+    assert :ok =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               comment_fn: capture_comments(test_pid),
+               pr_runner: pr_runner(test_pid)
+             )
+
+    assert_received {:review_session_attempt, 1, _first_prompt}
+    assert_received {:review_session_attempt, 2, retry_prompt}
+    assert retry_prompt =~ "Symphony retry guard"
+    assert retry_prompt =~ "turn_aborted"
+    assert_received {:pr_edit, body}
+    assert body =~ "Session retry completed the review."
+    refute_received {:review_comment, _, _}
   end
 
   test "fails open when no verdict file is written (clears stale verdicts first)", %{workspace: workspace} do
@@ -164,6 +222,112 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_comment, "issue-1", body}
     assert body =~ "symphony:review-skipped"
     refute File.exists?(verdict_path)
+  end
+
+  test "retries once when the reviewer completes without a verdict", %{workspace: workspace} do
+    test_pid = self()
+
+    runner = fn ctx ->
+      attempt = Process.get(:review_attempt, 0) + 1
+      Process.put(:review_attempt, attempt)
+      send(test_pid, {:review_attempt, attempt, ctx.prompt})
+
+      if attempt == 2 do
+        File.mkdir_p!(Path.dirname(ctx.verdict_path))
+
+        File.write!(
+          ctx.verdict_path,
+          Jason.encode!(%{
+            "verdict" => "approve",
+            "review_effort" => "focused",
+            "human_review" => "Retry produced the review guidance.",
+            "comments" => []
+          })
+        )
+      end
+
+      {:ok, %{}}
+    end
+
+    assert :ok =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               comment_fn: capture_comments(test_pid),
+               pr_runner: pr_runner(test_pid)
+             )
+
+    assert_received {:review_attempt, 1, first_prompt}
+    assert first_prompt =~ "Review UDPE-1"
+    assert first_prompt =~ "Symphony automated-review runtime guard"
+    assert first_prompt =~ "Do not spawn sub-agents"
+    assert first_prompt =~ "Do not run package-manager validation commands"
+    assert first_prompt =~ "Symphony review tool-output guard"
+    assert first_prompt =~ "Symphony verdict reliability guard"
+    assert first_prompt =~ "write a valid interim verdict"
+    assert first_prompt =~ ~s("symphony_interim": true)
+    assert first_prompt =~ "Before starting any long-running command or broad validation check"
+    assert first_prompt =~ "Do not run broad searches in `node_modules`"
+    assert first_prompt =~ "--glob '!node_modules/**'"
+    assert_received {:review_attempt, 2, retry_prompt}
+    assert retry_prompt =~ "Symphony review tool-output guard"
+    assert retry_prompt =~ "Symphony verdict reliability guard"
+    assert retry_prompt =~ "Symphony retry guard"
+    assert retry_prompt =~ "ended without a readable verdict file"
+    assert_received {:pr_edit, body}
+    assert body =~ "Retry produced the review guidance."
+    refute_received {:review_comment, _, _}
+  end
+
+  test "does not treat an interim verdict placeholder as final reviewer output", %{workspace: workspace} do
+    test_pid = self()
+
+    runner = fn ctx ->
+      attempt = Process.get(:review_interim_attempt, 0) + 1
+      Process.put(:review_interim_attempt, attempt)
+      send(test_pid, {:review_interim_attempt, attempt, ctx.prompt})
+      File.mkdir_p!(Path.dirname(ctx.verdict_path))
+
+      verdict =
+        if attempt == 1 do
+          %{
+            "verdict" => "request_changes",
+            "summary" => "Interim verdict while review is in progress.",
+            "review_effort" => "thorough",
+            "human_review" => "Interim guidance: review is still in progress.",
+            "comments" => [
+              %{
+                "severity" => "major",
+                "file" => ".artifacts/symphony-review/verdict.json",
+                "body" => "Interim placeholder: final review has not completed yet."
+              }
+            ]
+          }
+        else
+          %{
+            "verdict" => "approve",
+            "review_effort" => "skim",
+            "human_review" => "Retry completed a real review.",
+            "comments" => []
+          }
+        end
+
+      File.write!(ctx.verdict_path, Jason.encode!(verdict))
+      {:ok, %{}}
+    end
+
+    assert :ok =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               comment_fn: capture_comments(test_pid),
+               pr_runner: pr_runner(test_pid)
+             )
+
+    assert_received {:review_interim_attempt, 1, _first_prompt}
+    assert_received {:review_interim_attempt, 2, retry_prompt}
+    assert retry_prompt =~ "interim_verdict"
+    assert_received {:pr_edit, body}
+    assert body =~ "Retry completed a real review."
+    refute_received {:review_comment, _, _}
   end
 
   test "fails open on an unparseable verdict", %{workspace: workspace} do
@@ -253,6 +417,49 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert body =~ "Mostly skimmable; focus on `lib/foo.ex`."
   end
 
+  test "resolves the PR from the Linear attachment before requiring branch inference", %{workspace: workspace} do
+    test_pid = self()
+
+    issue = %{issue() | attachment_urls: ["https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358"]}
+
+    runner =
+      verdict_runner(%{
+        "verdict" => "approve",
+        "review_effort" => "focused",
+        "human_review" => "Check the handoff review path.",
+        "comments" => []
+      })
+
+    pr_runner = fn
+      [
+        "pr",
+        "view",
+        "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
+        "--json",
+        "id,number,body"
+      ],
+      _cwd ->
+        {Jason.encode!(%{"id" => "PR_1358", "number" => 1358, "body" => "Existing PR body."}), 0}
+
+      ["pr", "view", "--json", "id,number,body"], _cwd ->
+        flunk("must not rely on current branch PR detection when Linear has a PR attachment")
+
+      ["api", "graphql" | _] = args, _cwd ->
+        send(test_pid, {:pr_edit, graphql_body_arg(args)})
+        {"", 0}
+    end
+
+    assert :ok =
+             ReviewGate.run(workspace, issue, nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner
+             )
+
+    assert_received {:pr_edit, body}
+    assert body =~ "<!-- symphony:review:start -->"
+    assert body =~ "Check the handoff review path."
+  end
+
   test "skips the reviewer entirely when no PR is present (require_pr)", %{workspace: workspace} do
     test_pid = self()
     runner = fn _ctx -> flunk("the reviewer session must not run without a PR") end
@@ -276,7 +483,7 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     pr_runner = fn
       ["pr", "view" | _], _cwd -> {"no pull requests found", 1}
-      ["pr", "edit" | _], _cwd -> flunk("must not edit a PR that does not exist")
+      ["api", "graphql" | _], _cwd -> flunk("must not edit a PR that does not exist")
     end
 
     wf = review_workflow(%{"require_pr" => false})

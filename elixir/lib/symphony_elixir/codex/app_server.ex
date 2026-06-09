@@ -11,7 +11,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @interruption_log_bytes 500
+  @post_completion_audit_attempts 80
+  @post_completion_audit_sleep_ms 25
+  @interruption_markers [
+    "<turn_aborted>",
+    "aborted by user",
+    "interrupted by user",
+    "turn_aborted",
+    "turn/aborted",
+    "turn/interrupted"
+  ]
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @linear_save_issue_denial_tool "save issue"
   @source_env_pattern ~r/(?:^|[\s;&|('"])(?:\.|source)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/
 
   @type session :: %{
@@ -19,6 +31,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: map(),
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
+          thread_path: Path.t() | nil,
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
@@ -47,13 +60,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread} <- do_start_session(port, expanded_workspace, session_policies) do
+        thread_id = Map.fetch!(thread, :id)
+
         {:ok,
          %{
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: session_policies.approval_policy == "never",
+           thread_path: Map.get(thread, :path),
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -77,6 +93,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          thread_path: thread_path,
           workspace: workspace
         },
         prompt,
@@ -108,15 +125,16 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
           {:ok, result} ->
-            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
-
-            {:ok,
-             %{
-               result: result,
-               session_id: session_id,
-               thread_id: thread_id,
-               turn_id: turn_id
-             }}
+            handle_turn_success(
+              result,
+              thread_path,
+              thread_id,
+              turn_id,
+              session_id,
+              issue,
+              on_message,
+              metadata
+            )
 
           {:error, reason} ->
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
@@ -137,6 +155,45 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:error, reason} ->
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+        {:error, reason}
+    end
+  end
+
+  defp handle_turn_success(
+         result,
+         thread_path,
+         thread_id,
+         turn_id,
+         session_id,
+         issue,
+         on_message,
+         metadata
+       ) do
+    case post_completion_turn_audit(thread_path, turn_id) do
+      :ok ->
+        Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+
+        {:ok,
+         %{
+           result: result,
+           session_id: session_id,
+           thread_id: thread_id,
+           turn_id: turn_id
+         }}
+
+      {:error, reason} ->
+        Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+
+        emit_message(
+          on_message,
+          :turn_ended_with_error,
+          %{
+            session_id: session_id,
+            reason: reason
+          },
+          metadata
+        )
+
         {:error, reason}
     end
   end
@@ -387,8 +444,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
         case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
+          %{"id" => thread_id} ->
+            {:ok, %{id: thread_id, path: Map.get(thread_payload, "path")}}
+
+          _ ->
+            {:error, {:invalid_thread_payload, thread_payload}}
         end
 
       other ->
@@ -461,10 +521,17 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        handle_turn_completed(on_message, payload, payload_string, port)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
+        maybe_emit_interruption_signal(
+          on_message,
+          "turn/failed",
+          payload,
+          payload_string,
+          metadata_from_message(port, payload)
+        )
+
         emit_turn_event(
           on_message,
           :turn_failed,
@@ -477,6 +544,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_failed, Map.get(payload, "params")}}
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
+        maybe_emit_interruption_signal(
+          on_message,
+          "turn/cancelled",
+          payload,
+          payload_string,
+          metadata_from_message(port, payload)
+        )
+
         emit_turn_event(
           on_message,
           :turn_cancelled,
@@ -546,6 +621,31 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
+  defp handle_turn_completed(on_message, payload, payload_string, port) do
+    metadata = metadata_from_message(port, payload)
+    maybe_emit_interruption_signal(on_message, "turn/completed", payload, payload_string, metadata)
+
+    case abnormal_turn_completion_reason(payload) do
+      nil ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
+
+      reason ->
+        emit_message(
+          on_message,
+          :turn_completed_abnormally,
+          %{
+            payload: payload,
+            raw: payload_string,
+            details: reason
+          },
+          metadata
+        )
+
+        {:error, {:turn_completed_abnormally, reason}}
+    end
+  end
+
   defp handle_turn_method(
          port,
          on_message,
@@ -592,30 +692,170 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:approval_required, payload}}
 
       :unhandled ->
-        if needs_input?(method, payload) do
-          emit_message(
-            on_message,
-            :turn_input_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
-
-          {:error, {:turn_input_required, payload}}
-        else
-          emit_message(
-            on_message,
-            :notification,
-            %{
-              payload: payload,
-              raw: payload_string
-            },
-            metadata
-          )
-
-          Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-        end
+        handle_unhandled_turn_method(%{
+          port: port,
+          on_message: on_message,
+          payload: payload,
+          payload_string: payload_string,
+          method: method,
+          metadata: metadata,
+          timeout_ms: timeout_ms,
+          tool_executor: tool_executor,
+          auto_approve_requests: auto_approve_requests
+        })
     end
+  end
+
+  defp handle_unhandled_turn_method(
+         %{
+           method: method,
+           payload: payload,
+           on_message: on_message,
+           payload_string: payload_string,
+           metadata: metadata
+         } = context
+       ) do
+    if needs_input?(method, payload) do
+      emit_message(
+        on_message,
+        :turn_input_required,
+        %{payload: payload, raw: payload_string},
+        metadata
+      )
+
+      {:error, {:turn_input_required, payload}}
+    else
+      handle_unhandled_notification(context)
+    end
+  end
+
+  defp handle_unhandled_notification(%{
+         port: port,
+         on_message: on_message,
+         payload: payload,
+         payload_string: payload_string,
+         method: method,
+         metadata: metadata,
+         timeout_ms: timeout_ms,
+         tool_executor: tool_executor,
+         auto_approve_requests: auto_approve_requests
+       }) do
+    case maybe_emit_interruption_signal(on_message, method, payload, payload_string, metadata) do
+      {:interrupted, details} ->
+        {:error, {:turn_interruption_signal, details}}
+
+      :ok ->
+        emit_message(
+          on_message,
+          :notification,
+          %{
+            payload: payload,
+            raw: payload_string
+          },
+          metadata
+        )
+
+        Logger.debug("Codex notification: #{inspect(method)}")
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp maybe_emit_interruption_signal(on_message, method, payload, payload_string, metadata) do
+    if interruption_signal?(method, payload, payload_string) do
+      summary = interruption_summary(method, payload_string)
+      Logger.warning("Codex interruption signal method=#{inspect(method)} summary=#{summary}")
+
+      emit_message(
+        on_message,
+        :turn_interruption_signal,
+        %{
+          payload: payload,
+          raw: payload_string,
+          summary: summary
+        },
+        metadata
+      )
+
+      {:interrupted, %{method: method, summary: summary, payload: payload}}
+    else
+      :ok
+    end
+  end
+
+  defp interruption_signal?(method, payload, payload_string) do
+    method in ["turn/aborted", "turn/interrupted"] ||
+      abnormal_turn_status?(turn_status_type(payload)) ||
+      payload_string
+      |> String.downcase()
+      |> String.contains?(@interruption_markers)
+  end
+
+  defp abnormal_turn_completion_reason(payload) when is_map(payload) do
+    status_type = turn_status_type(payload)
+
+    if abnormal_turn_status?(status_type) do
+      %{
+        status_type: status_type,
+        status: turn_status(payload),
+        turn: map_at_path(payload, ["params", "turn"]) || map_at_path(payload, [:params, :turn])
+      }
+    end
+  end
+
+  defp abnormal_turn_status?(status_type) when is_binary(status_type) do
+    status_type
+    |> String.downcase()
+    |> then(&(&1 in ["aborted", "cancelled", "canceled", "failed", "interrupted"]))
+  end
+
+  defp abnormal_turn_status?(_status_type), do: false
+
+  defp turn_status_type(payload) when is_map(payload) do
+    case turn_status(payload) do
+      %{"type" => type} when is_binary(type) -> type
+      %{type: type} when is_binary(type) -> type
+      type when is_binary(type) -> type
+      _ -> nil
+    end
+  end
+
+  defp turn_status(payload) when is_map(payload) do
+    map_at_path(payload, ["params", "turn", "status"]) ||
+      map_at_path(payload, [:params, :turn, :status]) ||
+      map_at_path(payload, ["params", "status"]) ||
+      map_at_path(payload, [:params, :status]) ||
+      Map.get(payload, "status") ||
+      Map.get(payload, :status)
+  end
+
+  defp interruption_summary(method, payload_string) do
+    excerpt =
+      payload_string
+      |> interruption_excerpt()
+      |> String.replace(~r/\s+/, " ")
+      |> String.slice(0, @interruption_log_bytes)
+
+    "#{method}: #{excerpt}"
+  end
+
+  defp interruption_excerpt(payload_string) do
+    normalized_payload = String.downcase(payload_string)
+
+    case interruption_marker_match(normalized_payload) do
+      {index, _length} ->
+        start = max(index - 120, 0)
+        String.slice(payload_string, start, @interruption_log_bytes)
+
+      nil ->
+        String.slice(payload_string, 0, @interruption_log_bytes)
+    end
+  end
+
+  defp interruption_marker_match(normalized_payload) do
+    Enum.find_value(@interruption_markers, fn marker ->
+      match = :binary.match(normalized_payload, marker)
+      if match == :nomatch, do: nil, else: match
+    end)
   end
 
   defp maybe_handle_approval_request(
@@ -907,20 +1147,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
-    answers =
-      Enum.reduce_while(questions, %{}, fn question, acc ->
+    result =
+      Enum.reduce_while(questions, {%{}, []}, fn question, {answer_acc, decision_acc} ->
         case tool_request_user_input_approval_answer(question) do
-          {:ok, question_id, answer_label} ->
-            {:cont, Map.put(acc, question_id, %{"answers" => [answer_label]})}
+          {:ok, question_id, answer_label, decision} ->
+            answers = Map.put(answer_acc, question_id, %{"answers" => [answer_label]})
+            {:cont, {answers, [decision | decision_acc]}}
 
           :error ->
             {:halt, :error}
         end
       end)
 
-    case answers do
+    case result do
       :error -> :error
-      answer_map when map_size(answer_map) > 0 -> {:ok, answer_map, "Approve this Session"}
+      {answer_map, decisions} when map_size(answer_map) > 0 -> {:ok, answer_map, approval_decision(decisions)}
       _ -> :error
     end
   end
@@ -980,15 +1221,46 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tool_request_user_input_question_id(_question), do: :error
 
-  defp tool_request_user_input_approval_answer(%{"id" => question_id, "options" => options})
+  defp tool_request_user_input_approval_answer(%{"id" => question_id, "options" => options} = question)
        when is_binary(question_id) and is_list(options) do
-    case tool_request_user_input_approval_option_label(options) do
-      nil -> :error
-      answer_label -> {:ok, question_id, answer_label}
+    if deny_linear_save_issue_request?(question) do
+      case tool_request_user_input_deny_option_label(options) do
+        nil -> :error
+        answer_label -> {:ok, question_id, answer_label, answer_label}
+      end
+    else
+      case tool_request_user_input_approval_option_label(options) do
+        nil -> :error
+        answer_label -> {:ok, question_id, answer_label, answer_label}
+      end
     end
   end
 
   defp tool_request_user_input_approval_answer(_question), do: :error
+
+  defp approval_decision(decisions) do
+    if Enum.any?(decisions, &(&1 == "Deny")), do: "Deny", else: "Approve this Session"
+  end
+
+  defp deny_linear_save_issue_request?(%{"question" => question, "options" => options})
+       when is_binary(question) and is_list(options) do
+    normalized_question =
+      question
+      |> String.downcase()
+      |> String.replace(~r/\s+/, " ")
+
+    String.contains?(normalized_question, "linear mcp server") and
+      String.contains?(normalized_question, @linear_save_issue_denial_tool) and
+      is_binary(tool_request_user_input_deny_option_label(options))
+  end
+
+  defp deny_linear_save_issue_request?(_question), do: false
+
+  defp tool_request_user_input_deny_option_label(options) do
+    options
+    |> Enum.map(&tool_request_user_input_option_label/1)
+    |> Enum.find(&(&1 == "Deny"))
+  end
 
   defp tool_request_user_input_approval_option_label(options) do
     options
@@ -1081,6 +1353,69 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> String.starts_with?("{")
   end
 
+  defp post_completion_turn_audit(thread_path, turn_id) when is_binary(thread_path) and is_binary(turn_id) do
+    case find_session_turn_aborted(thread_path, turn_id, @post_completion_audit_attempts) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, payload} ->
+        {:error, {:turn_aborted, payload}}
+
+      {:error, reason} ->
+        Logger.debug("Codex session post-completion audit skipped path=#{thread_path} reason=#{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp post_completion_turn_audit(_thread_path, _turn_id), do: :ok
+
+  defp find_session_turn_aborted(thread_path, turn_id, attempts_left) do
+    cond do
+      File.regular?(thread_path) ->
+        thread_path
+        |> read_session_turn_aborted(turn_id)
+        |> maybe_retry_session_turn_aborted(thread_path, turn_id, attempts_left)
+
+      attempts_left > 0 ->
+        Process.sleep(@post_completion_audit_sleep_ms)
+        find_session_turn_aborted(thread_path, turn_id, attempts_left - 1)
+
+      true ->
+        {:error, :session_log_unavailable}
+    end
+  rescue
+    error -> {:error, {error.__struct__, Exception.message(error)}}
+  end
+
+  defp read_session_turn_aborted(thread_path, turn_id) do
+    with {:ok, contents} <- File.read(thread_path) do
+      payload =
+        contents
+        |> String.split("\n", trim: true)
+        |> Enum.find_value(&decode_turn_aborted_event(&1, turn_id))
+
+      {:ok, payload}
+    end
+  end
+
+  defp maybe_retry_session_turn_aborted({:ok, nil}, thread_path, turn_id, attempts_left)
+       when attempts_left > 0 do
+    Process.sleep(@post_completion_audit_sleep_ms)
+    find_session_turn_aborted(thread_path, turn_id, attempts_left - 1)
+  end
+
+  defp maybe_retry_session_turn_aborted(result, _thread_path, _turn_id, _attempts_left), do: result
+
+  defp decode_turn_aborted_event(line, turn_id) do
+    case Jason.decode(line) do
+      {:ok, %{"type" => "event_msg", "payload" => %{"type" => "turn_aborted", "turn_id" => ^turn_id} = payload}} ->
+        payload
+
+      _ ->
+        nil
+    end
+  end
+
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
@@ -1121,6 +1456,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp map_at_path(payload, keys) when is_map(payload) and is_list(keys) do
+    Enum.reduce_while(keys, payload, fn key, acc ->
+      case acc do
+        map when is_map(map) -> {:cont, Map.get(map, key)}
+        _ -> {:halt, nil}
+      end
+    end)
+  end
+
+  defp map_at_path(_payload, _keys), do: nil
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

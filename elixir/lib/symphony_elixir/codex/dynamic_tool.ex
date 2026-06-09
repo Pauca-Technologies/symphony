@@ -96,6 +96,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           }
         })
 
+      {:review_deferred, prompt} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "Automated reviewer deferred the In Review handoff until after this Codex turn.",
+            "remediation" => prompt,
+            "review" => %{"deferred" => true}
+          }
+        })
+
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
     end
@@ -136,14 +145,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          {:ok, current_state, target_state} <-
            resolve_transition_states(query, variables, issue, issue_id, linear_client),
          true <- HandoffGate.handoff_transition?(current_state, target_state) do
-      case HandoffGate.run_before_handoff(workspace, issue, worker_host, target_state, handoff_opts) do
-        :ok -> run_review_gate(workspace, issue, worker_host, context, linear_client)
+      gate_issue = issue_with_state(issue, current_state)
+
+      case HandoffGate.run_before_handoff(workspace, gate_issue, worker_host, target_state, handoff_opts) do
+        :ok -> run_review_gate(query, variables, workspace, gate_issue, worker_host, context, linear_client)
         {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
       end
     else
       _ -> :ok
     end
   end
+
+  defp issue_with_state(%SymphonyElixir.Linear.Issue{} = issue, state) when is_binary(state) do
+    %{issue | state: state}
+  end
+
+  defp issue_with_state(issue, _state), do: issue
 
   defp transition_matches_context_issue?(issue, issue_id) when is_binary(issue_id) do
     issue_id in [
@@ -157,25 +174,88 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   # (AgentRunner threads the loaded review workflow through the gate context).
   # A request-changes verdict blocks the handoff with the reviewer's comments
   # as remediation, reusing the same loop the shell hook uses.
-  defp run_review_gate(workspace, issue, worker_host, context, linear_client) do
+  defp run_review_gate(query, variables, workspace, issue, worker_host, context, linear_client) do
     case Map.get(context, :review_workflow) || Map.get(context, "review_workflow") do
       review_workflow when is_map(review_workflow) ->
-        # `:review_opts` is an optional passthrough (test/extensibility seam):
-        # the gate always pins `linear_client`; callers may add a custom
-        # session_runner / comment_fn.
-        review_opts =
-          context
-          |> Map.get(:review_opts, [])
-          |> Keyword.put(:linear_client, linear_client)
-
-        case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
-          :ok -> :ok
-          {:blocked, prompt, findings} -> {:review_blocked, prompt, findings}
-        end
+        review_workflow
+        |> review_gate_request(query, variables, workspace, issue, worker_host, context, linear_client)
+        |> maybe_defer_or_run_review_gate()
 
       _ ->
         :ok
     end
+  end
+
+  defp review_gate_request(review_workflow, query, variables, workspace, issue, worker_host, context, linear_client) do
+    # `:review_opts` is an optional passthrough (test/extensibility seam):
+    # the gate always pins `linear_client`; callers may add a custom
+    # session_runner / comment_fn.
+    review_opts =
+      context
+      |> Map.get(:review_opts, [])
+      |> Keyword.put(:linear_client, linear_client)
+
+    %{
+      query: query,
+      variables: variables,
+      workspace: workspace,
+      issue: issue,
+      worker_host: worker_host,
+      review_workflow: review_workflow,
+      review_opts: review_opts,
+      context: context,
+      linear_client: linear_client
+    }
+  end
+
+  defp maybe_defer_or_run_review_gate(
+         %{
+           workspace: workspace,
+           issue: issue,
+           worker_host: worker_host,
+           review_workflow: review_workflow,
+           review_opts: review_opts,
+           context: context
+         } = request
+       ) do
+    case deferred_review_callback(context) do
+      callback when is_function(callback, 1) ->
+        callback.(%{
+          query: request.query,
+          variables: request.variables,
+          workspace: workspace,
+          issue: issue,
+          worker_host: worker_host,
+          review_workflow: review_workflow,
+          review_opts: review_opts,
+          linear_client: request.linear_client
+        })
+
+        {:review_deferred, deferred_review_prompt(issue)}
+
+      nil ->
+        case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
+          :ok -> :ok
+          {:blocked, prompt, findings} -> {:review_blocked, prompt, findings}
+        end
+    end
+  end
+
+  defp deferred_review_callback(context) do
+    Map.get(context, :deferred_review_callback) || Map.get(context, "deferred_review_callback")
+  end
+
+  defp deferred_review_prompt(issue) do
+    identifier = Map.get(issue, :identifier) || Map.get(issue, "identifier") || "this issue"
+
+    """
+    System message:
+
+    Symphony accepted the In Progress -> In Review handoff request for #{identifier}, and will run the required automated reviewer outside this active tool call.
+
+    Do not retry the Linear handoff mutation in this turn. End the turn now. Symphony will either move the issue to In Review after reviewer approval, or continue you with reviewer findings if changes are requested.
+    """
+    |> String.trim()
   end
 
   defp issue_update_mutation?(query) when is_binary(query) do
@@ -204,13 +284,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp explicit_target_state(query, variables) do
     variable_string(variables, ["stateName", "state", "status"]) ||
+      variable_string(input_variables(variables), ["stateName", "state", "status"]) ||
       literal_argument(query, "stateName") ||
       literal_argument(query, "state") ||
       literal_argument(query, "status")
   end
 
   defp transition_state_id(query, variables) do
-    variable_string(variables, ["stateId"]) || literal_argument(query, "stateId")
+    variable_string(variables, ["stateId"]) ||
+      variable_string(input_variables(variables), ["stateId"]) ||
+      literal_argument(query, "stateId")
   end
 
   defp resolve_state_id_transition(issue_id, state_id, fallback_current_state, linear_client) do
@@ -252,6 +335,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         _ -> nil
       end
     end)
+  end
+
+  defp input_variables(variables) when is_map(variables) do
+    case Map.get(variables, "input") || Map.get(variables, :input) do
+      input when is_map(input) -> input
+      _ -> %{}
+    end
   end
 
   defp literal_argument(query, field) when is_binary(query) and is_binary(field) do

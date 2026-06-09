@@ -3,12 +3,14 @@ defmodule SymphonyElixir.ReviewGate do
   Runs a full reviewer agent at the `In Progress -> In Review` handoff.
 
   When a consumer repo ships a `WORKFLOW_REVIEW.md` (loaded by
-  `AgentRunner` alongside its `WORKFLOW.md`), this gate fires immediately
-  after the deterministic `before_handoff` shell hook passes and *before*
-  the Linear `issueUpdate` mutation that would move the issue out of
-  `In Progress`. It spawns a fresh Codex session in the implementor's own
-  worktree, driven by the review prompt, and reads a JSON verdict the
-  reviewer writes to a known path.
+  `AgentRunner` alongside its `WORKFLOW.md`), the handoff tool call first
+  verifies that the deterministic `before_handoff` shell hook passes, then
+  records the requested Linear `issueUpdate` mutation and returns control to
+  the implementor turn. `AgentRunner` runs this review gate after that turn
+  closes and *before* applying the recorded mutation that would move the
+  issue out of `In Progress`. The gate spawns a fresh Codex session in the
+  implementor's own worktree, driven by the review prompt, and reads a JSON
+  verdict the reviewer writes to a known path.
 
     * `approve` -> `:ok`, the handoff proceeds.
     * `request_changes` (and the per-issue iteration budget is not yet
@@ -56,6 +58,7 @@ defmodule SymphonyElixir.ReviewGate do
   require Logger
 
   alias SymphonyElixir.{
+    Cardinality,
     Codex.AppServer,
     Codex.DynamicTool,
     Github.PrReviewSection,
@@ -69,6 +72,7 @@ defmodule SymphonyElixir.ReviewGate do
   @default_max_iterations 3
   @default_verdict_path ".artifacts/symphony-review/verdict.json"
   @default_section_heading "## 🤖 How to review this PR"
+  @max_verdict_attempts 2
 
   @iteration_key {__MODULE__, :iteration}
   @budget_noted_key {__MODULE__, :budget_noted}
@@ -107,13 +111,15 @@ defmodule SymphonyElixir.ReviewGate do
       when is_binary(workspace) and is_binary(issue_id) and is_map(review_workflow) do
     settings = review_settings(review_workflow)
     iteration = current_iteration(issue_id)
+    pr_opts = review_pr_opts(issue, opts)
 
-    case PrReviewSection.resolve_pr(workspace, opts) do
+    case PrReviewSection.resolve_pr(workspace, pr_opts) do
       {:skip, reason} when settings.require_pr ->
         # No PR at the In Review handoff: skip the reviewer entirely (product
         # decision). The whole feature — review + PR annotation — is PR-centric
         # here; set `require_pr: false` to review on the diff anyway and just
         # no-op the annotation.
+        Logger.info("review.gate skipped #{issue_context(issue)} reason=#{inspect({:no_pr, reason})}")
         note_review_skipped(issue, {:no_pr, reason}, opts)
         emit_telemetry(issue, iteration, :skipped, 0, nil)
         :ok
@@ -130,7 +136,7 @@ defmodule SymphonyElixir.ReviewGate do
           emit_telemetry(issue, iteration, :budget_exhausted, 0, :thorough)
           :ok
         else
-          run_iteration(workspace, issue, worker_host, review_workflow, settings, iteration, pr, opts)
+          run_iteration(workspace, issue, worker_host, review_workflow, settings, iteration, pr, pr_opts)
         end
     end
   end
@@ -141,14 +147,55 @@ defmodule SymphonyElixir.ReviewGate do
   @spec telemetry_event() :: [atom()]
   def telemetry_event, do: @telemetry_event
 
+  defp review_pr_opts(%Issue{} = issue, opts) do
+    case attached_pr_url(issue) do
+      nil -> opts
+      url -> Keyword.put_new(opts, :pr_url, url)
+    end
+  end
+
+  defp attached_pr_url(%Issue{} = issue) do
+    issue
+    |> Cardinality.pr_urls()
+    |> List.first()
+  end
+
   defp pr_or_nil({:ok, pr}), do: pr
   defp pr_or_nil(_pr_result), do: nil
 
   defp run_iteration(workspace, %Issue{} = issue, worker_host, review_workflow, settings, iteration, pr, opts) do
+    run_iteration(
+      %{
+        workspace: workspace,
+        issue: issue,
+        worker_host: worker_host,
+        review_workflow: review_workflow,
+        settings: settings,
+        iteration: iteration,
+        pr: pr,
+        opts: opts
+      },
+      1,
+      nil
+    )
+  end
+
+  defp run_iteration(
+         %{
+           workspace: workspace,
+           issue: %Issue{} = issue,
+           worker_host: worker_host,
+           review_workflow: review_workflow,
+           settings: settings,
+           opts: opts
+         } = review_context,
+         attempt,
+         previous_reason
+       ) do
     verdict_path = Path.join(workspace, settings.verdict_path)
     prepare_verdict_path(verdict_path)
 
-    case render_review_prompt(issue, review_workflow) do
+    case render_review_prompt(issue, review_workflow, attempt, previous_reason, settings.verdict_path) do
       {:ok, prompt} ->
         ctx = %{
           workspace: workspace,
@@ -160,12 +207,25 @@ defmodule SymphonyElixir.ReviewGate do
         }
 
         case run_review_session(ctx, opts) do
-          {:ok, _session} -> evaluate_verdict(workspace, verdict_path, issue, settings, iteration, pr, opts)
-          {:error, reason} -> fail_open(issue, iteration, {:review_session_failed, reason}, opts)
+          {:ok, _session} ->
+            evaluate_verdict(verdict_path, review_context, attempt)
+
+          {:error, reason} ->
+            handle_review_session_failure(review_context, attempt, reason)
         end
 
       {:error, reason} ->
-        fail_open(issue, iteration, {:review_prompt_unavailable, reason}, opts)
+        fail_open(issue, review_context.iteration, {:review_prompt_unavailable, reason}, opts)
+    end
+  end
+
+  defp handle_review_session_failure(%{issue: %Issue{} = issue, opts: opts} = review_context, attempt, reason) do
+    if attempt < @max_verdict_attempts do
+      Logger.warning("review.gate session failed #{issue_context(issue)} reason=#{inspect(reason)} attempt=#{attempt}; retrying")
+
+      run_iteration(review_context, attempt + 1, {:review_session_failed, reason})
+    else
+      fail_open(issue, review_context.iteration, {:review_session_failed, reason}, opts)
     end
   end
 
@@ -173,7 +233,7 @@ defmodule SymphonyElixir.ReviewGate do
   # review_effort tier + prose (effort is orthogonal to the verdict — a change
   # needing a thorough review can still approve). Keeping it fresh through the
   # request_changes loop means the final pass's assessment wins.
-  defp evaluate_verdict(workspace, verdict_path, %Issue{} = issue, settings, iteration, pr, opts) do
+  defp evaluate_verdict(verdict_path, %{workspace: workspace, issue: %Issue{} = issue, settings: settings, iteration: iteration, pr: pr, opts: opts} = review_context, attempt) do
     case read_verdict(verdict_path) do
       {:ok, %{verdict: :approve} = verdict} ->
         maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
@@ -188,7 +248,13 @@ defmodule SymphonyElixir.ReviewGate do
         {:blocked, remediation_prompt(verdict, next_iteration, settings.max_iterations), verdict.comments}
 
       {:error, reason} ->
-        fail_open(issue, iteration, {:verdict_unreadable, reason}, opts)
+        if attempt < @max_verdict_attempts do
+          Logger.warning("review.gate verdict unreadable #{issue_context(issue)} reason=#{inspect(reason)} attempt=#{attempt}; retrying")
+
+          run_iteration(review_context, attempt + 1, reason)
+        else
+          fail_open(issue, iteration, {:verdict_unreadable, reason}, opts)
+        end
     end
   end
 
@@ -258,8 +324,12 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp mutation_query?(_query), do: false
 
-  defp render_review_prompt(%Issue{} = issue, review_workflow) do
+  defp render_review_prompt(%Issue{} = issue, review_workflow, attempt, previous_reason, verdict_path) do
     prompt = PromptBuilder.build_prompt(issue, per_repo_workflow: review_workflow)
+    prompt = add_review_runtime_stability_guard(prompt)
+    prompt = add_review_tool_output_guard(prompt)
+    prompt = add_verdict_reliability_guard(prompt, verdict_path)
+    prompt = maybe_add_verdict_retry_instructions(prompt, attempt, previous_reason, verdict_path)
 
     if String.trim(prompt) == "" do
       {:error, :empty_review_prompt}
@@ -268,6 +338,95 @@ defmodule SymphonyElixir.ReviewGate do
     end
   rescue
     error -> {:error, Exception.message(error)}
+  end
+
+  defp add_review_runtime_stability_guard(prompt) do
+    """
+    #{prompt}
+
+    ## Symphony automated-review runtime guard
+
+    This review is running inside an unattended Symphony gate. Complete the review directly in this
+    Codex turn. Do not spawn sub-agents, delegate lenses to other agents, or use multi-agent tools,
+    even if the repository review workflow asks for that pattern. Cover the required lenses yourself
+    with concise file/diff inspection.
+
+    Do not run package-manager validation commands such as `pnpm test`, `pnpm lint`, `pnpm
+    typecheck`, or app/browser checks during this automated gate unless the command is essential to
+    decide a concrete blocker and is expected to finish quickly. Prefer existing PR checks, the
+    implementor's recorded validation, and narrow file inspection. If validation cannot be completed
+    within this turn, say that in the final verdict and choose `request_changes` only when the
+    missing evidence meets the workflow severity bar.
+    """
+  end
+
+  defp add_review_tool_output_guard(prompt) do
+    """
+    #{prompt}
+
+    ## Symphony review tool-output guard
+
+    Keep review command output bounded. Do not run broad searches in `node_modules`, `.git`,
+    generated assets, source maps, build output, coverage output, or framework caches. Default
+    searches should exclude those trees, for example:
+
+    ```sh
+    rg -n "pattern" --glob '!node_modules/**' --glob '!dist/**' --glob '!build/**' --glob '!coverage/**' --glob '!*.map'
+    ```
+
+    If dependency internals are essential, inspect a specific file or tight path and cap the
+    output with a narrow pattern, `--max-count`, `head`, or a small `sed -n` range. Do not run a
+    long check in parallel with a command that may produce large output. If a command returns
+    unexpectedly large output, stop broad searching and write the verdict from the evidence already
+    gathered, using `request_changes` when the uncertainty meets the review severity bar.
+    """
+  end
+
+  defp add_verdict_reliability_guard(prompt, verdict_path) do
+    """
+    #{prompt}
+
+    ## Symphony verdict reliability guard
+
+    Before starting any long-running command or broad validation check, create the verdict directory
+    and write a valid interim verdict to `#{verdict_path}`. The interim verdict must include
+    `"symphony_interim": true`. If you do not yet have enough evidence to approve, that interim
+    verdict must be `"request_changes"` and explain the missing evidence or unresolved risk. Replace
+    it with your final verdict before your final message, and either omit `symphony_interim` or set
+    it to `false`.
+
+    Do not make a slow check the last thing standing between Symphony and the verdict file. If a
+    validation command is interrupted, times out, or returns partial evidence, keep or write the
+    verdict from the evidence already gathered, using `"request_changes"` when uncertainty meets
+    the review severity bar.
+    """
+  end
+
+  defp maybe_add_verdict_retry_instructions(prompt, attempt, _previous_reason, _verdict_path)
+       when attempt <= 1 do
+    prompt
+  end
+
+  defp maybe_add_verdict_retry_instructions(prompt, attempt, previous_reason, verdict_path) do
+    """
+    #{prompt}
+
+    ## Symphony retry guard
+
+    A previous reviewer session for this same handoff ended without a readable verdict file
+    (reason: `#{inspect(previous_reason)}`). This is retry attempt #{attempt} of #{@max_verdict_attempts}.
+
+    Before doing anything else, create the verdict directory:
+
+    ```sh
+    mkdir -p #{Path.dirname(verdict_path)}
+    ```
+
+    Complete a concise direct review under the original instructions above, then write valid JSON
+    to `#{verdict_path}` before your final message. Do not spawn sub-agents on this retry, and do
+    not start long-running checks unless they are essential to decide the verdict. If remaining
+    uncertainty meets the severity bar, use `"request_changes"` rather than ending without a verdict.
+    """
   end
 
   defp prepare_verdict_path(verdict_path) do
@@ -280,10 +439,53 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp read_verdict(verdict_path) do
     with {:ok, raw} <- File.read(verdict_path),
-         {:ok, decoded} <- Jason.decode(raw) do
+         {:ok, decoded} <- Jason.decode(raw),
+         :ok <- reject_interim_verdict(decoded) do
       normalize_verdict(decoded)
     end
   end
+
+  defp reject_interim_verdict(%{"symphony_interim" => true}), do: {:error, :interim_verdict}
+
+  defp reject_interim_verdict(decoded) when is_map(decoded) do
+    if legacy_interim_verdict?(decoded) do
+      {:error, :interim_verdict}
+    else
+      :ok
+    end
+  end
+
+  defp reject_interim_verdict(_decoded), do: :ok
+
+  defp legacy_interim_verdict?(decoded) do
+    text =
+      [
+        Map.get(decoded, "summary"),
+        Map.get(decoded, "human_review"),
+        decoded
+        |> Map.get("comments")
+        |> interim_comment_text()
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\n")
+      |> String.downcase()
+
+    String.contains?(text, "interim") and
+      (String.contains?(text, "review is in progress") or
+         String.contains?(text, "interim placeholder") or
+         String.contains?(text, "final review has not completed"))
+  end
+
+  defp interim_comment_text(comments) when is_list(comments) do
+    Enum.map_join(comments, "\n", fn
+      %{"body" => body} when is_binary(body) -> body
+      %{body: body} when is_binary(body) -> body
+      body when is_binary(body) -> body
+      _ -> ""
+    end)
+  end
+
+  defp interim_comment_text(_comments), do: nil
 
   defp normalize_verdict(decoded) when is_map(decoded) do
     case normalize_verdict_value(Map.get(decoded, "verdict")) do

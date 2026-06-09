@@ -7,8 +7,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   # human-review section edit) without shelling real gh.
   defp stub_pr_runner do
     fn
-      ["pr", "view" | _], _cwd -> {Jason.encode!(%{"number" => 7, "body" => "Body."}), 0}
-      ["pr", "edit" | _], _cwd -> {"", 0}
+      ["pr", "view" | _], _cwd -> {Jason.encode!(%{"id" => "PR_7", "number" => 7, "body" => "Body."}), 0}
+      ["api", "graphql" | _], _cwd -> {"", 0}
     end
   end
 
@@ -224,6 +224,77 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert get_in(output, ["error", "remediation"]) =~ "review-required: review gate should run"
   end
 
+  test "linear_graphql runs handoff gates when IssueUpdateInput carries stateId" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-input-state-handoff-tool-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.dirname(workspace),
+      hook_before_handoff: """
+      printf '%s' '{"checks":[{"name":"nested-input-state","status":"failed","detail":"nested stateId should run gates"}]}'
+      exit 2
+      """
+    )
+
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    issue = %Issue{
+      id: "30d1224d-9343-4f8f-a60c-e7ff285d13dd",
+      identifier: "UDPE-6112",
+      title: "Nested input handoff",
+      state: "Todo"
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => """
+          mutation MoveIssueToInReview($id: String!, $input: IssueUpdateInput!) {
+            issueUpdate(id: $id, input: $input) {
+              success
+            }
+          }
+          """,
+          "variables" => %{
+            "id" => "UDPE-6112",
+            "input" => %{"stateId" => "state-review"}
+          }
+        },
+        handoff_gate_context: %{issue: issue, workspace: workspace, worker_host: nil},
+        linear_client: fn
+          query, %{"issueId" => "UDPE-6112"}, [] ->
+            assert query =~ "SymphonyResolveIssueTransition"
+
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                   }
+                 }
+               }
+             }}
+
+          _query, _variables, [] ->
+            flunk("blocked nested-input handoff mutation should not be sent to Linear")
+        end
+      )
+
+    assert response["success"] == false
+
+    output = Jason.decode!(response["output"])
+    assert get_in(output, ["error", "message"]) =~ "before_handoff hook blocked"
+    assert get_in(output, ["error", "remediation"]) =~ "nested-input-state: nested stateId should run gates"
+  end
+
   test "linear_graphql runs the reviewer gate after before_handoff and blocks on request_changes" do
     workspace =
       Path.join(
@@ -242,7 +313,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     # Stand-in reviewer session: writes a request_changes verdict to the
     # gate-provided path instead of launching Codex.
+    test_pid = self()
+
     session_runner = fn ctx ->
+      send(test_pid, {:review_issue_state, ctx.issue.state})
       File.mkdir_p!(Path.dirname(ctx.verdict_path))
 
       File.write!(
@@ -257,7 +331,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       {:ok, %{}}
     end
 
-    issue = %Issue{id: "issue-review", identifier: "UDPE-2", title: "Review me", state: "In Progress"}
+    issue = %Issue{id: "issue-review", identifier: "UDPE-2", title: "Review me", state: "Todo"}
 
     response =
       DynamicTool.execute(
@@ -293,6 +367,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       )
 
     assert response["success"] == false
+    assert_received {:review_issue_state, "In Progress"}
 
     output = Jason.decode!(response["output"])
     assert get_in(output, ["error", "message"]) =~ "Automated reviewer requested changes"
@@ -363,6 +438,74 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == true
     assert_received :mutation_sent
+  end
+
+  test "linear_graphql defers the reviewer gate when a deferred callback is provided" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-review-gate-deferred-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    review_workflow = %{
+      config: %{"review" => %{}},
+      prompt: "Review {{ issue.identifier }}",
+      prompt_template: "Review {{ issue.identifier }}"
+    }
+
+    issue = %Issue{id: "issue-defer", identifier: "UDPE-4", title: "Defer review", state: "In Progress"}
+    test_pid = self()
+
+    query =
+      "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }"
+
+    variables = %{"issueId" => "issue-defer", "stateId" => "state-review"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => query, "variables" => variables},
+        handoff_gate_context: %{
+          issue: issue,
+          workspace: workspace,
+          worker_host: nil,
+          review_workflow: review_workflow,
+          deferred_review_callback: fn request -> send(test_pid, {:deferred_review, request}) end
+        },
+        linear_client: fn
+          state_query, %{"issueId" => "issue-defer"}, [] ->
+            assert state_query =~ "SymphonyResolveIssueTransition"
+
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                   }
+                 }
+               }
+             }}
+
+          _mutation, _mutation_variables, [] ->
+            flunk("deferred handoff mutation should not be sent before the reviewer runs")
+        end
+      )
+
+    assert response["success"] == false
+    output = Jason.decode!(response["output"])
+    assert get_in(output, ["error", "review", "deferred"]) == true
+    assert get_in(output, ["error", "remediation"]) =~ "Do not retry the Linear handoff mutation"
+
+    assert_received {:deferred_review, request}
+    assert request.query == query
+    assert request.variables == variables
+    assert request.issue.identifier == "UDPE-4"
+    assert request.review_workflow == review_workflow
   end
 
   test "linear_graphql accepts a raw GraphQL query string" do

@@ -83,6 +83,7 @@ Work only in the provided repository copy. Do not touch any other path.
 ## Prerequisite: Linear MCP or `linear_graphql` tool is available
 
 The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.
+When moving an issue from `In Progress` to `In Review` or `Human Review`, use `linear_graphql` for the Linear `issueUpdate` mutation so Symphony can run the handoff gates. Do not use native Linear MCP `save_issue` for that state change.
 
 ## Default posture
 

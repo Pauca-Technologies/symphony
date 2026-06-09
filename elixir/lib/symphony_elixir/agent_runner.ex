@@ -12,6 +12,7 @@ defmodule SymphonyElixir.AgentRunner do
     Linear.Issue,
     PromptBuilder,
     RepoConfig,
+    ReviewGate,
     Router,
     SessionStartHook,
     Telemetry,
@@ -21,6 +22,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   @type worker_host :: String.t() | nil
   @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
+  @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
 
   # See T04 in /data/projects/coding-harness/implementation-plan.md and audit §5.1 O9.
   # Symphony silently giving up on terminal failure is a trust-killer; we mark the
@@ -306,6 +308,9 @@ defmodule SymphonyElixir.AgentRunner do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
       handoff_gate_prompt = pop_handoff_gate_prompt()
 
+      handoff_gate_prompt =
+        maybe_run_deferred_review_handoff(pop_deferred_review_handoff(), handoff_gate_prompt)
+
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
@@ -345,7 +350,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
     session_start_prompt = Keyword.get(opts, :session_start_prompt)
 
-    [session_start_prompt, PromptBuilder.build_prompt(issue, opts)]
+    [session_start_prompt, handoff_tool_guidance(opts), PromptBuilder.build_prompt(issue, opts)]
     |> Enum.reject(&(is_nil(&1) or String.trim(&1) == ""))
     |> Enum.join("\n\n")
   end
@@ -355,6 +360,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     """
     #{handoff_gate_prompt_section(handoff_gate_prompt)}
+    #{handoff_tool_guidance(opts)}
     Continuation guidance:
 
     - The previous Codex turn completed normally, but the Linear issue is still in an active state.
@@ -374,6 +380,7 @@ defmodule SymphonyElixir.AgentRunner do
       %{issue: issue, workspace: workspace, worker_host: worker_host}
       |> maybe_put_map(:before_handoff_command, per_repo_before_handoff)
       |> maybe_put_map(:review_workflow, per_repo_review_workflow)
+      |> maybe_put_map(:deferred_review_callback, deferred_review_callback(per_repo_review_workflow))
 
     fn tool, arguments ->
       result =
@@ -389,6 +396,84 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp maybe_put_map(map, _key, nil), do: map
   defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
+
+  defp deferred_review_callback(nil), do: nil
+  defp deferred_review_callback(_review_workflow), do: &store_deferred_review_handoff/1
+
+  defp store_deferred_review_handoff(request) when is_map(request) do
+    Process.put(@deferred_review_handoff_key, request)
+    :ok
+  end
+
+  defp pop_deferred_review_handoff do
+    Process.delete(@deferred_review_handoff_key)
+  end
+
+  defp maybe_run_deferred_review_handoff(nil, handoff_gate_prompt), do: handoff_gate_prompt
+
+  defp maybe_run_deferred_review_handoff(%{} = request, _handoff_gate_prompt) do
+    issue = Map.fetch!(request, :issue)
+    workspace = Map.fetch!(request, :workspace)
+    worker_host = Map.get(request, :worker_host)
+    review_workflow = Map.fetch!(request, :review_workflow)
+    review_opts = Map.get(request, :review_opts, [])
+
+    Logger.info("review.gate deferred starting #{issue_context(issue)} workspace=#{workspace}")
+
+    case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
+      :ok ->
+        apply_deferred_review_handoff(request)
+
+      {:blocked, prompt, findings} ->
+        Logger.info("review.gate deferred blocked #{issue_context(issue)} findings=#{length(findings)}")
+        prompt
+    end
+  end
+
+  defp apply_deferred_review_handoff(%{} = request) do
+    issue = Map.fetch!(request, :issue)
+    query = Map.fetch!(request, :query)
+    variables = Map.get(request, :variables, %{})
+    linear_client = Map.fetch!(request, :linear_client)
+
+    Logger.info("review.gate deferred approved #{issue_context(issue)}; applying Linear handoff mutation")
+
+    case linear_client.(query, variables, []) do
+      {:ok, response} ->
+        if graphql_success?(response) do
+          Logger.info("review.gate deferred handoff applied #{issue_context(issue)}")
+          nil
+        else
+          Logger.warning("review.gate deferred handoff mutation returned GraphQL errors #{issue_context(issue)}")
+          deferred_handoff_failure_prompt(issue, {:linear_graphql_errors, graphql_errors(response)})
+        end
+
+      {:error, reason} ->
+        Logger.warning("review.gate deferred handoff mutation failed #{issue_context(issue)} reason=#{inspect(reason)}")
+        deferred_handoff_failure_prompt(issue, reason)
+    end
+  end
+
+  defp graphql_success?(response) do
+    graphql_errors(response) == []
+  end
+
+  defp graphql_errors(%{"errors" => errors}) when is_list(errors), do: errors
+  defp graphql_errors(%{errors: errors}) when is_list(errors), do: errors
+  defp graphql_errors(_response), do: []
+
+  defp deferred_handoff_failure_prompt(%Issue{} = issue, reason) do
+    """
+    System message:
+
+    The automated reviewer approved the In Progress -> In Review handoff for #{issue.identifier}, but Symphony could not apply the original Linear status mutation after the review completed.
+
+    Reason: `#{inspect(reason)}`
+
+    Keep the issue in In Progress, inspect the Linear status transition, and re-attempt the handoff with Symphony's `linear_graphql` tool.
+    """
+    |> String.trim()
+  end
 
   defp maybe_store_handoff_gate_prompt(%{"success" => false, "output" => output}) when is_binary(output) do
     case Jason.decode(output) do
@@ -414,6 +499,20 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp handoff_gate_prompt_section(_prompt), do: ""
+
+  defp handoff_tool_guidance(opts) do
+    if Keyword.has_key?(opts, :per_repo_before_handoff) or Keyword.has_key?(opts, :per_repo_review_workflow) do
+      """
+      Symphony handoff requirement:
+
+      - To move this issue from In Progress to In Review or Human Review, use Symphony's `linear_graphql` tool for the Linear `issueUpdate` mutation.
+      - Do not use the native Linear MCP `save_issue` tool for that handoff; it cannot run Symphony's before_handoff and automated review gates.
+      """
+      |> String.trim()
+    else
+      ""
+    end
+  end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
