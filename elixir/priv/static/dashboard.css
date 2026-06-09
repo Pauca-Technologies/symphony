@@ -477,6 +477,25 @@ pre,
   border-left-color: var(--muted);
 }
 
+.transcript-block-subagent {
+  margin-left: 1.5rem;
+  border-left-style: dashed;
+  background: var(--page-deep);
+}
+
+.transcript-subagent-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  background: #eef0ff;
+  color: #4338ca;
+  white-space: nowrap;
+}
+
 .transcript-block-head {
   display: flex;
   align-items: center;

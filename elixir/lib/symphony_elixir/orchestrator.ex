@@ -1425,18 +1425,20 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    resolved_session_id = session_id_for_update(running_entry.session_id, update)
+    parent_thread_id = parent_thread_from_session_id(resolved_session_id)
 
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: codex_message,
-        session_id: session_id_for_update(running_entry.session_id, update),
+        session_id: resolved_session_id,
         last_codex_event: event,
         recent_codex_events: append_recent_codex_event(Map.get(running_entry, :recent_codex_events, []), codex_message),
         recent_codex_transcript_blocks:
           append_recent_codex_transcript_block(
             Map.get(running_entry, :recent_codex_transcript_blocks, []),
-            transcript_block_for_update(update)
+            transcript_block_for_update(update, parent_thread_id)
           ),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1507,9 +1509,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp append_recent_codex_transcript_block(blocks, %{kind: kind, text: text} = block)
        when is_list(blocks) and is_binary(kind) and is_binary(text) do
+    thread_id = Map.get(block, :thread_id)
+
     merged_blocks =
       case Enum.reverse(blocks) do
-        [%{kind: ^kind, text: existing_text} = previous | rest]
+        [%{kind: ^kind, text: existing_text, thread_id: ^thread_id} = previous | rest]
         when kind in ["agent", "output", "reasoning"] ->
           Enum.reverse([%{previous | text: existing_text <> text} | rest])
 
@@ -1522,45 +1526,73 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp append_recent_codex_transcript_block(_blocks, block) when is_map(block), do: [block]
 
-  defp transcript_block_for_update(%{payload: %{} = payload, timestamp: timestamp}) do
+  defp transcript_block_for_update(%{payload: %{} = payload, timestamp: timestamp}, parent_thread_id) do
     method = Map.get(payload, "method") || Map.get(payload, :method)
+    origin = transcript_origin(payload, parent_thread_id)
 
     cond do
       method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
-        build_transcript_block("agent", timestamp, extract_transcript_text(payload, agent_text_paths()))
+        build_transcript_block("agent", timestamp, extract_transcript_text(payload, agent_text_paths()), origin)
 
       method in ["codex/event/exec_command_output_delta", "item/commandExecution/outputDelta"] ->
-        build_transcript_block("output", timestamp, extract_transcript_text(payload, output_text_paths()))
+        build_transcript_block("output", timestamp, extract_transcript_text(payload, output_text_paths()), origin)
 
       method == "codex/event/exec_command_begin" ->
-        build_transcript_block("command", timestamp, extract_transcript_command(payload))
+        build_transcript_block("command", timestamp, extract_transcript_command(payload), origin)
 
       method in reasoning_methods() ->
-        build_transcript_block("reasoning", timestamp, extract_transcript_text(payload, reasoning_text_paths()))
+        build_transcript_block("reasoning", timestamp, extract_transcript_text(payload, reasoning_text_paths()), origin)
 
       method == "item/tool/call" ->
-        build_transcript_tool_block(timestamp, payload)
+        build_transcript_tool_block(timestamp, payload, origin)
 
       true ->
         nil
     end
   end
 
-  defp transcript_block_for_update(_update), do: nil
+  defp transcript_block_for_update(_update, _parent_thread_id), do: nil
 
-  defp build_transcript_block(kind, timestamp, text) when is_binary(kind) and is_binary(text) do
+  defp build_transcript_block(kind, timestamp, text, origin) when is_binary(kind) and is_binary(text) do
     case normalize_transcript_text(text) do
       "" -> nil
-      normalized -> %{kind: kind, at: iso8601(timestamp), text: normalized}
+      normalized -> Map.merge(%{kind: kind, at: iso8601(timestamp), text: normalized}, origin)
     end
   end
 
-  defp build_transcript_block(_kind, _timestamp, _text), do: nil
+  defp build_transcript_block(_kind, _timestamp, _text, _origin), do: nil
 
-  defp build_transcript_tool_block(timestamp, payload) do
+  defp build_transcript_tool_block(timestamp, payload, origin) do
     {name, args_text} = extract_transcript_tool(payload)
-    %{kind: "tool", at: iso8601(timestamp), title: name, text: normalize_transcript_text(args_text)}
+    Map.merge(%{kind: "tool", at: iso8601(timestamp), title: name, text: normalize_transcript_text(args_text)}, origin)
   end
+
+  # Each Codex event carries the thread it belongs to (`params.threadId`); the
+  # session's own thread is the first UUID of `session_id` (`"<thread>-<turn>"`).
+  # An event from any other thread is a multiplexed subagent turn.
+  defp transcript_origin(payload, parent_thread_id) do
+    event_thread_id = event_thread_id(payload)
+    %{thread_id: event_thread_id, subagent: subagent_thread?(event_thread_id, parent_thread_id)}
+  end
+
+  defp event_thread_id(payload) when is_map(payload) do
+    string_path_value(payload, ["params", "threadId"]) || string_path_value(payload, ["params", "thread_id"])
+  end
+
+  defp subagent_thread?(event_thread_id, parent_thread_id)
+       when is_binary(event_thread_id) and is_binary(parent_thread_id),
+       do: event_thread_id != parent_thread_id
+
+  defp subagent_thread?(_event_thread_id, _parent_thread_id), do: false
+
+  # session_id is "<thread-uuid>-<turn-uuid>"; each UUID is a fixed 36 chars, so
+  # the parent thread is the leading 36 characters followed by the joining "-".
+  defp parent_thread_from_session_id(session_id)
+       when is_binary(session_id) and byte_size(session_id) >= 73 do
+    if binary_part(session_id, 36, 1) == "-", do: binary_part(session_id, 0, 36), else: nil
+  end
+
+  defp parent_thread_from_session_id(_session_id), do: nil
 
   defp agent_text_paths do
     [

@@ -336,22 +336,23 @@ defmodule SymphonyElixirWeb.Presenter do
   defp transcript_fragment(%{"payload" => %{} = payload} = record) do
     method = map_value(payload, ["method"])
     at = Map.get(record, "at")
+    origin = transcript_origin(payload, parent_thread_from_session_id(Map.get(record, "session_id")))
 
     cond do
       method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
-        build_text_fragment("agent", at, extract_text(payload, agent_text_paths()))
+        build_text_fragment("agent", at, extract_text(payload, agent_text_paths()), origin)
 
       method in ["codex/event/exec_command_output_delta", "item/commandExecution/outputDelta"] ->
-        build_text_fragment("output", at, extract_text(payload, output_text_paths()))
+        build_text_fragment("output", at, extract_text(payload, output_text_paths()), origin)
 
       method == "codex/event/exec_command_begin" ->
-        build_text_fragment("command", at, extract_command(payload))
+        build_text_fragment("command", at, extract_command(payload), origin)
 
       method in reasoning_methods() ->
-        build_text_fragment("reasoning", at, extract_text(payload, reasoning_text_paths()))
+        build_text_fragment("reasoning", at, extract_text(payload, reasoning_text_paths()), origin)
 
       method == "item/tool/call" ->
-        build_tool_fragment(at, payload)
+        build_tool_fragment(at, payload, origin)
 
       true ->
         nil
@@ -360,26 +361,62 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp transcript_fragment(_record), do: nil
 
-  defp build_tool_fragment(at, payload) when is_map(payload) do
+  defp build_tool_fragment(at, payload, origin) when is_map(payload) do
     {name, args_text} = extract_tool(payload)
-    %{kind: "tool", at: at, title: name, text: normalize_transcript_text(args_text)}
+    Map.merge(%{kind: "tool", at: at, title: name, text: normalize_transcript_text(args_text)}, origin)
   end
 
-  defp build_text_fragment(kind, at, text) when is_binary(kind) and is_binary(text) do
+  defp build_text_fragment(kind, at, text, origin) when is_binary(kind) and is_binary(text) do
     case normalize_transcript_text(text) do
       "" -> nil
-      normalized -> %{kind: kind, at: at, text: normalized}
+      normalized -> Map.merge(%{kind: kind, at: at, text: normalized}, origin)
     end
   end
 
-  defp build_text_fragment(_kind, _at, _text), do: nil
+  defp build_text_fragment(_kind, _at, _text, _origin), do: nil
+
+  # Each event carries its thread (`params.threadId`); the session's own thread is
+  # the first UUID of `session_id` ("<thread>-<turn>"). Anything else is a subagent.
+  defp transcript_origin(payload, parent_thread_id) do
+    event_thread_id = event_thread_id(payload)
+    %{thread_id: event_thread_id, subagent: subagent_thread?(event_thread_id, parent_thread_id)}
+  end
+
+  defp event_thread_id(payload) when is_map(payload) do
+    string_path_value(payload, ["params", "threadId"]) || string_path_value(payload, ["params", "thread_id"])
+  end
+
+  defp string_path_value(value, []), do: value
+
+  defp string_path_value(map, [key | rest]) when is_map(map) and is_binary(key) do
+    case Map.get(map, key) do
+      nil -> nil
+      nested -> string_path_value(nested, rest)
+    end
+  end
+
+  defp string_path_value(_map, _path), do: nil
+
+  defp subagent_thread?(event_thread_id, parent_thread_id)
+       when is_binary(event_thread_id) and is_binary(parent_thread_id),
+       do: event_thread_id != parent_thread_id
+
+  defp subagent_thread?(_event_thread_id, _parent_thread_id), do: false
+
+  defp parent_thread_from_session_id(session_id)
+       when is_binary(session_id) and byte_size(session_id) >= 73 do
+    if binary_part(session_id, 36, 1) == "-", do: binary_part(session_id, 0, 36), else: nil
+  end
+
+  defp parent_thread_from_session_id(_session_id), do: nil
 
   defp merge_transcript_fragments(fragments) when is_list(fragments) do
     fragments
     |> Enum.reduce([], fn fragment, acc ->
       case acc do
-        [%{kind: kind, text: existing_text} = previous | rest]
-        when kind == fragment.kind and kind in ["agent", "output", "reasoning"] ->
+        [%{kind: kind, text: existing_text, thread_id: prev_thread} = previous | rest]
+        when kind == fragment.kind and kind in ["agent", "output", "reasoning"] and
+               prev_thread == fragment.thread_id ->
           [%{previous | text: existing_text <> fragment.text} | rest]
 
         _ ->
@@ -497,23 +534,36 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp map_value(value, []), do: value
 
-  defp map_value(map, [key | rest]) when is_map(map) and is_atom(key) do
-    case Map.get(map, key) do
-      nil -> map_value(map, [Atom.to_string(key) | rest])
-      nested -> map_value(nested, rest)
+  defp map_value(map, [key | rest]) when is_map(map) do
+    case fetch_either_key(map, key) do
+      {:ok, nested} -> map_value(nested, rest)
+      :error -> nil
     end
-  end
-
-  defp map_value(map, [key | rest]) when is_map(map) and is_binary(key) do
-    case Map.get(map, key) do
-      nil -> map_value(map, [String.to_atom(key) | rest])
-      nested -> map_value(nested, rest)
-    end
-  rescue
-    ArgumentError -> nil
   end
 
   defp map_value(_map, _path), do: nil
+
+  # Look a key up under both string and atom representations without bouncing
+  # between them (the previous mutual recursion infinite-looped on absent keys).
+  defp fetch_either_key(map, key) when is_binary(key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> fetch_existing_atom_key(map, key)
+    end
+  end
+
+  defp fetch_either_key(map, key) when is_atom(key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(map, Atom.to_string(key))
+    end
+  end
+
+  defp fetch_existing_atom_key(map, key) do
+    Map.fetch(map, String.to_existing_atom(key))
+  rescue
+    ArgumentError -> :error
+  end
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

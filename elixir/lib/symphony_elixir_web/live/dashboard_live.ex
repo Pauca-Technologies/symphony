@@ -202,11 +202,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </p>
             <% else %>
               <div class="transcript-stack">
-                <article :for={block <- transcript_blocks(@issue_payload.transcript)} class={transcript_block_class(block.kind)}>
+                <article :for={block <- transcript_blocks(@issue_payload.transcript)} class={transcript_block_class(block.kind, block[:subagent])}>
                   <%= cond do %>
                     <% markdown_transcript_kind?(block.kind) -> %>
                       <div class="transcript-block-head">
                         <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
+                        <span :if={block[:subagent]} class="transcript-subagent-badge">↳ Subagent<%= subagent_suffix(block[:thread_id]) %></span>
                         <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
                       </div>
                       <div class="transcript-markdown"><%= Phoenix.HTML.raw(markdown_to_html(block.text)) %></div>
@@ -214,6 +215,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <details class="transcript-collapsible">
                         <summary class="transcript-summary">
                           <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
+                          <span :if={block[:subagent]} class="transcript-subagent-badge">↳ Subagent<%= subagent_suffix(block[:thread_id]) %></span>
                           <span class="transcript-summary-text mono"><%= transcript_preview(block) %></span>
                           <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
                         </summary>
@@ -226,6 +228,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <% true -> %>
                       <div class="transcript-block-head">
                         <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
+                        <span :if={block[:subagent]} class="transcript-subagent-badge">↳ Subagent<%= subagent_suffix(block[:thread_id]) %></span>
                         <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
                       </div>
                       <pre class="code-panel transcript-code transcript-command"><code><%= block.text %></code></pre>
@@ -619,9 +622,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp collapsible_transcript_kind?(kind), do: kind in ["output", "tool", "reasoning"]
 
-  defp transcript_block_class(kind), do: "transcript-block transcript-block-#{transcript_kind_slug(kind)}"
+  defp transcript_block_class(kind, subagent?) do
+    base = "transcript-block transcript-block-#{transcript_kind_slug(kind)}"
+    if subagent?, do: base <> " transcript-block-subagent", else: base
+  end
 
   defp transcript_chip_class(kind), do: "transcript-chip transcript-chip-#{transcript_kind_slug(kind)}"
+
+  defp subagent_suffix(thread_id) when is_binary(thread_id) and byte_size(thread_id) >= 4,
+    do: " · " <> binary_part(thread_id, byte_size(thread_id) - 4, 4)
+
+  defp subagent_suffix(_thread_id), do: ""
 
   defp transcript_kind_slug(kind) when kind in ["agent", "command", "output", "tool", "reasoning", "user"], do: kind
   defp transcript_kind_slug(_kind), do: "event"

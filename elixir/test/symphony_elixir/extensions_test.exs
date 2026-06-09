@@ -752,6 +752,84 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
   end
 
+  test "transcript distinguishes subagent turns from the main agent" do
+    parent_thread = "11111111-1111-1111-1111-111111111111"
+    parent_turn = "22222222-2222-2222-2222-222222222222"
+    session_id = parent_thread <> "-" <> parent_turn
+    subagent_thread = "99999999-9999-9999-9999-999999999999"
+
+    transcript_file =
+      write_transcript_fixture!([
+        agent_delta_record(session_id, "Main agent planning the work", parent_thread, parent_turn),
+        agent_delta_record(
+          session_id,
+          "Subagent exploring the codebase",
+          subagent_thread,
+          "33333333-3333-3333-3333-333333333333"
+        )
+      ])
+
+    orchestrator_name = Module.concat(__MODULE__, :SubagentOrchestrator)
+
+    snapshot = %{
+      running: [
+        %{
+          issue_id: "issue-sub",
+          identifier: "SUB-1",
+          title: "Has a subagent",
+          state: "In Progress",
+          session_id: session_id,
+          turn_count: 1,
+          codex_app_server_pid: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: :notification,
+          recent_codex_events: [],
+          codex_session_logs: [
+            %{
+              session_id: session_id,
+              path: transcript_file,
+              started_at: DateTime.utc_now(),
+              last_event_at: DateTime.utc_now(),
+              worker_host: nil,
+              workspace_path: nil
+            }
+          ],
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          started_at: DateTime.utc_now()
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0.0},
+      rate_limits: nil
+    }
+
+    {:ok, _pid} = StaticOrchestrator.start_link(name: orchestrator_name, snapshot: snapshot)
+
+    {:ok, payload} = SymphonyElixirWeb.Presenter.issue_payload("SUB-1", orchestrator_name, 5_000)
+    blocks = payload.transcript.blocks
+
+    assert Enum.any?(blocks, &(&1.text =~ "Main agent planning the work" and &1.subagent == false))
+
+    assert Enum.any?(
+             blocks,
+             &(&1.text =~ "Subagent exploring the codebase" and &1.subagent == true and
+                 &1.thread_id == subagent_thread)
+           )
+
+    # Distinct threads must not be merged into a single agent block.
+    assert Enum.count(blocks, &(&1.kind == "agent")) == 2
+
+    # The rendered issue page flags the subagent block.
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 5_000)
+    {:ok, _view, issue_html} = live(build_conn(), "/issues/SUB-1")
+    assert issue_html =~ "transcript-block-subagent"
+    assert issue_html =~ "Subagent"
+    assert issue_html =~ "Subagent exploring the codebase"
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -891,6 +969,18 @@ defmodule SymphonyElixir.ExtensionsTest do
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
+    }
+  end
+
+  defp agent_delta_record(session_id, delta, thread_id, turn_id) do
+    %{
+      "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      "event" => "notification",
+      "session_id" => session_id,
+      "payload" => %{
+        "method" => "item/agentMessage/delta",
+        "params" => %{"delta" => delta, "threadId" => thread_id, "turnId" => turn_id}
+      }
     }
   end
 
