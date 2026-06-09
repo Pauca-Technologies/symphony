@@ -143,7 +143,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </p>
               <p class="metric-detail">
                 <%= if started = issue_started_at(@issue_payload) do %>
-                  Started <time datetime={started} title={full_time(started)}><%= relative_time(started, @now) %></time>
+                  Started <time datetime={started} title={full_time(started)}><%= full_time(started) %></time>
                 <% else %>
                   Started n/a
                 <% end %>
@@ -210,25 +210,28 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </p>
             <% else %>
               <div class="transcript-stack">
-                <article :for={block <- transcript_blocks(@issue_payload.transcript)} class={transcript_block_class(block.kind, block[:subagent])}>
+                <article
+                  :for={{block, index} <- Enum.with_index(display_transcript_blocks(transcript_blocks(@issue_payload.transcript)))}
+                  class={transcript_block_class(block.kind, block[:subagent])}
+                >
                   <%= cond do %>
                     <% markdown_transcript_kind?(block.kind) -> %>
                       <div class="transcript-block-head">
                         <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
                         <span :if={block[:subagent]} class="transcript-subagent-badge">↳ Subagent<%= subagent_suffix(block[:thread_id]) %></span>
-                        <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
+                        <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= full_time(block.at) %></time>
                       </div>
                       <div class="transcript-markdown"><%= Phoenix.HTML.raw(markdown_to_html(block.text)) %></div>
                     <% collapsible_transcript_kind?(block.kind) -> %>
-                      <details class="transcript-collapsible">
+                      <details class="transcript-collapsible" id={"transcript-block-#{index}"} phx-hook="Collapsible">
                         <summary class="transcript-summary">
                           <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
                           <span :if={block[:subagent]} class="transcript-subagent-badge">↳ Subagent<%= subagent_suffix(block[:thread_id]) %></span>
-                          <span class="transcript-summary-text mono"><%= transcript_preview(block) %></span>
-                          <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
+                          <span class="transcript-summary-text mono" title={transcript_preview(block)}><%= transcript_preview(block) %></span>
+                          <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= full_time(block.at) %></time>
                         </summary>
                         <%= if block.text == "" do %>
-                          <p class="transcript-empty muted">No arguments.</p>
+                          <p class="transcript-empty muted"><%= empty_collapsible_message(block.kind) %></p>
                         <% else %>
                           <pre class="code-panel transcript-code"><code><%= block.text %></code></pre>
                         <% end %>
@@ -237,7 +240,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="transcript-block-head">
                         <span class={transcript_chip_class(block.kind)}><%= transcript_kind_label(block.kind) %></span>
                         <span :if={block[:subagent]} class="transcript-subagent-badge">↳ Subagent<%= subagent_suffix(block[:thread_id]) %></span>
-                        <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= relative_time(block.at, @now) %></time>
+                        <time :if={block.at} class="transcript-block-time" datetime={block.at} title={full_time(block.at)}><%= full_time(block.at) %></time>
                       </div>
                       <pre class="code-panel transcript-code transcript-command"><code><%= block.text %></code></pre>
                   <% end %>
@@ -423,7 +426,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <span class="muted event-meta">
                             <%= entry.last_event || "n/a" %>
                             <%= if entry.last_event_at do %>
-                              · <time class="event-time-stamp" datetime={entry.last_event_at} title={full_time(entry.last_event_at)}><%= relative_time(entry.last_event_at, @now) %></time>
+                              · <time class="event-time-stamp" datetime={entry.last_event_at} title={full_time(entry.last_event_at)}><%= full_time(entry.last_event_at) %></time>
                             <% end %>
                           </span>
                         </div>
@@ -482,7 +485,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <td><%= entry.attempt %></td>
                       <td>
                         <%= if entry.due_at do %>
-                          <time class="event-time-stamp" datetime={entry.due_at} title={full_time(entry.due_at)}><%= relative_time(entry.due_at, @now) %></time>
+                          <time class="event-time-stamp" datetime={entry.due_at} title={full_time(entry.due_at)}><%= full_time(entry.due_at) %></time>
                         <% else %>
                           <span class="muted">n/a</span>
                         <% end %>
@@ -639,6 +642,27 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp transcript_blocks(%{blocks: blocks}) when is_list(blocks), do: blocks
   defp transcript_blocks(_transcript), do: []
 
+  # Fold each command together with the output it produced into a single
+  # collapsible: the command line becomes the always-visible summary and its
+  # output becomes the collapsed body. This way the summary shows *what ran*,
+  # not just a slice of its output.
+  defp display_transcript_blocks(blocks) when is_list(blocks), do: fold_command_blocks(blocks, [])
+
+  defp fold_command_blocks([], acc), do: Enum.reverse(acc)
+
+  defp fold_command_blocks([%{kind: "command"} = command | rest], acc) do
+    {output_text, remaining} = collect_command_output(rest, [])
+    folded = command |> Map.put(:title, command.text) |> Map.put(:text, output_text)
+    fold_command_blocks(remaining, [folded | acc])
+  end
+
+  defp fold_command_blocks([block | rest], acc), do: fold_command_blocks(rest, [block | acc])
+
+  defp collect_command_output([%{kind: "output", text: text} | rest], acc),
+    do: collect_command_output(rest, [text | acc])
+
+  defp collect_command_output(blocks, acc), do: {acc |> Enum.reverse() |> Enum.join("\n"), blocks}
+
   defp transcript_kind_label("agent"), do: "Agent"
   defp transcript_kind_label("command"), do: "Command"
   defp transcript_kind_label("output"), do: "Output"
@@ -649,7 +673,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp markdown_transcript_kind?(kind), do: kind in ["agent", "user"]
 
-  defp collapsible_transcript_kind?(kind), do: kind in ["output", "tool", "reasoning"]
+  defp collapsible_transcript_kind?(kind), do: kind in ["command", "output", "tool", "reasoning"]
+
+  defp empty_collapsible_message("tool"), do: "No arguments."
+  defp empty_collapsible_message(_kind), do: "No output."
 
   defp transcript_block_class(kind, subagent?) do
     base = "transcript-block transcript-block-#{transcript_kind_slug(kind)}"
@@ -889,28 +916,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
-  end
-
-  defp relative_time(iso, %DateTime{} = now) when is_binary(iso) do
-    case DateTime.from_iso8601(iso) do
-      {:ok, datetime, _offset} -> humanize_relative(DateTime.diff(now, datetime, :second))
-      _ -> iso
-    end
-  end
-
-  defp relative_time(_iso, _now), do: "n/a"
-
-  defp humanize_relative(seconds) when is_integer(seconds) do
-    abs_seconds = abs(seconds)
-    suffix = if seconds < 0, do: "from now", else: "ago"
-
-    cond do
-      abs_seconds < 5 -> "just now"
-      abs_seconds < 60 -> "#{abs_seconds}s #{suffix}"
-      abs_seconds < 3600 -> "#{div(abs_seconds, 60)}m #{suffix}"
-      abs_seconds < 86_400 -> "#{div(abs_seconds, 3600)}h #{suffix}"
-      true -> "#{div(abs_seconds, 86_400)}d #{suffix}"
-    end
   end
 
   defp full_time(iso) when is_binary(iso) do

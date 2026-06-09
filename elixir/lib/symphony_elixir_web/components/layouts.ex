@@ -26,10 +26,57 @@ defmodule SymphonyElixirWeb.Layouts do
               .querySelector("meta[name='csrf-token']")
               ?.getAttribute("content");
 
+            // Render every <time datetime="…"> as an absolute, human-readable
+            // timestamp in the browser's timezone (date shown only when it is
+            // not today). Idempotent so it can re-run on every LiveView patch.
+            function formatTime(el) {
+              var iso = el.getAttribute("datetime");
+              if (!iso) return;
+              var d = new Date(iso);
+              if (isNaN(d.getTime())) return;
+              var sameDay = d.toDateString() === new Date().toDateString();
+              var time = d.toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+              var str = sameDay
+                ? time
+                : d.toLocaleDateString(undefined, {month: "short", day: "numeric"}) + ", " + time;
+              if (el.textContent !== str) el.textContent = str;
+              var title = d.toLocaleString();
+              if (el.getAttribute("title") !== title) el.setAttribute("title", title);
+            }
+
+            function formatTimes() {
+              document.querySelectorAll("time[datetime]").forEach(formatTime);
+            }
+
+            formatTimes();
+            // LiveView re-renders rewrite the server-side fallback text; reformat
+            // whenever the DOM changes. Guarded writes above avoid mutation loops.
+            new MutationObserver(formatTimes).observe(document.body, {childList: true, subtree: true});
+
             if (!window.Phoenix || !window.LiveView) return;
 
+            var Hooks = {
+              // <details> open/closed state lives in the DOM, so LiveView patches
+              // strip it on every re-render. Capture the user's intent on toggle
+              // and re-apply it after each patch so the panel stays as they left it.
+              Collapsible: {
+                mounted: function () {
+                  var self = this;
+                  this.el.addEventListener("toggle", function () {
+                    self.open = self.el.open;
+                  });
+                },
+                updated: function () {
+                  if (this.open != null && this.el.open !== this.open) {
+                    this.el.open = this.open;
+                  }
+                }
+              }
+            };
+
             var liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket, {
-              params: {_csrf_token: csrfToken}
+              params: {_csrf_token: csrfToken},
+              hooks: Hooks
             });
 
             liveSocket.connect();
