@@ -76,16 +76,17 @@ defmodule SymphonyElixir.Workspace do
     branch_name = resolve_worktree_branch_name(issue_or_identifier)
     base_branch = Map.get(routed_repo, :base_branch, "main")
 
-    # If a prior dispatch left a stale dir at this path, remove it first
-    # so `git worktree add` doesn't fail with "already exists".
+    # If a prior dispatch left non-worktree debris at this path, clear it so
+    # the worktree machinery has a clean slate. A valid worktree is left in
+    # place for `ensure_worktree` to reuse (preserving gitignored artifacts).
     if File.exists?(workspace) and not git_worktree_dir?(workspace) do
       File.rm_rf!(workspace)
     end
 
-    with {:ok, bare_path} <- BareClone.ensure_and_fetch(workspace_root, routed_repo),
-         :ok <- maybe_remove_existing_worktree(bare_path, workspace),
-         :ok <- BareClone.create_worktree(bare_path, workspace, branch_name, base_branch) do
-      Logger.info("Workspace ready via worktree repo=#{routed_repo.id} bare=#{bare_path} workspace=#{workspace} branch=#{branch_name} base=#{base_branch}")
+    with {:ok, bare_path} <- BareClone.ensure_and_fetch(workspace_root, routed_repo, branch_name),
+         {:ok, %{start_point: start_point, reused: reused?}} <-
+           BareClone.ensure_worktree(bare_path, workspace, branch_name, base_branch) do
+      Logger.info("Workspace ready via worktree repo=#{routed_repo.id} bare=#{bare_path} workspace=#{workspace} branch=#{branch_name} base=#{base_branch} start=#{start_point} reused=#{reused?}")
 
       {:ok, workspace, true}
     end
@@ -107,14 +108,6 @@ defmodule SymphonyElixir.Workspace do
 
   defp ensure_workspace(workspace, worker_host, _routed_repo, _issue) when is_binary(worker_host) do
     ensure_workspace_remote(workspace, worker_host)
-  end
-
-  defp maybe_remove_existing_worktree(bare_path, workspace) do
-    if File.exists?(workspace) and git_worktree_dir?(workspace) do
-      BareClone.remove_worktree(bare_path, workspace)
-    else
-      :ok
-    end
   end
 
   # A populated worktree always has a `.git` file (NOT a directory) that

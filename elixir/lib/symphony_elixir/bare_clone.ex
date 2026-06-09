@@ -37,14 +37,22 @@ defmodule SymphonyElixir.BareClone do
   Ensure the canonical clone exists, then fetch from origin so
   `origin/<base_branch>` reflects upstream's latest. Returns
   `{:ok, clone_path}` on success.
+
+  When `issue_branch` is given, its remote-tracking ref is refreshed too
+  (best-effort) so that an open PR's head — `origin/<issue_branch>` — is
+  available as a worktree start point. The branch may not exist on origin
+  yet (issue has no PR); that's not an error.
   """
-  @spec ensure_and_fetch(String.t(), routed_repo()) ::
+  @spec ensure_and_fetch(String.t(), routed_repo(), String.t() | nil) ::
           {:ok, Path.t()} | {:error, term()}
-  def ensure_and_fetch(workspace_root, %{repo_url: nil}) when is_binary(workspace_root) do
+  def ensure_and_fetch(workspace_root, routed, issue_branch \\ nil)
+
+  def ensure_and_fetch(workspace_root, %{repo_url: nil}, _issue_branch)
+      when is_binary(workspace_root) do
     {:error, :missing_repo_url}
   end
 
-  def ensure_and_fetch(workspace_root, %{id: repo_id, repo_url: repo_url} = routed)
+  def ensure_and_fetch(workspace_root, %{id: repo_id, repo_url: repo_url} = routed, issue_branch)
       when is_binary(workspace_root) and is_binary(repo_id) and is_binary(repo_url) do
     clone_path = clone_path(workspace_root, repo_id)
     File.mkdir_p!(Path.dirname(clone_path))
@@ -52,41 +60,138 @@ defmodule SymphonyElixir.BareClone do
     with_repo_lock(workspace_root, repo_id, fn ->
       with :ok <- ensure_clone(clone_path, repo_url),
            :ok <- fetch(clone_path, Map.get(routed, :base_branch, "main")) do
+        maybe_fetch_issue_branch(clone_path, issue_branch)
         {:ok, clone_path}
       end
     end)
   end
 
   @doc """
-  Create a worktree at `worktree_path` rooted at `origin/<base_branch>`
-  on a branch named `branch_name`. The canonical clone is a normal
-  (non-bare) clone, so remote-tracking refs at
-  `refs/remotes/origin/*` exist and the `origin/<branch>` form
-  resolves directly. `-B` creates or resets the per-issue branch so
-  retries on the same issue are idempotent. Caller must clean up any
-  existing dir at `worktree_path` first.
+  Ensure a worktree exists at `worktree_path` on branch `branch_name`,
+  synced to the latest appropriate start point:
+
+    * If `origin/<branch_name>` exists — the issue already has an open PR
+      whose head is this branch — the worktree continues that branch from
+      its latest pushed state, **not** a fresh fork from base. This is what
+      makes a re-dispatch pick up the existing PR instead of starting over.
+    * Otherwise the worktree starts from `origin/<base_branch>`.
+
+  When a worktree dir is already present for this issue (a prior dispatch),
+  it is reused in place: its tracked files are reset to the start point via
+  `git checkout --force`, which leaves untracked and gitignored files
+  alone. That preserves expensive build artifacts (node_modules, compiled
+  assets, …) across dispatches instead of recloning from scratch.
+
+  The canonical clone is a normal (non-bare) clone and worktrees share its
+  object store + `refs/remotes/origin/*`, so the `origin/<branch>` form
+  resolves both in the clone and inside the worktree.
+
+  Returns `{:ok, %{start_point: ref, reused: boolean}}`.
   """
-  @spec create_worktree(Path.t(), Path.t(), String.t(), String.t()) ::
-          :ok | {:error, term()}
-  def create_worktree(clone_path, worktree_path, branch_name, base_branch)
+  @spec ensure_worktree(Path.t(), Path.t(), String.t(), String.t()) ::
+          {:ok, %{start_point: String.t(), reused: boolean()}} | {:error, term()}
+  def ensure_worktree(clone_path, worktree_path, branch_name, base_branch)
       when is_binary(clone_path) and is_binary(worktree_path) and is_binary(branch_name) and
              is_binary(base_branch) do
-    File.mkdir_p!(Path.dirname(worktree_path))
+    start_point = worktree_start_point(clone_path, branch_name, base_branch)
 
-    args = [
-      "-C",
-      clone_path,
-      "worktree",
-      "add",
-      "-B",
-      branch_name,
-      worktree_path,
+    if reusable_worktree?(clone_path, worktree_path) do
+      case refresh_worktree(worktree_path, branch_name, start_point) do
+        :ok ->
+          {:ok, %{start_point: start_point, reused: true}}
+
+        {:error, reason} ->
+          Logger.warning("Worktree refresh failed (#{inspect(reason)}); recreating from scratch: #{worktree_path}")
+
+          recreate_worktree(clone_path, worktree_path, branch_name, start_point)
+      end
+    else
+      recreate_worktree(clone_path, worktree_path, branch_name, start_point)
+    end
+  end
+
+  # Prefer an existing remote branch matching the issue branch (an open
+  # PR's head) so we continue it; otherwise fork from the base branch.
+  defp worktree_start_point(clone_path, branch_name, base_branch) do
+    if remote_ref_exists?(clone_path, branch_name) do
+      "origin/#{branch_name}"
+    else
       "origin/#{base_branch}"
-    ]
+    end
+  end
+
+  defp remote_ref_exists?(clone_path, branch_name) do
+    case System.cmd(
+           "git",
+           ["-C", clone_path, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/#{branch_name}"],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      _ -> false
+    end
+  end
+
+  # A dir is reusable only when it's a worktree this very clone registered.
+  # `worktree list` is authoritative: a re-routed issue (now a different
+  # clone) or stale debris won't be listed, so we recreate instead.
+  defp reusable_worktree?(clone_path, worktree_path) do
+    File.regular?(Path.join(worktree_path, ".git")) and
+      registered_worktree?(clone_path, worktree_path)
+  end
+
+  defp registered_worktree?(clone_path, worktree_path) do
+    target = Path.expand(worktree_path)
+
+    case System.cmd("git", ["-C", clone_path, "worktree", "list", "--porcelain"], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> IO.iodata_to_binary()
+        |> String.split("\n", trim: true)
+        |> Enum.any?(&(worktree_line_path(&1) == target))
+
+      _ ->
+        false
+    end
+  end
+
+  # Extract the absolute path from a `worktree <path>` porcelain line, or
+  # nil for any other line (HEAD/branch/bare markers, blanks).
+  defp worktree_line_path(line) do
+    case String.split(line, " ", parts: 2) do
+      ["worktree", path] -> Path.expand(String.trim(path))
+      _ -> nil
+    end
+  end
+
+  # Reset an existing worktree's tracked files to `start_point` without
+  # disturbing untracked / gitignored build artifacts. `--force` discards
+  # local tracked edits left over from an aborted prior run; `-B` (re)points
+  # the branch at the start point. origin/* is already current (the shared
+  # clone was just fetched), so this is the "pull latest" step.
+  defp refresh_worktree(worktree_path, branch_name, start_point) do
+    args = ["-C", worktree_path, "checkout", "--force", "-B", branch_name, start_point]
 
     case System.cmd("git", args, stderr_to_stdout: true) do
       {_output, 0} ->
         :ok
+
+      {output, status} ->
+        {:error, {:worktree_checkout_failed, status, String.trim(IO.iodata_to_binary(output))}}
+    end
+  end
+
+  defp recreate_worktree(clone_path, worktree_path, branch_name, start_point) do
+    File.mkdir_p!(Path.dirname(worktree_path))
+    # Clear a present dir, then prune any stale registration so
+    # `worktree add` doesn't trip on "already exists / registered".
+    _ = remove_worktree(clone_path, worktree_path)
+    _ = System.cmd("git", ["-C", clone_path, "worktree", "prune"], stderr_to_stdout: true)
+
+    args = ["-C", clone_path, "worktree", "add", "-B", branch_name, worktree_path, start_point]
+
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {_output, 0} ->
+        {:ok, %{start_point: start_point, reused: false}}
 
       {output, status} ->
         {:error, {:worktree_add_failed, status, String.trim(IO.iodata_to_binary(output))}}
@@ -200,6 +305,22 @@ defmodule SymphonyElixir.BareClone do
     # and an objects directory under it. Either form resolves.
     git_path = Path.join(clone_path, ".git")
     File.dir?(git_path) or File.regular?(git_path)
+  end
+
+  # Best-effort fetch of the issue branch (an open PR's head). Absence is
+  # the common case (no PR yet), so a failure is logged at debug, not warn.
+  defp maybe_fetch_issue_branch(_clone_path, branch) when branch in [nil, ""], do: :ok
+
+  defp maybe_fetch_issue_branch(clone_path, branch) when is_binary(branch) do
+    case System.cmd("git", ["-C", clone_path, "fetch", "origin", branch], stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        Logger.debug("git fetch of issue branch #{branch} on clone #{clone_path} failed (status=#{status}); no open PR head to continue: #{String.trim(IO.iodata_to_binary(output))}")
+
+        :ok
+    end
   end
 
   defp fetch(clone_path, base_branch) do
