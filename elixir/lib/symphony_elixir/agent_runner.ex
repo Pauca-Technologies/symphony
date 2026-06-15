@@ -4,9 +4,10 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.{AppServer, DynamicTool}
+  alias SymphonyElixir.Codex.DynamicTool
 
   alias SymphonyElixir.{
+    AgentBackend,
     Config,
     Linear.Client,
     Linear.Issue,
@@ -283,22 +284,23 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    backend = AgentBackend.resolve()
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, session} <- backend.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(backend, session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
-        AppServer.stop_session(session)
+        backend.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(backend, app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
     tool_executor = dynamic_tool_executor(issue, workspace, app_session.worker_host, opts)
 
     with {:ok, turn_session} <-
-           AppServer.run_turn(
+           backend.run_turn(
              app_session,
              prompt,
              issue,
@@ -316,6 +318,7 @@ defmodule SymphonyElixir.AgentRunner do
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
           do_run_codex_turns(
+            backend,
             app_session,
             workspace,
             refreshed_issue,
