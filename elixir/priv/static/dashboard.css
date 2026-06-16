@@ -472,6 +472,11 @@ pre,
   border-left-color: #d97706;
 }
 
+.transcript-block-compaction {
+  border-left-color: #0f766e;
+  background: #f0fdfa;
+}
+
 .transcript-block-event,
 .transcript-block-user {
   border-left-color: var(--muted);
@@ -539,6 +544,11 @@ pre,
 .transcript-chip-reasoning {
   background: #fef3e2;
   color: #b45309;
+}
+
+.transcript-chip-compaction {
+  background: #ccfbf1;
+  color: #0f766e;
 }
 
 .transcript-block-time {

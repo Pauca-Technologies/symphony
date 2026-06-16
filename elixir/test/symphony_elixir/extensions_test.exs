@@ -369,7 +369,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                      "message" => "mix test"
                    }
                  ],
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+                 "context" => %{"tokens" => 0, "window" => nil, "fill_ratio" => nil}
                }
              ],
              "retrying" => [
@@ -427,7 +428,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "message" => "mix test"
                  }
                ],
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+               "context" => %{"tokens" => 0, "window" => nil, "fill_ratio" => nil}
              },
              "retry" => nil,
              "logs" => %{
@@ -609,6 +611,17 @@ defmodule SymphonyElixir.ExtensionsTest do
           "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
           "event" => "notification",
           "payload" => %{
+            "method" => "thread/compacted",
+            "params" => %{
+              "threadId" => "thread-http",
+              "turnId" => "turn-http-compact"
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
             "method" => "codex/event/exec_command_begin",
             "params" => %{"msg" => %{"command" => "mix test --cover"}}
           }
@@ -728,6 +741,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_html =~ "&lt;script&gt;alert(1)&lt;/script&gt;"
     assert issue_html =~ "$ mix test --cover"
     assert issue_html =~ "Compiling 3 files"
+    assert issue_html =~ "Compaction"
+    assert issue_html =~ "Context compacted for turn turn-htt"
+    assert issue_html =~ "transcript-block-compaction"
     refute issue_html =~ "OLD-BEGINNING"
     refute issue_html =~ "agent message content streaming: structured update"
     refute issue_html =~ "<script>alert(1)</script>"

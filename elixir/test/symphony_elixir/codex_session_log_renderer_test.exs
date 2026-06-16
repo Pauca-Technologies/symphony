@@ -140,6 +140,14 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
           }
         },
         %{
+          "at" => "2026-04-23T12:00:11Z",
+          "event" => "notification",
+          "payload" => %{
+            "method" => "thread/compacted",
+            "params" => %{"threadId" => "thread-1", "turnId" => "turn-compact-1"}
+          }
+        },
+        %{
           "at" => "2026-04-23T12:00:12Z",
           "event" => "tool_call_failed",
           "payload" => %{
@@ -172,6 +180,8 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
     assert output =~ "AGENT"
     assert output =~ "I found the mismatch and I am checking the failing command next."
     assert output =~ "TOOL OK linear_graphql"
+    assert output =~ "COMPACTION"
+    assert output =~ "Context compacted for turn turn-com"
     assert output =~ "TOOL FAILED linear_graphql"
     assert output =~ "… [400 chars]"
   end
@@ -420,6 +430,17 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
         %{
           "at" => "2026-04-23T12:00:15Z",
           "payload" => %{"method" => "item/tool/call", "params" => %{"tool" => "plain_tool"}}
+        },
+        %{
+          "at" => "2026-04-23T12:00:16Z",
+          "payload" => %{"method" => "thread/compacted", "params" => %{}}
+        },
+        %{
+          "at" => "2026-04-23T12:00:17Z",
+          "payload" => %{
+            "method" => "thread/compacted",
+            "params" => %{"turnId" => "turn1234"}
+          }
         }
       ]
       |> Enum.map_join("\n", fn
@@ -454,6 +475,8 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
     assert output =~ "tool requires user input"
     assert output =~ "TOOL REJECTED unknown_tool"
     assert output =~ "TOOL plain_tool"
+    assert output =~ "Context compacted."
+    assert output =~ "Context compacted for turn turn1234"
     assert output =~ "… [48 chars]"
     assert output =~ "… [2 more]"
     assert output =~ IO.ANSI.reset()

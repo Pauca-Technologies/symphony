@@ -1555,6 +1555,9 @@ defmodule SymphonyElixir.Orchestrator do
       method == "item/tool/call" ->
         build_transcript_tool_block(timestamp, payload, origin)
 
+      method == "thread/compacted" ->
+        build_transcript_compaction_block(timestamp, payload, origin)
+
       true ->
         nil
     end
@@ -1575,6 +1578,32 @@ defmodule SymphonyElixir.Orchestrator do
     {name, args_text} = extract_transcript_tool(payload)
     Map.merge(%{kind: "tool", at: iso8601(timestamp), title: name, text: normalize_transcript_text(args_text)}, origin)
   end
+
+  defp build_transcript_compaction_block(timestamp, payload, origin) do
+    Map.merge(
+      %{
+        kind: "compaction",
+        at: iso8601(timestamp),
+        text: compaction_transcript_text(payload)
+      },
+      origin
+    )
+  end
+
+  defp compaction_transcript_text(payload) when is_map(payload) do
+    case string_path_value(payload, ["params", "turnId"]) || string_path_value(payload, ["params", "turn_id"]) do
+      turn_id when is_binary(turn_id) and byte_size(turn_id) >= 8 ->
+        "Context compacted for turn #{short_identifier(turn_id)}."
+
+      _ ->
+        "Context compacted."
+    end
+  end
+
+  defp short_identifier(identifier) when is_binary(identifier) and byte_size(identifier) > 8,
+    do: binary_part(identifier, 0, 8)
+
+  defp short_identifier(identifier) when is_binary(identifier), do: identifier
 
   # Each Codex event carries the thread it belongs to (`params.threadId`); the
   # session's own thread is the first UUID of `session_id` (`"<thread>-<turn>"`).
@@ -2198,13 +2227,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp find_map_at_paths(roots, paths) do
     Enum.find_value(roots, fn root ->
-      Enum.find_value(paths, fn path ->
-        case map_at_path(root, path) do
-          value when is_map(value) -> value
-          _ -> nil
-        end
-      end)
+      Enum.find_value(paths, &map_at_path_if_map(root, &1))
     end)
+  end
+
+  defp map_at_path_if_map(root, path) do
+    case map_at_path(root, path) do
+      value when is_map(value) -> value
+      _ -> nil
+    end
   end
 
   defp last_usage_paths do

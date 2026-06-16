@@ -264,12 +264,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        }}
     )
 
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/compacted",
+           "params" => %{"threadId" => "thread-log", "turnId" => "turn-log-compact"}
+         },
+         timestamp: now
+       }}
+    )
+
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert [session_log] = snapshot_entry.codex_session_logs
     assert session_log.session_id == "thread-log-turn-log"
     assert File.exists?(session_log.path)
     assert String.starts_with?(session_log.path, Path.join(test_root, "log/codex_sessions"))
+    assert Enum.any?(snapshot_entry.recent_codex_transcript_blocks, &(&1.kind == "compaction"))
 
     lines =
       session_log.path
@@ -277,10 +291,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> String.split("\n", trim: true)
       |> Enum.map(&Jason.decode!/1)
 
-    assert Enum.map(lines, & &1["event"]) == ["session_started", "notification"]
+    assert Enum.map(lines, & &1["event"]) == ["session_started", "notification", "notification"]
     assert Enum.all?(lines, &(&1["issue_id"] == issue_id))
     assert Enum.all?(lines, &(&1["session_id"] == "thread-log-turn-log"))
-    assert List.last(lines)["summary"] == "mix test"
+    assert List.last(lines)["summary"] == "thread/compacted"
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

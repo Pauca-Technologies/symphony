@@ -374,6 +374,9 @@ defmodule SymphonyElixirWeb.Presenter do
       method == "item/tool/call" ->
         build_tool_fragment(at, payload, origin)
 
+      method == "thread/compacted" ->
+        build_compaction_fragment(at, payload, origin)
+
       true ->
         nil
     end
@@ -394,6 +397,32 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp build_text_fragment(_kind, _at, _text, _origin), do: nil
+
+  defp build_compaction_fragment(at, payload, origin) when is_map(payload) do
+    Map.merge(
+      %{
+        kind: "compaction",
+        at: at,
+        text: compaction_text(payload)
+      },
+      origin
+    )
+  end
+
+  defp compaction_text(payload) when is_map(payload) do
+    case string_path_value(payload, ["params", "turnId"]) || string_path_value(payload, ["params", "turn_id"]) do
+      turn_id when is_binary(turn_id) and byte_size(turn_id) >= 8 ->
+        "Context compacted for turn #{short_identifier(turn_id)}."
+
+      _ ->
+        "Context compacted."
+    end
+  end
+
+  defp short_identifier(identifier) when is_binary(identifier) and byte_size(identifier) > 8,
+    do: binary_part(identifier, 0, 8)
+
+  defp short_identifier(identifier) when is_binary(identifier), do: identifier
 
   # Each event carries its thread (`params.threadId`); the session's own thread is
   # the first UUID of `session_id` ("<thread>-<turn>"). Anything else is a subagent.

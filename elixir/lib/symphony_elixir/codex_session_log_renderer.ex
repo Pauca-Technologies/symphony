@@ -115,6 +115,7 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
 
   defp dispatch_payload("item/started", state, at, payload, _event), do: handle_item_started(state, at, payload)
   defp dispatch_payload("item/completed", state, at, payload, _event), do: handle_item_completed(state, at, payload)
+  defp dispatch_payload("thread/compacted", state, at, payload, _event), do: append_compaction_entry(state, at, payload)
 
   defp dispatch_payload(method, state, at, payload, _event)
        when method in [
@@ -255,6 +256,30 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
       text: extract_tool_input_text(payload)
     })
   end
+
+  defp append_compaction_entry(state, at, payload) do
+    append_entry(state, %{
+      kind: :event,
+      at: at,
+      label: "COMPACTION",
+      text: compaction_text(payload)
+    })
+  end
+
+  defp compaction_text(payload) when is_map(payload) do
+    case get_path(payload, ["params", "turnId"]) || get_path(payload, ["params", "turn_id"]) do
+      turn_id when is_binary(turn_id) and byte_size(turn_id) >= 8 ->
+        "Context compacted for turn #{short_identifier(turn_id)}."
+
+      _ ->
+        "Context compacted."
+    end
+  end
+
+  defp short_identifier(identifier) when is_binary(identifier) and byte_size(identifier) > 8,
+    do: binary_part(identifier, 0, 8)
+
+  defp short_identifier(identifier) when is_binary(identifier), do: identifier
 
   defp buffer_agent_message(state, at, payload) do
     item_id = extract_item_id(payload)
