@@ -120,6 +120,16 @@ defmodule SymphonyElixir.TestSupport do
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
+          agent_backend: nil,
+          acp_command: nil,
+          acp_auto_approve: nil,
+          acp_protocol_version: nil,
+          acp_withhold_linear_credentials: nil,
+          acp_advertise_fs: nil,
+          acp_advertise_terminal: nil,
+          acp_prompt_timeout_ms: nil,
+          acp_read_timeout_ms: nil,
+          acp_stall_timeout_ms: nil,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -159,6 +169,16 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    agent_backend = Keyword.get(config, :agent_backend)
+    acp_command = Keyword.get(config, :acp_command)
+    acp_auto_approve = Keyword.get(config, :acp_auto_approve)
+    acp_protocol_version = Keyword.get(config, :acp_protocol_version)
+    acp_withhold_linear_credentials = Keyword.get(config, :acp_withhold_linear_credentials)
+    acp_advertise_fs = Keyword.get(config, :acp_advertise_fs)
+    acp_advertise_terminal = Keyword.get(config, :acp_advertise_terminal)
+    acp_prompt_timeout_ms = Keyword.get(config, :acp_prompt_timeout_ms)
+    acp_read_timeout_ms = Keyword.get(config, :acp_read_timeout_ms)
+    acp_stall_timeout_ms = Keyword.get(config, :acp_stall_timeout_ms)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -201,6 +221,18 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        agent_backend && "  backend: #{yaml_value(agent_backend)}",
+        acp_yaml(
+          acp_command,
+          acp_auto_approve,
+          acp_protocol_version,
+          acp_withhold_linear_credentials,
+          acp_advertise_fs,
+          acp_advertise_terminal,
+          acp_prompt_timeout_ms,
+          acp_read_timeout_ms,
+          acp_stall_timeout_ms
+        ),
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
@@ -223,7 +255,7 @@ defmodule SymphonyElixir.TestSupport do
         "---",
         prompt
       ]
-      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.reject(&(&1 in [nil, false, ""]))
 
     Enum.join(sections, "\n") <> "\n"
   end
@@ -288,6 +320,27 @@ defmodule SymphonyElixir.TestSupport do
     ]
     |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
+  end
+
+  defp acp_yaml(command, auto_approve, protocol_version, withhold, advertise_fs, advertise_terminal, prompt_ms, read_ms, stall_ms) do
+    entries =
+      [
+        command && "  command: #{yaml_value(command)}",
+        is_boolean(auto_approve) && "  auto_approve: #{yaml_value(auto_approve)}",
+        protocol_version && "  protocol_version: #{yaml_value(protocol_version)}",
+        is_boolean(withhold) && "  withhold_linear_credentials: #{yaml_value(withhold)}",
+        is_boolean(advertise_fs) && "  advertise_fs: #{yaml_value(advertise_fs)}",
+        is_boolean(advertise_terminal) && "  advertise_terminal: #{yaml_value(advertise_terminal)}",
+        prompt_ms && "  prompt_timeout_ms: #{yaml_value(prompt_ms)}",
+        read_ms && "  read_timeout_ms: #{yaml_value(read_ms)}",
+        stall_ms && "  stall_timeout_ms: #{yaml_value(stall_ms)}"
+      ]
+      |> Enum.reject(&(&1 in [nil, false]))
+
+    case entries do
+      [] -> nil
+      lines -> Enum.join(["acp:" | lines], "\n")
+    end
   end
 
   defp observability_yaml(enabled, refresh_ms, render_interval_ms) do

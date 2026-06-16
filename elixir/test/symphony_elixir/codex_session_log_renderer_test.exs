@@ -506,4 +506,39 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
 
     assert {:error, :enoent} = CodexSessionLogRenderer.render_file(missing, use_color: false)
   end
+
+  # ACP (Option A) normalizes `agent_message_chunk` to `item/agentMessage/delta`
+  # with the text at `params.delta` and *no* item id — there is no following
+  # `item/completed` to flush a buffered message. The renderer must append these
+  # directly, the same way it already handles id-less reasoning deltas.
+  test "renders ACP-normalized agent and reasoning chunks that carry no item id" do
+    log =
+      [
+        %{"at" => "2026-04-23T12:00:00Z", "event" => "session_started", "session_id" => "sess-acp"},
+        %{
+          "at" => "2026-04-23T12:00:01Z",
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/reasoning/textDelta",
+            "params" => %{"textDelta" => "Considering the request", "threadId" => "sess-acp"}
+          }
+        },
+        %{
+          "at" => "2026-04-23T12:00:02Z",
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/agentMessage/delta",
+            "params" => %{"delta" => "Hello from the ACP agent", "threadId" => "sess-acp"}
+          }
+        }
+      ]
+      |> Enum.map_join("\n", &Jason.encode!/1)
+
+    output = CodexSessionLogRenderer.render_string(log, use_color: false)
+
+    assert output =~ "REASONING"
+    assert output =~ "Considering the request"
+    assert output =~ "AGENT"
+    assert output =~ "Hello from the ACP agent"
+  end
 end

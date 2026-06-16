@@ -914,6 +914,52 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.gc.lookback_days == 7
   end
 
+  test "acp block defaults to safe values when unset" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.acp.command == "opencode acp"
+    assert settings.acp.auto_approve == true
+    assert settings.acp.protocol_version == 1
+    assert settings.acp.withhold_linear_credentials == true
+    assert settings.acp.advertise_fs == false
+    assert settings.acp.advertise_terminal == false
+  end
+
+  test "parses an acp block and runtime settings" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "agent" => %{"backend" => "acp"},
+               "acp" => %{
+                 "command" => "opencode acp",
+                 "auto_approve" => false,
+                 "withhold_linear_credentials" => false,
+                 "read_timeout_ms" => 1234
+               }
+             })
+
+    assert settings.agent.backend == "acp"
+    assert settings.acp.auto_approve == false
+    assert settings.acp.withhold_linear_credentials == false
+    assert settings.acp.read_timeout_ms == 1234
+  end
+
+  test "acp_runtime_settings exposes the acp block as a map" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "acp",
+      acp_command: "opencode acp",
+      acp_auto_approve: false
+    )
+
+    assert {:ok, acp} = Config.acp_runtime_settings()
+    assert acp.command == "opencode acp"
+    assert acp.auto_approve == false
+    assert acp.withhold_linear_credentials == true
+  end
+
+  test "validate! rejects an empty acp command when the acp backend is selected" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"backend" => "acp"}, "acp" => %{"command" => ""}})
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

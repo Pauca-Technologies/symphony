@@ -26,6 +26,18 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
+  @type acp_runtime_settings :: %{
+          command: String.t(),
+          auto_approve: boolean(),
+          protocol_version: integer(),
+          withhold_linear_credentials: boolean(),
+          advertise_fs: boolean(),
+          advertise_terminal: boolean(),
+          prompt_timeout_ms: integer(),
+          read_timeout_ms: integer(),
+          stall_timeout_ms: integer()
+        }
+
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
     # T27 follow-up: host-level Symphony config lives in
@@ -140,7 +152,45 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  Resolve the ACP backend's runtime settings from the `acp` config block as a
+  plain map (see `SymphonyElixir.Acp.Client`).
+  """
+  @spec acp_runtime_settings() :: {:ok, acp_runtime_settings()} | {:error, term()}
+  def acp_runtime_settings do
+    with {:ok, settings} <- settings() do
+      acp = settings.acp
+
+      {:ok,
+       %{
+         command: acp.command,
+         auto_approve: acp.auto_approve,
+         protocol_version: acp.protocol_version,
+         withhold_linear_credentials: acp.withhold_linear_credentials,
+         advertise_fs: acp.advertise_fs,
+         advertise_terminal: acp.advertise_terminal,
+         prompt_timeout_ms: acp.prompt_timeout_ms,
+         read_timeout_ms: acp.read_timeout_ms,
+         stall_timeout_ms: acp.stall_timeout_ms
+       }}
+    end
+  end
+
   defp validate_semantics(settings) do
+    with :ok <- validate_agent_backend(settings) do
+      validate_tracker_semantics(settings)
+    end
+  end
+
+  defp validate_agent_backend(settings) do
+    if settings.agent.backend == "acp" and blank?(settings.acp.command) do
+      {:error, :missing_acp_command}
+    else
+      :ok
+    end
+  end
+
+  defp validate_tracker_semantics(settings) do
     cond do
       is_nil(settings.tracker.kind) ->
         {:error, :missing_tracker_kind}
@@ -164,6 +214,9 @@ defmodule SymphonyElixir.Config do
         :ok
     end
   end
+
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: true
 
   defp multi_repo_configured? do
     case SymphonyElixir.RepoConfig.load() do

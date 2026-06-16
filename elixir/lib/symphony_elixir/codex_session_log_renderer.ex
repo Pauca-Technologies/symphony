@@ -295,6 +295,18 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
           }
         end)
 
+      # ACP-normalized agent chunks (Option A) carry no item id and are never
+      # followed by an `item/completed`, so there is nothing to flush later.
+      # Append the chunk directly, mirroring `buffer_reasoning/3`. Codex agent
+      # messages always have an item id, so this branch is ACP-only.
+      {nil, delta} when is_binary(delta) ->
+        append_entry(state, %{
+          kind: :agent,
+          at: at,
+          label: agent_label(nil, false),
+          text: delta
+        })
+
       _ ->
         state
     end

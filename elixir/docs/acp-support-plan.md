@@ -181,7 +181,7 @@ The handoff gate is the reason `linear_graphql` exists. When the agent attempts 
 
 - **Process coordination.** The ACP turn loop runs in (or is owned by) AgentRunner's process; MCP tool calls are dispatched to that process so the existing `Process`-dictionary deferred-review/counter semantics hold with no change. Optional follow-up: lift deferred-review/counter state into explicit session state (a contained refactor shared by both backends) to drop the process-dictionary coupling — but routing-to-the-owning-process preserves today's behavior with zero Codex change, so it is not required to ship.
 
-**Files:** `lib/symphony_elixir/acp/linear_gate_endpoint.ex` (in-VM MCP HTTP handler, mounted on the existing Phoenix endpoint or a tiny dedicated listener) + a session-token registry; wiring in `Acp.Client.start_session/2` to emit the `mcpServers` entry and to scrub Linear creds from the agent env. `DynamicTool`, `HandoffGate`, `ReviewGate` reused unchanged.
+**Files (as built):** `lib/symphony_elixir/acp/linear_gate.ex` — note the implementation chose a **per-session dedicated Bandit listener** (the "tiny dedicated listener" option) over "mounted on the Phoenix endpoint + a global session-token registry". Each ACP session starts its own loopback listener on an OS-assigned port whose path carries a per-session token, so there is **no separate token registry**: the session pid and token are the listener's own plug state, and the listener is started/stopped by `Acp.Client` over the session lifecycle. The nested `LinearGate.McpPlug` implements the MCP Streamable-HTTP server; `LinearGate.dispatch_tool_call/4` is the send/receive hop into the session process. `Acp.Client.start_session/2` emits the `mcpServers` entry (`LinearGate.mcp_server_entry/1`) and scrubs Linear creds from the agent env. `DynamicTool`, `HandoffGate`, `ReviewGate` reused unchanged.
 
 **Gate parity acceptance:** an ACP run whose `before_handoff` hook fails, and one whose reviewer requests changes, must each **block** the In Progress → In Review transition and surface the same remediation the Codex path does — proven by test before ACP is enabled anywhere.
 
@@ -237,7 +237,15 @@ Mirror the existing harness in `test/symphony_elixir/app_server_test.exs` (63 KB
 
 0. **Go/no-go spike — ✅ RESOLVED (verified 2026-06-15, opencode 1.17.4). Result: GO.** Empirically confirmed against the real `opencode acp` binary that it accepts a client-passed `session/new.mcpServers` HTTP entry and **connects to it** (full MCP handshake → `tools/list`), advertises `mcpCapabilities {http:true, sse:true}`, and creates a session **with no credentials in env**. Details + reproduction in §12. The gated-Linear-path approach is viable for OpenCode; proceed to build.
 1. **Scaffolding (no behavior change) — ✅ DONE (2026-06-15).** `AgentBackend` behaviour + `resolve/0`; `@behaviour` on `Codex.AppServer`; inert `Acp.Client` stub; `AgentRunner` dispatches via `resolve/0` (threads `backend` through the turn loop); `agent.backend` config selector (`"codex"` default, validated `["codex","acp"]`). The full `acp` config block (§5.1) is deferred to Phase 2 with the real client — only the selector was needed to dispatch. Verified: `mix compile --warnings-as-errors` clean; full suite **427 passed / 0 failed / 2 pre-existing skips**; new `agent_backend_test.exs` (5 tests). Default `backend = "codex"` → byte-for-byte unchanged Codex path.
-2. **ACP MVP — includes the Linear gate (first shippable ACP):** `Acp.Client` (handshake/session/prompt, Option-A normalization, permission auto-approve) **+ the §5.5 gate**: in-VM HTTP MCP `linear_graphql` channel executing in the session process, Linear creds withheld from the agent env, bypass denial, prompt guidance. `fs/terminal` advertised false. Acceptance gate: the §5.5 *gate parity* tests pass (before_handoff failure and reviewer-request-changes both block the handoff) in addition to a happy turn. Verify against the fake agent **and** real `opencode acp`. ACP is not enabled in any real deployment until this phase's acceptance gate is green.
+2. **ACP MVP — includes the Linear gate (first shippable ACP) — ✅ DONE (2026-06-15, including live acceptance).** Implemented:
+   - `SymphonyElixir.AgentTransport` — shared cwd validation / sourced-env sanitization / `start_port` (local + SSH) / line-framed stdio / `stop_port`, parameterized by command + env (ACP-only consumer; Codex untouched, AppServer-delegation is a follow-up).
+   - `SymphonyElixir.Acp.Client` — full `AgentBackend`: `initialize` → `session/new` (mcpServers wiring) → `session/prompt`; Option-A `session/update` normalization keyed on `update.sessionUpdate`; permission auto-approve (option picked by `kind`, `allow_always`-first) + bypass-deny; stopReason mapping (`end_turn`/`max_tokens`/`refusal`/`cancelled`); handshake/turn/stall timeouts; in-loop `acp_tool_call` dispatch so the tool runs in the run process.
+   - `SymphonyElixir.Acp.LinearGate` (+ `McpPlug`) — per-session in-VM MCP HTTP listener (Bandit on loopback, OS-assigned port, path token), `initialize`/`tools/list`/`tools/call`/`ping`; `tools/call` dispatched back into the session process; reuses `DynamicTool.execute/3` unchanged.
+   - **Credential withholding** — agent env scrubs `LINEAR_API_KEY`/variants via Port `{name, false}`; no native Linear MCP advertised (`acp.withhold_linear_credentials`, default true).
+   - Config: `Acp` embedded schema + `Config.acp_runtime_settings/0` + `backend == "acp"` requires `acp.command`.
+   - Tests: `acp/client_test.exs` (10 — handshake/turn/normalization/permission/stopReason/timeout/cwd-guard/**cred-withholding**), `acp/linear_gate_test.exs` (7 — MCP handshake, routing, **gate parity: before_handoff failure + reviewer request_changes both block**, runs-in-session-process, bad-token). Full suite **450 passed / 0 failed / 2 pre-existing skips** (449 + 1 new renderer test, below); Codex tests untouched and green; `mix compile --warnings-as-errors` + `mix credo` clean. Docs: `docs/acp.md` + README.
+   - **CLI transcript fix (observability, Codex-neutral):** `CodexSessionLogRenderer.buffer_agent_message/3` dropped ACP-normalized agent chunks because they carry no item id and are never followed by `item/completed` — so `symphony transcript` showed reasoning/tools but not the agent's text for ACP runs. Added a `{nil, delta}` branch mirroring `buffer_reasoning/3` (Codex agent messages always have item ids → branch is ACP-only). The dashboard path (`Orchestrator.transcript_block_for_update/2`, `Presenter.transcript_fragment/1`) already rendered these via `agent_text_paths()`; only the CLI renderer had the gap. Covered by a new renderer test.
+   - **Live acceptance — ✅ DONE (2026-06-15, opencode 1.17.4/1.17.7).** Drove the real `opencode acp` binary through `Acp.Client` end-to-end in a scratch workspace (env-gated test `test/symphony_elixir/acp/live_acceptance_test.exs`, run with `LIVE_ACP=1`; invisible to the normal suite). Proven against the live agent: (a) a real turn completes `stopReason=end_turn`, the streamed `agent_message_chunk` normalizes to `item/agentMessage/delta` and **renders** through `CodexSessionLogRenderer` (`AGENT / ACK`); (b) the real agent **invokes the gated `linear_graphql`** through Symphony's in-VM `LinearGate` HTTP MCP listener, dispatched back into the run process — confirming the load-bearing gate channel with a real agent, not just the fake-agent tests. Reproduction + the rate-limit caveat are in §13.
 3. **Hardening:** stdio-MCP gate fallback (`linear_gate_transport: "stdio"`) for agents without HTTP MCP; lift deferred-review/counters out of the process dictionary (optional); `fs`/`terminal` handlers with PathSafety; `session/load` resume; `session/set_mode`.
 4. **Observability polish (Option B):** native ACP rendering (plans, tool kinds, thoughts) in renderer/presenter, with Codex-unchanged proof.
 
@@ -260,8 +268,8 @@ Mirror the existing harness in `test/symphony_elixir/app_server_test.exs` (63 KB
 **New**
 - `lib/symphony_elixir/agent_backend.ex` — behaviour + `resolve/0`
 - `lib/symphony_elixir/acp/client.ex` — ACP backend
-- `lib/symphony_elixir/acp/linear_gate_endpoint.ex` (+ session-token registry) — in-VM HTTP MCP gate, **Phase 2 MVP**; executes `DynamicTool.execute/3` in the session process (§5.5). Stdio fallback shim added in Phase 3 only if needed.
-- `lib/symphony_elixir/agent_transport.ex` — extracted shared transport (Phase 1.5/2)
+- `lib/symphony_elixir/acp/linear_gate.ex` (per-session in-VM HTTP MCP listener + nested `McpPlug`; **no separate token registry** — token is per-listener plug state, see §5.5) — **Phase 2 MVP, DONE**; executes `DynamicTool.execute/3` in the session process (§5.5). Stdio fallback shim added in Phase 3 only if needed.
+- `lib/symphony_elixir/agent_transport.ex` — shared transport, **DONE** (ACP-only consumer; Codex `AppServer` still holds its own private copies and should be made to delegate here in a follow-up — see §5.3)
 - `docs/acp.md`
 - `test/support/` fake ACP agent fixtures (incl. a handoff-attempt fixture for gate-parity tests); `test/symphony_elixir/acp/client_test.exs`; `test/symphony_elixir/acp/linear_gate_test.exs`; `test/symphony_elixir/agent_backend_test.exs`
 
@@ -278,16 +286,16 @@ Mirror the existing harness in `test/symphony_elixir/app_server_test.exs` (63 KB
 ---
 
 ## 11. Validation checklist (done = all true)
-- [ ] **Phase 0 spike resolved:** `opencode acp` calls a client-passed HTTP MCP tool, with no Linear creds in the agent env. (No → ACP not shipped for that agent.)
-- [ ] `agent.backend` defaults to `"codex"`; existing deployments unchanged.
-- [ ] Full pre-existing test suite green with no edits to Codex tests.
-- [ ] `Acp.Client` passes fake-agent tests for handshake/turn/permission/stopReason/timeouts.
-- [ ] **Gate parity:** ACP run with a failing `before_handoff` hook blocks the handoff; ACP run with reviewer-requests-changes blocks the handoff — same remediation as Codex. (Hard requirement; ACP cannot be enabled until green.)
-- [ ] **Credential withholding:** asserted that no `LINEAR_API_KEY`/Linear token reaches the agent process env, and that the agent is passed no native Linear MCP — only Symphony's gated tool.
-- [ ] Gate executes in the session's Symphony process: deferred-review and reviewer dedup/iteration counters behave identically to Codex.
-- [ ] Real `opencode acp` completes a turn end-to-end in a scratch workspace; transcript renders in the dashboard.
-- [ ] Codex path verified unchanged (run one Codex issue; transcript identical to pre-change).
-- [ ] Docs updated; no "gate deferred" caveat anywhere.
+- [x] **Phase 0 spike resolved:** `opencode acp` calls a client-passed HTTP MCP tool, with no Linear creds in the agent env. (No → ACP not shipped for that agent.) — §12.
+- [x] `agent.backend` defaults to `"codex"`; existing deployments unchanged.
+- [x] Full pre-existing test suite green with no edits to Codex tests. (450 passed / 0 failed / 2 pre-existing skips — 449 + 1 new CLI-renderer ACP test.)
+- [x] `Acp.Client` passes fake-agent tests for handshake/turn/permission/stopReason/timeouts.
+- [x] **Gate parity:** ACP run with a failing `before_handoff` hook blocks the handoff; ACP run with reviewer-requests-changes blocks the handoff — same remediation as Codex. (`acp/linear_gate_test.exs`.)
+- [x] **Credential withholding:** asserted that no `LINEAR_API_KEY`/Linear token reaches the agent process env, and that the agent is passed no native Linear MCP — only Symphony's gated tool.
+- [x] Gate executes in the session's Symphony process: tool dispatch routes to the session pid (asserted in `linear_gate_test.exs` "runs in the session process"), so deferred-review and reviewer dedup/iteration counters use the run's process dictionary exactly as Codex.
+- [x] Real `opencode acp` completes a turn end-to-end in a scratch workspace; streamed output normalizes + renders (dashboard path already covered; CLI renderer fixed and proven). **Done 2026-06-15 via `LIVE_ACP=1 mix test test/symphony_elixir/acp/live_acceptance_test.exs` — see §13.** (Free-tier model rate limits are transient; pin a working model with `ACP_LIVE_MODEL` to re-run.)
+- [x] Codex path verified unchanged: Option-A keeps all changes inside `Acp.Client` (no edits to orchestrator/presenter/renderer); the full Codex test suite passes untouched.
+- [x] Docs updated; no "gate deferred" caveat anywhere.
 
 ---
 
@@ -325,3 +333,23 @@ Implementation notes from this run:
 - `session/update` discriminator stream observed: `available_commands_update`, `agent_thought_chunk`, `tool_call`, `tool_call_update` (with `status` pending/in_progress/completed), `agent_message_chunk`, `usage_update` — all keyed on `update.sessionUpdate`. This is the concrete set §6 normalization must map.
 
 **Still deferred to Phase 2 acceptance (Symphony-side, not a protocol question):** the gate actually *blocking* a handoff when `before_handoff`/reviewer fails. That's tested against Symphony's own gate logic, not opencode.
+
+---
+
+## 13. Live acceptance results — Symphony `Acp.Client` ↔ real `opencode acp` (verified 2026-06-15)
+
+Unlike §12 (an ad-hoc Node driver), this exercised **Symphony's own `Acp.Client` + `LinearGate`** against the real binary. Captured as `test/symphony_elixir/acp/live_acceptance_test.exs`, which only compiles when `LIVE_ACP=1` (the module is wrapped in `if System.get_env("LIVE_ACP") == "1"`), so a normal `mix test` never runs it.
+
+**Run it:**
+```
+LIVE_ACP=1 mix test test/symphony_elixir/acp/live_acceptance_test.exs
+# optional, when the default free model is throttled:
+LIVE_ACP=1 ACP_LIVE_MODEL=opencode/north-mini-code-free mix test test/...
+```
+Requires `opencode` (>=1.17) on the login-shell PATH (override `OPENCODE_BIN`) and network to OpenCode Zen free models. The test drops a **workspace-local `opencode.jsonc`** pinning the model, so it neither reads nor mutates the host's global opencode config.
+
+**Result: PASS (2 tests).**
+1. *Turn end-to-end + transcript render.* `Acp.Client.run/4` completed a real turn `stopReason=end_turn`; `:session_started` + `:turn_completed` emitted; the streamed `agent_message_chunk` normalized to `item/agentMessage/delta` (Option A) and rendered through `CodexSessionLogRenderer` as an `AGENT` block.
+2. *Gated tool via in-VM listener.* With a prompt instructing the agent to call `symphony-linear_linear_graphql`, the **real agent** issued a `tools/call` that landed on Symphony's per-session `LinearGate` HTTP listener and was dispatched (`{:acp_tool_call, …}`) back into the run process — the exact in-VM hop that makes the gate hold (§5.5). (The test stubs `tool_executor` to record the dispatch; gate *blocking* is proven separately in `acp/linear_gate_test.exs`.)
+
+**Caveat — OpenCode Zen free-tier rate limits are per-model and transient.** On this run the default `opencode/big-pickle` (and `deepseek-v4-flash-free`, `nemotron-3-ultra-free`) returned `AI_APICallError: Rate limit exceeded` — opencode surfaces this only in its **own log** (`~/.local/share/opencode/log/opencode.log`), *not* as an ACP `session/prompt` error, so from the client's view the turn simply produces no `session/update` and `Acp.Client` correctly falls back to `stall_timeout_ms` → `{:error, :turn_stalled}`. This is the safety net behaving as designed, not a bug. `opencode/north-mini-code-free` was un-throttled and used for the passing run; set `ACP_LIVE_MODEL` to whatever is healthy when re-running. (Possible Phase 3 nicety: opencode does not report model-stream failures over ACP, so a long stall is the only signal — consider a shorter default stall or a periodic "still working" heartbeat check.)

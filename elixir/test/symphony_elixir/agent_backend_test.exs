@@ -31,10 +31,13 @@ defmodule SymphonyElixir.AgentBackendTest do
     end
   end
 
-  describe "Acp.Client stub conforms to the behaviour (Phase 1)" do
-    test "is inert until Phase 2" do
-      assert AcpClient.start_session("/tmp/x", worker_host: nil) == {:error, :acp_not_implemented}
-      assert AcpClient.run_turn(%{}, "prompt", %{}, []) == {:error, :acp_not_implemented}
+  describe "Acp.Client conforms to the behaviour" do
+    test "start_session validates the workspace cwd like the Codex path" do
+      assert {:error, {:invalid_workspace_cwd, _kind, _path, _root}} =
+               AcpClient.start_session("/definitely/outside/workspace/root", worker_host: nil)
+    end
+
+    test "stop_session tolerates a non-session map" do
       assert AcpClient.stop_session(%{}) == :ok
     end
 
