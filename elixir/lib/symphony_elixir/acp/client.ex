@@ -656,10 +656,11 @@ defmodule SymphonyElixir.Acp.Client do
   # ── env / config ─────────────────────────────────────────────────────────
 
   defp agent_env(acp) do
-    base = [
-      {~c"SYMPHONY_RUN", ~c"1"},
-      {~c"SYMPHONY_AGENT", ~c"1"}
-    ]
+    base =
+      [
+        {~c"SYMPHONY_RUN", ~c"1"},
+        {~c"SYMPHONY_AGENT", ~c"1"}
+      ] ++ model_env(acp)
 
     if acp.withhold_linear_credentials do
       base ++ Enum.map(@linear_credential_env_vars, &{&1, false})
@@ -667,6 +668,20 @@ defmodule SymphonyElixir.Acp.Client do
       base
     end
   end
+
+  # OpenCode reads its model from config, not from a flag: `opencode acp` rejects
+  # `--model` and ignores OPENCODE_MODEL, but honors inline config via
+  # OPENCODE_CONFIG_CONTENT. So `acp.model` is surfaced that way. This is
+  # OpenCode-specific; other ACP agents ignore the var and pick the model through
+  # their own configuration.
+  defp model_env(%{model: model}) when is_binary(model) do
+    case String.trim(model) do
+      "" -> []
+      trimmed -> [{~c"OPENCODE_CONFIG_CONTENT", String.to_charlist(Jason.encode!(%{"model" => trimmed}))}]
+    end
+  end
+
+  defp model_env(_acp), do: []
 
   defp maybe_warn_remote_gate(nil), do: :ok
 

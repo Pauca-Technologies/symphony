@@ -30,6 +30,7 @@ non-empty (it defaults to `opencode acp`).
 | Field | Default | Meaning |
 |---|---|---|
 | `command` | `opencode acp` | Shell command that launches the ACP agent over stdio. |
+| `model` | _(unset)_ | Model id, e.g. `opencode/north-mini-code-free`. **OpenCode-only** (see below). |
 | `auto_approve` | `true` | Auto-approve `session/request_permission` instead of blocking the turn (mirrors Codex `approval_policy: never`). |
 | `protocol_version` | `1` | ACP protocol version sent in `initialize`. |
 | `withhold_linear_credentials` | `true` | **Load-bearing.** Scrub `LINEAR_API_KEY` (and friends) from the agent's process env. |
@@ -38,6 +39,28 @@ non-empty (it defaults to `opencode acp`).
 | `prompt_timeout_ms` | `3_600_000` | Max wall-clock for one `session/prompt` turn. |
 | `read_timeout_ms` | `5_000` | Handshake (`initialize` / `session/new`) response timeout. |
 | `stall_timeout_ms` | `300_000` | Idle timeout between streamed `session/update`s during a turn. |
+
+### Selecting the model
+
+ACP has no protocol field for the model, and Symphony's `session/new` does not
+set one — each agent picks its model from its own configuration. For **OpenCode**
+specifically, `opencode acp` rejects a `--model` flag and ignores `OPENCODE_MODEL`,
+but honors inline config via `OPENCODE_CONFIG_CONTENT`. So setting `acp.model`
+injects `OPENCODE_CONFIG_CONTENT={"model":"<acp.model>"}` into the agent's env:
+
+```yaml
+acp:
+  command: opencode acp
+  model: opencode/north-mini-code-free   # provider/model-id
+```
+
+This field is OpenCode-specific. Other ACP agents (e.g. a Claude Code ACP bridge)
+ignore `OPENCODE_CONFIG_CONTENT` and select their model through their own
+config/auth; leave `acp.model` unset for them. Without `acp.model`, OpenCode
+falls back to its own resolution order (workspace `opencode.jsonc`, then global
+config). Note OpenCode Zen free models are rate-limited per-model and report
+throttling only in `~/.local/share/opencode/log/opencode.log`, not over ACP — a
+throttled model surfaces as a turn stall (`stall_timeout_ms`).
 
 ## How it works
 

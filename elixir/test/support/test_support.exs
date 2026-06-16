@@ -122,6 +122,7 @@ defmodule SymphonyElixir.TestSupport do
           max_concurrent_agents_by_state: %{},
           agent_backend: nil,
           acp_command: nil,
+          acp_model: nil,
           acp_auto_approve: nil,
           acp_protocol_version: nil,
           acp_withhold_linear_credentials: nil,
@@ -171,6 +172,7 @@ defmodule SymphonyElixir.TestSupport do
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     agent_backend = Keyword.get(config, :agent_backend)
     acp_command = Keyword.get(config, :acp_command)
+    acp_model = Keyword.get(config, :acp_model)
     acp_auto_approve = Keyword.get(config, :acp_auto_approve)
     acp_protocol_version = Keyword.get(config, :acp_protocol_version)
     acp_withhold_linear_credentials = Keyword.get(config, :acp_withhold_linear_credentials)
@@ -223,15 +225,16 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         agent_backend && "  backend: #{yaml_value(agent_backend)}",
         acp_yaml(
-          acp_command,
-          acp_auto_approve,
-          acp_protocol_version,
-          acp_withhold_linear_credentials,
-          acp_advertise_fs,
-          acp_advertise_terminal,
-          acp_prompt_timeout_ms,
-          acp_read_timeout_ms,
-          acp_stall_timeout_ms
+          command: acp_command,
+          model: acp_model,
+          auto_approve: acp_auto_approve,
+          protocol_version: acp_protocol_version,
+          withhold_linear_credentials: acp_withhold_linear_credentials,
+          advertise_fs: acp_advertise_fs,
+          advertise_terminal: acp_advertise_terminal,
+          prompt_timeout_ms: acp_prompt_timeout_ms,
+          read_timeout_ms: acp_read_timeout_ms,
+          stall_timeout_ms: acp_stall_timeout_ms
         ),
         "codex:",
         "  command: #{yaml_value(codex_command)}",
@@ -322,26 +325,41 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp acp_yaml(command, auto_approve, protocol_version, withhold, advertise_fs, advertise_terminal, prompt_ms, read_ms, stall_ms) do
+  # {field, kind}: `:bool` fields are only emitted when explicitly true/false
+  # (nil means "use the schema default"); `:raw` fields are emitted when present.
+  @acp_yaml_fields [
+    {:command, :raw},
+    {:model, :raw},
+    {:auto_approve, :bool},
+    {:protocol_version, :raw},
+    {:withhold_linear_credentials, :bool},
+    {:advertise_fs, :bool},
+    {:advertise_terminal, :bool},
+    {:prompt_timeout_ms, :raw},
+    {:read_timeout_ms, :raw},
+    {:stall_timeout_ms, :raw}
+  ]
+
+  defp acp_yaml(opts) do
     entries =
-      [
-        command && "  command: #{yaml_value(command)}",
-        is_boolean(auto_approve) && "  auto_approve: #{yaml_value(auto_approve)}",
-        protocol_version && "  protocol_version: #{yaml_value(protocol_version)}",
-        is_boolean(withhold) && "  withhold_linear_credentials: #{yaml_value(withhold)}",
-        is_boolean(advertise_fs) && "  advertise_fs: #{yaml_value(advertise_fs)}",
-        is_boolean(advertise_terminal) && "  advertise_terminal: #{yaml_value(advertise_terminal)}",
-        prompt_ms && "  prompt_timeout_ms: #{yaml_value(prompt_ms)}",
-        read_ms && "  read_timeout_ms: #{yaml_value(read_ms)}",
-        stall_ms && "  stall_timeout_ms: #{yaml_value(stall_ms)}"
-      ]
-      |> Enum.reject(&(&1 in [nil, false]))
+      Enum.flat_map(@acp_yaml_fields, fn {field, kind} ->
+        value = Keyword.get(opts, field)
+
+        if acp_field_present?(kind, value) do
+          ["  #{field}: #{yaml_value(value)}"]
+        else
+          []
+        end
+      end)
 
     case entries do
       [] -> nil
       lines -> Enum.join(["acp:" | lines], "\n")
     end
   end
+
+  defp acp_field_present?(:bool, value), do: is_boolean(value)
+  defp acp_field_present?(:raw, value), do: not is_nil(value)
 
   defp observability_yaml(enabled, refresh_ms, render_interval_ms) do
     [

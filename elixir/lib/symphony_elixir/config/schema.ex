@@ -215,6 +215,11 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       # Command that launches the ACP agent over stdio (e.g. "opencode acp").
       field(:command, :string, default: "opencode acp")
+      # Optional model id (e.g. "opencode/north-mini-code-free"). OpenCode-only:
+      # surfaced to the agent via OPENCODE_CONFIG_CONTENT, since `opencode acp`
+      # rejects a `--model` flag and ignores OPENCODE_MODEL. Other ACP agents
+      # select their model through their own config and ignore this field.
+      field(:model, :string)
       # Mirrors Codex `approval_policy == "never"`: auto-approve permission
       # requests instead of blocking the turn.
       field(:auto_approve, :boolean, default: true)
@@ -237,6 +242,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :model,
           :auto_approve,
           :protocol_version,
           :withhold_linear_credentials,

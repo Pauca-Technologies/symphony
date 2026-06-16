@@ -28,6 +28,7 @@ defmodule SymphonyElixir.Config do
 
   @type acp_runtime_settings :: %{
           command: String.t(),
+          model: String.t() | nil,
           auto_approve: boolean(),
           protocol_version: integer(),
           withhold_linear_credentials: boolean(),
@@ -164,6 +165,7 @@ defmodule SymphonyElixir.Config do
       {:ok,
        %{
          command: acp.command,
+         model: acp.model,
          auto_approve: acp.auto_approve,
          protocol_version: acp.protocol_version,
          withhold_linear_credentials: acp.withhold_linear_credentials,

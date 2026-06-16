@@ -141,6 +141,32 @@ defmodule SymphonyElixir.Acp.ClientTest do
     end)
   end
 
+  test "passes the configured model to OpenCode via OPENCODE_CONFIG_CONTENT" do
+    with_acp_env([acp_model: "opencode/north-mini-code-free"], fn workspace, trace ->
+      write_fake_agent!(workspace.agent_path, updates: [])
+
+      assert {:ok, _} = run(workspace, on_message: collector())
+
+      env_line =
+        trace |> File.read!() |> String.split("\n", trim: true) |> Enum.find(&String.starts_with?(&1, "ENV:OPENCODE_CONFIG_CONTENT="))
+
+      assert env_line == ~s|ENV:OPENCODE_CONFIG_CONTENT=[{"model":"opencode/north-mini-code-free"}]|
+    end)
+  end
+
+  test "omits OPENCODE_CONFIG_CONTENT when no model is configured" do
+    with_acp_env(fn workspace, trace ->
+      write_fake_agent!(workspace.agent_path, updates: [])
+
+      assert {:ok, _} = run(workspace, on_message: collector())
+
+      env_line =
+        trace |> File.read!() |> String.split("\n", trim: true) |> Enum.find(&String.starts_with?(&1, "ENV:OPENCODE_CONFIG_CONTENT="))
+
+      assert env_line == "ENV:OPENCODE_CONFIG_CONTENT=[]"
+    end)
+  end
+
   test "rejects a workspace outside the configured workspace root" do
     with_acp_env(fn workspace, _trace ->
       outside = Path.join(workspace.root, "../outside-#{System.unique_integer([:positive])}")
@@ -275,6 +301,7 @@ defmodule SymphonyElixir.Acp.ClientTest do
       case "$line" in
         *'"method":"initialize"'*)
           [ -n "$trace" ] && printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace"
+          [ -n "$trace" ] && printf 'ENV:OPENCODE_CONFIG_CONTENT=[%s]\\n' "$OPENCODE_CONFIG_CONTENT" >> "$trace"
           emit '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
           ;;
         *'"method":"session/new"'*)
