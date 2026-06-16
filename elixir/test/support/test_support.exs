@@ -121,6 +121,7 @@ defmodule SymphonyElixir.TestSupport do
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
           agent_backend: nil,
+          agent_pre_command: nil,
           acp_command: nil,
           acp_model: nil,
           acp_auto_approve: nil,
@@ -178,6 +179,7 @@ defmodule SymphonyElixir.TestSupport do
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     agent_backend = Keyword.get(config, :agent_backend)
+    agent_pre_command = Keyword.get(config, :agent_pre_command)
     acp_command = Keyword.get(config, :acp_command)
     acp_model = Keyword.get(config, :acp_model)
     acp_auto_approve = Keyword.get(config, :acp_auto_approve)
@@ -238,6 +240,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         agent_backend && "  backend: #{yaml_value(agent_backend)}",
+        agent_pre_command && "  pre_command: #{yaml_value(agent_pre_command)}",
         acp_yaml(
           command: acp_command,
           model: acp_model,

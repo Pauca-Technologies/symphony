@@ -1015,6 +1015,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.agent.label_presets == []
   end
 
+  test "agent.pre_command defaults to nil and parses when set" do
+    assert {:ok, defaults} = Schema.parse(%{})
+    assert defaults.agent.pre_command == nil
+
+    assert {:ok, settings} =
+             Schema.parse(%{"agent" => %{"pre_command" => ". .artifacts/github-app-auth/session.env"}})
+
+    assert settings.agent.pre_command == ". .artifacts/github-app-auth/session.env"
+  end
+
   test "parses agent.label_presets with backend+model overrides" do
     assert {:ok, settings} =
              Schema.parse(%{

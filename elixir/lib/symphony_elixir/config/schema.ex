@@ -178,6 +178,12 @@ defmodule SymphonyElixir.Config.Schema do
       # unchanged behavior); "acp" = Agent Client Protocol; "claude_code" =
       # native Claude Code `claude -p` stream-json. See AgentBackend.
       field(:backend, :string, default: "codex")
+      # Optional shell snippet run (joined with `&&`) in the launch shell before
+      # every backend's agent process, in the workspace cwd — e.g. sourcing a
+      # per-worktree GitHub-session env file: ". .artifacts/.../session.env".
+      # Backend-agnostic; unset ⇒ launches are byte-for-byte unchanged. See
+      # AgentTransport.with_pre_command/2.
+      field(:pre_command, :string)
       # Ordered per-task backend+model overrides keyed on Linear label name;
       # first match wins, falls through to `backend` for unmatched issues.
       embeds_many(:label_presets, LabelPreset, on_replace: :delete)
@@ -188,7 +194,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state, :backend],
+        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state, :backend, :pre_command],
         empty_values: []
       )
       |> cast_embed(:label_presets, with: &LabelPreset.changeset/2)

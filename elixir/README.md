@@ -140,6 +140,14 @@ Notes:
   [docs/claude-code.md](docs/claude-code.md) for the Claude Code setup and the `claude_code` config
   block. Both alternative backends share the same local-only gate / non-intercepted `fs`/`terminal`
   limitations as ACP.
+- `agent.pre_command` is an optional shell snippet run (joined with `&&`) in the launch shell —
+  inside the per-issue workspace cwd — **before every backend's** agent process (Codex, ACP, Claude
+  Code alike). Use it to source a per-worktree env file (e.g. a generated GitHub-App session:
+  `pre_command: . .artifacts/github-app-auth/session.env`) so all three backends get the same
+  environment without duplicating the wrapper in each backend's `command`. Any `.env` file it sources
+  is run through the same sanitizer as a command-sourced file. Unset ⇒ launches are byte-for-byte
+  unchanged. (With it set, you can drop the `sh -lc '… && exec …'` sourcing wrapper from
+  `codex.command` and leave just the bare agent invocation.)
 - `agent.label_presets` chooses the backend (and model) **per task** from the issue's Linear labels,
   overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
   whose `label` is present on the issue wins (positional precedence — list order, first match), and

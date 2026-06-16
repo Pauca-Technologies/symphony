@@ -34,6 +34,44 @@ defmodule SymphonyElixir.AgentTransport do
   def port_line_bytes, do: @port_line_bytes
 
   @doc """
+  The configured global `agent.pre_command` shell snippet, or `nil` when unset
+  or blank. Backend-agnostic: every backend runs this in the launch shell
+  before its agent process (see `with_pre_command/2`).
+  """
+  @spec pre_command() :: String.t() | nil
+  def pre_command do
+    case Config.settings!().agent.pre_command do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
+  Prepend the global `agent.pre_command` (if any) to a launch-shell fragment,
+  joined with `&&`, so it runs in the same shell — and workspace cwd — before
+  `fragment`. Returns `fragment` unchanged when no pre-command is configured, so
+  the default launch path stays byte-for-byte identical.
+
+  Used for both the local fragment (the bare command) and the remote fragment
+  (`exec <command>`), so the snippet runs before exec on either path.
+  """
+  @spec with_pre_command(String.t()) :: String.t()
+  def with_pre_command(fragment) when is_binary(fragment),
+    do: with_pre_command(fragment, pre_command())
+
+  @spec with_pre_command(String.t(), String.t() | nil) :: String.t()
+  def with_pre_command(fragment, nil) when is_binary(fragment), do: fragment
+
+  def with_pre_command(fragment, pre) when is_binary(fragment) and is_binary(pre),
+    do: pre <> " && " <> fragment
+
+  @doc """
   Validate that `workspace` is a safe agent cwd: a real directory strictly
   under the configured workspace root, with no symlink escape. Remote
   workspaces (when `worker_host` is set) are only sanity-checked for shell
@@ -91,8 +129,12 @@ defmodule SymphonyElixir.AgentTransport do
   @spec prepare_sourced_env_files(Path.t(), String.t() | nil, String.t()) :: :ok
   def prepare_sourced_env_files(workspace, nil, command)
       when is_binary(workspace) and is_binary(command) do
-    command
-    |> sourced_env_files(workspace)
+    # Scan both the backend command and the global `agent.pre_command` — either
+    # may `source` a generated workspace `.env` (e.g. a GitHub-session file).
+    [command, pre_command()]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.flat_map(&sourced_env_files(&1, workspace))
+    |> Enum.uniq()
     |> Enum.each(&sanitize_sourced_env_file(&1, workspace))
 
     :ok
@@ -122,7 +164,7 @@ defmodule SymphonyElixir.AgentTransport do
               :binary,
               :exit_status,
               :stderr_to_stdout,
-              args: [~c"-lc", String.to_charlist(command)],
+              args: [~c"-lc", String.to_charlist(with_pre_command(command))],
               cd: String.to_charlist(workspace),
               line: @port_line_bytes,
               env: env
@@ -190,7 +232,7 @@ defmodule SymphonyElixir.AgentTransport do
         {name, value} -> "export #{to_string(name)}=#{shell_escape(to_string(value))}"
       end)
 
-    (["cd #{shell_escape(workspace)}"] ++ env_lines ++ ["exec #{command}"])
+    (["cd #{shell_escape(workspace)}"] ++ env_lines ++ [with_pre_command("exec #{command}")])
     |> Enum.join(" && ")
   end
 

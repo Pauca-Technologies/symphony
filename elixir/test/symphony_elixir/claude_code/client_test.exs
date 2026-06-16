@@ -147,6 +147,19 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
     end)
   end
 
+  test "agent.pre_command runs in the launch shell so its env reaches the agent" do
+    with_cc_env([agent_pre_command: "export CC_PRECMD=propagated"], fn workspace, trace ->
+      write_fake_agent!(workspace.agent_path, events: [system_init()])
+
+      assert {:ok, _} = run(workspace, on_message: collector())
+
+      env_line =
+        trace |> File.read!() |> String.split("\n", trim: true) |> Enum.find(&String.starts_with?(&1, "ENV:CC_PRECMD="))
+
+      assert env_line == "ENV:CC_PRECMD=[propagated]"
+    end)
+  end
+
   test "rejects a workspace outside the configured workspace root" do
     with_cc_env(fn workspace, _trace ->
       outside = Path.join(workspace.root, "../outside-#{System.unique_integer([:positive])}")
@@ -264,6 +277,7 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
     if [ -n "$trace" ]; then
       printf 'ARGV:%s\\n' "$*" >> "$trace"
       printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace"
+      printf 'ENV:CC_PRECMD=[%s]\\n' "$CC_PRECMD" >> "$trace"
     fi
     IFS= read -r line
     [ -n "$trace" ] && printf 'JSON:%s\\n' "$line" >> "$trace"

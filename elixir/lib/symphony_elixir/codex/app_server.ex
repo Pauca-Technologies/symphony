@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @behaviour SymphonyElixir.AgentBackend
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -270,7 +270,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist(AgentTransport.with_pre_command(Config.settings!().codex.command))],
             cd: String.to_charlist(workspace),
             line: @port_line_bytes,
             # Mark this process as the inner agent so consumer-repo hooks can
@@ -299,8 +299,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp prepare_sourced_env_files(workspace, nil) when is_binary(workspace) do
-    Config.settings!().codex.command
-    |> sourced_env_files(workspace)
+    # Sanitize `.env` files sourced by either the codex command or the global
+    # `agent.pre_command` (when pre_command is unset this is the codex command
+    # alone — byte-for-byte unchanged).
+    [Config.settings!().codex.command, AgentTransport.pre_command()]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.flat_map(&sourced_env_files(&1, workspace))
+    |> Enum.uniq()
     |> Enum.each(&sanitize_sourced_env_file(&1, workspace))
 
     :ok
@@ -381,7 +386,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "cd #{shell_escape(workspace)}",
       "export SYMPHONY_RUN=1",
       "export SYMPHONY_AGENT=1",
-      "exec #{Config.settings!().codex.command}"
+      AgentTransport.with_pre_command("exec #{Config.settings!().codex.command}")
     ]
     |> Enum.join(" && ")
   end
