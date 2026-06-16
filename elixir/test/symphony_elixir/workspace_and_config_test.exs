@@ -1010,6 +1010,49 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{"agent" => %{"backend" => "claude_code"}, "claude_code" => %{"command" => ""}})
   end
 
+  test "agent.label_presets defaults to an empty list" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.agent.label_presets == []
+  end
+
+  test "parses agent.label_presets with backend+model overrides" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "agent" => %{
+                 "backend" => "codex",
+                 "label_presets" => [
+                   %{"label" => "agent:fast", "backend" => "acp", "model" => "opencode/north-mini-code-free"},
+                   %{"label" => "agent:deep", "backend" => "claude_code", "model" => "opus"},
+                   %{"label" => "agent:codex", "backend" => "codex"}
+                 ]
+               }
+             })
+
+    assert [fast, deep, codex] = settings.agent.label_presets
+    assert fast.label == "agent:fast"
+    assert fast.backend == "acp"
+    assert fast.model == "opencode/north-mini-code-free"
+    assert deep.backend == "claude_code"
+    assert deep.model == "opus"
+    assert codex.backend == "codex"
+    assert codex.model == nil
+  end
+
+  test "rejects a label_preset with an unknown backend" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"label_presets" => [%{"label" => "x", "backend" => "gemini"}]}})
+  end
+
+  test "rejects a label_preset with a blank label" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"label_presets" => [%{"label" => "  ", "backend" => "acp"}]}})
+  end
+
+  test "rejects a label_preset missing its backend" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"label_presets" => [%{"label" => "agent:fast"}]}})
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

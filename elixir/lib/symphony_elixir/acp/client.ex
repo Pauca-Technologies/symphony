@@ -73,14 +73,25 @@ defmodule SymphonyElixir.Acp.Client do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    overrides = Keyword.get(opts, :overrides, %{})
 
-    with {:ok, acp} <- Config.acp_runtime_settings(),
+    with {:ok, base_acp} <- Config.acp_runtime_settings(),
+         acp = apply_overrides(base_acp, overrides),
          {:ok, expanded_workspace} <- AgentTransport.validate_workspace_cwd(workspace, worker_host),
          :ok <- AgentTransport.prepare_sourced_env_files(expanded_workspace, worker_host, acp.command) do
       maybe_warn_remote_gate(worker_host)
       start_agent_session(expanded_workspace, worker_host, acp)
     end
   end
+
+  # Merge per-task overrides (e.g. %{model: ...} from an agent.label_presets
+  # entry) over the config-derived settings. Empty overrides ⇒ identical to the
+  # global-config path. Only keys the backend consumes are honored.
+  defp apply_overrides(acp, overrides) when is_map(overrides) do
+    Map.merge(acp, Map.take(overrides, [:model]))
+  end
+
+  defp apply_overrides(acp, _overrides), do: acp
 
   @impl true
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}

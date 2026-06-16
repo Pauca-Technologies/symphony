@@ -140,6 +140,25 @@ Notes:
   [docs/claude-code.md](docs/claude-code.md) for the Claude Code setup and the `claude_code` config
   block. Both alternative backends share the same local-only gate / non-intercepted `fs`/`terminal`
   limitations as ACP.
+- `agent.label_presets` chooses the backend (and model) **per task** from the issue's Linear labels,
+  overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
+  whose `label` is present on the issue wins (positional precedence — list order, first match), and
+  an unmatched issue falls through to `agent.backend`. Each preset has `label` (a Linear label name,
+  matched exactly), `backend` (`codex` | `acp` | `claude_code`), and an optional `model` (passed to
+  the chosen backend — `OPENCODE_CONFIG_CONTENT` for ACP/OpenCode, `--model` for Claude Code; ignored
+  for `codex`, which has no per-task model). Resolution happens once at run start, so a relabel takes
+  effect on the next run. Example:
+  ```yaml
+  agent:
+    backend: codex            # default for unmatched issues
+    label_presets:
+      - label: "agent:fast"
+        backend: acp
+        model: opencode/north-mini-code-free
+      - label: "agent:deep"
+        backend: claude_code
+        model: opus
+  ```
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

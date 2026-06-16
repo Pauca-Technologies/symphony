@@ -167,6 +167,20 @@ defmodule SymphonyElixir.Acp.ClientTest do
     end)
   end
 
+  test "a per-task model override takes effect even when no model is configured" do
+    with_acp_env(fn workspace, trace ->
+      write_fake_agent!(workspace.agent_path, updates: [])
+
+      assert {:ok, _} =
+               run(workspace, on_message: collector(), overrides: %{model: "opencode/north-mini-code-free"})
+
+      env_line =
+        trace |> File.read!() |> String.split("\n", trim: true) |> Enum.find(&String.starts_with?(&1, "ENV:OPENCODE_CONFIG_CONTENT="))
+
+      assert env_line == ~s|ENV:OPENCODE_CONFIG_CONTENT=[{"model":"opencode/north-mini-code-free"}]|
+    end)
+  end
+
   test "rejects a workspace outside the configured workspace root" do
     with_acp_env(fn workspace, _trace ->
       outside = Path.join(workspace.root, "../outside-#{System.unique_integer([:positive])}")

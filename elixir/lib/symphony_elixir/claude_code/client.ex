@@ -74,14 +74,25 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    overrides = Keyword.get(opts, :overrides, %{})
 
-    with {:ok, cc} <- Config.claude_code_runtime_settings(),
+    with {:ok, base_cc} <- Config.claude_code_runtime_settings(),
+         cc = apply_overrides(base_cc, overrides),
          {:ok, expanded_workspace} <- AgentTransport.validate_workspace_cwd(workspace, worker_host),
          :ok <- AgentTransport.prepare_sourced_env_files(expanded_workspace, worker_host, cc.command) do
       maybe_warn_remote_gate(worker_host)
       start_agent_session(expanded_workspace, worker_host, cc)
     end
   end
+
+  # Merge per-task overrides (e.g. %{model: ...} from an agent.label_presets
+  # entry) over the config-derived settings. Empty overrides ⇒ identical to the
+  # global-config path. Claude Code takes the model as a native `--model` flag.
+  defp apply_overrides(cc, overrides) when is_map(overrides) do
+    Map.merge(cc, Map.take(overrides, [:model]))
+  end
+
+  defp apply_overrides(cc, _overrides), do: cc
 
   @impl true
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}

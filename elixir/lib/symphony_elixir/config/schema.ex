@@ -129,6 +129,45 @@ defmodule SymphonyElixir.Config.Schema do
 
     alias SymphonyElixir.Config.Schema
 
+    @backend_names ["codex", "acp", "claude_code"]
+
+    defmodule LabelPreset do
+      @moduledoc """
+      One entry in `agent.label_presets`: maps a Linear label name to a
+      per-task backend (and optional model) override. See
+      `SymphonyElixir.AgentBackend.resolve_for_issue/1` and §15 of
+      `docs/acp-support-plan.md`. Presets are matched positionally — the first
+      preset whose `label` is present on the issue wins.
+      """
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @backend_names ["codex", "acp", "claude_code"]
+
+      @primary_key false
+      embedded_schema do
+        # Linear label name, matched exactly (case-sensitive, as Linear stores it).
+        field(:label, :string)
+        # Backend to use for issues carrying `label` (one of @backend_names).
+        field(:backend, :string)
+        # Optional per-task model. Interpreted by the chosen backend: ACP/OpenCode
+        # → OPENCODE_CONFIG_CONTENT; Claude Code → --model. Ignored for "codex"
+        # (Codex has no per-task model; it picks its model from its own config).
+        field(:model, :string)
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:label, :backend, :model], empty_values: [])
+        |> validate_required([:label, :backend])
+        |> validate_inclusion(:backend, @backend_names)
+        |> validate_change(:label, fn :label, value ->
+          if is_binary(value) and String.trim(value) != "", do: [], else: [label: "must not be blank"]
+        end)
+      end
+    end
+
     @primary_key false
     embedded_schema do
       field(:max_concurrent_agents, :integer, default: 10)
@@ -139,6 +178,9 @@ defmodule SymphonyElixir.Config.Schema do
       # unchanged behavior); "acp" = Agent Client Protocol; "claude_code" =
       # native Claude Code `claude -p` stream-json. See AgentBackend.
       field(:backend, :string, default: "codex")
+      # Ordered per-task backend+model overrides keyed on Linear label name;
+      # first match wins, falls through to `backend` for unmatched issues.
+      embeds_many(:label_presets, LabelPreset, on_replace: :delete)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -149,10 +191,11 @@ defmodule SymphonyElixir.Config.Schema do
         [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state, :backend],
         empty_values: []
       )
+      |> cast_embed(:label_presets, with: &LabelPreset.changeset/2)
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
-      |> validate_inclusion(:backend, ["codex", "acp", "claude_code"])
+      |> validate_inclusion(:backend, @backend_names)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -734,7 +777,13 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp flatten_errors(errors, prefix) when is_list(errors) do
-    Enum.map(errors, &(prefix <> " " <> &1))
+    # A field's errors are a list of message strings; an `embeds_many` field's
+    # errors are a list of per-element maps (empty map when that element is
+    # clean). Recurse into the maps so nested validation errors flatten too.
+    Enum.flat_map(errors, fn
+      message when is_binary(message) -> [prefix <> " " <> message]
+      nested -> flatten_errors(nested, prefix)
+    end)
   end
 
   defp translate_error({message, options}) do
