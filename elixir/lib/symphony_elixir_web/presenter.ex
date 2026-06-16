@@ -77,6 +77,7 @@ defmodule SymphonyElixirWeb.Presenter do
         restart_count: restart_count(retry),
         current_retry_attempt: retry_attempt(retry)
       },
+      agent: agent_payload(running || retry || %{}),
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
       logs: %{
@@ -111,6 +112,7 @@ defmodule SymphonyElixirWeb.Presenter do
       state: entry.state,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
+      agent: agent_payload(entry),
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
@@ -144,6 +146,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       worker_host: Map.get(running, :worker_host),
       workspace_path: Map.get(running, :workspace_path),
+      agent: agent_payload(running),
       session_id: running.session_id,
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
@@ -160,6 +163,26 @@ defmodule SymphonyElixirWeb.Presenter do
       context: context_payload(running)
     }
   end
+
+  # The actual backend + model the run is using, captured from the running
+  # session (not re-derived from the issue's labels). `backend` is the resolved
+  # backend module's config name; `model` is what was handed to/reported by the
+  # agent (nil when unknown, e.g. Codex picks its model from its own config).
+  defp agent_payload(entry) when is_map(entry) do
+    %{
+      backend: blank_to_nil(Map.get(entry, :backend)),
+      model: blank_to_nil(Map.get(entry, :model))
+    }
+  end
+
+  defp blank_to_nil(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp blank_to_nil(_value), do: nil
 
   defp context_payload(entry) do
     tokens = Map.get(entry, :codex_context_tokens, 0)

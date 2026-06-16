@@ -281,6 +281,36 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
+  # Report the *actual* backend (the resolved module the session runs on) and the
+  # model passed to it, so the dashboard shows what is really running rather than
+  # re-deriving it from the issue's labels. The model from the session map is the
+  # config/override value actually handed to the agent process; backends that
+  # report their real model on the wire (e.g. Claude Code's `system/init`) refine
+  # it later via the `:session_started` event.
+  defp send_agent_backend_info(recipient, %Issue{id: issue_id}, backend, session)
+       when is_binary(issue_id) and is_pid(recipient) do
+    send(
+      recipient,
+      {:worker_runtime_info, issue_id,
+       %{
+         backend: AgentBackend.backend_name(backend),
+         model: agent_session_model(session)
+       }}
+    )
+
+    :ok
+  end
+
+  defp send_agent_backend_info(_recipient, _issue, _backend, _session), do: :ok
+
+  defp agent_session_model(session) when is_map(session) do
+    model = get_in(session, [:claude_code, :model]) || get_in(session, [:acp, :model])
+
+    if is_binary(model) and String.trim(model) != "", do: model
+  end
+
+  defp agent_session_model(_session), do: nil
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
@@ -288,6 +318,8 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <-
            backend.start_session(workspace, worker_host: worker_host, overrides: overrides) do
+      send_agent_backend_info(codex_update_recipient, issue, backend, session)
+
       try do
         do_run_codex_turns(backend, session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after

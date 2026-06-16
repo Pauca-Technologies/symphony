@@ -137,6 +137,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </article>
 
             <article class="metric-card">
+              <p class="metric-label">Agent</p>
+              <p class="metric-value"><%= agent_backend_label(@issue_payload.agent.backend) %></p>
+              <p class="metric-detail mono">
+                <%= @issue_payload.agent.model || "model n/a" %>
+              </p>
+            </article>
+
+            <article class="metric-card">
               <p class="metric-label">Runtime</p>
               <p class="metric-value numeric">
                 <%= issue_runtime(@issue_payload, @now) %>
@@ -364,6 +372,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <col style="width: 14rem;" />
                     <col style="width: 8rem;" />
                     <col style="width: 7.5rem;" />
+                    <col style="width: 10rem;" />
                     <col style="width: 8.5rem;" />
                     <col />
                     <col style="width: 10rem;" />
@@ -373,6 +382,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <th>Issue</th>
                       <th>State</th>
                       <th>Session</th>
+                      <th>Agent</th>
                       <th>Runtime / turns</th>
                       <th>Codex update</th>
                       <th>Tokens</th>
@@ -414,6 +424,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <% else %>
                             <span class="muted">n/a</span>
                           <% end %>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="agent-stack">
+                          <span class="agent-backend"><%= agent_backend_label(entry.agent.backend) %></span>
+                          <span :if={entry.agent.model} class="muted agent-model mono" title={entry.agent.model}>
+                            <%= entry.agent.model %>
+                          </span>
                         </div>
                       </td>
                       <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
@@ -638,6 +656,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> base
     end
   end
+
+  # Humanize the actual backend the run resolved to. `nil` until the run reports
+  # it (e.g. an issue still spinning up, or one only in the retry queue).
+  defp agent_backend_label("codex"), do: "Codex"
+  defp agent_backend_label("acp"), do: "ACP / OpenCode"
+  defp agent_backend_label("claude_code"), do: "Claude Code"
+  defp agent_backend_label(name) when is_binary(name) and name != "", do: name
+  defp agent_backend_label(_name), do: "n/a"
 
   defp transcript_blocks(%{blocks: blocks}) when is_list(blocks), do: blocks
   defp transcript_blocks(_transcript), do: []

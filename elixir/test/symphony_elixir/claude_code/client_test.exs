@@ -28,7 +28,9 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
       assert {:ok, %{session_id: "cc-1", stop_reason: "end_turn"}} =
                run(workspace, on_message: collector())
 
-      assert_received {:cc_message, %{event: :session_started, session_id: "cc-1"}}
+      # The model Claude reports in `system/init` rides on :session_started so the
+      # dashboard can show the actual model.
+      assert_received {:cc_message, %{event: :session_started, session_id: "cc-1", model: "claude-haiku"}}
       assert_received {:cc_message, %{event: :turn_completed, stop_reason: "end_turn"}}
     end)
   end

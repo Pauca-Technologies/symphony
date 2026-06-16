@@ -115,6 +115,127 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            ]
   end
 
+  test "orchestrator snapshot captures the actual backend and model" do
+    issue_id = "issue-agent-meta"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-200",
+      title: "Agent meta test",
+      description: "Capture backend/model",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-200"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :AgentMetaOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      backend: nil,
+      model: nil,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    # AgentRunner reports the resolved backend + configured model out-of-band.
+    send(pid, {:worker_runtime_info, issue_id, %{backend: "claude_code", model: "opus"}})
+
+    # The agent then reports the model it actually resolved on `:session_started`,
+    # which refines the configured value.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         session_id: "claude-session-1",
+         model: "claude-opus-4-8",
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    assert %{running: [snapshot_entry]} = GenServer.call(pid, :snapshot)
+    assert snapshot_entry.backend == "claude_code"
+    assert snapshot_entry.model == "claude-opus-4-8"
+  end
+
+  test "orchestrator snapshot keeps the configured model when the agent reports none" do
+    issue_id = "issue-agent-meta-codex"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-201",
+      title: "Agent meta codex",
+      description: "Configured model only",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-201"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :AgentMetaCodexOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      backend: nil,
+      model: nil,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:worker_runtime_info, issue_id, %{backend: "acp", model: "opencode/north-mini-code-free"}})
+
+    # A session_started without a model must not clobber the configured one.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{event: :session_started, session_id: "acp-session-1", timestamp: DateTime.utc_now()}}
+    )
+
+    assert %{running: [snapshot_entry]} = GenServer.call(pid, :snapshot)
+    assert snapshot_entry.backend == "acp"
+    assert snapshot_entry.model == "opencode/north-mini-code-free"
+  end
+
   test "orchestrator snapshot retains a bounded recent codex event history" do
     issue_id = "issue-event-history"
 

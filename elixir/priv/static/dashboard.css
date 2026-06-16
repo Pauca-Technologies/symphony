@@ -336,10 +336,22 @@ pre,
 .issue-stack,
 .session-stack,
 .detail-stack,
+.agent-stack,
 .token-stack {
   display: grid;
   gap: 0.24rem;
   min-width: 0;
+}
+
+.agent-backend {
+  font-weight: 600;
+}
+
+.agent-model {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82em;
 }
 
 .event-text {

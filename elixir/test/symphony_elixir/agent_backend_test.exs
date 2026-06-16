@@ -36,6 +36,19 @@ defmodule SymphonyElixir.AgentBackendTest do
     end
   end
 
+  describe "backend_name/1" do
+    test "reverse-maps a backend module to its config name" do
+      assert AgentBackend.backend_name(AppServer) == "codex"
+      assert AgentBackend.backend_name(AcpClient) == "acp"
+      assert AgentBackend.backend_name(ClaudeCodeClient) == "claude_code"
+    end
+
+    test "returns nil for an unregistered module or non-module" do
+      assert AgentBackend.backend_name(String) == nil
+      assert AgentBackend.backend_name("codex") == nil
+    end
+  end
+
   describe "resolve_for_labels/2 (per-task backend+model)" do
     defp preset_agent do
       %Agent{

@@ -287,7 +287,13 @@ defmodule SymphonyElixir.ClaudeCode.Client do
       if state.session_started? do
         state
       else
-        emit_message(state.session, state.on_message, :session_started, %{session_id: session_id})
+        # `system/init` reports the model Claude actually resolved — surface it so
+        # the dashboard shows the real model, not just whatever was configured.
+        emit_message(state.session, state.on_message, :session_started, %{
+          session_id: session_id,
+          model: Map.get(message, "model")
+        })
+
         %{state | session_started?: true}
       end
 

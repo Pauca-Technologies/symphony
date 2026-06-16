@@ -40,6 +40,20 @@ defmodule SymphonyElixir.AgentBackend do
   def resolve(_backend), do: @default_backend
 
   @doc """
+  Reverse-map a backend module to its config name (e.g.
+  `SymphonyElixir.Codex.AppServer` -> `"codex"`).
+
+  Used to label the *actual* backend a run is using in the dashboard. Returns
+  `nil` for a module that isn't a registered backend.
+  """
+  @spec backend_name(module()) :: String.t() | nil
+  def backend_name(module) when is_atom(module) do
+    Enum.find_value(@backends, fn {name, mod} -> if mod == module, do: name end)
+  end
+
+  def backend_name(_module), do: nil
+
+  @doc """
   Resolve the backend module **and per-task overrides** for a given issue.
 
   The first `agent.label_presets` entry whose `label` is present on the issue

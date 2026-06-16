@@ -242,6 +242,8 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:backend, runtime_info[:backend])
+          |> maybe_put_runtime_value(:model, runtime_info[:model])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -900,6 +902,8 @@ defmodule SymphonyElixir.Orchestrator do
             issue: issue,
             worker_host: worker_host,
             workspace_path: nil,
+            backend: nil,
+            model: nil,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -1353,6 +1357,8 @@ defmodule SymphonyElixir.Orchestrator do
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
+          backend: Map.get(metadata, :backend),
+          model: Map.get(metadata, :model),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
@@ -1440,6 +1446,7 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: codex_message,
         session_id: resolved_session_id,
+        model: model_for_update(Map.get(running_entry, :model), update),
         last_codex_event: event,
         recent_codex_events: append_recent_codex_event(Map.get(running_entry, :recent_codex_events, []), codex_message),
         recent_codex_transcript_blocks:
@@ -1479,6 +1486,14 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  # An agent that reports its real model on the wire (e.g. Claude Code's
+  # `system/init`) carries it on the `:session_started` event; prefer that over
+  # the configured model already recorded from `:worker_runtime_info`.
+  defp model_for_update(_existing, %{model: model}) when is_binary(model) and model != "",
+    do: model
+
+  defp model_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

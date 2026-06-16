@@ -167,6 +167,12 @@ Notes:
         backend: claude_code
         model: opus
   ```
+  The observability dashboard surfaces the **actual** backend and model each run is using — an
+  "Agent" column in the running-issues list and an "Agent" card on the issue detail page — taken from
+  the resolved backend module and the model handed to (or reported by) the running agent, not
+  re-derived from the issue's labels. The model is the live one where the agent reports it (Claude
+  Code's `system/init`) and the configured/override value otherwise; Codex shows no model (it picks
+  its own).
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
