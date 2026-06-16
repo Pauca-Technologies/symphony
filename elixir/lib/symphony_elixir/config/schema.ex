@@ -283,6 +283,11 @@ defmodule SymphonyElixir.Config.Schema do
       field(:prompt_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      # Some ACP agents (notably opencode) don't report a model-stream failure
+      # over ACP — a rate-limited turn just goes silent until `stall_timeout_ms`.
+      # While a turn is idle, emit a "still waiting" heartbeat every
+      # `heartbeat_ms` so the silence is visible instead of dead air. 0 disables.
+      field(:heartbeat_ms, :integer, default: 30_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -300,7 +305,8 @@ defmodule SymphonyElixir.Config.Schema do
           :advertise_terminal,
           :prompt_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :heartbeat_ms
         ],
         empty_values: []
       )
@@ -309,6 +315,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:prompt_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:heartbeat_ms, greater_than_or_equal_to: 0)
     end
   end
 

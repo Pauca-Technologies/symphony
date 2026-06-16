@@ -39,6 +39,7 @@ non-empty (it defaults to `opencode acp`).
 | `prompt_timeout_ms` | `3_600_000` | Max wall-clock for one `session/prompt` turn. |
 | `read_timeout_ms` | `5_000` | Handshake (`initialize` / `session/new`) response timeout. |
 | `stall_timeout_ms` | `300_000` | Idle timeout between streamed `session/update`s during a turn. |
+| `heartbeat_ms` | `30_000` | While a turn is idle, emit a `:notification` "still waiting" heartbeat (and log line) every this-many ms, so a silent/stalled turn shows a visible countdown to `stall_timeout_ms` instead of dead air. `0` disables. See the stall note below. |
 
 ### Selecting the model
 
@@ -60,7 +61,11 @@ config/auth; leave `acp.model` unset for them. Without `acp.model`, OpenCode
 falls back to its own resolution order (workspace `opencode.jsonc`, then global
 config). Note OpenCode Zen free models are rate-limited per-model and report
 throttling only in `~/.local/share/opencode/log/opencode.log`, not over ACP — a
-throttled model surfaces as a turn stall (`stall_timeout_ms`).
+throttled model surfaces as a turn stall (`stall_timeout_ms`). While the turn is
+idle, Symphony emits a "still waiting" heartbeat every `heartbeat_ms` (default
+30s) so the silence is visible rather than dead air; lower `stall_timeout_ms` if
+you want a throttled turn to fail faster (at the cost of false positives on
+legitimately long-but-quiet operations).
 
 ## How it works
 

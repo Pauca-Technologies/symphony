@@ -126,6 +126,21 @@ defmodule SymphonyElixir.Acp.ClientTest do
     end)
   end
 
+  test "emits idle heartbeats while a silent turn counts down to the stall timeout" do
+    with_acp_env(
+      [acp_heartbeat_ms: 50, acp_stall_timeout_ms: 500, acp_prompt_timeout_ms: 5_000],
+      fn workspace, _trace ->
+        write_fake_agent!(workspace.agent_path, silent_prompt: true)
+
+        assert {:error, :turn_stalled} = run(workspace, on_message: collector())
+
+        # The silent turn surfaces a "still waiting" heartbeat before it stalls,
+        # so the dead air is visible instead of an opaque 5-minute freeze.
+        assert_received {:acp_message, %{event: :notification, kind: :idle_heartbeat, heartbeat: 1}}
+      end
+    )
+  end
+
   test "withholds Linear credentials from the agent process env" do
     previous = System.get_env("LINEAR_API_KEY")
     System.put_env("LINEAR_API_KEY", "super-secret-token")

@@ -118,13 +118,17 @@ defmodule SymphonyElixir.Acp.Client do
     Logger.info("ACP session prompt sent for #{issue_context(issue)} session_id=#{session_id}")
     emit_message(session, on_message, :session_started, %{session_id: session_id})
 
+    now = System.monotonic_time(:millisecond)
+
     loop_state = %{
       session: session,
       on_message: on_message,
       prompt_id: prompt_id,
       tool_executor: tool_executor,
       pending: "",
-      deadline: System.monotonic_time(:millisecond) + session.acp.prompt_timeout_ms
+      deadline: now + session.acp.prompt_timeout_ms,
+      last_activity: now,
+      heartbeats: 0
     }
 
     case receive_loop(loop_state) do
@@ -328,10 +332,14 @@ defmodule SymphonyElixir.Acp.Client do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         line = state.pending <> to_string(chunk)
-        dispatch_line(%{state | pending: ""}, line)
+        dispatch_line(%{state | pending: "", last_activity: System.monotonic_time(:millisecond)}, line)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        receive_loop(%{state | pending: state.pending <> to_string(chunk)})
+        receive_loop(%{
+          state
+          | pending: state.pending <> to_string(chunk),
+            last_activity: System.monotonic_time(:millisecond)
+        })
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
@@ -339,18 +347,60 @@ defmodule SymphonyElixir.Acp.Client do
       {:acp_tool_call, ref, from, tool_name, arguments} ->
         result = state.tool_executor.(tool_name, arguments)
         send(from, {:acp_tool_result, ref, result})
-        receive_loop(state)
+        receive_loop(%{state | last_activity: System.monotonic_time(:millisecond)})
     after
-      receive_timeout(state) ->
-        if turn_deadline_passed?(state), do: {:error, :turn_timeout}, else: {:error, :turn_stalled}
+      receive_timeout(state) -> on_idle_timeout(state)
     end
   end
 
-  defp receive_timeout(%{deadline: deadline, session: %{acp: acp}}) do
-    remaining = max(0, deadline - System.monotonic_time(:millisecond))
-    stall = acp.stall_timeout_ms
+  # The `after` window is sliced to the soonest of: turn deadline, stall
+  # deadline (since the last agent output), and the heartbeat interval. When it
+  # fires we distinguish a real timeout/stall from "still idle, emit a
+  # heartbeat and keep waiting".
+  defp on_idle_timeout(state) do
+    cond do
+      turn_deadline_passed?(state) -> {:error, :turn_timeout}
+      stalled?(state) -> {:error, :turn_stalled}
+      true -> receive_loop(emit_heartbeat(state))
+    end
+  end
 
-    if stall > 0, do: min(stall, remaining), else: remaining
+  defp receive_timeout(%{deadline: deadline, last_activity: last, session: %{acp: acp}}) do
+    now = System.monotonic_time(:millisecond)
+    turn_remaining = max(0, deadline - now)
+
+    stall_remaining =
+      if acp.stall_timeout_ms > 0, do: max(0, acp.stall_timeout_ms - (now - last)), else: turn_remaining
+
+    heartbeat = if acp.heartbeat_ms > 0, do: acp.heartbeat_ms, else: turn_remaining
+
+    Enum.min([turn_remaining, stall_remaining, heartbeat])
+  end
+
+  defp stalled?(%{last_activity: last, session: %{acp: %{stall_timeout_ms: stall}}}) do
+    stall > 0 and System.monotonic_time(:millisecond) - last >= stall
+  end
+
+  # Emit a "still waiting" liveness signal during a silent turn so a model that
+  # has gone quiet (e.g. an unreported opencode rate-limit) shows a visible
+  # countdown to `stall_timeout_ms` instead of dead air. Renders to no
+  # transcript block (unknown method), so it is purely advisory.
+  defp emit_heartbeat(%{session: %{acp: %{stall_timeout_ms: stall}} = session, last_activity: last} = state) do
+    idle_ms = System.monotonic_time(:millisecond) - last
+    count = state.heartbeats + 1
+
+    Logger.info(
+      "ACP turn idle #{idle_ms}ms (no agent output) session_id=#{session.session_id} heartbeat=#{count} stall_timeout_ms=#{stall}"
+    )
+
+    emit_message(session, state.on_message, :notification, %{
+      kind: :idle_heartbeat,
+      idle_ms: idle_ms,
+      heartbeat: count,
+      stall_timeout_ms: stall
+    })
+
+    %{state | heartbeats: count}
   end
 
   defp turn_deadline_passed?(%{deadline: deadline}) do

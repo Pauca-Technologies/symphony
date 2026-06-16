@@ -36,7 +36,8 @@ defmodule SymphonyElixir.Config do
           advertise_terminal: boolean(),
           prompt_timeout_ms: integer(),
           read_timeout_ms: integer(),
-          stall_timeout_ms: integer()
+          stall_timeout_ms: integer(),
+          heartbeat_ms: integer()
         }
 
   @type claude_code_runtime_settings :: %{
@@ -183,7 +184,8 @@ defmodule SymphonyElixir.Config do
          advertise_terminal: acp.advertise_terminal,
          prompt_timeout_ms: acp.prompt_timeout_ms,
          read_timeout_ms: acp.read_timeout_ms,
-         stall_timeout_ms: acp.stall_timeout_ms
+         stall_timeout_ms: acp.stall_timeout_ms,
+         heartbeat_ms: acp.heartbeat_ms
        }}
     end
   end

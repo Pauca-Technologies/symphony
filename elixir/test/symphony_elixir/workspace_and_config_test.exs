@@ -953,6 +953,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert acp.command == "opencode acp"
     assert acp.auto_approve == false
     assert acp.withhold_linear_credentials == true
+    assert acp.heartbeat_ms == 30_000
+  end
+
+  test "acp.heartbeat_ms defaults to 30s and rejects negative values" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.acp.heartbeat_ms == 30_000
+
+    assert {:ok, custom} = Schema.parse(%{"acp" => %{"heartbeat_ms" => 0}})
+    assert custom.acp.heartbeat_ms == 0
+
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"acp" => %{"heartbeat_ms" => -1}})
   end
 
   test "validate! rejects an empty acp command when the acp backend is selected" do

@@ -132,6 +132,7 @@ defmodule SymphonyElixir.TestSupport do
           acp_prompt_timeout_ms: nil,
           acp_read_timeout_ms: nil,
           acp_stall_timeout_ms: nil,
+          acp_heartbeat_ms: nil,
           claude_code_command: nil,
           claude_code_model: nil,
           claude_code_permission_mode: nil,
@@ -190,6 +191,7 @@ defmodule SymphonyElixir.TestSupport do
     acp_prompt_timeout_ms = Keyword.get(config, :acp_prompt_timeout_ms)
     acp_read_timeout_ms = Keyword.get(config, :acp_read_timeout_ms)
     acp_stall_timeout_ms = Keyword.get(config, :acp_stall_timeout_ms)
+    acp_heartbeat_ms = Keyword.get(config, :acp_heartbeat_ms)
     claude_code_command = Keyword.get(config, :claude_code_command)
     claude_code_model = Keyword.get(config, :claude_code_model)
     claude_code_permission_mode = Keyword.get(config, :claude_code_permission_mode)
@@ -251,7 +253,8 @@ defmodule SymphonyElixir.TestSupport do
           advertise_terminal: acp_advertise_terminal,
           prompt_timeout_ms: acp_prompt_timeout_ms,
           read_timeout_ms: acp_read_timeout_ms,
-          stall_timeout_ms: acp_stall_timeout_ms
+          stall_timeout_ms: acp_stall_timeout_ms,
+          heartbeat_ms: acp_heartbeat_ms
         ),
         claude_code_yaml(
           command: claude_code_command,
@@ -363,7 +366,8 @@ defmodule SymphonyElixir.TestSupport do
     {:advertise_terminal, :bool},
     {:prompt_timeout_ms, :raw},
     {:read_timeout_ms, :raw},
-    {:stall_timeout_ms, :raw}
+    {:stall_timeout_ms, :raw},
+    {:heartbeat_ms, :raw}
   ]
 
   defp acp_yaml(opts) do
