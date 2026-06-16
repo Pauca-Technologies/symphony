@@ -248,6 +248,13 @@ Mirror the existing harness in `test/symphony_elixir/app_server_test.exs` (63 KB
    - **Live acceptance — ✅ DONE (2026-06-15, opencode 1.17.4/1.17.7).** Drove the real `opencode acp` binary through `Acp.Client` end-to-end in a scratch workspace (env-gated test `test/symphony_elixir/acp/live_acceptance_test.exs`, run with `LIVE_ACP=1`; invisible to the normal suite). Proven against the live agent: (a) a real turn completes `stopReason=end_turn`, the streamed `agent_message_chunk` normalizes to `item/agentMessage/delta` and **renders** through `CodexSessionLogRenderer` (`AGENT / ACK`); (b) the real agent **invokes the gated `linear_graphql`** through Symphony's in-VM `LinearGate` HTTP MCP listener, dispatched back into the run process — confirming the load-bearing gate channel with a real agent, not just the fake-agent tests. Reproduction + the rate-limit caveat are in §13.
 3. **Hardening:** stdio-MCP gate fallback (`linear_gate_transport: "stdio"`) for agents without HTTP MCP; lift deferred-review/counters out of the process dictionary (optional); `fs`/`terminal` handlers with PathSafety; `session/load` resume; `session/set_mode`.
 4. **Observability polish (Option B):** native ACP rendering (plans, tool kinds, thoughts) in renderer/presenter, with Codex-unchanged proof.
+5. **Native Claude Code backend (§14) — ✅ DONE (2026-06-16, incl. live acceptance).** A third `AgentBackend` (`SymphonyElixir.ClaudeCode.Client`) driving `claude -p` headless stream-json, reusing `AgentTransport` + `LinearGate` wholesale. Implemented:
+   - `SymphonyElixir.ClaudeCode.Client` — full `AgentBackend`: `start_session` spawns `claude -p --output-format stream-json --input-format stream-json --verbose --permission-mode <mode> --add-dir <ws> --mcp-config <inline-json> --strict-mcp-config [--model …] [extra_args…]` via `AgentTransport` (no on-the-wire handshake; session id arrives in the first `system/init`); `run_turn` writes one stream-json user message and reads to the terminal `result`; Option-A normalization of `assistant` content blocks (`text`/`thinking`/`tool_use`), `tool_result`, and `system`/`result` into the **same** synthetic methods the ACP backend emits, so the renderer is untouched; in-loop `acp_tool_call` dispatch (same gate channel as ACP) so the tool runs in the run process; `result` mapping (`end_turn`/`max_tokens` → completed, `is_error`/non-`success` subtype → abnormal); prompt + stall timeouts.
+   - **Credential withholding** — agent env scrubs `LINEAR_API_KEY`/variants via Port `{name, false}`; `--strict-mcp-config` + the single client-passed gated MCP server is the only Linear path (`claude_code.withhold_linear_credentials`, default true). Claude auth (`ANTHROPIC_API_KEY`/session) passes through.
+   - Config: `ClaudeCode` embedded schema (`command` default `"claude"`, `model`, `permission_mode` default `"bypassPermissions"` validated against claude's modes, `extra_args`, `prompt_timeout_ms`, `stall_timeout_ms`, `withhold_linear_credentials`) + `Config.claude_code_runtime_settings/0` + `backend == "claude_code"` requires `claude_code.command`; `"claude_code"` registered in `AgentBackend.@backends` and `agent.backend` inclusion.
+   - Tests: `claude_code/client_test.exs` (9 — happy turn/session-id, command+mcp-config+`--strict-mcp-config` wiring, normalization of text/thinking/tool_use/tool_result, error→abnormal, max_tokens note, timeout, **cred-withholding**, `--model` flag, cwd guard) against a fake `claude` shell fixture; `agent_backend_test.exs` + `workspace_and_config_test.exs` extended. Full suite **466 passed / 0 failed / 2 pre-existing skips**; Codex + ACP tests untouched and green; `mix compile --warnings-as-errors` + `mix credo` clean (the new module is clean; pre-existing `do_run_codex_turns` arity-9 is unchanged). Docs: `docs/claude-code.md` + README.
+   - **Go/no-go spike + live acceptance — ✅ GO (2026-06-16, claude 2.1.178).** Confirmed against the real `claude` binary: (a) `claude -p` stream-json completes a turn and emits a terminal `result` (`stop_reason=end_turn`); (b) it connects to a client-passed `--mcp-config` HTTP MCP server (`initialize` → `tools/list` → `tools/call`, POST-only Streamable HTTP — no SSE GET) and the model **invokes** the gated `linear_graphql` with exact args (tool name to our endpoint is the bare `linear_graphql`; Claude exposes it to the model as `mcp__symphony-linear__linear_graphql`); (c) `session/new` needs no Linear creds. Captured as the env-gated `test/symphony_elixir/claude_code/live_acceptance_test.exs` (`LIVE_CLAUDE_CODE=1`, invisible to the normal suite): a real turn completes + normalizes + **renders** through `CodexSessionLogRenderer` (`AGENT`/`REASONING`), and the real agent invokes the gated tool through the in-VM `LinearGate` HTTP listener dispatched back into the run process. Verified pass.
+6. **Per-task backend+model selection via Linear labels (§15):** `agent.label_presets` map label → `{backend, model, …}`; `AgentBackend.resolve_for_issue/1` picks the preset whose label is on the issue, else the default. Depends only on ≥2 backends existing (already true with codex+acp), so it can land before Phase 5.
 
 ---
 
@@ -272,13 +279,16 @@ Mirror the existing harness in `test/symphony_elixir/app_server_test.exs` (63 KB
 - `lib/symphony_elixir/agent_transport.ex` — shared transport, **DONE** (ACP-only consumer; Codex `AppServer` still holds its own private copies and should be made to delegate here in a follow-up — see §5.3)
 - `docs/acp.md`
 - `test/support/` fake ACP agent fixtures (incl. a handoff-attempt fixture for gate-parity tests); `test/symphony_elixir/acp/client_test.exs`; `test/symphony_elixir/acp/linear_gate_test.exs`; `test/symphony_elixir/agent_backend_test.exs`
+- `lib/symphony_elixir/claude_code/client.ex` — native Claude Code `claude -p` stream-json backend (reuses `AgentTransport` + `LinearGate`); `test/symphony_elixir/claude_code/client_test.exs` + fake `claude` fixture; `test/symphony_elixir/claude_code/live_acceptance_test.exs` (`LIVE_CLAUDE_CODE=1`); `docs/claude-code.md` — **Phase 5, DONE (§14)**
 
 **Edited (additive)**
-- `lib/symphony_elixir/config/schema.ex` — `agent.backend` selector + `Acp` embedded schema + casts/validation
-- `lib/symphony_elixir/config.ex` — `acp_runtime_settings/1,2`
-- `lib/symphony_elixir/agent_runner.ex` — dispatch via `AgentBackend.resolve/0`
-- `lib/symphony_elixir/codex/app_server.ex` — add `@behaviour` (+ later delegate to `AgentTransport`)
-- `README.md` — mention ACP backend
+- `lib/symphony_elixir/config/schema.ex` — `agent.backend` selector + `Acp` embedded schema + casts/validation; `acp.model` (DONE §13); `ClaudeCode` block (DONE §14); (Phase 6) `agent.label_presets` list
+- `lib/symphony_elixir/config.ex` — `acp_runtime_settings/1,2` (incl. `model`, DONE); `claude_code_runtime_settings/0` (DONE §14)
+- `lib/symphony_elixir/agent_backend.ex` — register `"claude_code"` (DONE §14); (Phase 6) `resolve_for_issue/1` + per-task overrides
+- `lib/symphony_elixir/agent_runner.ex` — dispatch via `AgentBackend.resolve/0`; (Phase 6) switch call site to `resolve_for_issue(issue)` and thread `overrides` into `start_session`
+- `lib/symphony_elixir/codex/app_server.ex` — add `@behaviour` (+ later delegate to `AgentTransport`); (Phase 6) merge `opts[:overrides]`
+- `lib/symphony_elixir/acp/client.ex` — (Phase 6) merge `opts[:overrides]` over `acp_runtime_settings`
+- `README.md` — mention ACP backend + Claude Code backend (DONE §14)
 - (Phase 4 only) `lib/symphony_elixir/orchestrator.ex`, `presenter.ex`, `codex_session_log_renderer.ex` — native ACP rendering
 
 **Untouched contract:** the `on_message` event atoms (§2.2) and the `start_session`/`run_turn`/`stop_session` shapes — both backends conform.
@@ -353,3 +363,89 @@ Requires `opencode` (>=1.17) on the login-shell PATH (override `OPENCODE_BIN`) a
 2. *Gated tool via in-VM listener.* With a prompt instructing the agent to call `symphony-linear_linear_graphql`, the **real agent** issued a `tools/call` that landed on Symphony's per-session `LinearGate` HTTP listener and was dispatched (`{:acp_tool_call, …}`) back into the run process — the exact in-VM hop that makes the gate hold (§5.5). (The test stubs `tool_executor` to record the dispatch; gate *blocking* is proven separately in `acp/linear_gate_test.exs`.)
 
 **Caveat — OpenCode Zen free-tier rate limits are per-model and transient.** On this run the default `opencode/big-pickle` (and `deepseek-v4-flash-free`, `nemotron-3-ultra-free`) returned `AI_APICallError: Rate limit exceeded` — opencode surfaces this only in its **own log** (`~/.local/share/opencode/log/opencode.log`), *not* as an ACP `session/prompt` error, so from the client's view the turn simply produces no `session/update` and `Acp.Client` correctly falls back to `stall_timeout_ms` → `{:error, :turn_stalled}`. This is the safety net behaving as designed, not a bug. `opencode/north-mini-code-free` was un-throttled and used for the passing run; set `ACP_LIVE_MODEL` to whatever is healthy when re-running. (Possible Phase 3 nicety: opencode does not report model-stream failures over ACP, so a long stall is the only signal — consider a shorter default stall or a periodic "still working" heartbeat check.)
+
+**Note on `acp.model` (DONE 2026-06-16).** Model selection for the ACP/OpenCode path is now a first-class Symphony config field. ACP has no protocol field for the model and Symphony's `session/new` doesn't set one, so each agent picks its model from its own config. For OpenCode specifically, `opencode acp` **rejects** a `--model` flag and **ignores** `OPENCODE_MODEL`, but **honors** inline config via `OPENCODE_CONFIG_CONTENT` (all three verified against opencode 1.17.7). So `acp.model` is surfaced to the agent as `OPENCODE_CONFIG_CONTENT={"model":"<model>"}` injected into the agent env by `Acp.Client.agent_env/1`. It is OpenCode-specific (other ACP agents ignore the var); unset → opencode's own resolution (workspace/global `opencode.jsonc`). Schema `acp.model`, `Config.acp_runtime_settings`, `docs/acp.md`, and tests updated.
+
+---
+
+## 14. Native Claude Code backend — `claude -p` headless stream-json (Phase 5 — ✅ DONE 2026-06-16)
+
+`claude-code-acp` (Zed's bridge) lets Claude Code ride the ACP backend, but it is a **third-party translator over the Claude Agent SDK**, not native. Claude Code's own non-interactive interface is headless `--print` mode with JSON streaming over stdio — structurally the same shape Symphony already drives for Codex and ACP. A dedicated backend talking to it directly is more robust than the bridge and a clean fit for the existing `AgentBackend` behaviour. **Verified against the installed `claude` 2.1.178.**
+
+### 14.1 The native interface
+```
+claude -p --input-format stream-json --output-format stream-json --verbose \
+  --model <alias|full-name> --add-dir <workspace> \
+  --mcp-config <json> --strict-mcp-config \
+  --permission-mode bypassPermissions
+```
+- **stdio JSON stream.** `--input-format stream-json` (write user-message lines to stdin) + `--output-format stream-json` (read `system`/`assistant`/`tool_use`/`tool_result`/partial/`result` lines from stdout). The terminal `result` message carries the stop reason and `is_error`. Line-framed JSON over stdio — the same transport family as Codex/ACP.
+- This **is** Claude Code, no bridge process. (`claude-code-acp` ⊃ Claude Agent SDK ⊃ this CLI. The CLI is the most native surface that maps onto Symphony's shell-out-to-stdio architecture; embedding the TS/Python SDK would mean running a Node/Python sidecar from Elixir — worse.)
+
+### 14.2 Mapping onto `AgentBackend` (`SymphonyElixir.ClaudeCode.Client`)
+- **`start_session/2`** — spawn the `claude -p` command via the existing `AgentTransport` (cwd validation, env scrubbing, line-framed stdio reused). No new transport.
+- **`run_turn/4`** — write one user-message stream-json line to stdin; read the streamed events; map the terminal `result` stop reason → `:turn_completed` / abnormal. **Option-A normalization again:** translate Claude's `assistant`/`tool_use`/`result`/partial message types into Symphony's existing `on_message` atoms (§2.2) — new mapping table, same pattern, **zero downstream changes**.
+- **`stop_session/1`** — close the port (best-effort).
+- **Approvals** — `--permission-mode bypassPermissions` (or `acceptEdits`) mirrors Codex `approval_policy: never` / ACP `auto_approve`. Confirmed `--permission-mode` choices: `default | acceptEdits | bypassPermissions | auto | dontAsk | plan`.
+
+### 14.3 The handoff gate — reuses §5.5 infrastructure, *lower risk* than ACP
+- `--mcp-config <json>` loads MCP servers (HTTP/SSE/stdio first-class). Point it at the **same in-VM `LinearGate` HTTP listener** built in Phase 2 — no new gate code; `tools/call` dispatches back into the run process exactly as today.
+- `--strict-mcp-config` makes the agent use **only** those servers, ignoring all other MCP configuration — an *explicit* lock, stronger than the ACP path's implicit "we just didn't pass a Linear MCP." `--disallowedTools`/`--allowedTools`/`--tools` further restrict the toolset.
+- **Credential withholding** (scrub `LINEAR_API_KEY` from env) works identically and remains the load-bearing guarantee.
+- **Risk reduction vs ACP:** the §12 spike had to *empirically verify* that opencode forwards a **client-passed** HTTP MCP server. With native Claude Code there is no bridge in the path — `--mcp-config` HTTP servers are documented and first-class, so the "does the agent actually connect to our endpoint?" gating risk largely disappears. (Still confirm with a small spike before enabling.)
+
+### 14.4 Notes / trade-offs
+- **It is a third backend, not free from the ACP work.** ACP was chosen to cover a *family* of agents (OpenCode, Gemini, Qwen…) via one protocol; Claude Code stream-json is Claude-specific. So this is another `AgentBackend` impl + its own normalization — but it reuses `AgentTransport` + `LinearGate` wholesale, so it is meaningfully smaller than Phase 2 was.
+- **Model selection is a real native flag** here (`--model opus` / `--model claude-fable-5`), unlike opencode — so the per-task model from §15 maps directly to `--model` with no env shim.
+- **Auth** flows through Claude Code's own mechanism (`ANTHROPIC_API_KEY` / logged-in session / Bedrock/Vertex). Symphony scrubs only Linear creds, so Claude auth passes through. Consider `--bare`/`--safe-mode`/`--setting-sources` to control which host settings/hooks leak into the run.
+- **Useful natives:** `--session-id`/`--resume` (continuity), `--include-partial-messages`, `--replay-user-messages`, `--append-system-prompt`, `--max-budget-usd`, `--json-schema` (structured output).
+- **Config:** add `"claude_code" => SymphonyElixir.ClaudeCode.Client` to `AgentBackend.@backends`; a `ClaudeCode` embedded schema (`command` default `"claude"`, `model`, `permission_mode`, `extra_args`, timeouts) mirroring the `Acp` block; `Config.claude_code_runtime_settings/0`.
+- **Spike first (go/no-go, mirrors §12):** confirm `claude -p` stream-json (a) completes a turn and emits a terminal `result`, (b) connects to a `--mcp-config` HTTP server and the model invokes the gated tool, (c) creates no Linear creds in env. Capture the real stream-json event shapes (the normalization table depends on them).
+
+---
+
+## 15. Per-task backend + model selection via Linear labels (Phase 6)
+
+Today the backend is global: `AgentBackend.resolve/0` reads `Config.settings!().agent.backend` once (`agent_backend.ex:32`). We want the backend **and model** chosen **per task**, driven by the issue's Linear labels, so e.g. a `agent:fast` ticket runs OpenCode on a cheap model while a `agent:deep` ticket runs Claude Code on Opus — with a configured default for unlabelled issues.
+
+### 15.1 Why labels are a clean signal (verified in code)
+- `SymphonyElixir.Linear.Issue.labels :: [String.t()]` is a list of **label-name strings**, with a `label_names/1` helper (`linear/issue.ex:64`). Labels are already fetched on every polled issue and carried on the `Issue` struct (used in telemetry, `agent_runner.ex:78`).
+- `AgentRunner.run_codex_turns/5` calls `AgentBackend.resolve()` at `agent_runner.ex:287` with the `issue` already in scope — so threading the issue into resolution is a one-line change, no new plumbing.
+
+### 15.2 Config shape (recommended)
+A new ordered `agent.label_presets` list; first preset whose `label` is present on the issue wins; fall through to the existing `agent.backend` (+ that backend's block) as the default.
+```yaml
+agent:
+  backend: codex            # default backend for unmatched issues
+  label_presets:
+    - label: "agent:fast"
+      backend: acp
+      model: opencode/north-mini-code-free
+    - label: "agent:deep"
+      backend: claude_code
+      model: opus
+    - label: "agent:codex"
+      backend: codex          # model omitted → backend default
+```
+- **`label`** matches a Linear label name exactly (case-sensitive, as Linear stores it).
+- **`backend`** ∈ the `@backends` keys (`"codex" | "acp" | "claude_code"`).
+- **`model`** is interpreted by the chosen backend: ACP/OpenCode → `OPENCODE_CONFIG_CONTENT` (§13 `acp.model`); Claude Code → `--model` (§14); Codex → no per-task model today (Codex picks its model from its own config) → `model` ignored with a one-time `log()` if set, or validated out for `backend: codex`.
+- **Precedence is positional and deterministic** — list order, first match wins — so multiple matching labels on one issue resolve unambiguously. Document this; do not rely on label sort order from Linear.
+
+### 15.3 Resolution API
+Replace the global `resolve/0` call site with an issue-aware resolver that returns both the module and the per-task overrides:
+```elixir
+@spec resolve_for_issue(Issue.t()) :: {module(), overrides :: map()}
+# overrides carries e.g. %{model: "opus"} (and could carry command/extra_args later)
+```
+- `AgentRunner` calls `{backend, overrides} = AgentBackend.resolve_for_issue(issue)` and passes `overrides` into `backend.start_session(workspace, worker_host: …, overrides: overrides)`.
+- **Backends must accept the override instead of re-reading global config.** Today `Acp.Client.start_session` reads `Config.acp_runtime_settings()` internally and `Codex.AppServer` reads `Config.settings!().codex.command`; for per-task model to take effect, `start_session` must merge `opts[:overrides]` over the config-derived settings (e.g. `Map.merge(acp_runtime_settings, Map.take(overrides, [:model]))`). This is the one real code change beyond resolution — keep it minimal and additive (empty overrides → identical to today, so the Codex default path is byte-for-byte unchanged).
+- Keep `resolve/0` (no-issue) as the default/back-compat entry; `resolve_for_issue/1` delegates to it when no preset matches.
+
+### 15.4 Validation & edge cases
+- Validate each preset's `backend` against `@backends` and (when `backend: codex`) reject/ignore `model` per §15.2; require `label` non-empty and unique across presets (or document first-wins on duplicates).
+- An unmatched issue → default backend + that backend's configured model — i.e. exactly today's behavior when `label_presets` is empty/absent. **Default-path regression guard:** with no `label_presets`, the resolved `{backend, overrides}` must equal `{resolve/0, %{}}`.
+- Labels change mid-flight? Resolution happens once at run start (parity with how the backend is fixed for a run today); a relabel takes effect on the next run/turn-loop start, not mid-session.
+- Tests: `agent_backend_test.exs` — preset match picks backend+overrides; positional precedence; no-match → default; unknown backend rejected; `codex`+model handled. Config tests for the `label_presets` block.
+
+**Files:** `agent_backend.ex` (`resolve_for_issue/1` + overrides), `config/schema.ex` (`agent.label_presets` embedded list), `config.ex` (accessor), `agent_runner.ex` (call site `resolve_for_issue(issue)` + thread `overrides` into `start_session`), each backend's `start_session` (merge `overrides`). Additive; default path unchanged.

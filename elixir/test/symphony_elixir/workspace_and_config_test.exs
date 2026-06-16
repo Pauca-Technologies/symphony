@@ -960,6 +960,56 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{"agent" => %{"backend" => "acp"}, "acp" => %{"command" => ""}})
   end
 
+  test "claude_code block defaults to safe values when unset" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.claude_code.command == "claude"
+    assert settings.claude_code.permission_mode == "bypassPermissions"
+    assert settings.claude_code.extra_args == []
+    assert settings.claude_code.withhold_linear_credentials == true
+  end
+
+  test "parses a claude_code block and runtime settings" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "agent" => %{"backend" => "claude_code"},
+               "claude_code" => %{
+                 "command" => "claude",
+                 "model" => "opus",
+                 "permission_mode" => "acceptEdits",
+                 "extra_args" => ["--append-system-prompt", "hi"]
+               }
+             })
+
+    assert settings.agent.backend == "claude_code"
+    assert settings.claude_code.model == "opus"
+    assert settings.claude_code.permission_mode == "acceptEdits"
+    assert settings.claude_code.extra_args == ["--append-system-prompt", "hi"]
+  end
+
+  test "claude_code_runtime_settings exposes the claude_code block as a map" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "claude_code",
+      claude_code_command: "claude",
+      claude_code_model: "opus"
+    )
+
+    assert {:ok, cc} = Config.claude_code_runtime_settings()
+    assert cc.command == "claude"
+    assert cc.model == "opus"
+    assert cc.permission_mode == "bypassPermissions"
+    assert cc.withhold_linear_credentials == true
+  end
+
+  test "rejects an unknown claude_code permission_mode" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"claude_code" => %{"permission_mode" => "yolo"}})
+  end
+
+  test "validate! rejects an empty claude_code command when the claude_code backend is selected" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"backend" => "claude_code"}, "claude_code" => %{"command" => ""}})
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

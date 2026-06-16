@@ -134,9 +134,12 @@ Notes:
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - `agent.backend` selects the coding-agent backend: `codex` (default, the Codex app-server described
-  above) or `acp` (the Agent Client Protocol, e.g. `opencode acp`). The ACP backend honors the same
-  handoff gate and observability transcript; see [docs/acp.md](docs/acp.md) for setup, the `acp`
-  config block, and current limitations (local-only gate, `fs`/`terminal` not intercepted).
+  above), `acp` (the Agent Client Protocol, e.g. `opencode acp`), or `claude_code` (native Claude Code
+  `claude -p` stream-json). All backends honor the same handoff gate and observability transcript.
+  See [docs/acp.md](docs/acp.md) for the ACP setup and the `acp` config block, and
+  [docs/claude-code.md](docs/claude-code.md) for the Claude Code setup and the `claude_code` config
+  block. Both alternative backends share the same local-only gate / non-intercepted `fs`/`terminal`
+  limitations as ACP.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

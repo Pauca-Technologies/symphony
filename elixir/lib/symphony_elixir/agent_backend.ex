@@ -9,8 +9,9 @@ defmodule SymphonyElixir.AgentBackend do
   JSON-RPC, ACP, ...) but conforms to this behaviour and emits the same events,
   so `AgentRunner` and the observability pipeline stay backend-agnostic.
 
-  The active backend is selected by `agent.backend` config ("codex" | "acp")
-  and resolved via `resolve/0`. See `docs/acp-support-plan.md`.
+  The active backend is selected by `agent.backend` config
+  ("codex" | "acp" | "claude_code") and resolved via `resolve/0`. See
+  `docs/acp-support-plan.md`.
   """
 
   alias SymphonyElixir.Config
@@ -24,7 +25,8 @@ defmodule SymphonyElixir.AgentBackend do
   @default_backend SymphonyElixir.Codex.AppServer
   @backends %{
     "codex" => SymphonyElixir.Codex.AppServer,
-    "acp" => SymphonyElixir.Acp.Client
+    "acp" => SymphonyElixir.Acp.Client,
+    "claude_code" => SymphonyElixir.ClaudeCode.Client
   }
 
   @doc "Resolve the configured backend module (defaults to the Codex app-server)."

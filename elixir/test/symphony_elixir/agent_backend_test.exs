@@ -3,6 +3,7 @@ defmodule SymphonyElixir.AgentBackendTest do
 
   alias SymphonyElixir.AgentBackend
   alias SymphonyElixir.Acp.Client, as: AcpClient
+  alias SymphonyElixir.ClaudeCode.Client, as: ClaudeCodeClient
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config.Schema.Agent
 
@@ -10,6 +11,7 @@ defmodule SymphonyElixir.AgentBackendTest do
     test "maps backend names to modules, defaulting unknown/nil to the Codex app-server" do
       assert AgentBackend.resolve("codex") == AppServer
       assert AgentBackend.resolve("acp") == AcpClient
+      assert AgentBackend.resolve("claude_code") == ClaudeCodeClient
       assert AgentBackend.resolve("bogus") == AppServer
       assert AgentBackend.resolve(nil) == AppServer
     end
@@ -22,11 +24,12 @@ defmodule SymphonyElixir.AgentBackendTest do
   end
 
   describe "config selector" do
-    test "agent.backend defaults to codex and accepts codex/acp only" do
+    test "agent.backend defaults to codex and accepts codex/acp/claude_code only" do
       assert %Agent{}.backend == "codex"
 
       assert Agent.changeset(%Agent{}, %{"backend" => "acp"}).valid?
       assert Agent.changeset(%Agent{}, %{"backend" => "codex"}).valid?
+      assert Agent.changeset(%Agent{}, %{"backend" => "claude_code"}).valid?
       refute Agent.changeset(%Agent{}, %{"backend" => "gemini"}).valid?
     end
   end
@@ -41,8 +44,8 @@ defmodule SymphonyElixir.AgentBackendTest do
       assert AcpClient.stop_session(%{}) == :ok
     end
 
-    test "both backends declare the AgentBackend behaviour" do
-      for mod <- [AppServer, AcpClient] do
+    test "all backends declare the AgentBackend behaviour" do
+      for mod <- [AppServer, AcpClient, ClaudeCodeClient] do
         assert AgentBackend in (mod.module_info(:attributes)[:behaviour] || [])
       end
     end

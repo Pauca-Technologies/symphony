@@ -131,6 +131,13 @@ defmodule SymphonyElixir.TestSupport do
           acp_prompt_timeout_ms: nil,
           acp_read_timeout_ms: nil,
           acp_stall_timeout_ms: nil,
+          claude_code_command: nil,
+          claude_code_model: nil,
+          claude_code_permission_mode: nil,
+          claude_code_extra_args: nil,
+          claude_code_prompt_timeout_ms: nil,
+          claude_code_stall_timeout_ms: nil,
+          claude_code_withhold_linear_credentials: nil,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -181,6 +188,13 @@ defmodule SymphonyElixir.TestSupport do
     acp_prompt_timeout_ms = Keyword.get(config, :acp_prompt_timeout_ms)
     acp_read_timeout_ms = Keyword.get(config, :acp_read_timeout_ms)
     acp_stall_timeout_ms = Keyword.get(config, :acp_stall_timeout_ms)
+    claude_code_command = Keyword.get(config, :claude_code_command)
+    claude_code_model = Keyword.get(config, :claude_code_model)
+    claude_code_permission_mode = Keyword.get(config, :claude_code_permission_mode)
+    claude_code_extra_args = Keyword.get(config, :claude_code_extra_args)
+    claude_code_prompt_timeout_ms = Keyword.get(config, :claude_code_prompt_timeout_ms)
+    claude_code_stall_timeout_ms = Keyword.get(config, :claude_code_stall_timeout_ms)
+    claude_code_withhold_linear_credentials = Keyword.get(config, :claude_code_withhold_linear_credentials)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -235,6 +249,15 @@ defmodule SymphonyElixir.TestSupport do
           prompt_timeout_ms: acp_prompt_timeout_ms,
           read_timeout_ms: acp_read_timeout_ms,
           stall_timeout_ms: acp_stall_timeout_ms
+        ),
+        claude_code_yaml(
+          command: claude_code_command,
+          model: claude_code_model,
+          permission_mode: claude_code_permission_mode,
+          extra_args: claude_code_extra_args,
+          prompt_timeout_ms: claude_code_prompt_timeout_ms,
+          stall_timeout_ms: claude_code_stall_timeout_ms,
+          withhold_linear_credentials: claude_code_withhold_linear_credentials
         ),
         "codex:",
         "  command: #{yaml_value(codex_command)}",
@@ -360,6 +383,34 @@ defmodule SymphonyElixir.TestSupport do
 
   defp acp_field_present?(:bool, value), do: is_boolean(value)
   defp acp_field_present?(:raw, value), do: not is_nil(value)
+
+  @claude_code_yaml_fields [
+    {:command, :raw},
+    {:model, :raw},
+    {:permission_mode, :raw},
+    {:extra_args, :raw},
+    {:prompt_timeout_ms, :raw},
+    {:stall_timeout_ms, :raw},
+    {:withhold_linear_credentials, :bool}
+  ]
+
+  defp claude_code_yaml(opts) do
+    entries =
+      Enum.flat_map(@claude_code_yaml_fields, fn {field, kind} ->
+        value = Keyword.get(opts, field)
+
+        if acp_field_present?(kind, value) do
+          ["  #{field}: #{yaml_value(value)}"]
+        else
+          []
+        end
+      end)
+
+    case entries do
+      [] -> nil
+      lines -> Enum.join(["claude_code:" | lines], "\n")
+    end
+  end
 
   defp observability_yaml(enabled, refresh_ms, render_interval_ms) do
     [

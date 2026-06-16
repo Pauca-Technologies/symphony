@@ -39,6 +39,16 @@ defmodule SymphonyElixir.Config do
           stall_timeout_ms: integer()
         }
 
+  @type claude_code_runtime_settings :: %{
+          command: String.t(),
+          model: String.t() | nil,
+          permission_mode: String.t(),
+          extra_args: [String.t()],
+          prompt_timeout_ms: integer(),
+          stall_timeout_ms: integer(),
+          withhold_linear_credentials: boolean()
+        }
+
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
     # T27 follow-up: host-level Symphony config lives in
@@ -178,6 +188,30 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  Resolve the native Claude Code backend's runtime settings from the
+  `claude_code` config block as a plain map (see
+  `SymphonyElixir.ClaudeCode.Client`).
+  """
+  @spec claude_code_runtime_settings() ::
+          {:ok, claude_code_runtime_settings()} | {:error, term()}
+  def claude_code_runtime_settings do
+    with {:ok, settings} <- settings() do
+      claude_code = settings.claude_code
+
+      {:ok,
+       %{
+         command: claude_code.command,
+         model: claude_code.model,
+         permission_mode: claude_code.permission_mode,
+         extra_args: claude_code.extra_args,
+         prompt_timeout_ms: claude_code.prompt_timeout_ms,
+         stall_timeout_ms: claude_code.stall_timeout_ms,
+         withhold_linear_credentials: claude_code.withhold_linear_credentials
+       }}
+    end
+  end
+
   defp validate_semantics(settings) do
     with :ok <- validate_agent_backend(settings) do
       validate_tracker_semantics(settings)
@@ -185,10 +219,15 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_agent_backend(settings) do
-    if settings.agent.backend == "acp" and blank?(settings.acp.command) do
-      {:error, :missing_acp_command}
-    else
-      :ok
+    cond do
+      settings.agent.backend == "acp" and blank?(settings.acp.command) ->
+        {:error, :missing_acp_command}
+
+      settings.agent.backend == "claude_code" and blank?(settings.claude_code.command) ->
+        {:error, :missing_claude_code_command}
+
+      true ->
+        :ok
     end
   end
 

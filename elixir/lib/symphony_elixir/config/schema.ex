@@ -136,7 +136,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
       # Selects the coding-agent backend. "codex" = Codex app-server (default,
-      # unchanged behavior); "acp" = Agent Client Protocol. See AgentBackend.
+      # unchanged behavior); "acp" = Agent Client Protocol; "claude_code" =
+      # native Claude Code `claude -p` stream-json. See AgentBackend.
       field(:backend, :string, default: "codex")
     end
 
@@ -151,7 +152,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
-      |> validate_inclusion(:backend, ["codex", "acp"])
+      |> validate_inclusion(:backend, ["codex", "acp", "claude_code"])
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -258,6 +259,59 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:protocol_version, greater_than: 0)
       |> validate_number(:prompt_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
+      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+  end
+
+  defmodule ClaudeCode do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    # Claude Code's `--permission-mode` choices (verified against claude 2.1.178).
+    @permission_modes ~w(default acceptEdits bypassPermissions auto dontAsk plan)
+
+    @primary_key false
+    embedded_schema do
+      # Base launch command; the backend appends the stream-json / mcp-config
+      # flags. Just the binary by default (e.g. "claude").
+      field(:command, :string, default: "claude")
+      # Optional model alias/name passed as `--model` (e.g. "opus",
+      # "claude-fable-5"). Unlike OpenCode, Claude Code takes the model as a
+      # native flag; unset ⇒ Claude Code's own resolution.
+      field(:model, :string)
+      # Maps to `--permission-mode`. Default `bypassPermissions` mirrors Codex
+      # `approval_policy: never` / ACP `auto_approve` for non-interactive runs.
+      field(:permission_mode, :string, default: "bypassPermissions")
+      # Extra raw CLI args appended verbatim (e.g. ["--append-system-prompt", ...]).
+      field(:extra_args, {:array, :string}, default: [])
+      field(:prompt_timeout_ms, :integer, default: 3_600_000)
+      field(:stall_timeout_ms, :integer, default: 300_000)
+      # Load-bearing safety property (§5.5/§14.3), same as the ACP path: never
+      # expose Linear credentials to the agent process; the gated MCP tool holds
+      # the token server-side.
+      field(:withhold_linear_credentials, :boolean, default: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :command,
+          :model,
+          :permission_mode,
+          :extra_args,
+          :prompt_timeout_ms,
+          :stall_timeout_ms,
+          :withhold_linear_credentials
+        ],
+        empty_values: []
+      )
+      |> validate_required([:command])
+      |> validate_inclusion(:permission_mode, @permission_modes)
+      |> validate_number(:prompt_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
   end
@@ -391,6 +445,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:acp, Acp, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:claude_code, ClaudeCode, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -486,6 +541,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:acp, with: &Acp.changeset/2)
+    |> cast_embed(:claude_code, with: &ClaudeCode.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
