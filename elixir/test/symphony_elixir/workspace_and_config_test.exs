@@ -367,6 +367,56 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.assigned_to_worker
   end
 
+  test "linear client flattens grouped labels to <group>:<leaf>" do
+    raw_issue = %{
+      "id" => "issue-grouped",
+      "identifier" => "UDPE-6563",
+      "title" => "Grouped labels",
+      "state" => %{"name" => "In Progress"},
+      "labels" => %{
+        "nodes" => [
+          # ungrouped flat label → bare name
+          %{"name" => "improve-skill", "parent" => nil},
+          # grouped under "repo" → "repo:udp-dashboard-v2"
+          %{"name" => "udp-dashboard-v2", "parent" => %{"name" => "repo"}},
+          # ungrouped → bare name
+          %{"name" => "udpagent"},
+          # grouped under "agent" (leaf already contains a colon) →
+          # "agent:opencode:kimi2.7" — the case that drives backend selection
+          %{"name" => "opencode:kimi2.7", "parent" => %{"name" => "agent"}}
+        ]
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue, nil)
+
+    assert issue.labels == [
+             "improve-skill",
+             "repo:udp-dashboard-v2",
+             "udpagent",
+             "agent:opencode:kimi2.7"
+           ]
+  end
+
+  test "linear client dedupes a grouped label and its legacy flat twin" do
+    raw_issue = %{
+      "id" => "issue-dupe",
+      "identifier" => "UDPE-1",
+      "title" => "Dupe labels",
+      "state" => %{"name" => "Todo"},
+      "labels" => %{
+        "nodes" => [
+          %{"name" => "repo:udp-dashboard-v2", "parent" => nil},
+          %{"name" => "udp-dashboard-v2", "parent" => %{"name" => "repo"}}
+        ]
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue, nil)
+
+    assert issue.labels == ["repo:udp-dashboard-v2"]
+  end
+
   test "linear client marks explicitly unassigned issues as not routed to worker" do
     raw_issue = %{
       "id" => "issue-99",

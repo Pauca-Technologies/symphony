@@ -152,7 +152,7 @@ Notes:
   overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
   whose `label` is present on the issue wins (positional precedence — list order, first match), and
   an unmatched issue falls through to `agent.backend`. Each preset has `label` (a Linear label name,
-  matched exactly), `backend` (`codex` | `acp` | `claude_code`), and an optional `model` (passed to
+  matched exactly — see the label-group note below), `backend` (`codex` | `acp` | `claude_code`), and an optional `model` (passed to
   the chosen backend — `OPENCODE_CONFIG_CONTENT` for ACP/OpenCode, `--model` for Claude Code; ignored
   for `codex`, which has no per-task model). Resolution happens once at run start, so a relabel takes
   effect on the next run. Example:
@@ -173,6 +173,13 @@ Notes:
   re-derived from the issue's labels. The model is the live one where the agent reports it (Claude
   Code's `system/init`) and the configured/override value otherwise; Codex shows no model (it picks
   its own).
+- **Label groups.** A Linear label nested in a label *group* (e.g. the leaf `opencode:kimi2.7` under
+  group `agent`) is flattened to `<group>:<leaf>` (`agent:opencode:kimi2.7`) before matching — Symphony
+  fetches the label's `parent` and joins them. So `label_presets` and repo-routing labels are written
+  in the **`group:leaf`** form. Ungrouped (flat) labels keep their bare name. A grouped label and a
+  legacy flat label with the same qualified name (e.g. group `repo`/`udp-dashboard-v2` vs a flat
+  `repo:udp-dashboard-v2`) collapse to one entry, so you can migrate issues onto the grouped label
+  without changing config.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

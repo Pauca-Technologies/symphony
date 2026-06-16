@@ -49,6 +49,9 @@ defmodule SymphonyElixir.Linear.Client do
             labels {
               nodes {
                 name
+                parent {
+                  name
+                }
               }
             }
           }
@@ -61,6 +64,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -126,6 +132,9 @@ defmodule SymphonyElixir.Linear.Client do
             labels {
               nodes {
                 name
+                parent {
+                  name
+                }
               }
             }
           }
@@ -138,6 +147,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -208,6 +220,9 @@ defmodule SymphonyElixir.Linear.Client do
             labels {
               nodes {
                 name
+                parent {
+                  name
+                }
               }
             }
           }
@@ -220,6 +235,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -293,6 +311,9 @@ defmodule SymphonyElixir.Linear.Client do
             labels {
               nodes {
                 name
+                parent {
+                  name
+                }
               }
             }
           }
@@ -305,6 +326,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -370,6 +394,9 @@ defmodule SymphonyElixir.Linear.Client do
             labels {
               nodes {
                 name
+                parent {
+                  name
+                }
               }
             }
           }
@@ -382,6 +409,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -447,6 +477,9 @@ defmodule SymphonyElixir.Linear.Client do
             labels {
               nodes {
                 name
+                parent {
+                  name
+                }
               }
             }
           }
@@ -459,6 +492,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -511,6 +547,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         createdAt
@@ -540,6 +579,9 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
           }
         }
         createdAt
@@ -1273,12 +1315,28 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels
-    |> Enum.map(& &1["name"])
+    |> Enum.map(&label_name/1)
     |> Enum.reject(&is_nil/1)
     |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
   end
 
   defp extract_labels(_), do: []
+
+  # A label nested in a Linear label *group* carries the group on `parent`;
+  # Linear's `name` is only the leaf. Flatten grouped labels to "<group>:<leaf>"
+  # so they match the convention used by repo routing (`repo:<name>`) and
+  # `agent.label_presets` (`agent:<name>`) — e.g. the "agent" group's
+  # "opencode:kimi2.7" leaf becomes "agent:opencode:kimi2.7". Ungrouped labels
+  # keep their bare name. (`Enum.uniq` above collapses a grouped label and a
+  # legacy flat label of the same qualified name to one entry.)
+  defp label_name(%{"name" => name, "parent" => %{"name" => parent}})
+       when is_binary(name) and is_binary(parent) do
+    "#{parent}:#{name}"
+  end
+
+  defp label_name(%{"name" => name}) when is_binary(name), do: name
+  defp label_name(_node), do: nil
 
   defp extract_children(%{"children" => %{"nodes" => children}}) when is_list(children) do
     Enum.map(children, fn child ->
