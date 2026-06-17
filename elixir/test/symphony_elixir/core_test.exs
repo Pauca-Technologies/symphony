@@ -694,6 +694,141 @@ defmodule SymphonyElixir.CoreTest do
            } = :sys.get_state(pid).retry_attempts[issue_id]
   end
 
+  # Regression: the continuation/retry dispatch holds the issue's claim and has
+  # already consumed its retry entry. If the pre-dispatch revalidation reports
+  # the issue is gone (or no longer a candidate), the claim must be released —
+  # otherwise it strands in `state.claimed` and every future poll skips the
+  # issue until a restart (the symptom UDPE-6566 hit).
+  test "continuation dispatch releases the claim when revalidation finds the issue gone" do
+    previous_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_states = Application.get_env(:symphony_elixir, :memory_tracker_states_by_ids_result)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      max_concurrent_agents: 2,
+      poll_interval_ms: 30_000
+    )
+
+    issue_id = "issue-orphan-skip"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-6566",
+      title: "Open the PR",
+      description: "PR opened, handoff pending",
+      state: "In Progress",
+      labels: []
+    }
+
+    # The candidate poll still sees it as active...
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    # ...but the pre-dispatch revalidation (states-by-ids) no longer returns it.
+    Application.put_env(:symphony_elixir, :memory_tracker_states_by_ids_result, {:ok, []})
+
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationSkipOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_issues)
+      restore_app_env(:memory_tracker_states_by_ids_result, previous_states)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond) + 1_000,
+          identifier: "MT-6566"
+        }
+      })
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  # Regression: a *transient* revalidation failure during continuation dispatch
+  # must keep the claim and reschedule, not drop the claim or strand it.
+  test "continuation dispatch keeps the claim and reschedules on a transient revalidation error" do
+    previous_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_states = Application.get_env(:symphony_elixir, :memory_tracker_states_by_ids_result)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      max_concurrent_agents: 2,
+      poll_interval_ms: 30_000
+    )
+
+    issue_id = "issue-orphan-error"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-6567",
+      title: "Open the PR",
+      description: "PR opened, handoff pending",
+      state: "In Progress",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_states_by_ids_result, {:error, :linear_timeout})
+
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationErrorOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_issues)
+      restore_app_env(:memory_tracker_states_by_ids_result, previous_states)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond) + 1_000,
+          identifier: "MT-6567"
+        }
+      })
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.running, issue_id)
+
+    assert %{attempt: 2, error: "issue refresh failed during retry dispatch"} =
+             state.retry_attempts[issue_id]
+  end
+
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
     now_ms = System.monotonic_time(:millisecond)
     stale_tick_token = make_ref()

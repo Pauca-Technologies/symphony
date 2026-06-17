@@ -27,12 +27,23 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
-    wanted_ids = MapSet.new(issue_ids)
+    # Tests can pin this call's result independently of the configured issue
+    # list so the dispatch revalidation (which re-reads states by id) can
+    # diverge from `fetch_candidate_issues` — the divergence that strands a
+    # claim in the orchestrator retry path. Defaults to filtering the shared
+    # issue list by id.
+    case Application.get_env(:symphony_elixir, :memory_tracker_states_by_ids_result) do
+      nil ->
+        wanted_ids = MapSet.new(issue_ids)
 
-    {:ok,
-     Enum.filter(issue_entries(), fn %Issue{id: id} ->
-       MapSet.member?(wanted_ids, id)
-     end)}
+        {:ok,
+         Enum.filter(issue_entries(), fn %Issue{id: id} ->
+           MapSet.member?(wanted_ids, id)
+         end)}
+
+      result ->
+        result
+    end
   end
 
   @spec recently_terminal_issues(pos_integer()) :: {:ok, [Issue.t()]} | {:error, term()}

@@ -311,10 +311,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp agent_session_model(_session), do: nil
 
+  @doc false
+  # Test seam: drive the per-turn loop directly with an injected backend
+  # (`opts[:agent_backend]` = `{module, overrides}`), bypassing the
+  # workspace/clone/hook setup `run/3` performs.
+  def run_codex_turns_for_test(workspace, issue, recipient, opts, worker_host) do
+    run_codex_turns(workspace, issue, recipient, opts, worker_host)
+  end
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
-    {backend, overrides} = AgentBackend.resolve_for_issue(issue)
+    {backend, overrides} = Keyword.get(opts, :agent_backend) || AgentBackend.resolve_for_issue(issue)
 
     with {:ok, session} <-
            backend.start_session(workspace, worker_host: worker_host, overrides: overrides) do
@@ -332,54 +340,69 @@ defmodule SymphonyElixir.AgentRunner do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
     tool_executor = dynamic_tool_executor(issue, workspace, app_session.worker_host, opts)
 
-    with {:ok, turn_session} <-
-           backend.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue),
-             tool_executor: tool_executor
-           ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
-      handoff_gate_prompt = pop_handoff_gate_prompt()
+    case backend.run_turn(
+           app_session,
+           prompt,
+           issue,
+           on_message: codex_message_handler(codex_update_recipient, issue),
+           tool_executor: tool_executor
+         ) do
+      {:ok, turn_session} ->
+        Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+        handoff_gate_prompt = pop_handoff_gate_prompt()
 
-      handoff_gate_prompt =
-        maybe_run_deferred_review_handoff(pop_deferred_review_handoff(), handoff_gate_prompt)
+        handoff_gate_prompt =
+          maybe_run_deferred_review_handoff(pop_deferred_review_handoff(), handoff_gate_prompt)
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+        case continue_with_issue?(issue, issue_state_fetcher) do
+          {:continue, refreshed_issue} when turn_number < max_turns ->
+            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            backend,
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            Keyword.put(opts, :handoff_gate_prompt, handoff_gate_prompt),
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+            do_run_codex_turns(
+              backend,
+              app_session,
+              workspace,
+              refreshed_issue,
+              codex_update_recipient,
+              Keyword.put(opts, :handoff_gate_prompt, handoff_gate_prompt),
+              issue_state_fetcher,
+              turn_number + 1,
+              max_turns
+            )
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; marking Blocked and returning control to orchestrator")
+          {:continue, refreshed_issue} ->
+            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; marking Blocked and returning control to orchestrator")
 
-          mark_blocked_on_giveup(refreshed_issue, %{
-            reason: :max_turns_exhausted,
-            turn_number: turn_number,
-            max_turns: max_turns,
-            workspace: workspace
-          })
+            mark_blocked_on_giveup(refreshed_issue, %{
+              reason: :max_turns_exhausted,
+              turn_number: turn_number,
+              max_turns: max_turns,
+              workspace: workspace
+            })
 
-          :ok
+            :ok
 
-        {:done, _refreshed_issue} ->
-          :ok
+          {:done, _refreshed_issue} ->
+            :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} = error ->
+        # Abnormal turn completion (an interruption surfaces as
+        # `{:error, {:turn_completed_abnormally, _}}`) short-circuits before the
+        # normal deferred-review step above. The handoff mutation the agent
+        # captured during this turn lives in this task's process dictionary and
+        # would be silently dropped when the task exits, leaving the issue stuck
+        # In Progress. Run the deferred review here too so the In Review handoff
+        # isn't lost; the gate's own interim-verdict / abnormal-completion
+        # detection still guards against a false-success handoff. The returned
+        # findings prompt can't be consumed (the turn is over), so discard it —
+        # the orchestrator re-dispatches the still-active issue for a fresh turn.
+        maybe_run_deferred_review_handoff(pop_deferred_review_handoff(), nil)
+        Logger.warning("Agent turn ended abnormally for #{issue_context(issue)} turn=#{turn_number}/#{max_turns} reason=#{inspect(reason)}")
+        error
     end
   end
 
@@ -443,6 +466,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp pop_deferred_review_handoff do
     Process.delete(@deferred_review_handoff_key)
+  end
+
+  @doc false
+  # Test seam: seed the deferred-review handoff a backend would normally capture
+  # mid-turn via the dynamic tool executor, so the abnormal-completion path can
+  # be exercised without simulating the full handoff tool call.
+  def store_deferred_review_handoff_for_test(request) when is_map(request) do
+    store_deferred_review_handoff(request)
   end
 
   defp maybe_run_deferred_review_handoff(nil, handoff_gate_prompt), do: handoff_gate_prompt

@@ -1,7 +1,30 @@
+defmodule SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend do
+  @moduledoc false
+  # A backend whose turn completes abnormally *after* the agent captured a
+  # deferred In Review handoff — the case where a silent drop both skips the
+  # handoff and (pre-fix) fed the orchestrator claim leak. Seeds the captured
+  # request the test prepared, then reports the abnormal completion.
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, _prompt, _issue, _opts) do
+    request = Application.fetch_env!(:symphony_elixir, :fix2_deferred_request)
+    SymphonyElixir.AgentRunner.store_deferred_review_handoff_for_test(request)
+    {:error, {:turn_completed_abnormally, %{stop_reason: "interrupted"}}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend
   alias SymphonyElixir.Linear.Issue
 
   @idempotency_label "symphony:routing-warned"
@@ -87,6 +110,83 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       refute_received {:memory_tracker_comment, _id, _body}
       refute_received {:memory_tracker_state_update, _id, _state}
+    end
+  end
+
+  describe "deferred review handoff on abnormal turn completion" do
+    test "runs the captured handoff instead of dropping it when the turn aborts" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-fix2-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      test_pid = self()
+
+      issue = %Issue{
+        id: "issue-abnormal",
+        identifier: "UDPE-6566",
+        title: "Open the PR",
+        state: "In Progress",
+        labels: []
+      }
+
+      # Records the Linear handoff mutation `apply_deferred_review_handoff/1`
+      # fires once the (no-PR) reviewer gate approves.
+      linear_client = fn query, variables, _opts ->
+        send(test_pid, {:handoff_mutation_applied, query, variables})
+        {:ok, %{"data" => %{}}}
+      end
+
+      # No PR present -> the gate skips the reviewer and allows the handoff
+      # (a deterministic `:ok`), so no reviewer session is spawned.
+      no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
+
+      review_workflow = %{
+        config: %{"review" => %{"max_iterations" => 3}},
+        prompt: "Review {{ issue.identifier }}",
+        prompt_template: "Review {{ issue.identifier }}"
+      }
+
+      request = %{
+        query: "mutation { issueUpdate(input: {stateId: \"in-review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: review_workflow,
+        review_opts: [
+          pr_runner: no_pr,
+          comment_fn: fn _id, _body -> :ok end,
+          linear_client: linear_client
+        ],
+        linear_client: linear_client
+      }
+
+      Application.put_env(:symphony_elixir, :fix2_deferred_request, request)
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :fix2_deferred_request)
+        File.rm_rf(workspace)
+      end)
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "In Progress"}]} end
+
+      assert {:error, {:turn_completed_abnormally, _}} =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {Fix2AbnormalBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      # The handoff mutation was applied despite the abnormal turn — it was not
+      # silently dropped with the dying task's process dictionary.
+      assert_received {:handoff_mutation_applied, query, _variables}
+      assert query =~ "issueUpdate"
     end
   end
 end

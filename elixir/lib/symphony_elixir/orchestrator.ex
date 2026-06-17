@@ -853,22 +853,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+    {_outcome, state} = dispatch_issue_outcome(state, issue, attempt, preferred_worker_host)
+    state
+  end
+
+  # Revalidates `issue` against the tracker immediately before dispatch and
+  # reports the outcome so callers can react to a skip/error.
+  #
+  # The fresh-poll path (`choose_issues`) calls `dispatch_issue/4` and discards
+  # the tag: the issue was never claimed there, so a skipped/failed
+  # revalidation is a harmless no-op. The retry/continuation path
+  # (`handle_active_retry`) calls this directly because it holds the issue's
+  # claim and has already consumed its retry entry — a silently-dropped
+  # skip/error there would strand the claim in `state.claimed` until the next
+  # restart (every poll is gated on `!MapSet.member?(claimed, issue.id)`), so it
+  # must release the claim or reschedule. See `dispatch_active_retry/4`.
+  defp dispatch_issue_outcome(%State{} = state, issue, attempt, preferred_worker_host) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        {:dispatched, do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)}
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
-        state
+        {:skip, state}
 
       {:skip, %Issue{} = refreshed_issue} ->
         Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
 
-        state
+        {:skip, state}
 
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        {:error, state}
     end
   end
 
@@ -1131,7 +1147,7 @@ defmodule SymphonyElixir.Orchestrator do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+      dispatch_active_retry(state, issue, attempt, metadata)
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -1145,6 +1161,38 @@ defmodule SymphonyElixir.Orchestrator do
            error: "no available orchestrator slots"
          })
        )}
+    end
+  end
+
+  # The issue's claim is held here and its retry entry has already been popped,
+  # so every dispatch outcome must leave it tracked somewhere or it strands in
+  # `state.claimed` until restart:
+  #
+  #   * `:dispatched` re-enters `running` (or reschedules on spawn failure) — keep state as-is.
+  #   * `:skip` — the issue is gone or no longer a candidate at revalidation
+  #     time; release the claim so a later poll can pick it up if it requalifies.
+  #   * `:error` — a transient tracker-refresh failure; keep the claim and
+  #     reschedule so the continuation check isn't lost.
+  defp dispatch_active_retry(state, issue, attempt, metadata) do
+    case dispatch_issue_outcome(state, issue, attempt, metadata[:worker_host]) do
+      {:dispatched, state} ->
+        {:noreply, state}
+
+      {:skip, state} ->
+        Logger.info("Releasing claim after dispatch revalidation skip: #{issue_context(issue)}")
+        {:noreply, release_issue_claim(state, issue.id)}
+
+      {:error, state} ->
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             error: "issue refresh failed during retry dispatch"
+           })
+         )}
     end
   end
 
