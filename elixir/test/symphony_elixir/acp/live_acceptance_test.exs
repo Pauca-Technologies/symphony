@@ -9,8 +9,8 @@
 # OPENCODE_BIN) and network access to OpenCode Zen free models. Unlike
 # acp/client_test.exs (which drives a fake shell agent), this proves the real
 # agent completes a turn through SymphonyElixir.Acp.Client, that its streamed
-# output normalizes into the existing transcript shape and renders, and that the
-# in-VM LinearGate MCP channel is actually reachable by the real agent.
+# native `session/update` output renders through the transcript pipeline, and
+# that the in-VM LinearGate MCP channel is actually reachable by the real agent.
 if System.get_env("LIVE_ACP") == "1" do
   defmodule SymphonyElixir.Acp.LiveAcceptanceTest do
     @moduledoc false
@@ -58,16 +58,20 @@ if System.get_env("LIVE_ACP") == "1" do
         assert Enum.any?(events, &(&1.event == :session_started))
         assert Enum.any?(events, &(&1.event == :turn_completed))
 
-        # The real agent's text must arrive normalized into the existing
-        # `item/agentMessage/delta` shape the orchestrator/presenter consume.
+        # The real agent's text must arrive as a native ACP `session/update`
+        # `agent_message_chunk` (Option B); the observability pipeline renders it
+        # directly via the `update.sessionUpdate` discriminator.
         agent_payloads =
-          for %{event: :notification, payload: %{"method" => "item/agentMessage/delta"} = payload} <- events,
+          for %{
+                event: :notification,
+                payload: %{"method" => "session/update", "params" => %{"update" => %{"sessionUpdate" => "agent_message_chunk"}}} = payload
+              } <- events,
               do: payload
 
         assert agent_payloads != [],
-               "expected at least one normalized agent message; events=#{inspect(event_names(events))}"
+               "expected at least one native agent_message_chunk; events=#{inspect(event_names(events))}"
 
-        # And that normalized stream renders through the real session-log renderer.
+        # And that native stream renders through the real session-log renderer.
         rendered = render_transcript(events)
         IO.puts("\n──── rendered ACP transcript ────\n" <> rendered <> "\n────────────────────────────────")
         assert rendered =~ "AGENT"

@@ -418,6 +418,86 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert List.last(lines)["summary"] == "thread/compacted"
   end
 
+  test "orchestrator renders native ACP session/update notifications into transcript blocks" do
+    issue_id = "issue-acp-transcript"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "ACP-7",
+      title: "Native ACP transcript",
+      description: "Render session/update natively",
+      state: "In Progress",
+      url: "https://example.org/issues/ACP-7"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :AcpTranscriptOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      codex_session_logs: [],
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(pid, {:codex_worker_update, issue_id, %{event: :session_started, session_id: "sess-acp", timestamp: now}})
+
+    acp_update = fn update ->
+      %{
+        event: :notification,
+        payload: %{"method" => "session/update", "params" => %{"sessionId" => "sess-acp", "update" => update}},
+        timestamp: now
+      }
+    end
+
+    send(pid, {:codex_worker_update, issue_id, acp_update.(%{"sessionUpdate" => "agent_message_chunk", "content" => %{"type" => "text", "text" => "Done."}})})
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       acp_update.(%{"sessionUpdate" => "tool_call", "toolCallId" => "tc-1", "title" => "Update README", "kind" => "edit", "rawInput" => %{"path" => "README.md"}})}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       acp_update.(%{"sessionUpdate" => "plan", "entries" => [%{"content" => "write tests", "status" => "completed"}, %{"content" => "ship it", "status" => "pending"}]})}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    blocks = snapshot_entry.recent_codex_transcript_blocks
+
+    assert Enum.any?(blocks, &(&1.kind == "agent" and &1.text == "Done."))
+
+    tool_block = Enum.find(blocks, &(&1.kind == "tool"))
+    assert tool_block.title == "edit: Update README"
+
+    plan_block = Enum.find(blocks, &(&1.kind == "plan"))
+    assert plan_block.text =~ "- [x] write tests"
+    assert plan_block.text =~ "- [ ] ship it"
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 

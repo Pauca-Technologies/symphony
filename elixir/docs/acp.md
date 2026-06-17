@@ -72,9 +72,14 @@ legitimately long-but-quiet operations).
 1. **Handshake.** `initialize` (protocol version + client capabilities) →
    `session/new` (cwd + `mcpServers`) → a `sessionId`.
 2. **Turn.** Each Symphony turn is one `session/prompt`. Streaming
-   `session/update` notifications are normalized into Symphony's existing
-   transcript shape, so the dashboard renders ACP turns with no ACP-specific
-   rendering code (agent text, reasoning, tool calls, command output).
+   `session/update` notifications are forwarded verbatim and rendered
+   **natively** by the observability pipeline, which dispatches on the
+   `update.sessionUpdate` discriminator: `agent_message_chunk` → agent text,
+   `agent_thought_chunk` → reasoning, `tool_call` → a tool block that surfaces
+   the ACP tool **kind** (read/edit/execute/…), `tool_call_update` → command
+   output, and `plan` → a checklist block. ACP-only data (tool kinds, plans) is
+   preserved instead of being flattened into a Codex shape. The Codex and Claude
+   Code paths are untouched — they keep their own rendering branches.
 3. **Completion.** The `session/prompt` response carries a `stopReason`:
    `end_turn` ⇒ completed; `refusal`/`cancelled` ⇒ abnormal; `max_tokens` /
    `max_turn_requests` ⇒ completed with a note.

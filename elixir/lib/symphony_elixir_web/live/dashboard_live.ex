@@ -696,9 +696,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp transcript_kind_label("reasoning"), do: "Reasoning"
   defp transcript_kind_label("user"), do: "User"
   defp transcript_kind_label("compaction"), do: "Compaction"
+  defp transcript_kind_label("plan"), do: "Plan"
   defp transcript_kind_label(_kind), do: "Event"
 
-  defp markdown_transcript_kind?(kind), do: kind in ["agent", "user"]
+  # ACP `plan` updates render as markdown checklists, like agent text.
+  defp markdown_transcript_kind?(kind), do: kind in ["agent", "user", "plan"]
 
   defp collapsible_transcript_kind?(kind), do: kind in ["command", "output", "tool", "reasoning"]
 
@@ -717,7 +719,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp subagent_suffix(_thread_id), do: ""
 
-  defp transcript_kind_slug(kind) when kind in ["agent", "command", "output", "tool", "reasoning", "user", "compaction"], do: kind
+  defp transcript_kind_slug(kind) when kind in ["agent", "command", "output", "tool", "reasoning", "user", "compaction", "plan"], do: kind
   defp transcript_kind_slug(_kind), do: "event"
 
   defp transcript_preview(block) when is_map(block) do

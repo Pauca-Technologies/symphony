@@ -41,7 +41,7 @@ defmodule SymphonyElixir.Acp.ClientTest do
     end)
   end
 
-  test "normalizes agent and reasoning chunks into the existing transcript shape" do
+  test "forwards session/update notifications verbatim for native rendering (Option B)" do
     with_acp_env(fn workspace, _trace ->
       write_fake_agent!(workspace.agent_path,
         updates: [agent_chunk("Hello there"), thought_chunk("thinking hard")]
@@ -49,17 +49,54 @@ defmodule SymphonyElixir.Acp.ClientTest do
 
       assert {:ok, _} = run(workspace, on_message: collector())
 
+      # No Codex method synthesis: the native ACP `session/update` shape reaches
+      # the observability pipeline, which renders it via `update.sessionUpdate`.
       assert_received {:acp_message,
                        %{
                          event: :notification,
-                         payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => "Hello there"}}
+                         payload: %{
+                           "method" => "session/update",
+                           "params" => %{"update" => %{"sessionUpdate" => "agent_message_chunk", "content" => %{"text" => "Hello there"}}}
+                         }
                        }}
 
       assert_received {:acp_message,
                        %{
                          event: :notification,
-                         payload: %{"method" => "item/reasoning/textDelta", "params" => %{"textDelta" => "thinking hard"}}
+                         payload: %{
+                           "method" => "session/update",
+                           "params" => %{"update" => %{"sessionUpdate" => "agent_thought_chunk", "content" => %{"text" => "thinking hard"}}}
+                         }
                        }}
+    end)
+  end
+
+  test "renders native ACP tool-call and plan updates through the session-log renderer" do
+    alias SymphonyElixir.CodexSessionLogRenderer, as: Renderer
+
+    with_acp_env(fn workspace, _trace ->
+      write_fake_agent!(workspace.agent_path, updates: [tool_call_update(), plan_update()])
+
+      assert {:ok, _} = run(workspace, on_message: collector())
+
+      events = drain_acp_messages()
+
+      # Replay the captured stream the way `symphony transcript` does.
+      log =
+        events
+        |> Enum.filter(&match?(%{event: :notification, payload: %{"method" => "session/update"}}, &1))
+        |> Enum.map_join("\n", fn %{payload: payload} ->
+          Jason.encode!(%{"at" => "2026-06-17T00:00:00Z", "payload" => payload})
+        end)
+
+      output = Renderer.render_string(log, use_color: false)
+
+      # The ACP tool `kind` is surfaced (Codex tool calls carry no kind), and the
+      # plan checklist renders natively.
+      assert output =~ "TOOL edit: Update README"
+      assert output =~ "PLAN"
+      assert output =~ "- [x] write tests"
+      assert output =~ "- [ ] ship it"
     end)
   end
 
@@ -286,6 +323,48 @@ defmodule SymphonyElixir.Acp.ClientTest do
         "update" => %{"sessionUpdate" => "agent_thought_chunk", "content" => %{"type" => "text", "text" => text}}
       }
     })
+  end
+
+  defp tool_call_update do
+    Jason.encode!(%{
+      "jsonrpc" => "2.0",
+      "method" => "session/update",
+      "params" => %{
+        "sessionId" => "sess-1",
+        "update" => %{
+          "sessionUpdate" => "tool_call",
+          "toolCallId" => "tc-1",
+          "title" => "Update README",
+          "kind" => "edit",
+          "rawInput" => %{"path" => "README.md"}
+        }
+      }
+    })
+  end
+
+  defp plan_update do
+    Jason.encode!(%{
+      "jsonrpc" => "2.0",
+      "method" => "session/update",
+      "params" => %{
+        "sessionId" => "sess-1",
+        "update" => %{
+          "sessionUpdate" => "plan",
+          "entries" => [
+            %{"content" => "write tests", "status" => "completed"},
+            %{"content" => "ship it", "status" => "pending"}
+          ]
+        }
+      }
+    })
+  end
+
+  defp drain_acp_messages(acc \\ []) do
+    receive do
+      {:acp_message, message} -> drain_acp_messages([message | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   defp permission_request do

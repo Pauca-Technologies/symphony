@@ -7,8 +7,9 @@ defmodule SymphonyElixir.Acp.Client do
   `session/request_permission`) to an ACP-capable agent such as
   `opencode acp`. Conforms to `SymphonyElixir.AgentBackend` and emits the same
   `on_message` event vocabulary as the Codex app-server backend, so the
-  orchestrator/observability pipeline stays backend-agnostic
-  (`docs/acp-support-plan.md` §2.2, §6 Option A).
+  orchestrator/observability pipeline stays backend-agnostic. Streaming
+  `session/update` notifications are forwarded verbatim and rendered natively
+  by the observability pipeline (`docs/acp-support-plan.md` §2.2, §6 Option B).
 
   ## Handoff gate
 
@@ -435,7 +436,7 @@ defmodule SymphonyElixir.Acp.Client do
   # session/update streaming notification.
   defp dispatch_message(state, %{"method" => "session/update", "params" => params} = message, raw)
        when is_map(params) do
-    handle_session_update(state, params, message, raw)
+    handle_session_update(state, message, raw)
     receive_loop(state)
   end
 
@@ -641,78 +642,18 @@ defmodule SymphonyElixir.Acp.Client do
     {:error, {:turn_completed_abnormally, %{stop_reason: stop_reason}}}
   end
 
-  # ── session/update normalization (Option A) ──────────────────────────────
+  # ── session/update pass-through (Option B: native ACP rendering) ─────────
   #
-  # Translate each ACP `session/update` into the existing on_message shape,
-  # synthesizing a Codex `payload["method"]` the orchestrator transcript
-  # pipeline already understands and placing text at its extraction paths
-  # (orchestrator.ex `agent_text_paths/0` etc.). `raw` keeps the real ACP JSON.
-  defp handle_session_update(state, params, message, raw) do
-    update = Map.get(params, "update") || %{}
-    type = Map.get(update, "sessionUpdate")
-    payload = synthetic_payload(type, update, state.session.session_id) || message
-    emit_message(state.session, state.on_message, :notification, %{payload: payload, raw: raw})
+  # Emit the native ACP `session/update` message verbatim. The observability
+  # pipeline (orchestrator/presenter/`CodexSessionLogRenderer`) understands the
+  # ACP `update.sessionUpdate` discriminator directly — agent/thought chunks,
+  # tool calls (with their ACP `kind`), tool-call output, and `plan` updates —
+  # so no Codex method names are synthesized here. This keeps ACP-only data
+  # (plans, tool kinds) visible instead of flattening it into a Codex shape.
+  # `raw` keeps the real ACP JSON; the Codex/Claude-Code paths are untouched.
+  defp handle_session_update(state, message, raw) do
+    emit_message(state.session, state.on_message, :notification, %{payload: message, raw: raw})
   end
-
-  defp synthetic_payload("agent_message_chunk", update, session_id) do
-    synthetic_text_payload("item/agentMessage/delta", "delta", update, session_id)
-  end
-
-  defp synthetic_payload("agent_thought_chunk", update, session_id) do
-    synthetic_text_payload("item/reasoning/textDelta", "textDelta", update, session_id)
-  end
-
-  defp synthetic_payload("tool_call", update, session_id) do
-    name = Map.get(update, "title") || Map.get(update, "kind") || "tool"
-
-    %{
-      "method" => "item/tool/call",
-      "params" => %{
-        "name" => to_string(name),
-        "arguments" => Map.get(update, "rawInput") || %{},
-        "threadId" => session_id
-      }
-    }
-  end
-
-  defp synthetic_payload("tool_call_update", update, session_id) do
-    case content_text(Map.get(update, "content")) do
-      text when is_binary(text) and text != "" ->
-        %{
-          "method" => "item/commandExecution/outputDelta",
-          "params" => %{"output" => text, "threadId" => session_id}
-        }
-
-      _ ->
-        nil
-    end
-  end
-
-  defp synthetic_payload(_type, _update, _session_id), do: nil
-
-  defp synthetic_text_payload(method, text_key, update, session_id) do
-    case content_text(Map.get(update, "content")) do
-      text when is_binary(text) and text != "" ->
-        %{"method" => method, "params" => %{text_key => text, "threadId" => session_id}}
-
-      _ ->
-        nil
-    end
-  end
-
-  # ACP content is either a single `{type:"text", text:...}` block or a list of
-  # such blocks; pull the text out of whichever shape arrives.
-  defp content_text(%{"text" => text}) when is_binary(text), do: text
-
-  defp content_text(blocks) when is_list(blocks) do
-    blocks
-    |> Enum.map(&content_text/1)
-    |> Enum.filter(&is_binary/1)
-    |> Enum.join("")
-  end
-
-  defp content_text(%{"content" => nested}), do: content_text(nested)
-  defp content_text(_content), do: nil
 
   # ── env / config ─────────────────────────────────────────────────────────
 

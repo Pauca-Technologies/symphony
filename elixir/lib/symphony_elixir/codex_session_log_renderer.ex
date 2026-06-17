@@ -151,7 +151,124 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
        do: append_input_required_entry(state, at, payload)
 
   defp dispatch_payload("item/tool/call", state, at, payload, event), do: render_tool_call(state, at, event, payload)
+
+  # Native ACP streaming notifications (Option B). The ACP backend forwards
+  # `session/update` verbatim; dispatch on `update.sessionUpdate`. ACP chunks
+  # carry no item id and are never flushed by an `item/completed`, so each is
+  # appended directly (mirroring the `{nil, delta}` branches above).
+  defp dispatch_payload("session/update", state, at, payload, _event), do: handle_acp_update(state, at, payload)
+
   defp dispatch_payload(_method, state, _at, _payload, _event), do: state
+
+  defp handle_acp_update(state, at, payload) do
+    update = acp_update(payload)
+
+    case Map.get(update, "sessionUpdate") do
+      "agent_message_chunk" ->
+        append_acp_text(state, at, :agent, "AGENT", acp_chunk_text(update))
+
+      "agent_thought_chunk" ->
+        append_acp_text(state, at, :reasoning, "REASONING", acp_chunk_text(update))
+
+      "tool_call" ->
+        append_acp_tool(state, at, update)
+
+      "tool_call_update" ->
+        append_acp_text(state, at, :output, "OUT", acp_chunk_text(update))
+
+      "plan" ->
+        append_entry(state, %{kind: :event, at: at, label: "PLAN", text: acp_plan_text(update)})
+
+      _ ->
+        state
+    end
+  end
+
+  defp append_acp_text(state, at, kind, label, text) when is_binary(text) and text != "" do
+    append_entry(state, %{kind: kind, at: at, label: label, text: text})
+  end
+
+  defp append_acp_text(state, _at, _kind, _label, _text), do: state
+
+  defp append_acp_tool(state, at, update) do
+    args =
+      update
+      |> Map.get("rawInput")
+      |> compact_tool_arguments()
+
+    text =
+      case args do
+        %{} = compacted when map_size(compacted) > 0 ->
+          inspect(compacted, pretty: true, limit: :infinity, width: 100)
+
+        _ ->
+          nil
+      end
+
+    append_entry(state, %{kind: :tool, at: at, label: "TOOL #{acp_tool_title(update)}", text: text})
+  end
+
+  defp acp_update(payload) do
+    case get_path(payload, ["params", "update"]) do
+      %{} = update -> update
+      _ -> %{}
+    end
+  end
+
+  defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
+  defp acp_chunk_text(_update), do: nil
+
+  defp acp_content_text(%{"content" => nested}), do: acp_content_text(nested)
+  defp acp_content_text(%{"text" => text}) when is_binary(text), do: text
+
+  defp acp_content_text(blocks) when is_list(blocks) do
+    blocks
+    |> Enum.map(&acp_content_text/1)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join("")
+  end
+
+  defp acp_content_text(_content), do: nil
+
+  defp acp_tool_title(update) do
+    kind = acp_presence(Map.get(update, "kind"))
+    title = acp_presence(Map.get(update, "title"))
+
+    cond do
+      kind && title -> "#{kind}: #{title}"
+      title -> title
+      kind -> kind
+      true -> "tool"
+    end
+  end
+
+  defp acp_plan_text(update) do
+    update
+    |> Map.get("entries", [])
+    |> List.wrap()
+    |> Enum.map(&acp_plan_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp acp_plan_entry(%{"content" => content} = entry) when is_binary(content) do
+    "#{acp_plan_marker(Map.get(entry, "status"))} #{String.trim(content)}"
+  end
+
+  defp acp_plan_entry(_entry), do: nil
+
+  defp acp_plan_marker("completed"), do: "- [x]"
+  defp acp_plan_marker("in_progress"), do: "- [~]"
+  defp acp_plan_marker(_status), do: "- [ ]"
+
+  defp acp_presence(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp acp_presence(_value), do: nil
 
   defp handle_item_started(state, at, payload) do
     item = get_path(payload, ["params", "item"]) || %{}

@@ -489,6 +489,11 @@ pre,
   background: #f0fdfa;
 }
 
+.transcript-block-plan {
+  border-left-color: #0ea5e9;
+  background: #f0f9ff;
+}
+
 .transcript-block-event,
 .transcript-block-user {
   border-left-color: var(--muted);
@@ -561,6 +566,11 @@ pre,
 .transcript-chip-compaction {
   background: #ccfbf1;
   color: #0f766e;
+}
+
+.transcript-chip-plan {
+  background: #e0f2fe;
+  color: #0369a1;
 }
 
 .transcript-block-time {

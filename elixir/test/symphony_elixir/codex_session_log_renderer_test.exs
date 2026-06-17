@@ -507,11 +507,11 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
     assert {:error, :enoent} = CodexSessionLogRenderer.render_file(missing, use_color: false)
   end
 
-  # ACP (Option A) normalizes `agent_message_chunk` to `item/agentMessage/delta`
-  # with the text at `params.delta` and *no* item id — there is no following
-  # `item/completed` to flush a buffered message. The renderer must append these
-  # directly, the same way it already handles id-less reasoning deltas.
-  test "renders ACP-normalized agent and reasoning chunks that carry no item id" do
+  # The Claude Code backend normalizes (Option A) `agent_message_chunk` to
+  # `item/agentMessage/delta` with the text at `params.delta` and *no* item id —
+  # there is no following `item/completed` to flush a buffered message. The
+  # renderer must append these directly, like id-less reasoning deltas.
+  test "renders Option-A normalized agent and reasoning chunks that carry no item id" do
     log =
       [
         %{"at" => "2026-04-23T12:00:00Z", "event" => "session_started", "session_id" => "sess-acp"},
@@ -540,5 +540,67 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
     assert output =~ "Considering the request"
     assert output =~ "AGENT"
     assert output =~ "Hello from the ACP agent"
+  end
+
+  # Native ACP rendering (Option B): the ACP backend forwards `session/update`
+  # verbatim and the renderer dispatches on `update.sessionUpdate`, surfacing the
+  # ACP tool `kind` and `plan` updates that Option-A flattening would have lost.
+  test "renders native ACP session/update notifications (chunks, tool kinds, plans)" do
+    log =
+      [
+        %{"at" => "2026-04-23T12:00:00Z", "event" => "session_started", "session_id" => "sess-acp"},
+        acp_update("2026-04-23T12:00:01Z", %{
+          "sessionUpdate" => "agent_thought_chunk",
+          "content" => %{"type" => "text", "text" => "Considering the request"}
+        }),
+        acp_update("2026-04-23T12:00:02Z", %{
+          "sessionUpdate" => "agent_message_chunk",
+          "content" => %{"type" => "text", "text" => "Hello from the ACP agent"}
+        }),
+        acp_update("2026-04-23T12:00:03Z", %{
+          "sessionUpdate" => "tool_call",
+          "toolCallId" => "tc-1",
+          "title" => "Update README",
+          "kind" => "edit",
+          "rawInput" => %{"path" => "README.md"}
+        }),
+        acp_update("2026-04-23T12:00:04Z", %{
+          "sessionUpdate" => "tool_call_update",
+          "toolCallId" => "tc-1",
+          "content" => [%{"type" => "content", "content" => %{"type" => "text", "text" => "patched 1 file"}}]
+        }),
+        acp_update("2026-04-23T12:00:05Z", %{
+          "sessionUpdate" => "plan",
+          "entries" => [
+            %{"content" => "write tests", "status" => "completed"},
+            %{"content" => "ship it", "status" => "pending"}
+          ]
+        })
+      ]
+      |> Enum.map_join("\n", &Jason.encode!/1)
+
+    output = CodexSessionLogRenderer.render_string(log, use_color: false)
+
+    assert output =~ "REASONING"
+    assert output =~ "Considering the request"
+    assert output =~ "AGENT"
+    assert output =~ "Hello from the ACP agent"
+    assert output =~ "TOOL edit: Update README"
+    assert output =~ "OUT"
+    assert output =~ "patched 1 file"
+    assert output =~ "PLAN"
+    assert output =~ "- [x] write tests"
+    assert output =~ "- [ ] ship it"
+  end
+
+  defp acp_update(at, update) do
+    %{
+      "at" => at,
+      "event" => "notification",
+      "payload" => %{
+        "method" => "session/update",
+        "params" => %{"sessionId" => "sess-acp", "update" => update}
+      }
+    }
   end
 end

@@ -1555,17 +1555,12 @@ defmodule SymphonyElixir.Orchestrator do
     origin = transcript_origin(payload, parent_thread_id)
 
     cond do
-      method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
-        build_transcript_block("agent", timestamp, extract_transcript_text(payload, agent_text_paths()), origin)
-
-      method in ["codex/event/exec_command_output_delta", "item/commandExecution/outputDelta"] ->
-        build_transcript_block("output", timestamp, extract_transcript_text(payload, output_text_paths()), origin)
+      spec = text_block_spec(method) ->
+        {kind, paths} = spec
+        build_transcript_block(kind, timestamp, extract_transcript_text(payload, paths), origin)
 
       method == "codex/event/exec_command_begin" ->
         build_transcript_block("command", timestamp, extract_transcript_command(payload), origin)
-
-      method in reasoning_methods() ->
-        build_transcript_block("reasoning", timestamp, extract_transcript_text(payload, reasoning_text_paths()), origin)
 
       method == "item/tool/call" ->
         build_transcript_tool_block(timestamp, payload, origin)
@@ -1573,12 +1568,155 @@ defmodule SymphonyElixir.Orchestrator do
       method == "thread/compacted" ->
         build_transcript_compaction_block(timestamp, payload, origin)
 
+      # Native ACP streaming notifications (Option B). The ACP backend forwards
+      # `session/update` verbatim; dispatch on the `update.sessionUpdate`
+      # discriminator so ACP-only data (tool kinds, plans) renders natively.
+      method == "session/update" ->
+        acp_transcript_block(timestamp, payload, origin)
+
       true ->
         nil
     end
   end
 
   defp transcript_block_for_update(_update, _parent_thread_id), do: nil
+
+  # The streamed text-delta methods share one shape: a `kind` + the path list its
+  # text lives at. Grouping them keeps `transcript_block_for_update/2` flat.
+  defp text_block_spec(method) do
+    cond do
+      method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
+        {"agent", agent_text_paths()}
+
+      method in ["codex/event/exec_command_output_delta", "item/commandExecution/outputDelta"] ->
+        {"output", output_text_paths()}
+
+      method in reasoning_methods() ->
+        {"reasoning", reasoning_text_paths()}
+
+      true ->
+        nil
+    end
+  end
+
+  defp acp_transcript_block(timestamp, payload, origin) do
+    update = acp_update(payload)
+
+    case Map.get(update, "sessionUpdate") do
+      "agent_message_chunk" ->
+        build_transcript_block("agent", timestamp, acp_chunk_text(update), origin)
+
+      "agent_thought_chunk" ->
+        build_transcript_block("reasoning", timestamp, acp_chunk_text(update), origin)
+
+      "tool_call" ->
+        build_acp_tool_block(timestamp, update, origin)
+
+      "tool_call_update" ->
+        build_transcript_block("output", timestamp, acp_chunk_text(update), origin)
+
+      "plan" ->
+        build_acp_plan_block(timestamp, update, origin)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp acp_update(payload) do
+    case string_path_value(payload, ["params", "update"]) do
+      %{} = update -> update
+      _ -> %{}
+    end
+  end
+
+  defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
+  defp acp_chunk_text(_update), do: nil
+
+  # ACP content is a single `{type:"text", text:...}` block, a list of blocks, or
+  # a `{type:"content", content:{...}}` wrapper (tool-call output); pull the text
+  # out of whichever shape arrives.
+  defp acp_content_text(%{"content" => nested}), do: acp_content_text(nested)
+  defp acp_content_text(%{"text" => text}) when is_binary(text), do: text
+
+  defp acp_content_text(blocks) when is_list(blocks) do
+    blocks
+    |> Enum.map(&acp_content_text/1)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join("")
+  end
+
+  defp acp_content_text(_content), do: nil
+
+  defp build_acp_tool_block(timestamp, update, origin) do
+    Map.merge(
+      %{
+        kind: "tool",
+        at: iso8601(timestamp),
+        title: acp_tool_title(update),
+        text: normalize_transcript_text(acp_tool_arguments(update))
+      },
+      origin
+    )
+  end
+
+  # Surface the ACP tool `kind` (read/edit/execute/think/…) alongside the
+  # human-readable `title`, which Codex tool calls don't carry.
+  defp acp_tool_title(update) do
+    kind = presence(Map.get(update, "kind"))
+    title = presence(Map.get(update, "title"))
+
+    cond do
+      kind && title -> "#{kind}: #{title}"
+      title -> title
+      kind -> kind
+      true -> "tool"
+    end
+  end
+
+  defp acp_tool_arguments(update) do
+    case Map.get(update, "rawInput") do
+      nil -> ""
+      input -> format_tool_arguments(input)
+    end
+  end
+
+  defp build_acp_plan_block(timestamp, update, origin) do
+    case acp_plan_text(update) do
+      "" -> nil
+      text -> Map.merge(%{kind: "plan", at: iso8601(timestamp), text: text}, origin)
+    end
+  end
+
+  # ACP `plan` updates are full snapshots of the agent's TODO list; render each
+  # as a markdown checklist keyed on entry `status`.
+  defp acp_plan_text(update) do
+    update
+    |> Map.get("entries", [])
+    |> List.wrap()
+    |> Enum.map(&acp_plan_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp acp_plan_entry(%{"content" => content} = entry) when is_binary(content) do
+    "#{acp_plan_marker(Map.get(entry, "status"))} #{String.trim(content)}"
+  end
+
+  defp acp_plan_entry(_entry), do: nil
+
+  defp acp_plan_marker("completed"), do: "- [x]"
+  defp acp_plan_marker("in_progress"), do: "- [~]"
+  defp acp_plan_marker(_status), do: "- [ ]"
+
+  defp presence(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp presence(_value), do: nil
 
   defp build_transcript_block(kind, timestamp, text, origin) when is_binary(kind) and is_binary(text) do
     case normalize_transcript_text(text) do

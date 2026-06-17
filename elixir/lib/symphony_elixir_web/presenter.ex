@@ -400,12 +400,124 @@ defmodule SymphonyElixirWeb.Presenter do
       method == "thread/compacted" ->
         build_compaction_fragment(at, payload, origin)
 
+      # Native ACP streaming notifications (Option B): dispatch on the
+      # `update.sessionUpdate` discriminator so tool kinds and plans render.
+      method == "session/update" ->
+        build_acp_fragment(at, payload, origin)
+
       true ->
         nil
     end
   end
 
   defp transcript_fragment(_record), do: nil
+
+  defp build_acp_fragment(at, payload, origin) do
+    update = acp_update(payload)
+
+    case map_value(update, ["sessionUpdate"]) do
+      "agent_message_chunk" ->
+        build_text_fragment("agent", at, acp_chunk_text(update), origin)
+
+      "agent_thought_chunk" ->
+        build_text_fragment("reasoning", at, acp_chunk_text(update), origin)
+
+      "tool_call" ->
+        build_acp_tool_fragment(at, update, origin)
+
+      "tool_call_update" ->
+        build_text_fragment("output", at, acp_chunk_text(update), origin)
+
+      "plan" ->
+        build_acp_plan_fragment(at, update, origin)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp acp_update(payload) do
+    case map_value(payload, ["params", "update"]) do
+      %{} = update -> update
+      _ -> %{}
+    end
+  end
+
+  defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
+  defp acp_chunk_text(_update), do: nil
+
+  defp acp_content_text(%{"content" => nested}), do: acp_content_text(nested)
+  defp acp_content_text(%{"text" => text}) when is_binary(text), do: text
+
+  defp acp_content_text(blocks) when is_list(blocks) do
+    blocks
+    |> Enum.map(&acp_content_text/1)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join("")
+  end
+
+  defp acp_content_text(_content), do: nil
+
+  defp build_acp_tool_fragment(at, update, origin) do
+    Map.merge(
+      %{kind: "tool", at: at, title: acp_tool_title(update), text: normalize_transcript_text(acp_tool_arguments(update))},
+      origin
+    )
+  end
+
+  defp acp_tool_title(update) do
+    kind = presence(Map.get(update, "kind"))
+    title = presence(Map.get(update, "title"))
+
+    cond do
+      kind && title -> "#{kind}: #{title}"
+      title -> title
+      kind -> kind
+      true -> "tool"
+    end
+  end
+
+  defp acp_tool_arguments(update) do
+    case Map.get(update, "rawInput") do
+      nil -> ""
+      input -> format_tool_arguments(input)
+    end
+  end
+
+  defp build_acp_plan_fragment(at, update, origin) do
+    case acp_plan_text(update) do
+      "" -> nil
+      text -> Map.merge(%{kind: "plan", at: at, text: text}, origin)
+    end
+  end
+
+  defp acp_plan_text(update) do
+    update
+    |> Map.get("entries", [])
+    |> List.wrap()
+    |> Enum.map(&acp_plan_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp acp_plan_entry(%{"content" => content} = entry) when is_binary(content) do
+    "#{acp_plan_marker(Map.get(entry, "status"))} #{String.trim(content)}"
+  end
+
+  defp acp_plan_entry(_entry), do: nil
+
+  defp acp_plan_marker("completed"), do: "- [x]"
+  defp acp_plan_marker("in_progress"), do: "- [~]"
+  defp acp_plan_marker(_status), do: "- [ ]"
+
+  defp presence(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp presence(_value), do: nil
 
   defp build_tool_fragment(at, payload, origin) when is_map(payload) do
     {name, args_text} = extract_tool(payload)

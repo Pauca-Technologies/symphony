@@ -644,6 +644,43 @@ defmodule SymphonyElixir.ExtensionsTest do
             "method" => "item/tool/call",
             "params" => %{"tool" => "linear.get_issue", "arguments" => %{"id" => "UDPE-1"}}
           }
+        },
+        # Native ACP `session/update` notifications (Option B): the presenter
+        # renders these via `update.sessionUpdate`, surfacing the ACP tool `kind`
+        # and `plan` checklist that Option-A flattening would have dropped.
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "session/update",
+            "params" => %{
+              "sessionId" => "sess-acp",
+              "update" => %{
+                "sessionUpdate" => "tool_call",
+                "toolCallId" => "tc-acp",
+                "title" => "Edit changelog",
+                "kind" => "edit",
+                "rawInput" => %{"path" => "CHANGELOG.md"}
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "session/update",
+            "params" => %{
+              "sessionId" => "sess-acp",
+              "update" => %{
+                "sessionUpdate" => "plan",
+                "entries" => [
+                  %{"content" => "draft the migration", "status" => "completed"},
+                  %{"content" => "run the suite", "status" => "pending"}
+                ]
+              }
+            }
+          }
         }
       ])
 
@@ -753,6 +790,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_html =~ "Wire up the HTTP server"
     assert issue_html =~ "linear.get_issue"
     assert issue_html =~ "transcript-block-tool"
+    # Native ACP rendering: the tool `kind` is surfaced and the plan checklist
+    # renders as its own block.
+    assert issue_html =~ "edit: Edit changelog"
+    assert issue_html =~ "transcript-block-plan"
+    assert issue_html =~ "draft the migration"
+    assert issue_html =~ "run the suite"
 
     updated_issue_snapshot =
       put_in(updated_snapshot.running, [
