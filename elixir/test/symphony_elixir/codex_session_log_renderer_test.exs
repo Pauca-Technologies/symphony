@@ -593,6 +593,50 @@ defmodule SymphonyElixir.CodexSessionLogRendererTest do
     assert output =~ "- [ ] ship it"
   end
 
+  # ACP sends the initial `tool_call` with an empty `rawInput`; the arguments and
+  # the cumulative output stream in via `tool_call_update`. Keyed on `toolCallId`,
+  # the renderer fills the arguments into the one TOOL entry and shows the latest
+  # output once instead of concatenating each cumulative resend.
+  test "merges ACP tool_call_update arguments and de-duplicates cumulative output" do
+    log =
+      [
+        %{"at" => "2026-04-23T12:00:00Z", "event" => "session_started", "session_id" => "sess-acp"},
+        acp_update("2026-04-23T12:00:01Z", %{
+          "sessionUpdate" => "tool_call",
+          "toolCallId" => "read_0",
+          "kind" => "read",
+          "title" => "read",
+          "rawInput" => %{}
+        }),
+        acp_update("2026-04-23T12:00:02Z", %{
+          "sessionUpdate" => "tool_call_update",
+          "toolCallId" => "read_0",
+          "rawInput" => %{"filePath" => "lib/foo.ex"}
+        }),
+        acp_update("2026-04-23T12:00:03Z", %{
+          "sessionUpdate" => "tool_call_update",
+          "toolCallId" => "read_0",
+          "content" => %{"type" => "text", "text" => "alpha\n"}
+        }),
+        acp_update("2026-04-23T12:00:04Z", %{
+          "sessionUpdate" => "tool_call_update",
+          "toolCallId" => "read_0",
+          "content" => %{"type" => "text", "text" => "alpha\nbeta\n"}
+        })
+      ]
+      |> Enum.map_join("\n", &Jason.encode!/1)
+
+    output = CodexSessionLogRenderer.render_string(log, use_color: false)
+
+    assert output =~ "TOOL read: read"
+    assert output =~ "lib/foo.ex"
+    assert output =~ "beta"
+    # One TOOL entry, one OUT entry — and the cumulative output appears once.
+    assert length(String.split(output, "] TOOL ")) == 2
+    assert length(String.split(output, "] OUT")) == 2
+    assert length(String.split(output, "alpha")) == 2
+  end
+
   defp acp_update(at, update) do
     %{
       "at" => at,

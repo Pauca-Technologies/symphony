@@ -171,10 +171,14 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
         append_acp_text(state, at, :reasoning, "REASONING", acp_chunk_text(update))
 
       "tool_call" ->
-        append_acp_tool(state, at, update)
+        # Emit on the initial call (even with an empty `rawInput`) so the tool's
+        # title is captured before arguments stream in via tool_call_update.
+        upsert_acp_tool(state, at, update, true)
 
       "tool_call_update" ->
-        append_acp_text(state, at, :output, "OUT", acp_chunk_text(update))
+        state
+        |> upsert_acp_tool(at, update, false)
+        |> upsert_acp_tool_output(at, update)
 
       "plan" ->
         append_entry(state, %{kind: :event, at: at, label: "PLAN", text: acp_plan_text(update)})
@@ -190,22 +194,73 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
 
   defp append_acp_text(state, _at, _kind, _label, _text), do: state
 
-  defp append_acp_tool(state, at, update) do
-    args =
-      update
-      |> Map.get("rawInput")
-      |> compact_tool_arguments()
+  # ACP resends the cumulative state of a tool call on every `tool_call_update`
+  # (the initial `tool_call` usually has an empty `rawInput`, and `content` grows
+  # as output streams). Key the tool/output entries on `toolCallId` so each
+  # update refreshes the same entry in place — arguments fill in and cumulative
+  # output isn't concatenated into itself.
+  defp upsert_acp_tool(state, at, update, force?) do
+    text = acp_tool_args_text(update)
 
-    text =
-      case args do
-        %{} = compacted when map_size(compacted) > 0 ->
-          inspect(compacted, pretty: true, limit: :infinity, width: 100)
+    if is_nil(text) and not force? do
+      state
+    else
+      upsert_acp_entry(state, {:tool, Map.get(update, "toolCallId")}, %{
+        kind: :tool,
+        at: at,
+        label: "TOOL #{acp_tool_title(update)}",
+        text: text
+      })
+    end
+  end
 
-        _ ->
-          nil
-      end
+  defp upsert_acp_tool_output(state, at, update) do
+    case acp_chunk_text(update) do
+      text when is_binary(text) and text != "" ->
+        upsert_acp_entry(state, {:output, Map.get(update, "toolCallId")}, %{
+          kind: :output,
+          at: at,
+          label: "OUT",
+          text: text
+        })
 
-    append_entry(state, %{kind: :tool, at: at, label: "TOOL #{acp_tool_title(update)}", text: text})
+      _ ->
+        state
+    end
+  end
+
+  defp acp_tool_args_text(update) do
+    case update |> Map.get("rawInput") |> compact_tool_arguments() do
+      %{} = compacted when map_size(compacted) > 0 ->
+        inspect(compacted, pretty: true, limit: :infinity, width: 100)
+
+      _ ->
+        nil
+    end
+  end
+
+  # Replace the entry sharing this key in place (keeping its position and
+  # original timestamp), else prepend a new one. Without a `toolCallId` there is
+  # nothing to key on, so just append.
+  defp upsert_acp_entry(state, {_kind, nil}, entry), do: append_entry(state, entry)
+
+  defp upsert_acp_entry(state, key, entry) do
+    tagged = Map.put(entry, :acp_key, key)
+    update_in(state.entries, &merge_acp_entries(&1, key, tagged))
+  end
+
+  # Only the text changes between updates; keep the label/timestamp the initial
+  # entry established.
+  defp merge_acp_entries(entries, key, tagged) do
+    if Enum.any?(entries, &(Map.get(&1, :acp_key) == key)) do
+      Enum.map(entries, &refresh_acp_entry(&1, key, tagged.text))
+    else
+      [tagged | entries]
+    end
+  end
+
+  defp refresh_acp_entry(entry, key, text) do
+    if Map.get(entry, :acp_key) == key, do: %{entry | text: text}, else: entry
   end
 
   defp acp_update(payload) do

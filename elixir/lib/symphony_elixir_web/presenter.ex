@@ -4,9 +4,13 @@ defmodule SymphonyElixirWeb.Presenter do
   """
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
-  @transcript_line_limit 500
-  @transcript_block_limit 80
-  @transcript_byte_limit 262_144
+  # The details page renders the persisted transcript for the whole session, so
+  # these bound how much of a long log we surface (and re-parse per refresh).
+  # Generous enough that typical sessions render in full; very long sessions
+  # still window to the most recent activity rather than dropping at ~80 blocks.
+  @transcript_line_limit 4_000
+  @transcript_block_limit 1_000
+  @transcript_byte_limit 1_048_576
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -292,21 +296,18 @@ defmodule SymphonyElixirWeb.Presenter do
     )
   end
 
+  # The details page shows the full session transcript from the persisted log —
+  # for running entries too, not just completed ones. The orchestrator's
+  # in-memory `recent_codex_transcript_blocks` is a small ring buffer (kept lean
+  # so it's cheap to ship in every snapshot); reading it here would drop older
+  # entries as new ones stream in. The on-disk log is the complete history, so
+  # prefer it and fall back to the in-memory buffer only before the log exists
+  # (e.g. pre-`session_id` events that aren't persisted yet).
   defp transcript_blocks_for_entry(entry, _path) when is_map(entry) do
-    case Map.get(entry, :recent_codex_transcript_blocks) do
-      blocks when is_list(blocks) and blocks != [] ->
-        blocks
-
-      [] ->
-        if running_entry?(entry), do: [], else: load_transcript_blocks(Map.get(latest_session_log_entry(entry) || %{}, :path))
-
-      _ ->
-        load_transcript_blocks(Map.get(latest_session_log_entry(entry) || %{}, :path))
+    case load_transcript_blocks(Map.get(latest_session_log_entry(entry) || %{}, :path)) do
+      blocks when is_list(blocks) and blocks != [] -> blocks
+      _ -> entry |> Map.get(:recent_codex_transcript_blocks) |> List.wrap()
     end
-  end
-
-  defp running_entry?(entry) when is_map(entry) do
-    Map.has_key?(entry, :turn_count)
   end
 
   defp load_transcript_blocks(path) when is_binary(path) do
@@ -317,8 +318,9 @@ defmodule SymphonyElixirWeb.Presenter do
         |> Enum.take(-@transcript_line_limit)
         |> Enum.map(&transcript_record/1)
         |> Enum.reject(&is_nil/1)
-        |> Enum.map(&transcript_fragment/1)
-        |> Enum.reject(&is_nil/1)
+        # `transcript_fragment/1` may yield a single fragment, nil, or a list
+        # (an ACP `tool_call_update` produces both a tool and an output fragment).
+        |> Enum.flat_map(fn record -> record |> transcript_fragment() |> List.wrap() end)
         |> merge_transcript_fragments()
         |> Enum.take(-@transcript_block_limit)
 
@@ -326,6 +328,8 @@ defmodule SymphonyElixirWeb.Presenter do
         []
     end
   end
+
+  defp load_transcript_blocks(_path), do: []
 
   defp read_transcript_tail(path) when is_binary(path) do
     with {:ok, %File.Stat{size: size}} <- File.stat(path),
@@ -426,7 +430,7 @@ defmodule SymphonyElixirWeb.Presenter do
         build_acp_tool_fragment(at, update, origin)
 
       "tool_call_update" ->
-        build_text_fragment("output", at, acp_chunk_text(update), origin)
+        acp_tool_update_fragments(at, update, origin)
 
       "plan" ->
         build_acp_plan_fragment(at, update, origin)
@@ -460,10 +464,44 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp build_acp_tool_fragment(at, update, origin) do
     Map.merge(
-      %{kind: "tool", at: at, title: acp_tool_title(update), text: normalize_transcript_text(acp_tool_arguments(update))},
+      %{
+        kind: "tool",
+        at: at,
+        tool_call_id: acp_tool_call_id(update),
+        title: acp_tool_title(update),
+        text: normalize_transcript_text(acp_tool_arguments(update))
+      },
       origin
     )
   end
+
+  # See `Orchestrator.acp_tool_update_blocks/3`: a `tool_call_update` carries the
+  # cumulative state of an in-flight tool call. Refresh the arguments and emit
+  # the latest output, both keyed on `toolCallId` so `merge_transcript_fragments/1`
+  # updates the existing fragments in place instead of duplicating them.
+  defp acp_tool_update_fragments(at, update, origin) do
+    [
+      acp_tool_args_fragment(at, update, origin),
+      acp_tool_output_fragment(at, update, origin)
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp acp_tool_args_fragment(at, update, origin) do
+    case acp_tool_arguments(update) do
+      "" -> nil
+      _args -> build_acp_tool_fragment(at, update, origin)
+    end
+  end
+
+  defp acp_tool_output_fragment(at, update, origin) do
+    case build_text_fragment("output", at, acp_chunk_text(update), origin) do
+      nil -> nil
+      fragment -> Map.put(fragment, :tool_call_id, acp_tool_call_id(update))
+    end
+  end
+
+  defp acp_tool_call_id(update), do: presence(Map.get(update, "toolCallId"))
 
   defp acp_tool_title(update) do
     kind = presence(Map.get(update, "kind"))
@@ -597,18 +635,52 @@ defmodule SymphonyElixirWeb.Presenter do
   defp merge_transcript_fragments(fragments) when is_list(fragments) do
     fragments
     |> Enum.reduce([], fn fragment, acc ->
-      case acc do
-        [%{kind: kind, text: existing_text, thread_id: prev_thread} = previous | rest]
-        when kind == fragment.kind and kind in ["agent", "output", "reasoning"] and
-               prev_thread == fragment.thread_id ->
-          [%{previous | text: existing_text <> fragment.text} | rest]
+      cond do
+        # ACP tool/output fragments resend cumulative state per update; replace
+        # the matching fragment in place (keyed on `tool_call_id`) so arguments
+        # fill in and cumulative output isn't concatenated into itself.
+        keyed_fragment?(fragment) ->
+          upsert_keyed_fragment(acc, fragment)
 
-        _ ->
+        mergeable_text_head?(acc, fragment) ->
+          [previous | rest] = acc
+          [%{previous | text: previous.text <> fragment.text} | rest]
+
+        true ->
           [fragment | acc]
       end
     end)
     |> Enum.reverse()
   end
+
+  defp mergeable_text_head?([%{kind: kind, thread_id: prev_thread} | _rest], fragment) do
+    kind == fragment.kind and kind in ["agent", "output", "reasoning"] and
+      prev_thread == fragment.thread_id and not keyed_fragment?(fragment)
+  end
+
+  defp mergeable_text_head?(_acc, _fragment), do: false
+
+  defp keyed_fragment?(%{kind: kind, tool_call_id: id}) when kind in ["tool", "output"] and is_binary(id),
+    do: true
+
+  defp keyed_fragment?(_fragment), do: false
+
+  defp upsert_keyed_fragment(acc, %{kind: kind, tool_call_id: id} = fragment) do
+    if Enum.any?(acc, &keyed_fragment_match?(&1, kind, id)) do
+      # Only the text changes between updates; keep the title/timestamp the
+      # initial `tool_call` established (see `Orchestrator.upsert_keyed_transcript_block/4`).
+      Enum.map(acc, &refresh_keyed_fragment(&1, kind, id, fragment.text))
+    else
+      [fragment | acc]
+    end
+  end
+
+  defp refresh_keyed_fragment(fragment, kind, id, text) do
+    if keyed_fragment_match?(fragment, kind, id), do: %{fragment | text: text}, else: fragment
+  end
+
+  defp keyed_fragment_match?(%{kind: kind, tool_call_id: id}, kind, id), do: true
+  defp keyed_fragment_match?(_fragment, _kind, _id), do: false
 
   defp agent_text_paths do
     [

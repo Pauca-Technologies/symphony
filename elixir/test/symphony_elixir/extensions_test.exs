@@ -586,7 +586,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "event" => "notification",
           "payload" => %{
             "method" => "codex/event/agent_message_content_delta",
-            "params" => %{"msg" => %{"content" => "OLD-BEGINNING " <> String.duplicate("x", 300_000)}}
+            "params" => %{"msg" => %{"content" => "OLD-BEGINNING " <> String.duplicate("x", 2_000_000)}}
           }
         },
         %{
@@ -661,6 +661,42 @@ defmodule SymphonyElixir.ExtensionsTest do
                 "title" => "Edit changelog",
                 "kind" => "edit",
                 "rawInput" => %{"path" => "CHANGELOG.md"}
+              }
+            }
+          }
+        },
+        # tool_call_update records carry the cumulative state of tc-acp: the
+        # arguments fill in (filePath) and the output is resent in full each
+        # time. The presenter keys these on toolCallId so the arguments land on
+        # the existing tool block and the output renders once, not concatenated.
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "session/update",
+            "params" => %{
+              "sessionId" => "sess-acp",
+              "update" => %{
+                "sessionUpdate" => "tool_call_update",
+                "toolCallId" => "tc-acp",
+                "kind" => "edit",
+                "title" => "Edit changelog",
+                "rawInput" => %{"path" => "CHANGELOG.md", "newText" => "ACP-EDIT-ARG"}
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "session/update",
+            "params" => %{
+              "sessionId" => "sess-acp",
+              "update" => %{
+                "sessionUpdate" => "tool_call_update",
+                "toolCallId" => "tc-acp",
+                "content" => %{"type" => "text", "text" => "ACP-EDIT-OUTPUT line"}
               }
             }
           }
@@ -793,6 +829,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     # Native ACP rendering: the tool `kind` is surfaced and the plan checklist
     # renders as its own block.
     assert issue_html =~ "edit: Edit changelog"
+    # tool_call_update fills the arguments onto the existing tool block and emits
+    # the tool output (the presenter returns both fragments for one update, and
+    # keys them on toolCallId so they merge in place). Block-level de-duplication
+    # of cumulative output is covered by the orchestrator/renderer unit tests.
+    assert issue_html =~ "ACP-EDIT-ARG"
+    assert issue_html =~ "ACP-EDIT-OUTPUT line"
     assert issue_html =~ "transcript-block-plan"
     assert issue_html =~ "draft the migration"
     assert issue_html =~ "run the suite"

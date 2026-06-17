@@ -600,6 +600,157 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert is_integer(completed_state.codex_totals.seconds_running)
   end
 
+  test "orchestrator counts token usage reported by non-Codex backends" do
+    issue_id = "issue-acp-usage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "ACP-9",
+      title: "ACP usage",
+      description: "Count ACP/Claude usage",
+      state: "In Progress",
+      url: "https://example.org/issues/ACP-9"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :AcpUsageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+    send(pid, {:codex_worker_update, issue_id, %{event: :session_started, session_id: "sess-acp", timestamp: now}})
+
+    # ACP `usage_update` carries the counts under `params.update.usage`.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "session/update",
+           "params" => %{
+             "sessionId" => "sess-acp",
+             "update" => %{"sessionUpdate" => "usage_update", "usage" => %{"input_tokens" => 30, "output_tokens" => 10, "total_tokens" => 40}}
+           }
+         },
+         timestamp: now
+       }}
+    )
+
+    # A backend may instead hand us a flat usage map (Claude Code `result.usage`)
+    # with no total — the total is synthesized from input + output.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{event: :notification, usage: %{"input_tokens" => 130, "output_tokens" => 35}, timestamp: now}}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 130
+    assert snapshot_entry.codex_output_tokens == 35
+    assert snapshot_entry.codex_total_tokens == 165
+  end
+
+  test "orchestrator fills ACP tool arguments from updates and de-duplicates cumulative output" do
+    issue_id = "issue-acp-tool"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "ACP-8",
+      title: "ACP tool lifecycle",
+      description: "Merge tool_call + tool_call_update",
+      state: "In Progress",
+      url: "https://example.org/issues/ACP-8"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :AcpToolOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      codex_session_logs: [],
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+    send(pid, {:codex_worker_update, issue_id, %{event: :session_started, session_id: "sess-acp", timestamp: now}})
+
+    acp_update = fn update ->
+      %{
+        event: :notification,
+        payload: %{"method" => "session/update", "params" => %{"sessionId" => "sess-acp", "update" => update}},
+        timestamp: now
+      }
+    end
+
+    # ACP sends the initial tool_call with an empty rawInput; the arguments and
+    # the (cumulative) output then stream in via tool_call_update.
+    send(pid, {:codex_worker_update, issue_id, acp_update.(%{"sessionUpdate" => "tool_call", "toolCallId" => "tc-9", "kind" => "read", "title" => "read", "rawInput" => %{}})})
+    send(pid, {:codex_worker_update, issue_id, acp_update.(%{"sessionUpdate" => "tool_call_update", "toolCallId" => "tc-9", "rawInput" => %{"filePath" => "lib/foo.ex"}})})
+    send(pid, {:codex_worker_update, issue_id, acp_update.(%{"sessionUpdate" => "tool_call_update", "toolCallId" => "tc-9", "content" => %{"type" => "text", "text" => "alpha\n"}})})
+    send(pid, {:codex_worker_update, issue_id, acp_update.(%{"sessionUpdate" => "tool_call_update", "toolCallId" => "tc-9", "content" => %{"type" => "text", "text" => "alpha\nbeta\n"}})})
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    blocks = snapshot_entry.recent_codex_transcript_blocks
+
+    tool_blocks = Enum.filter(blocks, &(&1.kind == "tool" and Map.get(&1, :tool_call_id) == "tc-9"))
+    assert length(tool_blocks) == 1
+    assert hd(tool_blocks).text =~ "lib/foo.ex"
+
+    output_blocks = Enum.filter(blocks, &(&1.kind == "output" and Map.get(&1, :tool_call_id) == "tc-9"))
+    assert length(output_blocks) == 1
+    output_text = hd(output_blocks).text
+    assert output_text =~ "beta"
+    # Cumulative output is replaced, not concatenated — "alpha" appears once.
+    assert length(String.split(output_text, "alpha")) == 2
+  end
+
   test "orchestrator context occupancy tracks the main thread and ignores subagents" do
     issue_id = "issue-context-occupancy"
 

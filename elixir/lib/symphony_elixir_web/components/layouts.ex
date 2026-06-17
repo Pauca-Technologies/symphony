@@ -50,8 +50,16 @@ defmodule SymphonyElixirWeb.Layouts do
 
             formatTimes();
             // LiveView re-renders rewrite the server-side fallback text; reformat
-            // whenever the DOM changes. Guarded writes above avoid mutation loops.
-            new MutationObserver(formatTimes).observe(document.body, {childList: true, subtree: true});
+            // whenever the DOM changes. `characterData` is essential: LiveView
+            // patches an unchanged-structure node by rewriting its text node in
+            // place (a characterData mutation), which a childList-only observer
+            // misses — so the timestamp would revert to UTC and stay there.
+            // Guarded writes above avoid mutation loops.
+            new MutationObserver(formatTimes).observe(document.body, {
+              childList: true,
+              subtree: true,
+              characterData: true
+            });
 
             if (!window.Phoenix || !window.LiveView) return;
 

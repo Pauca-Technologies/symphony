@@ -1531,6 +1531,25 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp append_recent_codex_transcript_block(blocks, nil) when is_list(blocks), do: blocks
 
+  defp append_recent_codex_transcript_block(blocks, updates)
+       when is_list(blocks) and is_list(updates) do
+    Enum.reduce(updates, blocks, fn block, acc ->
+      append_recent_codex_transcript_block(acc, block)
+    end)
+  end
+
+  # ACP tool/output blocks carry a `tool_call_id`. ACP resends the cumulative
+  # state of a tool call on every `tool_call_update`, so replace the matching
+  # block in place (keeping its position and original timestamp) instead of
+  # appending a duplicate — otherwise arguments never fill in and cumulative
+  # output is concatenated into itself.
+  defp append_recent_codex_transcript_block(blocks, %{kind: kind, tool_call_id: id} = block)
+       when is_list(blocks) and is_binary(id) and kind in ["tool", "output"] do
+    blocks
+    |> upsert_keyed_transcript_block(kind, id, block)
+    |> Enum.take(-@recent_codex_transcript_blocks_limit)
+  end
+
   defp append_recent_codex_transcript_block(blocks, %{kind: kind, text: text} = block)
        when is_list(blocks) and is_binary(kind) and is_binary(text) do
     thread_id = Map.get(block, :thread_id)
@@ -1549,6 +1568,24 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp append_recent_codex_transcript_block(_blocks, block) when is_map(block), do: [block]
+
+  defp upsert_keyed_transcript_block(blocks, kind, id, block) do
+    if Enum.any?(blocks, &keyed_transcript_block?(&1, kind, id)) do
+      # Only the text changes between updates; the title/kind/timestamp are set
+      # once (by the initial `tool_call`) and kept — a later update that omits
+      # the title must not overwrite it with a generic placeholder.
+      Enum.map(blocks, &refresh_keyed_block(&1, kind, id, block.text))
+    else
+      blocks ++ [block]
+    end
+  end
+
+  defp refresh_keyed_block(block, kind, id, text) do
+    if keyed_transcript_block?(block, kind, id), do: %{block | text: text}, else: block
+  end
+
+  defp keyed_transcript_block?(%{kind: kind, tool_call_id: id}, kind, id), do: true
+  defp keyed_transcript_block?(_block, _kind, _id), do: false
 
   defp transcript_block_for_update(%{payload: %{} = payload, timestamp: timestamp}, parent_thread_id) do
     method = Map.get(payload, "method") || Map.get(payload, :method)
@@ -1613,7 +1650,7 @@ defmodule SymphonyElixir.Orchestrator do
         build_acp_tool_block(timestamp, update, origin)
 
       "tool_call_update" ->
-        build_transcript_block("output", timestamp, acp_chunk_text(update), origin)
+        acp_tool_update_blocks(timestamp, update, origin)
 
       "plan" ->
         build_acp_plan_block(timestamp, update, origin)
@@ -1653,12 +1690,49 @@ defmodule SymphonyElixir.Orchestrator do
       %{
         kind: "tool",
         at: iso8601(timestamp),
+        tool_call_id: acp_tool_call_id(update),
         title: acp_tool_title(update),
         text: normalize_transcript_text(acp_tool_arguments(update))
       },
       origin
     )
   end
+
+  # A `tool_call_update` carries the cumulative state of an in-flight tool call:
+  # its `rawInput` (arguments) fills in after the initial `tool_call` — which
+  # usually arrives with an empty `rawInput` — and its `content` grows as output
+  # streams. Emit a tool block to refresh the arguments and an output block for
+  # the latest output. Both are keyed on `toolCallId` (see
+  # `append_recent_codex_transcript_block/2`) so they update the existing blocks
+  # in place rather than appending a duplicate per streamed update.
+  defp acp_tool_update_blocks(timestamp, update, origin) do
+    [
+      acp_tool_args_block(timestamp, update, origin),
+      acp_tool_output_block(timestamp, update, origin)
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp acp_tool_args_block(timestamp, update, origin) do
+    case acp_tool_arguments(update) do
+      "" -> nil
+      _args -> build_acp_tool_block(timestamp, update, origin)
+    end
+  end
+
+  defp acp_tool_output_block(timestamp, update, origin) do
+    with text when is_binary(text) <- acp_chunk_text(update),
+         normalized when normalized != "" <- normalize_transcript_text(text) do
+      Map.merge(
+        %{kind: "output", at: iso8601(timestamp), tool_call_id: acp_tool_call_id(update), text: normalized},
+        origin
+      )
+    else
+      _ -> nil
+    end
+  end
+
+  defp acp_tool_call_id(update), do: presence(Map.get(update, "toolCallId"))
 
   # Surface the ACP tool `kind` (read/edit/execute/think/…) alongside the
   # human-readable `title`, which Codex tool calls don't carry.
@@ -2274,19 +2348,44 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_token_usage(update) do
-    payloads = [
-      update[:usage],
-      Map.get(update, "usage"),
-      Map.get(update, :usage),
-      update[:payload],
-      Map.get(update, "payload"),
-      update
-    ]
+    # Backends that report a flat token map (ACP `usage_update`, Claude Code
+    # `result.usage`) hand it to us directly as `:usage` metadata. Recognize it
+    # as-is before falling back to digging Codex token paths out of a payload.
+    direct_usage = [update[:usage], Map.get(update, "usage"), Map.get(update, :usage)]
+    payloads = direct_usage ++ [update[:payload], Map.get(update, "payload"), update]
 
-    Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
-      Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
-      %{}
+    usage =
+      Enum.find_value(direct_usage, &direct_token_usage_from_payload/1) ||
+        Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
+        Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
+        %{}
+
+    with_synthesized_total(usage)
   end
+
+  # A usage map handed to us directly (not nested under a Codex token path) is
+  # already the value we want — accept it when it carries integer token counts.
+  defp direct_token_usage_from_payload(payload) when is_map(payload) do
+    if integer_token_map?(payload), do: payload
+  end
+
+  defp direct_token_usage_from_payload(_payload), do: nil
+
+  # Anthropic-style usage (Claude Code) reports input/output but no total; ACP
+  # `usage_update` may do the same. Fill the total so the headline gauge isn't
+  # stuck at 0 while in/out climb. Codex already carries its own total.
+  defp with_synthesized_total(usage) when is_map(usage) do
+    input = get_token_usage(usage, :input)
+    output = get_token_usage(usage, :output)
+
+    if is_nil(get_token_usage(usage, :total)) and is_integer(input) and is_integer(output) do
+      Map.put(usage, "total_tokens", input + output)
+    else
+      usage
+    end
+  end
+
+  defp with_synthesized_total(usage), do: usage
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||
@@ -2306,7 +2405,13 @@ defmodule SymphonyElixir.Orchestrator do
       ["params", "tokenUsage", "total"],
       [:params, :tokenUsage, :total],
       ["tokenUsage", "total"],
-      [:tokenUsage, :total]
+      [:tokenUsage, :total],
+      # ACP `usage_update` session/update: tokens sit under `params.update.usage`
+      # (or directly on `params.update`). The `integer_token_map?` guard in
+      # `explicit_map_at_paths/2` keeps non-usage updates (chunks, tool calls)
+      # from matching `params.update`.
+      ["params", "update", "usage"],
+      ["params", "update"]
     ]
 
     explicit_map_at_paths(payload, absolute_paths)
