@@ -63,7 +63,11 @@ claude -p \
    existing transcript shape, so the dashboard and CLI renderer render Claude
    Code turns with no Claude-specific rendering code (same synthetic
    `item/agentMessage/delta` / `item/reasoning/textDelta` / `item/tool/call` /
-   `item/commandExecution/outputDelta` methods the ACP backend emits).
+   `item/commandExecution/outputDelta` methods). Two Claude-specific cases get
+   nicer rendering: the **`TodoWrite`** builtin normalizes to the shared
+   `session/update`/`plan` checklist block (the same one the ACP backend feeds),
+   and a failed `tool_result` (`is_error`) is prefixed `[tool error]` so it reads
+   as a failure rather than ordinary output.
 3. **Completion.** The terminal `result` message carries `stop_reason` /
    `is_error` / `subtype`: a successful result ⇒ completed (`max_tokens` /
    `max_turn_requests` complete with a note); any error result ⇒ abnormal.

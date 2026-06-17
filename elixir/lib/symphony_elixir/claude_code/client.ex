@@ -351,6 +351,25 @@ defmodule SymphonyElixir.ClaudeCode.Client do
     text_payload("item/reasoning/textDelta", "textDelta", text, session_id)
   end
 
+  # Claude's planning surfaces through the `TodoWrite` builtin tool. Render it as
+  # a plan checklist — the same `session/update`/`plan` block the ACP backend
+  # feeds the transcript pipeline — instead of a raw tool-call args dump. Each
+  # entry `status` (pending/in_progress/completed) already matches the plan
+  # block's expected statuses.
+  defp synthetic_payload(%{"type" => "tool_use", "name" => "TodoWrite", "input" => %{"todos" => todos}}, session_id)
+       when is_list(todos) do
+    %{
+      "method" => "session/update",
+      "params" => %{
+        "sessionId" => session_id,
+        "update" => %{
+          "sessionUpdate" => "plan",
+          "entries" => Enum.map(todos, &todo_plan_entry/1)
+        }
+      }
+    }
+  end
+
   defp synthetic_payload(%{"type" => "tool_use"} = block, session_id) do
     %{
       "method" => "item/tool/call",
@@ -363,11 +382,13 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   end
 
   defp synthetic_payload(%{"type" => "tool_result"} = block, session_id) do
-    case tool_result_text(Map.get(block, "content")) do
-      text when is_binary(text) and text != "" ->
+    text = tool_result_text(Map.get(block, "content")) || ""
+
+    case tool_result_output(text, Map.get(block, "is_error") == true) do
+      output when is_binary(output) ->
         %{
           "method" => "item/commandExecution/outputDelta",
-          "params" => %{"output" => text, "threadId" => session_id}
+          "params" => %{"output" => output, "threadId" => session_id}
         }
 
       _ ->
@@ -376,6 +397,19 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   end
 
   defp synthetic_payload(_block, _session_id), do: nil
+
+  defp todo_plan_entry(todo) when is_map(todo) do
+    %{"content" => Map.get(todo, "content"), "status" => Map.get(todo, "status")}
+  end
+
+  defp todo_plan_entry(_todo), do: %{}
+
+  # A failed Claude tool (`is_error: true`) would otherwise be indistinguishable
+  # from normal output; mark it so it reads as an error in the transcript.
+  defp tool_result_output("", true), do: "[tool error]"
+  defp tool_result_output("", false), do: nil
+  defp tool_result_output(text, true), do: "[tool error] " <> text
+  defp tool_result_output(text, false), do: text
 
   defp text_payload(_method, _key, "", _session_id), do: nil
 

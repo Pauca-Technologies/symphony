@@ -79,6 +79,70 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
     end)
   end
 
+  test "renders a TodoWrite tool call as a native plan checklist" do
+    alias SymphonyElixir.CodexSessionLogRenderer, as: Renderer
+
+    with_cc_env(fn workspace, _trace ->
+      write_fake_agent!(workspace.agent_path,
+        events: [
+          system_init(),
+          assistant_tool_use("TodoWrite", %{
+            "todos" => [
+              %{"content" => "write tests", "status" => "completed", "activeForm" => "writing tests"},
+              %{"content" => "ship it", "status" => "pending", "activeForm" => "shipping it"}
+            ]
+          })
+        ]
+      )
+
+      assert {:ok, _} = run(workspace, on_message: collector())
+
+      # A TodoWrite call normalizes to the canonical `session/update`/plan block
+      # (shared with ACP), not a raw `item/tool/call` args dump.
+      assert_received {:cc_message,
+                       %{
+                         event: :notification,
+                         payload: %{"method" => "session/update", "params" => %{"update" => %{"sessionUpdate" => "plan"} = update}}
+                       }}
+
+      assert update["entries"] == [
+               %{"content" => "write tests", "status" => "completed"},
+               %{"content" => "ship it", "status" => "pending"}
+             ]
+
+      # And it renders as a checklist through the session-log renderer.
+      log =
+        Jason.encode!(%{
+          "at" => "2026-06-17T00:00:00Z",
+          "payload" => %{
+            "method" => "session/update",
+            "params" => %{"sessionId" => "cc-1", "update" => %{"sessionUpdate" => "plan", "entries" => update["entries"]}}
+          }
+        })
+
+      output = Renderer.render_string(log, use_color: false)
+      assert output =~ "PLAN"
+      assert output =~ "- [x] write tests"
+      assert output =~ "- [ ] ship it"
+    end)
+  end
+
+  test "marks a failed tool_result as an error in the transcript" do
+    with_cc_env(fn workspace, _trace ->
+      write_fake_agent!(workspace.agent_path,
+        events: [system_init(), user_tool_result_error("permission denied")]
+      )
+
+      assert {:ok, _} = run(workspace, on_message: collector())
+
+      assert_received {:cc_message,
+                       %{
+                         event: :notification,
+                         payload: %{"method" => "item/commandExecution/outputDelta", "params" => %{"output" => "[tool error] permission denied"}}
+                       }}
+    end)
+  end
+
   test "maps an error result to an abnormal completion" do
     with_cc_env(fn workspace, _trace ->
       write_fake_agent!(workspace.agent_path,
@@ -243,6 +307,17 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
     Jason.encode!(%{
       "type" => "user",
       "message" => %{"role" => "user", "content" => [%{"type" => "tool_result", "tool_use_id" => "toolu_1", "content" => content}]},
+      "session_id" => "cc-1"
+    })
+  end
+
+  defp user_tool_result_error(content) do
+    Jason.encode!(%{
+      "type" => "user",
+      "message" => %{
+        "role" => "user",
+        "content" => [%{"type" => "tool_result", "tool_use_id" => "toolu_1", "content" => content, "is_error" => true}]
+      },
       "session_id" => "cc-1"
     })
   end
