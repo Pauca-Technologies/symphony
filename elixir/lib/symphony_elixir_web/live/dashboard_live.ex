@@ -170,6 +170,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <article class="metric-card">
               <p class="metric-label">Context filled</p>
               <p class="metric-value numeric"><%= issue_context_fill(@issue_payload) %></p>
+              <% ctx_pct = issue_context_percent(@issue_payload) %>
+              <div :if={ctx_pct} class={"meter #{context_meter_level(ctx_pct)}"}>
+                <div class="meter-fill" style={"width: #{ctx_pct}%"}></div>
+              </div>
               <p class="metric-detail numeric">
                 <%= issue_context_detail(@issue_payload) %>
               </p>
@@ -454,7 +458,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <div class="token-stack numeric">
                           <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                           <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                          <% ctx_pct = context_fill_percent(entry.context) %>
                           <span class="muted" title={context_fill_title(entry.context)}>Ctx <%= context_fill_label(entry.context) %></span>
+                          <div :if={ctx_pct} class={"meter meter-sm #{context_meter_level(ctx_pct)}"}>
+                            <div class="meter-fill" style={"width: #{ctx_pct}%"}></div>
+                          </div>
                         </div>
                       </td>
                     </tr>
@@ -602,6 +610,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp issue_context_detail(%{running: %{context: context}}), do: context_fill_title(context)
   defp issue_context_detail(_issue_payload), do: "n/a"
+
+  defp issue_context_percent(%{running: %{context: context}}), do: context_fill_percent(context)
+  defp issue_context_percent(_issue_payload), do: nil
+
+  # Integer percentage (0–100) of the model context window currently filled,
+  # or nil when the fill ratio is unknown. Drives the meter bars.
+  defp context_fill_percent(%{fill_ratio: ratio}) when is_float(ratio), do: round(ratio * 100)
+  defp context_fill_percent(_context), do: nil
+
+  defp context_meter_level(pct) when is_integer(pct) and pct >= 85, do: "meter-danger"
+  defp context_meter_level(pct) when is_integer(pct) and pct >= 65, do: "meter-warn"
+  defp context_meter_level(_pct), do: ""
 
   # Main-agent context window occupancy (current prompt tokens / model window).
   defp context_fill_label(%{fill_ratio: ratio}) when is_float(ratio) do

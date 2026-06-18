@@ -11,10 +11,11 @@ defmodule SymphonyElixirWeb.Layouts do
 
     ~H"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="en" style="background:#0a0b0d">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="color-scheme" content="dark" />
         <meta name="csrf-token" content={@csrf_token} />
         <title>Symphony Observability</title>
         <script defer src="/vendor/phoenix_html/phoenix_html.js"></script>
