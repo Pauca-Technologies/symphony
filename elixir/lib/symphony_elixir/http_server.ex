@@ -40,13 +40,46 @@ defmodule SymphonyElixir.HttpServer do
             |> Keyword.merge(endpoint_opts)
 
           Application.put_env(:symphony_elixir, Endpoint, endpoint_config)
-          Endpoint.start_link()
+
+          children = [Endpoint | loopback_listener(ip, port)]
+          Supervisor.start_link(children, strategy: :one_for_one)
         end
 
       _ ->
         :ignore
     end
   end
+
+  # When the dashboard is bound to a host that does not already accept loopback
+  # traffic (e.g. a LAN or Tailscale host such as `raul-vps.taild2bbf9.ts.net`),
+  # the primary listener only accepts connections destined to that IP, so
+  # `localhost:<port>` would be refused. Start an extra Bandit listener on the
+  # loopback interface — serving the same Phoenix endpoint as a plug — so the
+  # dashboard is *always* reachable via `localhost`/`127.0.0.1` in addition to
+  # the configured host, without exposing it on every interface. Skipped when
+  # the primary already covers `127.0.0.1` (a `127.0.0.1` or wildcard bind, where
+  # an extra listener would also collide on the shared port) or when the port is
+  # ephemeral (`0`), where the two listeners could not share a fixed port.
+  defp loopback_listener(ip, port) when is_integer(port) and port > 0 do
+    if covers_ipv4_loopback?(ip) do
+      []
+    else
+      [
+        Supervisor.child_spec(
+          {Bandit, plug: Endpoint, scheme: :http, ip: {127, 0, 0, 1}, port: port},
+          id: __MODULE__.Loopback
+        )
+      ]
+    end
+  end
+
+  defp loopback_listener(_ip, _port), do: []
+
+  # Addresses whose listener already accepts IPv4 loopback (`127.0.0.1`) traffic.
+  defp covers_ipv4_loopback?({127, 0, 0, 1}), do: true
+  defp covers_ipv4_loopback?({0, 0, 0, 0}), do: true
+  defp covers_ipv4_loopback?({0, 0, 0, 0, 0, 0, 0, 0}), do: true
+  defp covers_ipv4_loopback?(_), do: false
 
   @spec bound_port(term()) :: non_neg_integer() | nil
   def bound_port(_server \\ __MODULE__) do

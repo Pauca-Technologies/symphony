@@ -1010,6 +1010,44 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, _reason} = HttpServer.start_link(host: "bad host", port: 0)
   end
 
+  test "http server also listens on loopback when bound to a non-loopback host" do
+    snapshot = static_snapshot()
+    orchestrator_name = Module.concat(__MODULE__, :LoopbackOrchestrator)
+
+    refresh = %{
+      queued: true,
+      coalesced: false,
+      requested_at: DateTime.utc_now(),
+      operations: ["poll"]
+    }
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh})
+
+    port = free_tcp_port()
+
+    server_opts = [
+      # 127.0.0.2 is a loopback alias that is NOT 127.0.0.1, so the primary
+      # listener alone would refuse `localhost`/`127.0.0.1` connections.
+      host: "127.0.0.2",
+      port: port,
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50
+    ]
+
+    start_supervised!({HttpServer, server_opts})
+
+    assert wait_for_bound_port() == port
+
+    # Reachable via the configured host...
+    primary = Req.get!("http://127.0.0.2:#{port}/api/v1/state")
+    assert primary.status == 200
+
+    # ...and always via loopback, thanks to the extra listener.
+    loopback = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
+    assert loopback.status == 200
+    assert loopback.body["counts"] == %{"running" => 1, "retrying" => 1}
+  end
+
   defp start_test_endpoint(overrides) do
     endpoint_config =
       :symphony_elixir
@@ -1113,6 +1151,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     HttpServer.bound_port()
+  end
+
+  defp free_tcp_port do
+    {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, reuseaddr: true)
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
   end
 
   defp assert_eventually(fun, attempts \\ 20)
