@@ -61,7 +61,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <p class="eyebrow">
                   Symphony Observability
                 </p>
-                <h1 class="hero-title">
+                <h1 class="hero-title hero-title-sm">
                   <%= @issue_identifier %>
                 </h1>
                 <p class="hero-copy">
@@ -92,14 +92,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <p class="eyebrow">
                   Symphony Observability
                 </p>
-                <h1 class="hero-title">
+                <h1 class="hero-title hero-title-sm">
                   <%= @issue_payload.title || @issue_payload.issue_identifier %>
                 </h1>
                 <p :if={@issue_payload.title} class="hero-subtitle mono">
                   <%= @issue_payload.issue_identifier %>
                 </p>
                 <p class="hero-copy">
-                  Live issue detail view with the latest reconstructed Codex transcript for this workspace.
+                  Live issue detail with the latest reconstructed agent transcript for this workspace.
                 </p>
               </div>
 
@@ -129,8 +129,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
             <article class="metric-card">
               <p class="metric-label">Session</p>
-              <p class="metric-value">
-                <%= @issue_payload.transcript.session_id || @issue_payload.running && @issue_payload.running.session_id || "n/a" %>
+              <p class="metric-value metric-value-id mono" title={issue_session_id(@issue_payload)}>
+                <%= issue_session_id(@issue_payload) %>
               </p>
               <p class="metric-detail">
                 Turns: <%= @issue_payload.running && @issue_payload.running.turn_count || 0 %>
@@ -139,8 +139,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
             <article class="metric-card">
               <p class="metric-label">Agent</p>
-              <p class="metric-value"><%= agent_backend_label(@issue_payload.agent.backend) %></p>
-              <p class="metric-detail mono">
+              <p class="metric-value metric-value-text"><%= agent_backend_label(@issue_payload.agent.backend) %></p>
+              <p class="metric-detail mono" title={@issue_payload.agent.model}>
                 <%= @issue_payload.agent.model || "model n/a" %>
               </p>
             </article>
@@ -184,17 +184,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </div>
             </div>
 
-            <div class="detail-stack">
+            <div class="field-list">
               <div>
-                <span class="muted event-meta">Workspace</span>
+                <span class="field-label">Workspace</span>
                 <pre class="code-panel"><%= @issue_payload.workspace.path || "n/a" %></pre>
               </div>
               <div>
-                <span class="muted event-meta">Worker host</span>
+                <span class="field-label">Worker host</span>
                 <pre class="code-panel"><%= @issue_payload.workspace.host || "local" %></pre>
               </div>
               <div :if={@issue_payload.last_error}>
-                <span class="muted event-meta">Latest retry error</span>
+                <span class="field-label">Latest retry error</span>
                 <pre class="code-panel"><%= @issue_payload.last_error %></pre>
               </div>
             </div>
@@ -203,9 +203,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <section class="section-card">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Codex Transcript</h2>
+                <h2 class="section-title">Transcript</h2>
                 <p class="section-copy">
-                  Reconstructed assistant text, commands, and command output from the latest session transcript.
+                  Reconstructed assistant text, reasoning, tool calls, and command output from the latest session.
                 </p>
               </div>
             </div>
@@ -320,7 +320,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <article class="metric-card">
               <p class="metric-label">Runtime</p>
               <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@dashboard_payload, @now)) %></p>
-              <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
+              <p class="metric-detail">Total agent runtime across completed and active sessions.</p>
             </article>
           </section>
 
@@ -385,7 +385,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <th>Session</th>
                       <th>Agent</th>
                       <th>Runtime / turns</th>
-                      <th>Codex update</th>
+                      <th>Last activity</th>
                       <th>Tokens</th>
                     </tr>
                   </thead>
@@ -583,6 +583,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp issue_started_at(%{running: %{started_at: started_at}}), do: started_at
   defp issue_started_at(_issue_payload), do: nil
+
+  defp issue_session_id(payload) do
+    payload.transcript.session_id || (payload.running && payload.running.session_id) || "n/a"
+  end
 
   defp issue_total_tokens(%{running: %{tokens: %{total_tokens: total_tokens}}}), do: format_int(total_tokens)
   defp issue_total_tokens(_issue_payload), do: "n/a"

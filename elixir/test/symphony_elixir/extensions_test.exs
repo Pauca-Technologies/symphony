@@ -743,7 +743,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Last activity"
     assert html =~ "Issue details"
     refute html =~ "mix test --cover"
     refute html =~ "Investigating the failure"
@@ -809,7 +809,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     {:ok, issue_view, issue_html} = live(build_conn(), "/issues/MT-HTTP")
-    assert issue_html =~ "Codex Transcript"
+    assert issue_html =~ ~r/<h2[^>]*>Transcript<\/h2>/
     assert issue_html =~ "Investigating the failure and updating the fix."
     assert issue_html =~ "<pre><code class=\"language-elixir\">assert {:ok, view} = live(conn, &quot;/&quot;)</code></pre>"
     assert issue_html =~ "<li>renders <code>code</code></li>"

@@ -526,6 +526,7 @@ defmodule SymphonyElixirWeb.Presenter do
     title = presence(Map.get(update, "title"))
 
     cond do
+      kind && title && String.downcase(kind) == String.downcase(title) -> title
       kind && title -> "#{kind}: #{title}"
       title -> title
       kind -> kind
