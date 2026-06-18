@@ -227,8 +227,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     # A session_started without a model must not clobber the configured one.
     send(
       pid,
-      {:codex_worker_update, issue_id,
-       %{event: :session_started, session_id: "acp-session-1", timestamp: DateTime.utc_now()}}
+      {:codex_worker_update, issue_id, %{event: :session_started, session_id: "acp-session-1", timestamp: DateTime.utc_now()}}
     )
 
     assert %{running: [snapshot_entry]} = GenServer.call(pid, :snapshot)
@@ -474,8 +473,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     send(
       pid,
-      {:codex_worker_update, issue_id,
-       acp_update.(%{"sessionUpdate" => "tool_call", "toolCallId" => "tc-1", "title" => "Update README", "kind" => "edit", "rawInput" => %{"path" => "README.md"}})}
+      {:codex_worker_update, issue_id, acp_update.(%{"sessionUpdate" => "tool_call", "toolCallId" => "tc-1", "title" => "Update README", "kind" => "edit", "rawInput" => %{"path" => "README.md"}})}
     )
 
     send(
@@ -496,6 +494,87 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     plan_block = Enum.find(blocks, &(&1.kind == "plan"))
     assert plan_block.text =~ "- [x] write tests"
     assert plan_block.text =~ "- [ ] ship it"
+  end
+
+  test "orchestrator renders codex item-lifecycle tool calls into transcript blocks" do
+    issue_id = "issue-codex-items"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "CDX-7",
+      title: "Codex item transcript",
+      description: "Render item/started + item/completed tool calls",
+      state: "In Progress",
+      url: "https://example.org/issues/CDX-7"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CodexItemTranscriptOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      codex_session_logs: [],
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(pid, {:codex_worker_update, issue_id, %{event: :session_started, session_id: "sess-cdx", timestamp: now}})
+
+    notification = fn payload ->
+      %{event: :notification, payload: payload, timestamp: now}
+    end
+
+    item = fn method, item_map ->
+      notification.(%{"method" => method, "params" => %{"item" => item_map}})
+    end
+
+    # commandExecution: the call header must precede its streamed output.
+    send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "c1", "type" => "commandExecution", "command" => "mix test"})})
+    send(pid, {:codex_worker_update, issue_id, notification.(%{"method" => "item/commandExecution/outputDelta", "params" => %{"itemId" => "c1", "delta" => "1 test, 0 failures"}})})
+    send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "f1", "type" => "fileChange", "changes" => [%{"path" => "lib/a.ex", "diff" => "@@\n+x"}]})})
+    send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "m1", "type" => "mcpToolCall", "server" => "sentry", "tool" => "get_issue", "arguments" => %{"id" => 7}})})
+    send(pid, {:codex_worker_update, issue_id, item.("item/completed", %{"id" => "m1", "type" => "mcpToolCall", "result" => %{"content" => [%{"type" => "text", "text" => "MCP-RESULT"}]}})})
+    # dynamicToolCall is dispatched via item/tool/call and must not double up.
+    send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "d1", "type" => "dynamicToolCall", "tool" => "linear_graphql"})})
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    blocks = snapshot_entry.recent_codex_transcript_blocks
+
+    command_block = Enum.find(blocks, &(&1.kind == "command"))
+    assert command_block.text == "$ mix test"
+    command_index = Enum.find_index(blocks, &(&1.kind == "command"))
+    output_index = Enum.find_index(blocks, &(&1.kind == "output" and &1.text =~ "1 test, 0 failures"))
+    assert command_index < output_index
+
+    file_block = Enum.find(blocks, &(&1.kind == "tool" and &1.title == "edit: a.ex"))
+    assert file_block.text =~ "+x"
+
+    mcp_call = Enum.find(blocks, &(&1.kind == "tool" and &1.title == "sentry: get_issue"))
+    assert mcp_call
+    assert Enum.any?(blocks, &(&1.kind == "output" and &1.text == "MCP-RESULT"))
+
+    refute Enum.any?(blocks, &(Map.get(&1, :title) == "linear_graphql"))
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
@@ -667,8 +746,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     # with no total — the total is synthesized from input + output.
     send(
       pid,
-      {:codex_worker_update, issue_id,
-       %{event: :notification, usage: %{"input_tokens" => 130, "output_tokens" => 35}, timestamp: now}}
+      {:codex_worker_update, issue_id, %{event: :notification, usage: %{"input_tokens" => 130, "output_tokens" => 35}, timestamp: now}}
     )
 
     snapshot = GenServer.call(pid, :snapshot)

@@ -419,6 +419,9 @@ defmodule SymphonyElixirWeb.Presenter do
       method == "item/tool/call" ->
         build_tool_fragment(at, payload, origin)
 
+      method in ["item/started", "item/completed"] ->
+        codex_item_fragments(method, at, payload, origin)
+
       method == "thread/compacted" ->
         build_compaction_fragment(at, payload, origin)
 
@@ -580,6 +583,145 @@ defmodule SymphonyElixirWeb.Presenter do
     {name, args_text} = extract_tool(payload)
     Map.merge(%{kind: "tool", at: at, title: name, text: normalize_transcript_text(args_text)}, origin)
   end
+
+  # Codex reports each tool call's lifecycle as an `item/started` then an
+  # `item/completed` notification. The streamed deltas handled above already
+  # cover the agent-message, reasoning and command *output* items, but the call
+  # itself — the command line, the file diff, the MCP/web-search/subagent
+  # invocation — only ever arrives inside these item events. Without rendering
+  # them the details page showed orphaned command output with no command above
+  # it, and surfaced no MCP/web/subagent tool calls at all. `dynamicToolCall` is
+  # intentionally skipped: it is the Symphony-provided tool the app-server
+  # dispatches via `item/tool/call`, already rendered by `build_tool_fragment/3`.
+  defp codex_item_fragments(method, at, payload, origin) do
+    with %{} = item <- map_value(payload, ["params", "item"]),
+         type when is_binary(type) <- Map.get(item, "type") do
+      codex_item_fragment(method, type, at, item, presence(Map.get(item, "id")), origin)
+    else
+      _ -> nil
+    end
+  end
+
+  defp codex_item_fragment("item/started", "commandExecution", at, item, _id, origin),
+    do: build_text_fragment("command", at, codex_command_text(item), origin)
+
+  defp codex_item_fragment("item/started", "fileChange", at, item, id, origin),
+    do: codex_item_tool_fragment(at, id, codex_file_change_title(item), codex_file_change_text(item), origin)
+
+  defp codex_item_fragment("item/started", "collabAgentToolCall", at, item, id, origin),
+    do: codex_item_tool_fragment(at, id, codex_collab_tool_title(item), codex_collab_tool_text(item), origin)
+
+  defp codex_item_fragment("item/started", "webSearch", at, item, id, origin),
+    do: codex_item_tool_fragment(at, id, "web_search", presence(Map.get(item, "query")), origin)
+
+  defp codex_item_fragment("item/started", "mcpToolCall", at, item, id, origin),
+    do: codex_item_tool_fragment(at, id, codex_mcp_tool_title(item), codex_mcp_args_text(item), origin)
+
+  # The MCP result only lands on `item/completed`; emit it as an output block
+  # keyed on the call id so it sits beside the tool block from `item/started`.
+  defp codex_item_fragment("item/completed", "mcpToolCall", at, item, id, origin),
+    do: codex_mcp_output_fragment(at, id, item, origin)
+
+  defp codex_item_fragment(_method, _type, _at, _item, _id, _origin), do: nil
+
+  defp codex_item_tool_fragment(at, id, title, text, origin) do
+    fragment = Map.merge(%{kind: "tool", at: at, title: title, text: normalize_transcript_text(text || "")}, origin)
+    if is_binary(id), do: Map.put(fragment, :tool_call_id, id), else: fragment
+  end
+
+  defp codex_command_text(item) do
+    case Map.get(item, "command") do
+      command when is_binary(command) -> "$ #{String.trim(command)}"
+      _ -> nil
+    end
+  end
+
+  defp codex_file_change_title(item) do
+    case codex_file_change_paths(item) do
+      [] -> "edit"
+      [path] -> "edit: #{Path.basename(path)}"
+      paths -> "edit: #{length(paths)} files"
+    end
+  end
+
+  defp codex_file_change_paths(item) do
+    item
+    |> Map.get("changes", [])
+    |> List.wrap()
+    |> Enum.map(&Map.get(&1, "path"))
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp codex_file_change_text(item) do
+    item
+    |> Map.get("changes", [])
+    |> List.wrap()
+    |> Enum.map(&codex_file_change_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
+    |> truncate_tool_text()
+  end
+
+  defp codex_file_change_entry(%{"path" => path} = change) when is_binary(path) do
+    case Map.get(change, "diff") do
+      diff when is_binary(diff) -> "#{path}\n#{diff}"
+      _ -> path
+    end
+  end
+
+  defp codex_file_change_entry(_change), do: nil
+
+  defp codex_collab_tool_title(item), do: presence(Map.get(item, "tool")) || "agent"
+
+  defp codex_collab_tool_text(item) do
+    case presence(Map.get(item, "prompt")) do
+      nil -> nil
+      prompt -> truncate_tool_text(prompt)
+    end
+  end
+
+  defp codex_mcp_tool_title(item) do
+    tool = presence(Map.get(item, "tool")) || "tool"
+
+    case presence(Map.get(item, "server")) do
+      nil -> tool
+      server -> "#{server}: #{tool}"
+    end
+  end
+
+  defp codex_mcp_args_text(item) do
+    case Map.get(item, "arguments") do
+      nil -> ""
+      arguments -> format_tool_arguments(arguments)
+    end
+  end
+
+  defp codex_mcp_output_fragment(at, id, item, origin) do
+    with text when is_binary(text) and text != "" <- codex_mcp_result_text(item),
+         fragment when is_map(fragment) <- build_text_fragment("output", at, truncate_tool_text(text), origin) do
+      if is_binary(id), do: Map.put(fragment, :tool_call_id, id), else: fragment
+    else
+      _ -> nil
+    end
+  end
+
+  defp codex_mcp_result_text(item) do
+    case codex_mcp_error_text(item) do
+      nil -> item |> Map.get("result") |> codex_mcp_content_text()
+      error -> "Error: #{error}"
+    end
+  end
+
+  defp codex_mcp_error_text(item) do
+    case Map.get(item, "error") do
+      error when is_binary(error) -> presence(error)
+      %{} = error -> presence(inspect(error))
+      _ -> nil
+    end
+  end
+
+  defp codex_mcp_content_text(%{"content" => content}), do: acp_content_text(content)
+  defp codex_mcp_content_text(_result), do: nil
 
   defp build_text_fragment(kind, at, text, origin) when is_binary(kind) and is_binary(text) do
     case normalize_transcript_text(text) do

@@ -717,6 +717,117 @@ defmodule SymphonyElixir.ExtensionsTest do
               }
             }
           }
+        },
+        # Codex item-lifecycle tool calls (item/started + item/completed). Before
+        # the fix only their streamed output rendered; the call header — the
+        # command line, the file diff, the MCP/subagent invocation — was dropped,
+        # leaving orphaned output. dynamicToolCall is excluded because it doubles
+        # the item/tool/call above (linear.get_issue).
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/started",
+            "params" => %{
+              "item" => %{
+                "id" => "call_cmd_codex",
+                "type" => "commandExecution",
+                "command" => "pnpm run codex-check",
+                "status" => "inProgress"
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/commandExecution/outputDelta",
+            "params" => %{"itemId" => "call_cmd_codex", "delta" => "CODEX-CMD-OUTPUT line\n"}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/started",
+            "params" => %{
+              "item" => %{
+                "id" => "call_file_codex",
+                "type" => "fileChange",
+                "changes" => [%{"path" => "lib/codex_edit.ex", "diff" => "@@ -1 +1 @@\n-old\n+CODEX-FILE-DIFF"}]
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/started",
+            "params" => %{
+              "item" => %{
+                "id" => "call_collab_codex",
+                "type" => "collabAgentToolCall",
+                "tool" => "spawnAgent",
+                "prompt" => "CODEX-COLLAB-PROMPT review the diff"
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/started",
+            "params" => %{
+              "item" => %{
+                "id" => "call_mcp_codex",
+                "type" => "mcpToolCall",
+                "server" => "sentry",
+                "tool" => "get_sentry_resource",
+                "arguments" => %{"url" => "https://sentry.example/issue/1"}
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/completed",
+            "params" => %{
+              "item" => %{
+                "id" => "call_mcp_codex",
+                "type" => "mcpToolCall",
+                "server" => "sentry",
+                "tool" => "get_sentry_resource",
+                "arguments" => %{"url" => "https://sentry.example/issue/1"},
+                "result" => %{"content" => [%{"type" => "text", "text" => "CODEX-MCP-RESULT body"}]},
+                "status" => "completed"
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/started",
+            "params" => %{
+              "item" => %{"id" => "call_dyn_codex", "type" => "dynamicToolCall", "tool" => "linear_graphql"}
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/completed",
+            "params" => %{
+              "item" => %{"id" => "call_dyn_codex", "type" => "dynamicToolCall", "tool" => "linear_graphql"}
+            }
+          }
         }
       ])
 
@@ -840,6 +951,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_html =~ "transcript-block-plan"
     assert issue_html =~ "draft the migration"
     assert issue_html =~ "run the suite"
+    # Codex item-lifecycle tool calls now surface the call, not just its output:
+    # the command header folds with its output, and file/MCP/subagent calls that
+    # previously rendered nothing now appear.
+    assert issue_html =~ "$ pnpm run codex-check"
+    assert issue_html =~ "CODEX-CMD-OUTPUT line"
+    assert issue_html =~ "edit: codex_edit.ex"
+    assert issue_html =~ "CODEX-FILE-DIFF"
+    assert issue_html =~ "spawnAgent"
+    assert issue_html =~ "CODEX-COLLAB-PROMPT review the diff"
+    assert issue_html =~ "sentry: get_sentry_resource"
+    assert issue_html =~ "CODEX-MCP-RESULT body"
+    # dynamicToolCall is the Symphony tool dispatched via item/tool/call
+    # (linear.get_issue, asserted above); its item/started + item/completed
+    # lifecycle must not render a duplicate tool block.
+    refute issue_html =~ "linear_graphql"
 
     updated_issue_snapshot =
       put_in(updated_snapshot.running, [

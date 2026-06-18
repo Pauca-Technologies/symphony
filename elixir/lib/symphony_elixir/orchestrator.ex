@@ -1650,6 +1650,9 @@ defmodule SymphonyElixir.Orchestrator do
       method == "item/tool/call" ->
         build_transcript_tool_block(timestamp, payload, origin)
 
+      method in ["item/started", "item/completed"] ->
+        codex_item_transcript_blocks(method, timestamp, payload, origin)
+
       method == "thread/compacted" ->
         build_transcript_compaction_block(timestamp, payload, origin)
 
@@ -1853,6 +1856,143 @@ defmodule SymphonyElixir.Orchestrator do
     {name, args_text} = extract_transcript_tool(payload)
     Map.merge(%{kind: "tool", at: iso8601(timestamp), title: name, text: normalize_transcript_text(args_text)}, origin)
   end
+
+  # Codex reports each tool call's lifecycle as an `item/started` then an
+  # `item/completed` notification. The streamed deltas handled by
+  # `text_block_spec/1` cover the agent-message, reasoning and command *output*
+  # items, but the call itself — the command line, the file diff, the
+  # MCP/web-search/subagent invocation — only ever arrives inside these item
+  # events. Mirror `Presenter.codex_item_fragments/4` so the live ring buffer and
+  # the persisted transcript render identically. `dynamicToolCall` is skipped: it
+  # is the Symphony-provided tool dispatched via `item/tool/call` and already
+  # rendered by `build_transcript_tool_block/3`.
+  defp codex_item_transcript_blocks(method, timestamp, payload, origin) do
+    with %{} = item <- string_path_value(payload, ["params", "item"]),
+         type when is_binary(type) <- Map.get(item, "type") do
+      codex_item_transcript_block(method, type, timestamp, item, presence(Map.get(item, "id")), origin)
+    else
+      _ -> nil
+    end
+  end
+
+  defp codex_item_transcript_block("item/started", "commandExecution", timestamp, item, _id, origin),
+    do: build_transcript_block("command", timestamp, codex_item_command_text(item), origin)
+
+  defp codex_item_transcript_block("item/started", "fileChange", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, codex_item_file_change_title(item), codex_item_file_change_text(item), origin)
+
+  defp codex_item_transcript_block("item/started", "collabAgentToolCall", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, codex_item_collab_title(item), codex_item_collab_text(item), origin)
+
+  defp codex_item_transcript_block("item/started", "webSearch", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, "web_search", presence(Map.get(item, "query")), origin)
+
+  defp codex_item_transcript_block("item/started", "mcpToolCall", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, codex_item_mcp_title(item), codex_item_mcp_args_text(item), origin)
+
+  defp codex_item_transcript_block("item/completed", "mcpToolCall", timestamp, item, id, origin),
+    do: codex_item_mcp_output_block(timestamp, id, item, origin)
+
+  defp codex_item_transcript_block(_method, _type, _timestamp, _item, _id, _origin), do: nil
+
+  defp codex_item_tool_block(timestamp, id, title, text, origin) do
+    block = Map.merge(%{kind: "tool", at: iso8601(timestamp), title: title, text: normalize_transcript_text(text || "")}, origin)
+    if is_binary(id), do: Map.put(block, :tool_call_id, id), else: block
+  end
+
+  defp codex_item_command_text(item) do
+    case Map.get(item, "command") do
+      command when is_binary(command) -> "$ #{String.trim(command)}"
+      _ -> nil
+    end
+  end
+
+  defp codex_item_file_change_title(item) do
+    case codex_item_file_change_paths(item) do
+      [] -> "edit"
+      [path] -> "edit: #{Path.basename(path)}"
+      paths -> "edit: #{length(paths)} files"
+    end
+  end
+
+  defp codex_item_file_change_paths(item) do
+    item
+    |> Map.get("changes", [])
+    |> List.wrap()
+    |> Enum.map(&Map.get(&1, "path"))
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp codex_item_file_change_text(item) do
+    item
+    |> Map.get("changes", [])
+    |> List.wrap()
+    |> Enum.map(&codex_item_file_change_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
+    |> truncate_tool_text()
+  end
+
+  defp codex_item_file_change_entry(%{"path" => path} = change) when is_binary(path) do
+    case Map.get(change, "diff") do
+      diff when is_binary(diff) -> "#{path}\n#{diff}"
+      _ -> path
+    end
+  end
+
+  defp codex_item_file_change_entry(_change), do: nil
+
+  defp codex_item_collab_title(item), do: presence(Map.get(item, "tool")) || "agent"
+
+  defp codex_item_collab_text(item) do
+    case presence(Map.get(item, "prompt")) do
+      nil -> nil
+      prompt -> truncate_tool_text(prompt)
+    end
+  end
+
+  defp codex_item_mcp_title(item) do
+    tool = presence(Map.get(item, "tool")) || "tool"
+
+    case presence(Map.get(item, "server")) do
+      nil -> tool
+      server -> "#{server}: #{tool}"
+    end
+  end
+
+  defp codex_item_mcp_args_text(item) do
+    case Map.get(item, "arguments") do
+      nil -> ""
+      arguments -> format_tool_arguments(arguments)
+    end
+  end
+
+  defp codex_item_mcp_output_block(timestamp, id, item, origin) do
+    with text when is_binary(text) and text != "" <- codex_item_mcp_result_text(item),
+         block when is_map(block) <- build_transcript_block("output", timestamp, truncate_tool_text(text), origin) do
+      if is_binary(id), do: Map.put(block, :tool_call_id, id), else: block
+    else
+      _ -> nil
+    end
+  end
+
+  defp codex_item_mcp_result_text(item) do
+    case codex_item_mcp_error_text(item) do
+      nil -> item |> Map.get("result") |> codex_item_mcp_content_text()
+      error -> "Error: #{error}"
+    end
+  end
+
+  defp codex_item_mcp_error_text(item) do
+    case Map.get(item, "error") do
+      error when is_binary(error) -> presence(error)
+      %{} = error -> presence(inspect(error))
+      _ -> nil
+    end
+  end
+
+  defp codex_item_mcp_content_text(%{"content" => content}), do: acp_content_text(content)
+  defp codex_item_mcp_content_text(_result), do: nil
 
   defp build_transcript_compaction_block(timestamp, payload, origin) do
     Map.merge(
