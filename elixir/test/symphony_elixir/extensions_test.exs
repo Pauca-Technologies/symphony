@@ -586,7 +586,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "event" => "notification",
           "payload" => %{
             "method" => "codex/event/agent_message_content_delta",
-            "params" => %{"msg" => %{"content" => "OLD-BEGINNING " <> String.duplicate("x", 2_000_000)}}
+            "params" => %{"msg" => %{"content" => "OLD-BEGINNING " <> String.duplicate("x", 1_200_000)}}
           }
         },
         %{
@@ -820,7 +820,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_html =~ "Compaction"
     assert issue_html =~ "Context compacted for turn turn-htt"
     assert issue_html =~ "transcript-block-compaction"
-    refute issue_html =~ "OLD-BEGINNING"
+    # The full persisted history is shown — even the very first entry, which sits
+    # well past the former 1 MB tail-read window, must still render.
+    assert issue_html =~ "OLD-BEGINNING"
     refute issue_html =~ "agent message content streaming: structured update"
     refute issue_html =~ "<script>alert(1)</script>"
     assert issue_html =~ "Wire up the HTTP server"

@@ -15,6 +15,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:dashboard_payload, %{})
       |> assign(:issue_payload, nil)
       |> assign(:issue_identifier, nil)
+      |> assign(:transcript_cache, %{})
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
@@ -526,21 +527,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
     |> assign(:dashboard_payload, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
     |> assign(:issue_payload, nil)
     |> assign(:issue_identifier, nil)
+    |> assign(:transcript_cache, %{})
   end
 
   defp load_issue_page(socket, issue_identifier) when is_binary(issue_identifier) do
-    issue_payload =
-      case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
-        {:ok, payload} ->
-          payload
+    transcript_cache = socket.assigns[:transcript_cache] || %{}
+
+    {issue_payload, transcript_cache} =
+      case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms(), transcript_cache) do
+        {:ok, payload, new_cache} ->
+          {payload, new_cache}
 
         {:error, :issue_not_found} ->
-          %{error: %{code: "issue_not_found", message: "Issue not found"}}
+          {%{error: %{code: "issue_not_found", message: "Issue not found"}}, %{}}
       end
 
     socket
     |> assign(:issue_payload, issue_payload)
     |> assign(:issue_identifier, issue_identifier)
+    |> assign(:transcript_cache, transcript_cache)
   end
 
   defp reload_current_page(%{assigns: %{live_action: :issue, issue_identifier: issue_identifier}} = socket)
