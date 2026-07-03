@@ -319,6 +319,99 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
   end
 
+  test "linear adapter add_label reuses an existing label id" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "team" => %{"id" => "team-1", "labels" => %{"nodes" => [%{"id" => "label-1"}]}}
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueAddLabel" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.add_label("issue-1", "symphony:routing-warned")
+
+    assert_receive {:graphql_called, lookup_query, %{issueId: "issue-1", labelName: "symphony:routing-warned"}}
+    assert lookup_query =~ "labels(filter"
+
+    assert_receive {:graphql_called, add_query, %{issueId: "issue-1", labelId: "label-1"}}
+    assert add_query =~ "issueAddLabel"
+
+    # No create mutation is issued when the label already exists (the create
+    # mutation is the only call carrying `name`/`teamId` variables).
+    refute_received {:graphql_called, _create_query, %{name: _, teamId: _}}
+  end
+
+  test "linear adapter add_label creates the label when it is missing" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{"team" => %{"id" => "team-1", "labels" => %{"nodes" => []}}}
+           }
+         }},
+        {:ok,
+         %{
+           "data" => %{
+             "issueLabelCreate" => %{"success" => true, "issueLabel" => %{"id" => "label-new"}}
+           }
+         }},
+        {:ok, %{"data" => %{"issueAddLabel" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.add_label("issue-1", "symphony:routing-warned")
+
+    assert_receive {:graphql_called, _lookup_query, %{issueId: "issue-1", labelName: "symphony:routing-warned"}}
+
+    assert_receive {:graphql_called, create_query,
+                    %{name: "symphony:routing-warned", teamId: "team-1"}}
+
+    assert create_query =~ "issueLabelCreate"
+
+    assert_receive {:graphql_called, _add_query, %{issueId: "issue-1", labelId: "label-new"}}
+  end
+
+  test "linear adapter add_label surfaces missing team and create failures" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    # No team id and no matching label -> cannot resolve or create.
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"issue" => %{"team" => %{"labels" => %{"nodes" => []}}}}}}
+    )
+
+    assert {:error, :label_missing} = Adapter.add_label("issue-1", "symphony:routing-warned")
+
+    # Team present, label missing, but the create mutation returns no id.
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{"team" => %{"id" => "team-1", "labels" => %{"nodes" => []}}}
+           }
+         }},
+        {:ok, %{"data" => %{"issueLabelCreate" => %{"success" => false}}}}
+      ]
+    )
+
+    assert {:error, :label_create_failed} = Adapter.add_label("issue-1", "symphony:routing-warned")
+  end
+
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)

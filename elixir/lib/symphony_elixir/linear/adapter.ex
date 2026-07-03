@@ -41,11 +41,23 @@ defmodule SymphonyElixir.Linear.Adapter do
   query SymphonyResolveLabelId($issueId: String!, $labelName: String!) {
     issue(id: $issueId) {
       team {
+        id
         labels(filter: {name: {eq: $labelName}}, first: 1) {
           nodes {
             id
           }
         }
+      }
+    }
+  }
+  """
+
+  @create_label_mutation """
+  mutation SymphonyCreateLabel($name: String!, $teamId: String!) {
+    issueLabelCreate(input: {name: $name, teamId: $teamId}) {
+      success
+      issueLabel {
+        id
       }
     }
   }
@@ -102,7 +114,7 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec add_label(String.t(), String.t()) :: :ok | {:error, :label_missing} | {:error, term()}
   def add_label(issue_id, label_name)
       when is_binary(issue_id) and is_binary(label_name) do
-    case resolve_label_id(issue_id, label_name) do
+    case ensure_label_id(issue_id, label_name) do
       {:ok, label_id} ->
         with {:ok, response} <-
                client_module().graphql(@add_label_mutation, %{issueId: issue_id, labelId: label_id}),
@@ -114,9 +126,6 @@ defmodule SymphonyElixir.Linear.Adapter do
           _ -> {:error, :add_label_failed}
         end
 
-      {:error, :label_missing} ->
-        {:error, :label_missing}
-
       {:error, reason} ->
         {:error, reason}
     end
@@ -126,15 +135,38 @@ defmodule SymphonyElixir.Linear.Adapter do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end
 
-  defp resolve_label_id(issue_id, label_name) do
+  # Resolve the id of `label_name` on the issue's team, creating the label
+  # when it does not yet exist. Symphony's marker labels (e.g.
+  # `symphony:routing-warned`) are not seeded in the workspace, so a plain
+  # lookup returns `:label_missing` and the best-effort `add_label` call at
+  # the call site silently no-ops — leaving no idempotency marker and causing
+  # warning comments to be re-posted on every poll. Creating the label on
+  # first use makes the marker actually land so the warning fires once.
+  defp ensure_label_id(issue_id, label_name) do
     with {:ok, response} <-
-           client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}),
+           client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}) do
+      case get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
+        label_id when is_binary(label_id) ->
+          {:ok, label_id}
+
+        _ ->
+          case get_in(response, ["data", "issue", "team", "id"]) do
+            team_id when is_binary(team_id) -> create_label(team_id, label_name)
+            _ -> {:error, :label_missing}
+          end
+      end
+    end
+  end
+
+  defp create_label(team_id, label_name) do
+    with {:ok, response} <-
+           client_module().graphql(@create_label_mutation, %{name: label_name, teamId: team_id}),
          label_id when is_binary(label_id) <-
-           get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
+           get_in(response, ["data", "issueLabelCreate", "issueLabel", "id"]) do
       {:ok, label_id}
     else
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :label_missing}
+      _ -> {:error, :label_create_failed}
     end
   end
 
