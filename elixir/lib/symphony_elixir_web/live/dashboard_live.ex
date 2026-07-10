@@ -697,21 +697,101 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp transcript_blocks(%{blocks: blocks}) when is_list(blocks), do: blocks
   defp transcript_blocks(_transcript), do: []
 
-  # Fold each command together with the output it produced into a single
-  # collapsible: the command line becomes the always-visible summary and its
-  # output becomes the collapsed body. This way the summary shows *what ran*,
-  # not just a slice of its output.
-  defp display_transcript_blocks(blocks) when is_list(blocks), do: fold_command_blocks(blocks, [])
+  # Fold command/tool output into the activity that produced it. Native Codex
+  # streams can interleave a long-running command's output with agent messages,
+  # so adjacency is not a reliable association; item/tool ids are. The legacy
+  # adjacent fallback keeps older logs without ids readable.
+  defp display_transcript_blocks(blocks) when is_list(blocks) do
+    output_by_key =
+      Enum.reduce(blocks, %{}, fn
+        %{kind: "output"} = output, acc ->
+          case transcript_activity_key(output) do
+            nil -> acc
+            key -> Map.put(acc, key, output)
+          end
 
-  defp fold_command_blocks([], acc), do: Enum.reverse(acc)
+        _block, acc ->
+          acc
+      end)
 
-  defp fold_command_blocks([%{kind: "command"} = command | rest], acc) do
-    {output_text, remaining} = collect_command_output(rest, [])
-    folded = command |> Map.put(:title, command.text) |> Map.put(:text, output_text)
-    fold_command_blocks(remaining, [folded | acc])
+    activity_keys =
+      blocks
+      |> Enum.filter(&(Map.get(&1, :kind) in ["command", "tool"]))
+      |> Enum.map(&transcript_activity_key/1)
+      |> Enum.reject(&is_nil/1)
+      |> MapSet.new()
+
+    fold_activity_blocks(blocks, output_by_key, activity_keys, [])
   end
 
-  defp fold_command_blocks([block | rest], acc), do: fold_command_blocks(rest, [block | acc])
+  defp fold_activity_blocks([], _output_by_key, _activity_keys, acc), do: Enum.reverse(acc)
+
+  defp fold_activity_blocks(
+         [%{kind: "command"} = command | rest],
+         output_by_key,
+         activity_keys,
+         acc
+       ) do
+    case transcript_activity_key(command) do
+      nil ->
+        {output_text, remaining} = collect_command_output(rest, [])
+        folded = command |> Map.put(:title, command.text) |> Map.put(:text, output_text)
+        fold_activity_blocks(remaining, output_by_key, activity_keys, [folded | acc])
+
+      key ->
+        output_text = output_by_key |> Map.get(key, %{}) |> Map.get(:text, "")
+        folded = command |> Map.put(:title, command.text) |> Map.put(:text, output_text)
+        fold_activity_blocks(rest, output_by_key, activity_keys, [folded | acc])
+    end
+  end
+
+  defp fold_activity_blocks(
+         [%{kind: "tool"} = tool | rest],
+         output_by_key,
+         activity_keys,
+         acc
+       ) do
+    output = Map.get(output_by_key, transcript_activity_key(tool))
+    fold_activity_blocks(rest, output_by_key, activity_keys, [fold_tool_output(tool, output) | acc])
+  end
+
+  defp fold_activity_blocks(
+         [%{kind: "output"} = output | rest],
+         output_by_key,
+         activity_keys,
+         acc
+       ) do
+    if MapSet.member?(activity_keys, transcript_activity_key(output)) do
+      fold_activity_blocks(rest, output_by_key, activity_keys, acc)
+    else
+      fold_activity_blocks(rest, output_by_key, activity_keys, [output | acc])
+    end
+  end
+
+  defp fold_activity_blocks([block | rest], output_by_key, activity_keys, acc),
+    do: fold_activity_blocks(rest, output_by_key, activity_keys, [block | acc])
+
+  defp fold_tool_output(tool, nil), do: tool
+
+  defp fold_tool_output(tool, %{text: output_text}) do
+    text =
+      [
+        if(tool.text == "", do: nil, else: "Arguments:\n#{tool.text}"),
+        if(output_text == "", do: nil, else: "Output:\n#{output_text}")
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\n\n")
+
+    Map.put(tool, :text, text)
+  end
+
+  defp transcript_activity_key(%{item_id: id} = block) when is_binary(id),
+    do: {:item, Map.get(block, :thread_id), id}
+
+  defp transcript_activity_key(%{tool_call_id: id} = block) when is_binary(id),
+    do: {:tool, Map.get(block, :thread_id), id}
+
+  defp transcript_activity_key(_block), do: nil
 
   defp collect_command_output([%{kind: "output", text: text} | rest], acc),
     do: collect_command_output(rest, [text | acc])

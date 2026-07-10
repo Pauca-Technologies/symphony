@@ -376,8 +376,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_receive {:graphql_called, _lookup_query, %{issueId: "issue-1", labelName: "symphony:routing-warned"}}
 
-    assert_receive {:graphql_called, create_query,
-                    %{name: "symphony:routing-warned", teamId: "team-1"}}
+    assert_receive {:graphql_called, create_query, %{name: "symphony:routing-warned", teamId: "team-1"}}
 
     assert create_query =~ "issueLabelCreate"
 
@@ -730,6 +729,151 @@ defmodule SymphonyElixir.ExtensionsTest do
             "params" => %{"msg" => %{"content" => "Compiling 3 files\\n"}}
           }
         },
+        # Native Codex item streams can interleave while a command remains in
+        # flight. These deltas are one logical agent message and one logical
+        # command output, not a new transcript card per alternating fragment.
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/started",
+            "params" => %{
+              "item" => %{
+                "id" => "cmd-interleaved",
+                "type" => "commandExecution",
+                "command" => "mix test interleaved"
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/commandExecution/outputDelta",
+            "params" => %{"itemId" => "cmd-interleaved", "delta" => "alpha"}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/started",
+            "params" => %{
+              "item" => %{
+                "id" => "agent-interleaved",
+                "type" => "agentMessage",
+                "phase" => "commentary"
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/agentMessage/delta",
+            "params" => %{"itemId" => "agent-interleaved", "delta" => "The changed-s"}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/commandExecution/outputDelta",
+            "params" => %{"itemId" => "cmd-interleaved", "delta" => "beta"}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/agentMessage/delta",
+            "params" => %{"itemId" => "agent-interleaved", "delta" => "cope suite."}
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/completed",
+            "params" => %{
+              "item" => %{
+                "id" => "agent-interleaved",
+                "type" => "agentMessage",
+                "phase" => "commentary",
+                "text" => "The changed-scope suite is green."
+              }
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "item/completed",
+            "params" => %{
+              "item" => %{
+                "id" => "cmd-interleaved",
+                "type" => "commandExecution",
+                "command" => "mix test interleaved",
+                "aggregatedOutput" => "canonical interleaved output"
+              }
+            }
+          }
+        },
+        # Legacy codex/event wrappers use ids nested under `params.msg` and can
+        # interleave in exactly the same way as native v2 item notifications.
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/exec_command_begin",
+            "params" => %{
+              "msg" => %{"call_id" => "legacy-command", "command" => "mix test legacy"}
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/exec_command_output_delta",
+            "params" => %{
+              "msg" => %{"call_id" => "legacy-command", "content" => "legacy-left"}
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/agent_message_content_delta",
+            "params" => %{
+              "msg" => %{"item_id" => "legacy-agent", "content" => "Legacy coherent"}
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/exec_command_output_delta",
+            "params" => %{
+              "msg" => %{"call_id" => "legacy-command", "content" => "-right"}
+            }
+          }
+        },
+        %{
+          "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+          "event" => "notification",
+          "payload" => %{
+            "method" => "codex/event/agent_message_content_delta",
+            "params" => %{
+              "msg" => %{"item_id" => "legacy-agent", "content" => " message."}
+            }
+          }
+        },
         %{
           "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
           "event" => "tool_call_completed",
@@ -1060,6 +1204,53 @@ defmodule SymphonyElixir.ExtensionsTest do
     # lifecycle must not render a duplicate tool block.
     refute issue_html =~ "linear_graphql"
 
+    {:ok, reconstructed} =
+      SymphonyElixirWeb.Presenter.issue_payload("MT-HTTP", orchestrator_name, 5_000)
+
+    assert [interleaved_agent] =
+             Enum.filter(
+               reconstructed.transcript.blocks,
+               &(Map.get(&1, :item_id) == "agent-interleaved" and &1.kind == "agent")
+             )
+
+    assert interleaved_agent.text == "The changed-scope suite is green."
+    refute Map.has_key?(interleaved_agent, :replace_item_text)
+
+    assert [interleaved_output] =
+             Enum.filter(
+               reconstructed.transcript.blocks,
+               &(Map.get(&1, :item_id) == "cmd-interleaved" and &1.kind == "output")
+             )
+
+    assert interleaved_output.text == "canonical interleaved output"
+
+    assert [legacy_agent] =
+             Enum.filter(
+               reconstructed.transcript.blocks,
+               &(Map.get(&1, :item_id) == "legacy-agent" and &1.kind == "agent")
+             )
+
+    assert legacy_agent.text == "Legacy coherent message."
+
+    assert [legacy_output] =
+             Enum.filter(
+               reconstructed.transcript.blocks,
+               &(Map.get(&1, :item_id) == "legacy-command" and &1.kind == "output")
+             )
+
+    assert legacy_output.text == "legacy-left-right"
+    assert issue_html =~ "The changed-scope suite is green."
+    assert issue_html =~ "$ mix test interleaved"
+    assert issue_html =~ "canonical interleaved output"
+    assert issue_html =~ "Legacy coherent message."
+    assert issue_html =~ "$ mix test legacy"
+    assert issue_html =~ "legacy-left-right"
+    assert issue_html =~ "Arguments:"
+    assert issue_html =~ "Output:"
+    # Every output in this fixture belongs to a command/tool and is folded into
+    # that activity; no stream fragment leaks into a standalone Output card.
+    refute issue_html =~ "transcript-block-output"
+
     updated_issue_snapshot =
       put_in(updated_snapshot.running, [
         %{List.first(updated_snapshot.running) | last_codex_timestamp: DateTime.utc_now()}
@@ -1091,6 +1282,50 @@ defmodule SymphonyElixir.ExtensionsTest do
           "Subagent exploring the codebase",
           subagent_thread,
           "33333333-3333-3333-3333-333333333333"
+        ),
+        codex_item_record(
+          session_id,
+          "item/started",
+          parent_thread,
+          %{
+            "id" => "shared-call-id",
+            "type" => "mcpToolCall",
+            "server" => "parent",
+            "tool" => "lookup",
+            "arguments" => %{"scope" => "main"}
+          }
+        ),
+        codex_item_record(
+          session_id,
+          "item/started",
+          subagent_thread,
+          %{
+            "id" => "shared-call-id",
+            "type" => "mcpToolCall",
+            "server" => "child",
+            "tool" => "lookup",
+            "arguments" => %{"scope" => "subagent"}
+          }
+        ),
+        codex_item_record(
+          session_id,
+          "item/completed",
+          parent_thread,
+          %{
+            "id" => "shared-call-id",
+            "type" => "mcpToolCall",
+            "result" => %{"content" => [%{"type" => "text", "text" => "parent result"}]}
+          }
+        ),
+        codex_item_record(
+          session_id,
+          "item/completed",
+          subagent_thread,
+          %{
+            "id" => "shared-call-id",
+            "type" => "mcpToolCall",
+            "result" => %{"content" => [%{"type" => "text", "text" => "subagent result"}]}
+          }
         )
       ])
 
@@ -1147,12 +1382,32 @@ defmodule SymphonyElixir.ExtensionsTest do
     # Distinct threads must not be merged into a single agent block.
     assert Enum.count(blocks, &(&1.kind == "agent")) == 2
 
+    shared_tools =
+      Enum.filter(
+        blocks,
+        &(Map.get(&1, :tool_call_id) == "shared-call-id" and &1.kind == "tool")
+      )
+
+    assert Enum.sort(Enum.map(shared_tools, & &1.title)) == ["child: lookup", "parent: lookup"]
+
+    shared_outputs =
+      Enum.filter(
+        blocks,
+        &(Map.get(&1, :tool_call_id) == "shared-call-id" and &1.kind == "output")
+      )
+
+    assert Enum.sort(Enum.map(shared_outputs, & &1.text)) == ["parent result", "subagent result"]
+
     # The rendered issue page flags the subagent block.
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 5_000)
     {:ok, _view, issue_html} = live(build_conn(), "/issues/SUB-1")
     assert issue_html =~ "transcript-block-subagent"
     assert issue_html =~ "Subagent"
     assert issue_html =~ "Subagent exploring the codebase"
+    assert issue_html =~ "parent: lookup"
+    assert issue_html =~ "child: lookup"
+    assert issue_html =~ "parent result"
+    assert issue_html =~ "subagent result"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -1345,6 +1600,22 @@ defmodule SymphonyElixir.ExtensionsTest do
       "payload" => %{
         "method" => "item/agentMessage/delta",
         "params" => %{"delta" => delta, "threadId" => thread_id, "turnId" => turn_id}
+      }
+    }
+  end
+
+  defp codex_item_record(session_id, method, thread_id, item) do
+    %{
+      "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      "event" => "notification",
+      "session_id" => session_id,
+      "payload" => %{
+        "method" => method,
+        "params" => %{
+          "item" => item,
+          "threadId" => thread_id,
+          "turnId" => "44444444-4444-4444-4444-444444444444"
+        }
       }
     }
   end

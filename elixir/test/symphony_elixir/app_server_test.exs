@@ -76,7 +76,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server passes explicit turn sandbox policies through unchanged" do
+  test "app server retains its resolved model and passes explicit turn sandbox policies through unchanged" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -115,7 +115,7 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"},"model":"gpt-5.6-sol"}}'
             ;;
           3)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001"}}}'
@@ -159,7 +159,18 @@ defmodule SymphonyElixir.AppServerTest do
           codex_turn_sandbox_policy: configured_policy
         )
 
-        assert {:ok, _result} = AppServer.run(workspace, "Validate supported turn policy", issue)
+        test_pid = self()
+        on_message = fn message -> send(test_pid, {:codex_message, message}) end
+
+        assert {:ok, _result} =
+                 AppServer.run(workspace, "Validate supported turn policy", issue, on_message: on_message)
+
+        assert_receive {:codex_message,
+                        %{
+                          event: :session_started,
+                          session_id: "thread-1001-turn-1001",
+                          model: "gpt-5.6-sol"
+                        }}
 
         trace = File.read!(trace_file)
         lines = String.split(trace, "\n", trim: true)

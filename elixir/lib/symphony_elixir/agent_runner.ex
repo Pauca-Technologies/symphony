@@ -281,12 +281,11 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  # Report the *actual* backend (the resolved module the session runs on) and the
-  # model passed to it, so the dashboard shows what is really running rather than
-  # re-deriving it from the issue's labels. The model from the session map is the
-  # config/override value actually handed to the agent process; backends that
-  # report their real model on the wire (e.g. Claude Code's `system/init`) refine
-  # it later via the `:session_started` event.
+  # Report the *actual* backend (the resolved module the session runs on) and
+  # model, so the dashboard shows what is really running rather than re-deriving
+  # it from the issue's labels. The session holds Codex's resolved model or the
+  # config/override value handed to ACP/Claude Code; backends that report their
+  # real model later on the wire refine it via the `:session_started` event.
   defp send_agent_backend_info(recipient, %Issue{id: issue_id}, backend, session)
        when is_binary(issue_id) and is_pid(recipient) do
     send(
@@ -304,7 +303,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_agent_backend_info(_recipient, _issue, _backend, _session), do: :ok
 
   defp agent_session_model(session) when is_map(session) do
-    model = get_in(session, [:claude_code, :model]) || get_in(session, [:acp, :model])
+    model =
+      Map.get(session, :model) ||
+        get_in(session, [:claude_code, :model]) ||
+        get_in(session, [:acp, :model])
 
     if is_binary(model) and String.trim(model) != "", do: model
   end

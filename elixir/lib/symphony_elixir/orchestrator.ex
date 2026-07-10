@@ -1731,6 +1731,14 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.take(-@recent_codex_transcript_blocks_limit)
   end
 
+  defp append_recent_codex_transcript_block(blocks, %{kind: kind, item_id: id} = block)
+       when is_list(blocks) and is_binary(id) and
+              kind in ["agent", "command", "output", "reasoning"] do
+    blocks
+    |> upsert_item_transcript_block(kind, id, block)
+    |> Enum.take(-@recent_codex_transcript_blocks_limit)
+  end
+
   defp append_recent_codex_transcript_block(blocks, %{kind: kind, text: text} = block)
        when is_list(blocks) and is_binary(kind) and is_binary(text) do
     thread_id = Map.get(block, :thread_id)
@@ -1751,22 +1759,62 @@ defmodule SymphonyElixir.Orchestrator do
   defp append_recent_codex_transcript_block(_blocks, block) when is_map(block), do: [block]
 
   defp upsert_keyed_transcript_block(blocks, kind, id, block) do
-    if Enum.any?(blocks, &keyed_transcript_block?(&1, kind, id)) do
+    if Enum.any?(blocks, &keyed_transcript_block?(&1, kind, id, block.thread_id)) do
       # Only the text changes between updates; the title/kind/timestamp are set
       # once (by the initial `tool_call`) and kept — a later update that omits
       # the title must not overwrite it with a generic placeholder.
-      Enum.map(blocks, &refresh_keyed_block(&1, kind, id, block.text))
+      Enum.map(blocks, &refresh_keyed_block(&1, kind, id, block.thread_id, block.text))
     else
       blocks ++ [block]
     end
   end
 
-  defp refresh_keyed_block(block, kind, id, text) do
-    if keyed_transcript_block?(block, kind, id), do: %{block | text: text}, else: block
+  defp refresh_keyed_block(block, kind, id, thread_id, text) do
+    if keyed_transcript_block?(block, kind, id, thread_id),
+      do: %{block | text: text},
+      else: block
   end
 
-  defp keyed_transcript_block?(%{kind: kind, tool_call_id: id}, kind, id), do: true
-  defp keyed_transcript_block?(_block, _kind, _id), do: false
+  defp keyed_transcript_block?(
+         %{kind: kind, tool_call_id: id, thread_id: thread_id},
+         kind,
+         id,
+         thread_id
+       ),
+       do: true
+
+  defp keyed_transcript_block?(_block, _kind, _id, _thread_id), do: false
+
+  defp upsert_item_transcript_block(blocks, kind, id, block) do
+    if Enum.any?(blocks, &item_transcript_block?(&1, kind, id, block.thread_id)) do
+      Enum.map(blocks, &merge_item_transcript_block(&1, block))
+    else
+      blocks ++ [Map.delete(block, :replace_item_text)]
+    end
+  end
+
+  defp merge_item_transcript_block(existing, %{kind: kind, item_id: id} = incoming) do
+    if item_transcript_block?(existing, kind, id, incoming.thread_id) do
+      text =
+        if Map.get(incoming, :replace_item_text),
+          do: incoming.text,
+          else: existing.text <> incoming.text
+
+      %{existing | text: text}
+    else
+      existing
+    end
+  end
+
+  defp item_transcript_block?(
+         %{kind: kind, item_id: id, thread_id: thread_id},
+         kind,
+         id,
+         thread_id
+       ),
+       do: true
+
+  defp item_transcript_block?(_block, _kind, _id, _thread_id), do: false
 
   defp transcript_block_for_update(%{payload: %{} = payload, timestamp: timestamp}, parent_thread_id) do
     method = Map.get(payload, "method") || Map.get(payload, :method)
@@ -1775,10 +1823,16 @@ defmodule SymphonyElixir.Orchestrator do
     cond do
       spec = text_block_spec(method) ->
         {kind, paths} = spec
-        build_transcript_block(kind, timestamp, extract_transcript_text(payload, paths), origin)
+        build_streamed_transcript_block(kind, timestamp, payload, paths, origin)
 
       method == "codex/event/exec_command_begin" ->
-        build_transcript_block("command", timestamp, extract_transcript_command(payload), origin)
+        build_streamed_transcript_block(
+          "command",
+          timestamp,
+          payload,
+          extract_transcript_command(payload),
+          origin
+        )
 
       method == "item/tool/call" ->
         build_transcript_tool_block(timestamp, payload, origin)
@@ -1976,6 +2030,53 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp presence(_value), do: nil
 
+  defp build_streamed_transcript_block(kind, timestamp, payload, paths, origin)
+       when is_list(paths) do
+    build_streamed_transcript_block(
+      kind,
+      timestamp,
+      payload,
+      extract_transcript_text(payload, paths),
+      origin
+    )
+  end
+
+  defp build_streamed_transcript_block(kind, timestamp, payload, text, origin) do
+    build_item_transcript_block(kind, timestamp, text, codex_item_id(payload), origin)
+  end
+
+  defp build_item_transcript_block(kind, timestamp, text, item_id, origin) do
+    case build_transcript_block(kind, timestamp, text, origin) do
+      nil -> nil
+      block when is_binary(item_id) -> Map.put(block, :item_id, item_id)
+      block -> block
+    end
+  end
+
+  defp build_completed_item_transcript_block(kind, timestamp, text, item_id, origin) do
+    case build_item_transcript_block(kind, timestamp, text, item_id, origin) do
+      %{item_id: _item_id} = block -> Map.put(block, :replace_item_text, true)
+      block -> block
+    end
+  end
+
+  defp codex_item_id(payload) when is_map(payload) do
+    [
+      ["params", "itemId"],
+      ["params", "item_id"],
+      ["params", "callId"],
+      ["params", "call_id"],
+      ["params", "item", "id"],
+      ["params", "msg", "itemId"],
+      ["params", "msg", "item_id"],
+      ["params", "msg", "callId"],
+      ["params", "msg", "call_id"],
+      ["params", "msg", "id"],
+      ["params", "id"]
+    ]
+    |> Enum.find_value(fn path -> presence(string_path_value(payload, path)) end)
+  end
+
   defp build_transcript_block(kind, timestamp, text, origin) when is_binary(kind) and is_binary(text) do
     case normalize_transcript_text(text) do
       "" -> nil
@@ -2008,8 +2109,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp codex_item_transcript_block("item/started", "commandExecution", timestamp, item, _id, origin),
-    do: build_transcript_block("command", timestamp, codex_item_command_text(item), origin)
+  defp codex_item_transcript_block("item/started", "commandExecution", timestamp, item, id, origin),
+    do: build_item_transcript_block("command", timestamp, codex_item_command_text(item), id, origin)
 
   defp codex_item_transcript_block("item/started", "fileChange", timestamp, item, id, origin),
     do: codex_item_tool_block(timestamp, id, codex_item_file_change_title(item), codex_item_file_change_text(item), origin)
@@ -2025,6 +2126,36 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_item_transcript_block("item/completed", "mcpToolCall", timestamp, item, id, origin),
     do: codex_item_mcp_output_block(timestamp, id, item, origin)
+
+  defp codex_item_transcript_block("item/completed", "agentMessage", timestamp, item, id, origin),
+    do:
+      build_completed_item_transcript_block(
+        "agent",
+        timestamp,
+        Map.get(item, "text"),
+        id,
+        origin
+      )
+
+  defp codex_item_transcript_block("item/completed", "commandExecution", timestamp, item, id, origin) do
+    [
+      build_completed_item_transcript_block(
+        "command",
+        timestamp,
+        codex_item_command_text(item),
+        id,
+        origin
+      ),
+      build_completed_item_transcript_block(
+        "output",
+        timestamp,
+        Map.get(item, "aggregatedOutput"),
+        id,
+        origin
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
 
   defp codex_item_transcript_block(_method, _type, _timestamp, _item, _id, _origin), do: nil
 

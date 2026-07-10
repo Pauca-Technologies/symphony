@@ -170,9 +170,9 @@ Notes:
   The observability dashboard surfaces the **actual** backend and model each run is using — an
   "Agent" column in the running-issues list and an "Agent" card on the issue detail page — taken from
   the resolved backend module and the model handed to (or reported by) the running agent, not
-  re-derived from the issue's labels. The model is the live one where the agent reports it (Claude
-  Code's `system/init`) and the configured/override value otherwise; Codex shows no model (it picks
-  its own).
+  re-derived from the issue's labels. The model is the live resolved one where the agent reports it
+  (Codex's `thread/start` response and Claude Code's `system/init`) and the configured/override value
+  otherwise.
 - **Label groups.** A Linear label nested in a label *group* (e.g. the leaf `opencode:kimi2.7` under
   group `agent`) is flattened to `<group>:<leaf>` (`agent:opencode:kimi2.7`) before matching — Symphony
   fetches the label's `parent` and joins them. So `label_presets` and repo-routing labels are written

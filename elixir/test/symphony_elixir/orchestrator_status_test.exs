@@ -548,12 +548,72 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       notification.(%{"method" => method, "params" => %{"item" => item_map}})
     end
 
-    # commandExecution: the call header must precede its streamed output.
+    threaded_item = fn method, thread_id, item_map ->
+      notification.(%{
+        "method" => method,
+        "params" => %{"threadId" => thread_id, "item" => item_map}
+      })
+    end
+
+    # A long-running command can keep streaming output while an agent message is
+    # emitted. Group both streams by item id rather than splitting on every
+    # interleave (the exact shape seen in UDPE-6776).
     send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "c1", "type" => "commandExecution", "command" => "mix test"})})
-    send(pid, {:codex_worker_update, issue_id, notification.(%{"method" => "item/commandExecution/outputDelta", "params" => %{"itemId" => "c1", "delta" => "1 test, 0 failures"}})})
+    send(pid, {:codex_worker_update, issue_id, notification.(%{"method" => "item/commandExecution/outputDelta", "params" => %{"itemId" => "c1", "delta" => "alpha"}})})
+    send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "a1", "type" => "agentMessage", "phase" => "commentary"})})
+    send(pid, {:codex_worker_update, issue_id, notification.(%{"method" => "item/agentMessage/delta", "params" => %{"itemId" => "a1", "delta" => "The changed-s"}})})
+    send(pid, {:codex_worker_update, issue_id, notification.(%{"method" => "item/commandExecution/outputDelta", "params" => %{"itemId" => "c1", "delta" => "beta"}})})
+    send(pid, {:codex_worker_update, issue_id, notification.(%{"method" => "item/agentMessage/delta", "params" => %{"itemId" => "a1", "delta" => "cope suite"}})})
+
+    partial_snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [partial_entry]} = partial_snapshot
+
+    assert [partial_agent] =
+             Enum.filter(
+               partial_entry.recent_codex_transcript_blocks,
+               &(Map.get(&1, :item_id) == "a1" and &1.kind == "agent")
+             )
+
+    assert partial_agent.text == "The changed-scope suite"
+
+    assert [partial_output] =
+             Enum.filter(
+               partial_entry.recent_codex_transcript_blocks,
+               &(Map.get(&1, :item_id) == "c1" and &1.kind == "output")
+             )
+
+    assert partial_output.text == "alphabeta"
+
+    # Completion payloads are authoritative and replace (rather than duplicate)
+    # the accumulated deltas.
+    send(pid, {:codex_worker_update, issue_id, item.("item/completed", %{"id" => "a1", "type" => "agentMessage", "phase" => "commentary", "text" => "The changed-scope suite is green."})})
+    send(pid, {:codex_worker_update, issue_id, item.("item/completed", %{"id" => "c1", "type" => "commandExecution", "command" => "mix test", "aggregatedOutput" => "1 test, 0 failures"})})
     send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "f1", "type" => "fileChange", "changes" => [%{"path" => "lib/a.ex", "diff" => "@@\n+x"}]})})
-    send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "m1", "type" => "mcpToolCall", "server" => "sentry", "tool" => "get_issue", "arguments" => %{"id" => 7}})})
-    send(pid, {:codex_worker_update, issue_id, item.("item/completed", %{"id" => "m1", "type" => "mcpToolCall", "result" => %{"content" => [%{"type" => "text", "text" => "MCP-RESULT"}]}})})
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       threaded_item.("item/started", "thread-parent", %{"id" => "m1", "type" => "mcpToolCall", "server" => "sentry", "tool" => "get_issue", "arguments" => %{"id" => 7}})}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       threaded_item.("item/started", "thread-child", %{"id" => "m1", "type" => "mcpToolCall", "server" => "github", "tool" => "get_pr", "arguments" => %{"number" => 8}})}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       threaded_item.("item/completed", "thread-parent", %{"id" => "m1", "type" => "mcpToolCall", "result" => %{"content" => [%{"type" => "text", "text" => "MCP-RESULT"}]}})}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       threaded_item.("item/completed", "thread-child", %{"id" => "m1", "type" => "mcpToolCall", "result" => %{"content" => [%{"type" => "text", "text" => "CHILD-RESULT"}]}})}
+    )
+
     # dynamicToolCall is dispatched via item/tool/call and must not double up.
     send(pid, {:codex_worker_update, issue_id, item.("item/started", %{"id" => "d1", "type" => "dynamicToolCall", "tool" => "linear_graphql"})})
 
@@ -567,12 +627,24 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     output_index = Enum.find_index(blocks, &(&1.kind == "output" and &1.text =~ "1 test, 0 failures"))
     assert command_index < output_index
 
+    assert [agent_block] =
+             Enum.filter(blocks, &(Map.get(&1, :item_id) == "a1" and &1.kind == "agent"))
+
+    assert agent_block.text == "The changed-scope suite is green."
+
+    assert [command_output] =
+             Enum.filter(blocks, &(Map.get(&1, :item_id) == "c1" and &1.kind == "output"))
+
+    assert command_output.text == "1 test, 0 failures"
+
     file_block = Enum.find(blocks, &(&1.kind == "tool" and &1.title == "edit: a.ex"))
     assert file_block.text =~ "+x"
 
     mcp_call = Enum.find(blocks, &(&1.kind == "tool" and &1.title == "sentry: get_issue"))
     assert mcp_call
+    assert Enum.any?(blocks, &(&1.kind == "tool" and &1.title == "github: get_pr"))
     assert Enum.any?(blocks, &(&1.kind == "output" and &1.text == "MCP-RESULT"))
+    assert Enum.any?(blocks, &(&1.kind == "output" and &1.text == "CHILD-RESULT"))
 
     refute Enum.any?(blocks, &(Map.get(&1, :title) == "linear_graphql"))
   end

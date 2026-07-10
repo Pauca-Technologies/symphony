@@ -184,8 +184,8 @@ defmodule SymphonyElixirWeb.Presenter do
 
   # The actual backend + model the run is using, captured from the running
   # session (not re-derived from the issue's labels). `backend` is the resolved
-  # backend module's config name; `model` is what was handed to/reported by the
-  # agent (nil when unknown, e.g. Codex picks its model from its own config).
+  # backend module's config name; `model` is what was handed to or resolved by
+  # the agent (nil only until the run reports one, or when a backend omits it).
   defp agent_payload(entry) when is_map(entry) do
     %{
       backend: blank_to_nil(Map.get(entry, :backend)),
@@ -405,16 +405,16 @@ defmodule SymphonyElixirWeb.Presenter do
 
     cond do
       method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
-        build_text_fragment("agent", at, extract_text(payload, agent_text_paths()), origin)
+        build_stream_fragment("agent", at, payload, agent_text_paths(), origin)
 
       method in ["codex/event/exec_command_output_delta", "item/commandExecution/outputDelta"] ->
-        build_text_fragment("output", at, extract_text(payload, output_text_paths()), origin)
+        build_stream_fragment("output", at, payload, output_text_paths(), origin)
 
       method == "codex/event/exec_command_begin" ->
-        build_text_fragment("command", at, extract_command(payload), origin)
+        build_stream_fragment("command", at, payload, extract_command(payload), origin)
 
       method in reasoning_methods() ->
-        build_text_fragment("reasoning", at, extract_text(payload, reasoning_text_paths()), origin)
+        build_stream_fragment("reasoning", at, payload, reasoning_text_paths(), origin)
 
       method == "item/tool/call" ->
         build_tool_fragment(at, payload, origin)
@@ -602,8 +602,8 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp codex_item_fragment("item/started", "commandExecution", at, item, _id, origin),
-    do: build_text_fragment("command", at, codex_command_text(item), origin)
+  defp codex_item_fragment("item/started", "commandExecution", at, item, id, origin),
+    do: build_item_fragment("command", at, codex_command_text(item), id, origin)
 
   defp codex_item_fragment("item/started", "fileChange", at, item, id, origin),
     do: codex_item_tool_fragment(at, id, codex_file_change_title(item), codex_file_change_text(item), origin)
@@ -621,6 +621,17 @@ defmodule SymphonyElixirWeb.Presenter do
   # keyed on the call id so it sits beside the tool block from `item/started`.
   defp codex_item_fragment("item/completed", "mcpToolCall", at, item, id, origin),
     do: codex_mcp_output_fragment(at, id, item, origin)
+
+  defp codex_item_fragment("item/completed", "agentMessage", at, item, id, origin),
+    do: build_completed_item_fragment("agent", at, Map.get(item, "text"), id, origin)
+
+  defp codex_item_fragment("item/completed", "commandExecution", at, item, id, origin) do
+    [
+      build_completed_item_fragment("command", at, codex_command_text(item), id, origin),
+      build_completed_item_fragment("output", at, Map.get(item, "aggregatedOutput"), id, origin)
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
 
   defp codex_item_fragment(_method, _type, _at, _item, _id, _origin), do: nil
 
@@ -723,6 +734,46 @@ defmodule SymphonyElixirWeb.Presenter do
   defp codex_mcp_content_text(%{"content" => content}), do: acp_content_text(content)
   defp codex_mcp_content_text(_result), do: nil
 
+  defp build_stream_fragment(kind, at, payload, paths, origin) when is_list(paths) do
+    build_stream_fragment(kind, at, payload, extract_text(payload, paths), origin)
+  end
+
+  defp build_stream_fragment(kind, at, payload, text, origin) do
+    build_item_fragment(kind, at, text, codex_item_id(payload), origin)
+  end
+
+  defp build_item_fragment(kind, at, text, item_id, origin) do
+    case build_text_fragment(kind, at, text, origin) do
+      nil -> nil
+      fragment when is_binary(item_id) -> Map.put(fragment, :item_id, item_id)
+      fragment -> fragment
+    end
+  end
+
+  defp build_completed_item_fragment(kind, at, text, item_id, origin) do
+    case build_item_fragment(kind, at, text, item_id, origin) do
+      %{item_id: _item_id} = fragment -> Map.put(fragment, :replace_item_text, true)
+      fragment -> fragment
+    end
+  end
+
+  defp codex_item_id(payload) when is_map(payload) do
+    [
+      ["params", "itemId"],
+      ["params", "item_id"],
+      ["params", "callId"],
+      ["params", "call_id"],
+      ["params", "item", "id"],
+      ["params", "msg", "itemId"],
+      ["params", "msg", "item_id"],
+      ["params", "msg", "callId"],
+      ["params", "msg", "call_id"],
+      ["params", "msg", "id"],
+      ["params", "id"]
+    ]
+    |> Enum.find_value(fn path -> presence(map_value(payload, path)) end)
+  end
+
   defp build_text_fragment(kind, at, text, origin) when is_binary(kind) and is_binary(text) do
     case normalize_transcript_text(text) do
       "" -> nil
@@ -803,6 +854,9 @@ defmodule SymphonyElixirWeb.Presenter do
         keyed_fragment?(fragment) ->
           upsert_keyed_fragment(acc, fragment)
 
+        item_fragment?(fragment) ->
+          upsert_item_fragment(acc, fragment)
+
         mergeable_text_head?(acc, fragment) ->
           [previous | rest] = acc
           [%{previous | text: previous.text <> fragment.text} | rest]
@@ -812,6 +866,7 @@ defmodule SymphonyElixirWeb.Presenter do
       end
     end)
     |> Enum.reverse()
+    |> Enum.map(&Map.delete(&1, :replace_item_text))
   end
 
   defp mergeable_text_head?([%{kind: kind, thread_id: prev_thread} | _rest], fragment) do
@@ -826,22 +881,71 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp keyed_fragment?(_fragment), do: false
 
-  defp upsert_keyed_fragment(acc, %{kind: kind, tool_call_id: id} = fragment) do
-    if Enum.any?(acc, &keyed_fragment_match?(&1, kind, id)) do
-      # Only the text changes between updates; keep the title/timestamp the
-      # initial `tool_call` established (see `Orchestrator.upsert_keyed_transcript_block/4`).
-      Enum.map(acc, &refresh_keyed_fragment(&1, kind, id, fragment.text))
+  defp item_fragment?(%{kind: kind, item_id: id})
+       when kind in ["agent", "command", "output", "reasoning"] and is_binary(id),
+       do: true
+
+  defp item_fragment?(_fragment), do: false
+
+  defp upsert_item_fragment(acc, %{kind: kind, item_id: id} = fragment) do
+    if Enum.any?(acc, &item_fragment_match?(&1, kind, id, fragment.thread_id)) do
+      Enum.map(acc, &merge_item_fragment(&1, fragment))
     else
       [fragment | acc]
     end
   end
 
-  defp refresh_keyed_fragment(fragment, kind, id, text) do
-    if keyed_fragment_match?(fragment, kind, id), do: %{fragment | text: text}, else: fragment
+  defp merge_item_fragment(existing, %{kind: kind, item_id: id} = incoming) do
+    if item_fragment_match?(existing, kind, id, incoming.thread_id) do
+      text =
+        if Map.get(incoming, :replace_item_text),
+          do: incoming.text,
+          else: existing.text <> incoming.text
+
+      %{existing | text: text}
+    else
+      existing
+    end
   end
 
-  defp keyed_fragment_match?(%{kind: kind, tool_call_id: id}, kind, id), do: true
-  defp keyed_fragment_match?(_fragment, _kind, _id), do: false
+  defp item_fragment_match?(
+         %{kind: kind, item_id: id, thread_id: thread_id},
+         kind,
+         id,
+         thread_id
+       ),
+       do: true
+
+  defp item_fragment_match?(_fragment, _kind, _id, _thread_id), do: false
+
+  defp upsert_keyed_fragment(acc, %{kind: kind, tool_call_id: id} = fragment) do
+    if Enum.any?(acc, &keyed_fragment_match?(&1, kind, id, fragment.thread_id)) do
+      # Only the text changes between updates; keep the title/timestamp the
+      # initial `tool_call` established (see `Orchestrator.upsert_keyed_transcript_block/4`).
+      Enum.map(
+        acc,
+        &refresh_keyed_fragment(&1, kind, id, fragment.thread_id, fragment.text)
+      )
+    else
+      [fragment | acc]
+    end
+  end
+
+  defp refresh_keyed_fragment(fragment, kind, id, thread_id, text) do
+    if keyed_fragment_match?(fragment, kind, id, thread_id),
+      do: %{fragment | text: text},
+      else: fragment
+  end
+
+  defp keyed_fragment_match?(
+         %{kind: kind, tool_call_id: id, thread_id: thread_id},
+         kind,
+         id,
+         thread_id
+       ),
+       do: true
+
+  defp keyed_fragment_match?(_fragment, _kind, _id, _thread_id), do: false
 
   defp agent_text_paths do
     [

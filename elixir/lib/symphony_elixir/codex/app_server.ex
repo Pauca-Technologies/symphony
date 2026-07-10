@@ -41,6 +41,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @type session :: %{
           port: port(),
           metadata: map(),
+          model: String.t() | nil,
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
           thread_path: Path.t() | nil,
@@ -79,6 +80,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          %{
            port: port,
            metadata: metadata,
+           model: Map.get(thread, :model),
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_path: Map.get(thread, :path),
@@ -103,6 +105,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: metadata,
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
+          model: model,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           thread_path: thread_path,
@@ -130,7 +133,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            model: model
           },
           metadata
         )
@@ -459,10 +463,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
+      {:ok, %{"thread" => thread_payload} = response} ->
         case thread_payload do
           %{"id" => thread_id} ->
-            {:ok, %{id: thread_id, path: Map.get(thread_payload, "path")}}
+            {:ok,
+             %{
+               id: thread_id,
+               path: Map.get(thread_payload, "path"),
+               model: Map.get(response, "model")
+             }}
 
           _ ->
             {:error, {:invalid_thread_payload, thread_payload}}
