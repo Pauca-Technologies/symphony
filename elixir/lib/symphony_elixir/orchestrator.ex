@@ -39,6 +39,21 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  # Fallback flood guard for issue warnings (routing / cardinality /
+  # version gates). The persistent `symphony:routing-warned` label is the
+  # primary idempotency marker, but if that label write itself fails
+  # (e.g. Linear rate limiting) the marker never lands — and without this
+  # the warning would be re-attempted, comment and all, on every poll. A
+  # write storm like that can exhaust the tracker's hourly API budget and
+  # block dispatch for every issue. So we refuse to re-attempt a warning
+  # for the same issue within this cooldown, and stamp the marker BEFORE
+  # posting the comment (see `emit_issue_warning/4`). One hour mirrors
+  # Linear's rate-limit window.
+  @warn_retry_cooldown_ms 3_600_000
+  # When a poll comes back rate-limited, ease off the next tick instead of
+  # hammering. Bounded so a stale/huge Retry-After can't wedge the loop.
+  @default_rate_limit_backoff_ms 60_000
+  @max_rate_limit_backoff_ms 300_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @recent_codex_events_limit 200
@@ -75,10 +90,15 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :poll_backoff_until_ms,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
+      # issue_id => monotonic ms of the last warning attempt. Fallback
+      # flood guard for the routing/cardinality/version gates when the
+      # persistent `symphony:routing-warned` marker can't be written.
+      warned_at: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -153,8 +173,8 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
-    state = %{state | poll_check_in_progress: false}
+    state = schedule_tick(state, poll_delay_ms(state))
+    state = %{state | poll_check_in_progress: false, poll_backoff_until_ms: nil}
 
     notify_dashboard()
     {:noreply, state}
@@ -318,6 +338,11 @@ defmodule SymphonyElixir.Orchestrator do
 
         state
 
+      {:error, {:rate_limited, retry_after_ms}} ->
+        Logger.warning("Linear rate limit hit during poll; backing off next tick. retry_after_ms=#{inspect(retry_after_ms)}")
+
+        arm_poll_backoff(state, retry_after_ms)
+
       {:error, {:invalid_workflow_config, message}} ->
         Logger.error("Invalid WORKFLOW.md config: #{message}")
         state
@@ -402,6 +427,24 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  def gate_routing_and_cardinality_for_test(%Issue{} = issue, repo_config, %MapSet{} = active_states) do
+    gate_routing_and_cardinality(issue, repo_config, active_states)
+  end
+
+  @doc false
+  def emit_issue_warning_for_test(%State{} = state, %Issue{} = issue, body, telemetry) do
+    emit_issue_warning(state, issue, body, telemetry)
+  end
+
+  @doc false
+  def poll_delay_ms_for_test(%State{} = state), do: poll_delay_ms(state)
+
+  @doc false
+  def arm_poll_backoff_for_test(%State{} = state, retry_after_ms) do
+    arm_poll_backoff(state, retry_after_ms)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -610,13 +653,25 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      with true <- should_dispatch_issue?(issue, state_acc, active_states, terminal_states),
-           :ok <- gate_routing_and_cardinality(issue, repo_config, active_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        _ -> state_acc
-      end
+      consider_issue_for_dispatch(issue, state_acc, repo_config, active_states, terminal_states)
     end)
+  end
+
+  defp consider_issue_for_dispatch(issue, state, repo_config, active_states, terminal_states) do
+    if should_dispatch_issue?(issue, state, active_states, terminal_states) do
+      issue
+      |> gate_routing_and_cardinality(repo_config, active_states)
+      |> apply_gate_decision(state, issue)
+    else
+      state
+    end
+  end
+
+  defp apply_gate_decision(:pass, state, issue), do: dispatch_issue(state, issue)
+  defp apply_gate_decision(:skip_silent, state, _issue), do: state
+
+  defp apply_gate_decision({:skip_warn, body, telemetry}, state, issue) do
+    emit_issue_warning(state, issue, body, telemetry)
   end
 
   defp load_repo_config_or_default do
@@ -634,11 +689,17 @@ defmodule SymphonyElixir.Orchestrator do
   # When repos.yaml is unconfigured (`source == :default`), we run in
   # legacy single-repo mode and skip both gates — preserves backwards
   # compat for hosts that have not yet migrated to the multi-repo driver.
-  defp gate_routing_and_cardinality(%Issue{} = _issue, %{source: :default}, _active_states), do: :ok
+  #
+  # Each gate is a *pure decision*: it returns `:pass`, `:skip_silent`, or
+  # `{:skip_warn, body, {telemetry_event, meta}}`. Emitting the warning
+  # (the only side effect) is centralized in `emit_issue_warning/4` so the
+  # flood guard is applied uniformly. `with :pass <- ...` short-circuits on
+  # the first gate that skips.
+  defp gate_routing_and_cardinality(%Issue{} = _issue, %{source: :default}, _active_states), do: :pass
 
   defp gate_routing_and_cardinality(%Issue{} = issue, %{} = repo_config, %MapSet{} = active_states) do
-    with :ok <- gate_orchestrator_version(issue),
-         :ok <- gate_routing(issue, repo_config, active_states) do
+    with :pass <- gate_orchestrator_version(issue),
+         :pass <- gate_routing(issue, repo_config, active_states) do
       gate_cardinality(issue, repo_config)
     end
   end
@@ -646,85 +707,157 @@ defmodule SymphonyElixir.Orchestrator do
   defp gate_orchestrator_version(%Issue{} = issue) do
     case OrchestratorVersion.check() do
       :ok ->
-        :ok
+        :pass
 
       {:incompatible, requirement, current_version} ->
-        unless Router.already_warned?(issue) do
-          body = OrchestratorVersion.incompatibility_comment(requirement, current_version)
-          _ = Tracker.create_comment(issue.id, body)
-          _ = Tracker.add_label(issue.id, Router.routing_warned_label())
-        end
+        body = OrchestratorVersion.incompatibility_comment(requirement, current_version)
 
-        Logger.warning("Orchestrator version gate: #{issue_context(issue)} requires=#{requirement} current=#{current_version}; skipping")
-
-        :skip
+        {:skip_warn, body,
+         {:version_skip,
+          %{
+            issue_id: issue.id,
+            identifier: issue.identifier,
+            requirement: requirement,
+            current: current_version
+          }}}
 
       {:invalid_requirement, requirement} ->
         Logger.error("Ignoring invalid orchestrator_version_required in WORKFLOW.md: #{inspect(requirement)}")
 
-        :ok
+        :pass
     end
   end
 
   defp gate_routing(%Issue{} = issue, %{} = repo_config, %MapSet{} = active_states) do
     case Router.route(issue, repo_config) do
       {:ok, _repo} ->
-        :ok
+        :pass
 
       {:skip, :legacy_mode} ->
-        :ok
+        :pass
 
       {:skip, reason, _ctx} = decision ->
-        maybe_emit_routing_warning(issue, decision, repo_config, active_states, reason)
-        :skip
+        if Router.should_warn?(decision, issue, active_states) do
+          body = Router.warning_comment(issue, decision, repo_config)
+
+          {:skip_warn, body, {:routing_skip, %{issue_id: issue.id, identifier: issue.identifier, reason: Atom.to_string(reason)}}}
+        else
+          :skip_silent
+        end
     end
   end
 
   defp gate_cardinality(%Issue{} = issue, %{} = repo_config) do
     case Cardinality.check(issue, repo_config) do
       :ok ->
-        :ok
+        :pass
 
       {:not_enforced, _} ->
-        :ok
+        :pass
 
       {:violations, violations} ->
-        maybe_emit_cardinality_warning(issue, violations)
-        :skip
+        body = Cardinality.violation_comment(issue, violations)
+
+        {:skip_warn, body,
+         {:cardinality_skip,
+          %{
+            issue_id: issue.id,
+            identifier: issue.identifier,
+            violations: Enum.map(violations, &Atom.to_string/1)
+          }}}
     end
   end
 
-  defp maybe_emit_routing_warning(%Issue{} = issue, decision, %{} = repo_config, active_states, reason) do
-    if Router.should_warn?(decision, issue, active_states) do
-      body = Router.warning_comment(issue, decision, repo_config)
-      _ = Tracker.create_comment(issue.id, body)
-      _ = Tracker.add_label(issue.id, Router.routing_warned_label())
+  # Flood-safe emitter shared by every gate warning. Two guards stop a
+  # warning from becoming a per-poll write storm when the marker write
+  # fails (the incident that motivated this):
+  #
+  #   1. Persistent — the `symphony:routing-warned` label. Once it lands,
+  #      `Router.already_warned?/1` suppresses the warning permanently,
+  #      across restarts.
+  #   2. In-memory fallback — a per-issue cooldown (`warned_at`). If the
+  #      label write keeps failing (e.g. Linear rate limiting) the marker
+  #      never lands, so this bounds re-attempts to once per cooldown
+  #      instead of once per 15s tick.
+  #
+  # The marker is stamped BEFORE the comment. If the stamp fails we post
+  # nothing and record the attempt, so a partial failure can never leave
+  # an un-suppressed comment that re-fires and re-comments next poll.
+  defp emit_issue_warning(%State{} = state, %Issue{} = issue, body, {event, meta})
+       when is_binary(body) do
+    cond do
+      Router.already_warned?(issue) ->
+        state
 
-      Telemetry.emit(:routing_skip, %{
-        issue_id: issue.id,
-        identifier: issue.identifier,
-        reason: Atom.to_string(reason)
-      })
+      within_warn_cooldown?(state, issue) ->
+        state
 
-      Logger.info("Routing skip: #{issue_context(issue)} reason=#{reason}; routing-warned label applied")
+      true ->
+        state = record_warn_attempt(state, issue)
+
+        case Tracker.add_label(issue.id, Router.routing_warned_label()) do
+          :ok ->
+            _ = Tracker.create_comment(issue.id, body)
+            Telemetry.emit(event, meta)
+            Logger.info("Issue warning emitted (#{event}): #{issue_context(issue)}; routing-warned label applied")
+            state
+
+          {:error, reason} ->
+            Logger.warning("Deferring #{event} warning for #{issue_context(issue)}; marker label write failed: #{inspect(reason)}")
+
+            state
+        end
     end
   end
 
-  defp maybe_emit_cardinality_warning(%Issue{} = issue, violations) do
-    unless Router.already_warned?(issue) do
-      body = Cardinality.violation_comment(issue, violations)
-      _ = Tracker.create_comment(issue.id, body)
-      _ = Tracker.add_label(issue.id, Router.routing_warned_label())
+  defp within_warn_cooldown?(%State{warned_at: warned_at}, %Issue{id: issue_id})
+       when is_map(warned_at) and is_binary(issue_id) do
+    case Map.get(warned_at, issue_id) do
+      last when is_integer(last) ->
+        System.monotonic_time(:millisecond) - last < warn_retry_cooldown_ms()
 
-      Telemetry.emit(:cardinality_skip, %{
-        issue_id: issue.id,
-        identifier: issue.identifier,
-        violations: Enum.map(violations, &Atom.to_string/1)
-      })
-
-      Logger.info("Cardinality skip: #{issue_context(issue)} violations=#{inspect(violations)}")
+      _ ->
+        false
     end
   end
+
+  defp within_warn_cooldown?(_state, _issue), do: false
+
+  defp record_warn_attempt(%State{warned_at: warned_at} = state, %Issue{id: issue_id})
+       when is_map(warned_at) and is_binary(issue_id) do
+    %{state | warned_at: Map.put(warned_at, issue_id, System.monotonic_time(:millisecond))}
+  end
+
+  defp record_warn_attempt(state, _issue), do: state
+
+  defp warn_retry_cooldown_ms do
+    Application.get_env(:symphony_elixir, :warn_retry_cooldown_ms, @warn_retry_cooldown_ms)
+  end
+
+  # Rate-limit backoff for the poll loop. `arm_poll_backoff/2` stamps a
+  # deadline on the state; `poll_delay_ms/1` extends the next tick to
+  # honor it (clamped to at least the normal interval). The deadline is a
+  # one-shot: `run_poll_cycle` clears it after scheduling, so a recovered
+  # budget resumes the normal cadence immediately.
+  defp arm_poll_backoff(%State{} = state, retry_after_ms) do
+    backoff = rate_limit_backoff_ms(retry_after_ms)
+    %{state | poll_backoff_until_ms: System.monotonic_time(:millisecond) + backoff}
+  end
+
+  defp rate_limit_backoff_ms(retry_after_ms) when is_integer(retry_after_ms) and retry_after_ms > 0 do
+    retry_after_ms
+    |> max(@default_rate_limit_backoff_ms)
+    |> min(@max_rate_limit_backoff_ms)
+  end
+
+  defp rate_limit_backoff_ms(_retry_after_ms), do: @default_rate_limit_backoff_ms
+
+  defp poll_delay_ms(%State{poll_backoff_until_ms: until, poll_interval_ms: interval})
+       when is_integer(until) do
+    max(interval, until - System.monotonic_time(:millisecond))
+  end
+
+  defp poll_delay_ms(%State{poll_interval_ms: interval}), do: interval
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn

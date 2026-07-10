@@ -752,18 +752,81 @@ defmodule SymphonyElixir.Linear.Client do
       {:ok, body}
     else
       {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
+        case rate_limit_retry_after_ms(response) do
+          {:rate_limited, retry_after_ms} ->
+            Logger.warning(
+              "Linear GraphQL request rate-limited status=#{response.status} retry_after_ms=#{inspect(retry_after_ms)}" <>
+                linear_error_context(payload, response)
+            )
 
-        {:error, {:linear_api_status, response.status}}
+            {:error, {:rate_limited, retry_after_ms}}
+
+          :not_rate_limited ->
+            Logger.error(
+              "Linear GraphQL request failed status=#{response.status}" <>
+                linear_error_context(payload, response)
+            )
+
+            {:error, {:linear_api_status, response.status}}
+        end
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
         {:error, {:linear_api_request, reason}}
     end
   end
+
+  # Linear surfaces rate limiting as an HTTP 400 (occasionally 429) whose body
+  # carries an `extensions.code == "RATELIMITED"` (or `type == "ratelimited"`)
+  # error. Detect it so callers can back off deliberately instead of treating
+  # it as a generic API failure and hammering the next poll — the failure mode
+  # that let a warning-comment loop pin the account at its hourly ceiling and
+  # starve dispatch. `Retry-After` (seconds) is read from the response headers
+  # when present; otherwise the caller applies its own default backoff.
+  defp rate_limit_retry_after_ms(%{body: body} = response) do
+    if rate_limited_body?(body) do
+      {:rate_limited, retry_after_header_ms(response)}
+    else
+      :not_rate_limited
+    end
+  end
+
+  defp rate_limit_retry_after_ms(_response), do: :not_rate_limited
+
+  defp rate_limited_body?(%{"errors" => errors}) when is_list(errors) do
+    Enum.any?(errors, fn
+      %{"extensions" => %{"code" => "RATELIMITED"}} -> true
+      %{"extensions" => %{"type" => "ratelimited"}} -> true
+      _ -> false
+    end)
+  end
+
+  defp rate_limited_body?(_body), do: false
+
+  defp retry_after_header_ms(%{headers: headers}) when is_map(headers) do
+    headers
+    |> header_value("retry-after")
+    |> parse_retry_after_seconds()
+  end
+
+  defp retry_after_header_ms(_response), do: nil
+
+  defp header_value(headers, name) when is_map(headers) do
+    case Map.get(headers, name) do
+      [value | _] when is_binary(value) -> value
+      value when is_binary(value) -> value
+      _ -> nil
+    end
+  end
+
+  defp parse_retry_after_seconds(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {seconds, _rest} when seconds > 0 -> seconds * 1000
+      _ -> nil
+    end
+  end
+
+  defp parse_retry_after_seconds(_value), do: nil
 
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
