@@ -317,6 +317,8 @@ defmodule SymphonyElixir.AgentRunner do
   # Test seam: drive the per-turn loop directly with an injected backend
   # (`opts[:agent_backend]` = `{module, overrides}`), bypassing the
   # workspace/clone/hook setup `run/3` performs.
+  @spec run_codex_turns_for_test(Path.t(), Issue.t(), pid() | nil, keyword(), worker_host()) ::
+          :ok | {:error, term()}
   def run_codex_turns_for_test(workspace, issue, recipient, opts, worker_host) do
     run_codex_turns(workspace, issue, recipient, opts, worker_host)
   end
@@ -354,7 +356,11 @@ defmodule SymphonyElixir.AgentRunner do
         handoff_gate_prompt = pop_handoff_gate_prompt()
 
         handoff_gate_prompt =
-          maybe_run_deferred_review_handoff(pop_deferred_review_handoff(), handoff_gate_prompt)
+          maybe_run_deferred_review_handoff(
+            pop_deferred_review_handoff(),
+            handoff_gate_prompt,
+            codex_update_recipient
+          )
 
         case continue_with_issue?(issue, issue_state_fetcher) do
           {:continue, refreshed_issue} when turn_number < max_turns ->
@@ -402,7 +408,12 @@ defmodule SymphonyElixir.AgentRunner do
         # detection still guards against a false-success handoff. The returned
         # findings prompt can't be consumed (the turn is over), so discard it —
         # the orchestrator re-dispatches the still-active issue for a fresh turn.
-        maybe_run_deferred_review_handoff(pop_deferred_review_handoff(), nil)
+        maybe_run_deferred_review_handoff(
+          pop_deferred_review_handoff(),
+          nil,
+          codex_update_recipient
+        )
+
         Logger.warning("Agent turn ended abnormally for #{issue_context(issue)} turn=#{turn_number}/#{max_turns} reason=#{inspect(reason)}")
         error
     end
@@ -462,8 +473,18 @@ defmodule SymphonyElixir.AgentRunner do
   defp deferred_review_callback(_review_workflow), do: &store_deferred_review_handoff/1
 
   defp store_deferred_review_handoff(request) when is_map(request) do
-    Process.put(@deferred_review_handoff_key, request)
-    :ok
+    case Process.get(@deferred_review_handoff_key) do
+      nil ->
+        Process.put(@deferred_review_handoff_key, request)
+        :ok
+
+      existing_request ->
+        issue = Map.get(existing_request, :issue) || Map.get(request, :issue)
+
+        Logger.info("review.gate deferred already pending #{issue_context(issue)}; coalescing repeated handoff request")
+
+        :already_pending
+    end
   end
 
   defp pop_deferred_review_handoff do
@@ -474,30 +495,176 @@ defmodule SymphonyElixir.AgentRunner do
   # Test seam: seed the deferred-review handoff a backend would normally capture
   # mid-turn via the dynamic tool executor, so the abnormal-completion path can
   # be exercised without simulating the full handoff tool call.
+  @spec store_deferred_review_handoff_for_test(map()) :: :ok | :already_pending
   def store_deferred_review_handoff_for_test(request) when is_map(request) do
     store_deferred_review_handoff(request)
   end
 
-  defp maybe_run_deferred_review_handoff(nil, handoff_gate_prompt), do: handoff_gate_prompt
+  defp maybe_run_deferred_review_handoff(nil, handoff_gate_prompt, _recipient),
+    do: handoff_gate_prompt
 
-  defp maybe_run_deferred_review_handoff(%{} = request, _handoff_gate_prompt) do
+  defp maybe_run_deferred_review_handoff(%{} = request, _handoff_gate_prompt, recipient) do
     issue = Map.fetch!(request, :issue)
     workspace = Map.fetch!(request, :workspace)
     worker_host = Map.get(request, :worker_host)
     review_workflow = Map.fetch!(request, :review_workflow)
-    review_opts = Map.get(request, :review_opts, [])
+    review_job_id = System.unique_integer([:positive, :monotonic])
+    review_opts = review_opts_with_progress(request, recipient, issue, review_job_id)
+    review_timeout_ms = handoff_review_timeout_ms()
 
     Logger.info("review.gate deferred starting #{issue_context(issue)} workspace=#{workspace}")
 
-    case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
-      :ok ->
-        apply_deferred_review_handoff(request)
+    :ok =
+      transition_agent_lifecycle(recipient, issue, :handoff_pending_review, %{
+        timeout_ms: review_timeout_ms,
+        review_job_id: review_job_id,
+        review_key: {:resolving_review_target, issue.id}
+      })
 
-      {:blocked, prompt, findings} ->
-        Logger.info("review.gate deferred blocked #{issue_context(issue)} findings=#{length(findings)}")
-        prompt
+    {review_key, review_opts} = ReviewGate.prepare_review(workspace, issue, review_opts)
+
+    :ok =
+      transition_agent_lifecycle(recipient, issue, :handoff_pending_review, %{
+        timeout_ms: review_timeout_ms,
+        review_job_id: review_job_id,
+        review_key: review_key
+      })
+
+    result =
+      case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
+        :ok ->
+          apply_reviewed_handoff(request, review_key, review_opts)
+
+        {:blocked, prompt, findings} ->
+          Logger.info("review.gate deferred blocked #{issue_context(issue)} findings=#{length(findings)}")
+          {:changes_requested, prompt}
+
+        {:skipped, reason} ->
+          Logger.info("review.gate deferred skipped #{issue_context(issue)} reason=#{inspect(reason)}")
+          apply_skipped_review_handoff(request)
+      end
+
+    {outcome, handoff_gate_prompt} = result
+
+    :ok =
+      transition_agent_lifecycle(recipient, issue, :implementing, %{
+        review_job_id: review_job_id,
+        review_outcome: outcome
+      })
+
+    handoff_gate_prompt
+  end
+
+  defp apply_reviewed_handoff(request, review_key, review_opts) do
+    workspace = Map.fetch!(request, :workspace)
+    issue = Map.fetch!(request, :issue)
+    current_review_key = ReviewGate.current_review_key(workspace, issue, review_opts)
+
+    if review_key_pinned?(review_key) and current_review_key == review_key do
+      case apply_deferred_review_handoff(request) do
+        nil -> {:approved, nil}
+        failure_prompt -> {:handoff_failed, failure_prompt}
+      end
+    else
+      Logger.warning("review.gate deferred head changed #{issue_context(issue)} reviewed_key=#{inspect(review_key)} current_key=#{inspect(current_review_key)}; withholding Linear handoff")
+
+      {:head_changed, deferred_review_head_changed_prompt(issue)}
     end
   end
+
+  defp apply_skipped_review_handoff(request) do
+    case apply_deferred_review_handoff(request) do
+      nil -> {:review_skipped, nil}
+      failure_prompt -> {:handoff_failed, failure_prompt}
+    end
+  end
+
+  defp review_key_pinned?({:pull_request, _issue_id, _pr_identity, head_oid}),
+    do: is_binary(head_oid) and head_oid != ""
+
+  defp review_key_pinned?({:workspace, _issue_id, head_oid}),
+    do: is_binary(head_oid) and head_oid != ""
+
+  defp handoff_review_timeout_ms do
+    codex = Config.settings!().codex
+
+    if codex.stall_timeout_ms > 0 do
+      codex.stall_timeout_ms
+    else
+      codex.turn_timeout_ms
+    end
+  end
+
+  defp review_opts_with_progress(request, recipient, issue, review_job_id) do
+    review_opts = Map.get(request, :review_opts, [])
+    existing_on_message = Keyword.get(review_opts, :on_message)
+    worker_pid = self()
+
+    on_message = fn message ->
+      if is_function(existing_on_message, 1), do: existing_on_message.(message)
+
+      send_handoff_review_heartbeat(
+        recipient,
+        issue,
+        worker_pid,
+        review_job_id,
+        message
+      )
+    end
+
+    Keyword.put(review_opts, :on_message, on_message)
+  end
+
+  defp send_handoff_review_heartbeat(
+         recipient,
+         %Issue{id: issue_id},
+         worker_pid,
+         review_job_id,
+         message
+       )
+       when is_pid(recipient) and is_binary(issue_id) and is_pid(worker_pid) and
+              is_integer(review_job_id) and is_map(message) do
+    timestamp =
+      case Map.get(message, :timestamp) do
+        %DateTime{} = timestamp -> timestamp
+        _ -> DateTime.utc_now()
+      end
+
+    send(recipient, {:handoff_review_heartbeat, issue_id, worker_pid, review_job_id, timestamp})
+    :ok
+  end
+
+  defp send_handoff_review_heartbeat(
+         _recipient,
+         _issue,
+         _worker_pid,
+         _review_job_id,
+         _message
+       ),
+       do: :ok
+
+  defp transition_agent_lifecycle(recipient, %Issue{id: issue_id}, lifecycle_state, metadata)
+       when is_pid(recipient) and is_binary(issue_id) and is_atom(lifecycle_state) and
+              is_map(metadata) do
+    if recipient == self() do
+      send(recipient, {:agent_lifecycle, issue_id, lifecycle_state, metadata})
+      :ok
+    else
+      case GenServer.call(
+             recipient,
+             {:agent_lifecycle, issue_id, lifecycle_state, metadata},
+             15_000
+           ) do
+        :ok ->
+          :ok
+
+        other ->
+          raise "orchestrator rejected #{lifecycle_state} lifecycle transition for issue_id=#{issue_id}: #{inspect(other)}"
+      end
+    end
+  end
+
+  defp transition_agent_lifecycle(_recipient, _issue, _lifecycle_state, _metadata), do: :ok
 
   defp apply_deferred_review_handoff(%{} = request) do
     issue = Map.fetch!(request, :issue)
@@ -540,6 +707,17 @@ defmodule SymphonyElixir.AgentRunner do
     Reason: `#{inspect(reason)}`
 
     Keep the issue in In Progress, inspect the Linear status transition, and re-attempt the handoff with Symphony's `linear_graphql` tool.
+    """
+    |> String.trim()
+  end
+
+  defp deferred_review_head_changed_prompt(%Issue{} = issue) do
+    """
+    System message:
+
+    The pull request head for #{issue.identifier} changed while the automated reviewer was running, so Symphony did not apply the reviewed Linear handoff.
+
+    Keep the issue in In Progress and re-attempt the handoff. The next reviewer will inspect the new pull request head.
     """
     |> String.trim()
   end

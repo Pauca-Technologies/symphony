@@ -1749,6 +1749,224 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert remaining_ms <= 10_500
   end
 
+  test "pending handoff review suppresses implementor stall restart" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue_id = "issue-pending-review"
+    orchestrator_name = Module.concat(__MODULE__, :PendingReviewOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    parent = self()
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          {:start_review, orchestrator} ->
+            result =
+              GenServer.call(
+                orchestrator,
+                {:agent_lifecycle, issue_id, :handoff_pending_review,
+                 %{
+                   timeout_ms: 30_000,
+                   review_job_id: 17,
+                   review_key: {:pull_request, issue_id, "PR_17", "head-17"}
+                 }}
+              )
+
+            send(parent, {:review_started, result})
+        end
+
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial_state = :sys.get_state(pid)
+
+    issue = %Issue{id: issue_id, identifier: "MT-REVIEW", state: "In Progress"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: "MT-REVIEW",
+      issue: issue,
+      session_id: "thread-review-turn-review",
+      last_codex_message: nil,
+      last_codex_timestamp: stale_activity_at,
+      last_codex_event: :turn_completed,
+      lifecycle_state: :implementing,
+      lifecycle_started_at: stale_activity_at,
+      started_at: stale_activity_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(worker_pid, {:start_review, pid})
+    assert_receive {:review_started, :ok}, 1_000
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    assert Process.alive?(worker_pid)
+    assert state.running[issue_id].lifecycle_state == :handoff_pending_review
+    assert state.running[issue_id].handoff_review_job_id == 17
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    send(worker_pid, :done)
+  end
+
+  test "stalled handoff review clears pending state and retries visibly" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue_id = "issue-review-timeout"
+    orchestrator_name = Module.concat(__MODULE__, :ReviewTimeoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: "MT-REVIEW-TIMEOUT",
+      issue: %Issue{id: issue_id, identifier: "MT-REVIEW-TIMEOUT", state: "In Progress"},
+      session_id: "thread-review-timeout",
+      last_codex_timestamp: stale_activity_at,
+      lifecycle_state: :handoff_pending_review,
+      lifecycle_started_at: stale_activity_at,
+      handoff_review_job_id: 18,
+      handoff_review_key: {:pull_request, issue_id, "PR_18", "head-18"},
+      handoff_review_timeout_ms: 1_000,
+      handoff_review_last_event_at: stale_activity_at,
+      started_at: stale_activity_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    log =
+      capture_log(fn ->
+        send(pid, :tick)
+        Process.sleep(100)
+      end)
+
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+    assert state.retry_attempts[issue_id].error =~ "handoff review timed out"
+    assert log =~ "Handoff review timed out"
+    assert log =~ "issue_identifier=MT-REVIEW-TIMEOUT"
+  end
+
+  test "reviewer heartbeat refreshes only the matching worker and review job" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue_id = "issue-review-heartbeat"
+    orchestrator_name = Module.concat(__MODULE__, :ReviewHeartbeatOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    issue = %Issue{id: issue_id, identifier: "MT-REVIEW-HEARTBEAT", state: "In Progress"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-review-heartbeat",
+      lifecycle_state: :handoff_pending_review,
+      lifecycle_started_at: stale_activity_at,
+      handoff_review_job_id: 19,
+      handoff_review_key: {:pull_request, issue_id, "PR_19", "head-19"},
+      handoff_review_timeout_ms: 30_000,
+      last_codex_timestamp: stale_activity_at,
+      started_at: stale_activity_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:handoff_review_heartbeat, issue_id, worker_pid, 18, now}
+    )
+
+    Process.sleep(20)
+    assert :sys.get_state(pid).running[issue_id].last_codex_timestamp == stale_activity_at
+
+    send(
+      pid,
+      {:handoff_review_heartbeat, issue_id, worker_pid, 19, now}
+    )
+
+    Process.sleep(20)
+    assert :sys.get_state(pid).running[issue_id].last_codex_timestamp == now
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    assert Process.alive?(worker_pid)
+    assert Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    send(worker_pid, :done)
+  end
+
   test "status dashboard renders offline marker to terminal" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->

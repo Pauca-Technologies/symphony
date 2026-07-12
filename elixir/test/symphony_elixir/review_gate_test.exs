@@ -348,6 +348,26 @@ defmodule SymphonyElixir.ReviewGateTest do
              )
   end
 
+  test "passes reviewer events to the lifecycle heartbeat callback", %{workspace: workspace} do
+    test_pid = self()
+
+    runner = fn ctx ->
+      ctx.on_message.(%{event: :notification, timestamp: DateTime.utc_now()})
+      File.mkdir_p!(Path.dirname(ctx.verdict_path))
+      File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+      {:ok, %{}}
+    end
+
+    assert :ok =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner(),
+               on_message: fn update -> send(test_pid, {:review_heartbeat, update}) end
+             )
+
+    assert_received {:review_heartbeat, %{event: :notification}}
+  end
+
   test "honors a custom max_iterations", %{workspace: workspace} do
     runner =
       verdict_runner(%{"verdict" => "request_changes", "comments" => [%{"body" => "x"}]})
@@ -440,12 +460,12 @@ defmodule SymphonyElixir.ReviewGateTest do
         "view",
         "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
         "--json",
-        "id,number,body"
+        "id,number,body,headRefOid"
       ],
       _cwd ->
         {Jason.encode!(%{"id" => "PR_1358", "number" => 1358, "body" => "Existing PR body."}), 0}
 
-      ["pr", "view", "--json", "id,number,body"], _cwd ->
+      ["pr", "view", "--json", "id,number,body,headRefOid"], _cwd ->
         flunk("must not rely on current branch PR detection when Linear has a PR attachment")
 
       ["api", "graphql" | _] = args, _cwd ->
@@ -470,7 +490,7 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
 
-    assert :ok =
+    assert {:skipped, {:no_pr, :no_pr}} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: no_pr,

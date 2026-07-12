@@ -195,6 +195,12 @@ Notes:
 - If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
   implementor turn that requested the handoff has closed, and applies the captured Linear
   transition only after the reviewer approves or the configured review budget is exhausted.
+  The issue remains claimed in a distinct `handoff_pending_review` lifecycle while that reviewer
+  runs, so the completed implementor is not mistaken for a stalled turn. Reviewer events emit a
+  minimal, job-scoped heartbeat that refreshes worker activity without replacing implementor
+  session or token accounting; a silent reviewer is timed out with a review-specific log and retry.
+  Symphony also pins the reviewed PR head and rechecks it before applying the transition, so a push
+  during review requires a fresh handoff review.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

@@ -89,7 +89,33 @@ defmodule SymphonyElixir.ReviewGate do
           human_review: String.t(),
           comments: [map()]
         }
-  @type result :: :ok | {:blocked, String.t(), [map()]}
+  @type result ::
+          :ok
+          | {:blocked, String.t(), [map()]}
+          | {:skipped, term()}
+  @type review_key ::
+          {:pull_request, String.t(), String.t(), String.t() | nil}
+          | {:workspace, String.t(), String.t() | nil}
+
+  @doc """
+  Resolve and pin the code revision a deferred review will inspect.
+
+  The returned options reuse the resolved PR inside `run/5`, so lifecycle
+  registration and the reviewer operate on the same PR head.
+  """
+  @spec prepare_review(Path.t(), Issue.t(), keyword()) :: {review_key(), keyword()}
+  def prepare_review(workspace, %Issue{} = issue, opts) when is_binary(workspace) do
+    pr_opts = review_pr_opts(issue, opts)
+    pr_result = PrReviewSection.resolve_pr(workspace, pr_opts)
+    {review_key(workspace, issue, pr_result), Keyword.put(pr_opts, :resolved_pr_result, pr_result)}
+  end
+
+  @doc "Resolve the current code revision key for a deferred review."
+  @spec current_review_key(Path.t(), Issue.t(), keyword()) :: review_key()
+  def current_review_key(workspace, %Issue{} = issue, opts) when is_binary(workspace) do
+    {key, _opts} = prepare_review(workspace, issue, Keyword.delete(opts, :resolved_pr_result))
+    key
+  end
 
   @doc """
   Run the reviewer gate for an `In Progress -> In Review` handoff.
@@ -103,6 +129,9 @@ defmodule SymphonyElixir.ReviewGate do
     * `:session_runner` — `fn ctx -> {:ok, term()} | {:error, term()} end`
       that runs the reviewer Codex session. Defaults to the real
       `AppServer`-backed runner. Injected in tests.
+    * `:on_message` — callback for reviewer Codex events. The orchestrator uses
+      these events as a reviewer-specific heartbeat while the implementor is
+      paused.
     * `:comment_fn` — `fn issue_id, body -> :ok | {:error, term()} end` for
       the budget/skip notes. Defaults to `&Tracker.create_comment/2`.
   """
@@ -113,7 +142,12 @@ defmodule SymphonyElixir.ReviewGate do
     iteration = current_iteration(issue_id)
     pr_opts = review_pr_opts(issue, opts)
 
-    case PrReviewSection.resolve_pr(workspace, pr_opts) do
+    pr_result =
+      Keyword.get_lazy(pr_opts, :resolved_pr_result, fn ->
+        PrReviewSection.resolve_pr(workspace, pr_opts)
+      end)
+
+    case pr_result do
       {:skip, reason} when settings.require_pr ->
         # No PR at the In Review handoff: skip the reviewer entirely (product
         # decision). The whole feature — review + PR annotation — is PR-centric
@@ -122,7 +156,7 @@ defmodule SymphonyElixir.ReviewGate do
         Logger.info("review.gate skipped #{issue_context(issue)} reason=#{inspect({:no_pr, reason})}")
         note_review_skipped(issue, {:no_pr, reason}, opts)
         emit_telemetry(issue, iteration, :skipped, 0, nil)
-        :ok
+        {:skipped, {:no_pr, reason}}
 
       pr_result ->
         pr = pr_or_nil(pr_result)
@@ -162,6 +196,24 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp pr_or_nil({:ok, pr}), do: pr
   defp pr_or_nil(_pr_result), do: nil
+
+  defp review_key(_workspace, %Issue{id: issue_id}, {:ok, pr}) do
+    pr_identity = Map.get(pr, :id) || Integer.to_string(pr.number)
+    {:pull_request, issue_id, pr_identity, Map.get(pr, :head_oid)}
+  end
+
+  defp review_key(workspace, %Issue{id: issue_id}, _pr_result) do
+    {:workspace, issue_id, workspace_head_oid(workspace)}
+  end
+
+  defp workspace_head_oid(workspace) do
+    case System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"], stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output)
+      _ -> nil
+    end
+  rescue
+    _error -> nil
+  end
 
   defp run_iteration(workspace, %Issue{} = issue, worker_host, review_workflow, settings, iteration, pr, opts) do
     run_iteration(
@@ -203,7 +255,8 @@ defmodule SymphonyElixir.ReviewGate do
           worker_host: worker_host,
           prompt: prompt,
           verdict_path: verdict_path,
-          tool_executor: review_tool_executor(Keyword.get(opts, :linear_client))
+          tool_executor: review_tool_executor(Keyword.get(opts, :linear_client)),
+          on_message: Keyword.get(opts, :on_message)
         }
 
         case run_review_session(ctx, opts) do
@@ -290,9 +343,25 @@ defmodule SymphonyElixir.ReviewGate do
     runner.(ctx)
   end
 
-  defp default_session_runner(%{workspace: workspace, issue: issue, worker_host: worker_host, prompt: prompt, tool_executor: tool_executor}) do
-    AppServer.run(workspace, prompt, issue, worker_host: worker_host, tool_executor: tool_executor)
+  defp default_session_runner(%{
+         workspace: workspace,
+         issue: issue,
+         worker_host: worker_host,
+         prompt: prompt,
+         tool_executor: tool_executor,
+         on_message: on_message
+       }) do
+    opts =
+      [worker_host: worker_host, tool_executor: tool_executor]
+      |> maybe_put_on_message(on_message)
+
+    AppServer.run(workspace, prompt, issue, opts)
   end
+
+  defp maybe_put_on_message(opts, on_message) when is_function(on_message, 1),
+    do: Keyword.put(opts, :on_message, on_message)
+
+  defp maybe_put_on_message(opts, _on_message), do: opts
 
   # The reviewer talks to Linear read-only and without a handoff gate
   # context: read-only blocks any `issueUpdate`/mutation so the reviewer

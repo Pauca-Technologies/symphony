@@ -797,11 +797,26 @@ Reconciliation runs every tick and has two parts.
 
 Part A: Stall detection
 
-- For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
-  - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
-- If `stall_timeout_ms <= 0`, skip stall detection entirely.
+- Each running issue has a lifecycle state. Normal agent work uses `implementing`; an accepted
+  deferred handoff review uses `handoff_pending_review` and remains in the running/claimed sets.
+- For `implementing`, compute `elapsed_ms` since the newest of:
+  - `last_codex_timestamp` if any event has been seen,
+  - the current lifecycle state's start time, or
+  - `started_at`.
+- If implementor `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `stall_timeout_ms <= 0`, skip implementor stall detection; pending reviews retain their
+  reviewer-specific hard timeout.
+- For `handoff_pending_review`, do not apply the implementor activity clock and do not dispatch a
+  replacement implementor. Convert reviewer events into a minimal heartbeat, scoped to the current
+  worker and review job, that refreshes `last_codex_timestamp` without altering session/token
+  accounting. Terminate the worker with a visible review-timeout retry if reviewer inactivity
+  exceeds the review timeout.
+- A pending review is keyed to the issue and reviewed PR head. Repeated requests while that job is
+  pending coalesce into the existing review. Before applying the captured tracker transition,
+  re-resolve the PR head; if it changed, clear pending state and require a fresh review.
+- Reviewer request-changes or timeout clears pending state. Request-changes returns control to the
+  implementor, approval applies the captured tracker transition, and existing fail-open handling
+  remains in force for reviewer infrastructure/session failures.
 
 Part B: Tracker state refresh
 
@@ -1810,6 +1825,8 @@ function dispatch_issue(issue, state, attempt):
     last_codex_message: null,
     last_codex_event: null,
     last_codex_timestamp: null,
+    lifecycle_state: implementing,
+    lifecycle_started_at: now_utc(),
     codex_input_tokens: 0,
     codex_output_tokens: 0,
     codex_total_tokens: 0,
@@ -2017,6 +2034,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
+- Pending handoff review suppresses implementor stall detection and redispatch
+- Pending handoff review uses reviewer-specific heartbeat/timeout handling
+- Stale reviewer worker/job events do not mutate a newer running entry
+- Repeated handoff requests coalesce while the same review is pending
+- A changed PR head withholds the reviewed handoff until a fresh review runs
 - Slot exhaustion requeues retries with explicit error reason
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits

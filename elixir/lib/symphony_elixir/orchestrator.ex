@@ -294,6 +294,25 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
+  def handle_info(
+        {:handoff_review_heartbeat, issue_id, worker_pid, review_job_id, %DateTime{} = timestamp},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_pid(worker_pid) and is_integer(review_job_id) do
+    case Map.get(running, issue_id) do
+      %{
+        pid: ^worker_pid,
+        lifecycle_state: :handoff_pending_review,
+        handoff_review_job_id: ^review_job_id
+      } = running_entry ->
+        updated_running_entry = Map.put(running_entry, :last_codex_timestamp, timestamp)
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
       case pop_retry_attempt_state(state, issue_id, retry_token) do
@@ -311,6 +330,63 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
   end
+
+  defp transition_agent_lifecycle(
+         running_entry,
+         :handoff_pending_review,
+         %{
+           timeout_ms: timeout_ms,
+           review_job_id: review_job_id,
+           review_key: review_key
+         }
+       )
+       when is_map(running_entry) and is_integer(timeout_ms) and timeout_ms > 0 and
+              is_integer(review_job_id) do
+    now = DateTime.utc_now()
+    issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+    session_id = running_entry_session_id(running_entry)
+
+    Logger.info(
+      "Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=handoff_pending_review review_job_id=#{review_job_id} review_key=#{inspect(review_key)} timeout_ms=#{timeout_ms}"
+    )
+
+    running_entry
+    |> Map.put(:lifecycle_state, :handoff_pending_review)
+    |> Map.put(:lifecycle_started_at, now)
+    |> Map.put(:handoff_review_job_id, review_job_id)
+    |> Map.put(:handoff_review_key, review_key)
+    |> Map.put(:handoff_review_timeout_ms, timeout_ms)
+  end
+
+  defp transition_agent_lifecycle(running_entry, :implementing, metadata)
+       when is_map(running_entry) do
+    if Map.get(running_entry, :handoff_review_job_id) == Map.get(metadata, :review_job_id) do
+      now = DateTime.utc_now()
+      issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+      outcome = Map.get(metadata, :review_outcome, :unknown)
+      session_id = running_entry_session_id(running_entry)
+
+      Logger.info("Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=implementing review_outcome=#{outcome}")
+
+      running_entry
+      |> Map.drop([
+        :handoff_review_job_id,
+        :handoff_review_key,
+        :handoff_review_timeout_ms
+      ])
+      |> Map.put(:lifecycle_state, :implementing)
+      |> Map.put(:lifecycle_started_at, now)
+    else
+      running_entry
+    end
+  end
+
+  defp transition_agent_lifecycle(running_entry, _lifecycle_state, _metadata),
+    do: running_entry
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
@@ -430,19 +506,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec gate_routing_and_cardinality_for_test(Issue.t(), map(), MapSet.t()) :: term()
   def gate_routing_and_cardinality_for_test(%Issue{} = issue, repo_config, %MapSet{} = active_states) do
     gate_routing_and_cardinality(issue, repo_config, active_states)
   end
 
   @doc false
+  @spec emit_issue_warning_for_test(term(), Issue.t(), String.t(), term()) :: term()
   def emit_issue_warning_for_test(%State{} = state, %Issue{} = issue, body, telemetry) do
     emit_issue_warning(state, issue, body, telemetry)
   end
 
   @doc false
+  @spec poll_delay_ms_for_test(term()) :: non_neg_integer()
   def poll_delay_ms_for_test(%State{} = state), do: poll_delay_ms(state)
 
   @doc false
+  @spec arm_poll_backoff_for_test(term(), term()) :: term()
   def arm_poll_backoff_for_test(%State{} = state, retry_after_ms) do
     arm_poll_backoff(state, retry_after_ms)
   end
@@ -577,19 +657,58 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
 
-    cond do
-      timeout_ms <= 0 ->
-        state
+    if map_size(state.running) == 0 do
+      state
+    else
+      now = DateTime.utc_now()
 
-      map_size(state.running) == 0 ->
-        state
+      Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+        reconcile_running_issue_timeout(state_acc, issue_id, running_entry, now, timeout_ms)
+      end)
+    end
+  end
 
-      true ->
-        now = DateTime.utc_now()
+  defp reconcile_running_issue_timeout(
+         state,
+         issue_id,
+         %{lifecycle_state: :handoff_pending_review} = running_entry,
+         now,
+         _implementor_timeout_ms
+       ) do
+    restart_timed_out_handoff_review(state, issue_id, running_entry, now)
+  end
 
-        Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-          restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
-        end)
+  defp reconcile_running_issue_timeout(state, issue_id, running_entry, now, timeout_ms) do
+    if timeout_ms > 0 do
+      restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
+    else
+      state
+    end
+  end
+
+  defp restart_timed_out_handoff_review(state, issue_id, running_entry, now) do
+    timeout_ms = Map.get(running_entry, :handoff_review_timeout_ms)
+    elapsed_ms = handoff_review_elapsed_ms(running_entry, now)
+
+    if is_integer(timeout_ms) and timeout_ms > 0 and is_integer(elapsed_ms) and
+         elapsed_ms > timeout_ms do
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      session_id = running_entry_session_id(running_entry)
+
+      Logger.warning(
+        "Handoff review timed out: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms} timeout_ms=#{timeout_ms}; clearing pending review and restarting with backoff"
+      )
+
+      next_attempt = next_retry_attempt_from_running(running_entry)
+
+      state
+      |> terminate_running_issue(issue_id, false)
+      |> schedule_issue_retry(issue_id, next_attempt, %{
+        identifier: identifier,
+        error: "handoff review timed out after #{elapsed_ms}ms without reviewer activity"
+      })
+    else
+      state
     end
   end
 
@@ -628,10 +747,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    [
+      Map.get(running_entry, :last_codex_timestamp),
+      Map.get(running_entry, :lifecycle_started_at),
+      Map.get(running_entry, :started_at)
+    ]
+    |> Enum.filter(&match?(%DateTime{}, &1))
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
+
+  defp handoff_review_elapsed_ms(running_entry, now) do
+    running_entry
+    |> handoff_review_activity_timestamp()
+    |> case do
+      %DateTime{} = timestamp -> max(0, DateTime.diff(now, timestamp, :millisecond))
+      _ -> nil
+    end
+  end
+
+  defp handoff_review_activity_timestamp(running_entry) when is_map(running_entry) do
+    last_activity_timestamp(running_entry)
+  end
 
   defp terminate_task(pid) when is_pid(pid) do
     case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
@@ -1071,6 +1209,8 @@ defmodule SymphonyElixir.Orchestrator do
             codex_context_window: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            lifecycle_state: :implementing,
+            lifecycle_started_at: DateTime.utc_now(),
             started_at: DateTime.utc_now()
           })
 
@@ -1523,6 +1663,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call(
+        {:agent_lifecycle, issue_id, lifecycle_state, metadata},
+        {worker_pid, _tag},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_atom(lifecycle_state) and is_map(metadata) do
+    case Map.get(running, issue_id) do
+      %{pid: ^worker_pid} = running_entry ->
+        updated_running_entry =
+          transition_agent_lifecycle(running_entry, lifecycle_state, metadata)
+
+        notify_dashboard()
+
+        {:reply, :ok, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+      _ ->
+        {:reply, :stale_worker, state}
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -1548,6 +1708,8 @@ defmodule SymphonyElixir.Orchestrator do
           codex_context_tokens: Map.get(metadata, :codex_context_tokens, 0),
           codex_context_window: Map.get(metadata, :codex_context_window),
           turn_count: Map.get(metadata, :turn_count, 0),
+          lifecycle_state: Map.get(metadata, :lifecycle_state, :implementing),
+          lifecycle_started_at: Map.get(metadata, :lifecycle_started_at),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,

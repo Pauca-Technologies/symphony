@@ -43,7 +43,8 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   @type pr :: %{
           required(:number) => pos_integer(),
           required(:body) => String.t(),
-          optional(:id) => String.t() | nil
+          optional(:id) => String.t() | nil,
+          optional(:head_oid) => String.t() | nil
         }
   # (gh args, cwd) -> {output, exit_status}; mirrors Github.ReviewerRequest.
   @type runner :: ([String.t()], Path.t() -> {String.t(), non_neg_integer()})
@@ -61,7 +62,10 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   @spec resolve_pr(Path.t(), keyword()) :: {:ok, pr()} | {:skip, term()}
   def resolve_pr(workspace, opts \\ []) when is_binary(workspace) do
     runner = Keyword.get(opts, :pr_runner, &default_runner/2)
-    args = ["pr", "view"] ++ explicit_pr_ref_args(opts) ++ ["--json", "id,number,body"]
+
+    args =
+      ["pr", "view"] ++
+        explicit_pr_ref_args(opts) ++ ["--json", "id,number,body,headRefOid"]
 
     case safe_run(runner, args, workspace) do
       {output, 0} -> parse_pr(output)
@@ -161,7 +165,8 @@ defmodule SymphonyElixir.Github.PrReviewSection do
          %{
            id: string_or_nil(Map.get(decoded, "id")),
            number: number,
-           body: string_or_empty(Map.get(decoded, "body"))
+           body: string_or_empty(Map.get(decoded, "body")),
+           head_oid: string_or_nil(Map.get(decoded, "headRefOid"))
          }}
 
       _ ->

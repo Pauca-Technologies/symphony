@@ -20,11 +20,79 @@ defmodule SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.DeferredBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, _prompt, _issue, _opts) do
+    :symphony_elixir
+    |> Application.fetch_env!(:deferred_requests_for_test)
+    |> Enum.each(&SymphonyElixir.AgentRunner.store_deferred_review_handoff_for_test/1)
+
+    {:ok, %{session_id: "deferred-test-session"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
+defmodule SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, _prompt, _issue, _opts) do
+    request = Application.fetch_env!(:symphony_elixir, :blocking_deferred_request_for_test)
+    recipient = Application.fetch_env!(:symphony_elixir, :blocking_deferred_recipient_for_test)
+    SymphonyElixir.AgentRunner.store_deferred_review_handoff_for_test(request)
+    send(recipient, {:implementor_turn_ready, self()})
+
+    receive do
+      :finish_implementor_turn -> {:ok, %{session_id: "blocking-deferred-session"}}
+    end
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
+defmodule SymphonyElixir.AgentRunnerTest.LifecycleRecipient do
+  @moduledoc false
+  use GenServer
+
+  def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
+
+  @impl true
+  def init(owner), do: {:ok, owner}
+
+  @impl true
+  def handle_call(message, _from, owner) do
+    send(owner, {:lifecycle_call, message})
+    {:reply, :ok, owner}
+  end
+
+  @impl true
+  def handle_info(message, owner) do
+    send(owner, {:lifecycle_info, message})
+    {:noreply, owner}
+  end
+end
+
 defmodule SymphonyElixir.AgentRunnerTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend
+  alias SymphonyElixir.AgentRunnerTest.DeferredBackend
   alias SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend
+  alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
   alias SymphonyElixir.Linear.Issue
 
   @idempotency_label "symphony:routing-warned"
@@ -187,6 +255,452 @@ defmodule SymphonyElixir.AgentRunnerTest do
       # silently dropped with the dying task's process dictionary.
       assert_received {:handoff_mutation_applied, query, _variables}
       assert query =~ "issueUpdate"
+    end
+  end
+
+  describe "deferred review lifecycle" do
+    test "coalesces repeated handoff requests into one review and one mutation" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-coalesced-review-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      {_, 0} = System.cmd("git", ["-C", workspace, "init", "--quiet"])
+      File.write!(Path.join(workspace, "README.md"), "review target\n")
+      {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          workspace,
+          "-c",
+          "user.name=Symphony Test",
+          "-c",
+          "user.email=symphony@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "test review target"
+        ])
+
+      test_pid = self()
+
+      issue = %Issue{
+        id: "issue-coalesced",
+        identifier: "UDPE-6460",
+        title: "Coalesce review",
+        state: "In Progress",
+        labels: []
+      }
+
+      linear_client = fn query, variables, _opts ->
+        send(test_pid, {:handoff_mutation_applied, query, variables})
+        {:ok, %{"data" => %{}}}
+      end
+
+      review_runner = fn ctx ->
+        send(test_pid, :review_session_started)
+        File.mkdir_p!(Path.dirname(ctx.verdict_path))
+        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        {:ok, %{}}
+      end
+
+      no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
+
+      review_workflow = %{
+        config: %{"review" => %{"require_pr" => false}},
+        prompt: "Review {{ issue.identifier }}",
+        prompt_template: "Review {{ issue.identifier }}"
+      }
+
+      request = %{
+        query: "mutation { issueUpdate(input: {stateId: \"in-review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: review_workflow,
+        review_opts: [
+          pr_runner: no_pr,
+          session_runner: review_runner,
+          comment_fn: fn _id, _body -> :ok end,
+          linear_client: linear_client
+        ],
+        linear_client: linear_client
+      }
+
+      Application.put_env(:symphony_elixir, :deferred_requests_for_test, [request, request])
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :deferred_requests_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {DeferredBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received :review_session_started
+      refute_received :review_session_started
+      assert_received {:handoff_mutation_applied, query, %{}}
+      assert query =~ "issueUpdate"
+      refute_received {:handoff_mutation_applied, _, _}
+    end
+
+    test "withholds a reviewed handoff when the pull request head changes" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-head-change-review-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      test_pid = self()
+
+      issue = %Issue{
+        id: "issue-head-change",
+        identifier: "UDPE-6460",
+        title: "Revalidate review head",
+        state: "In Progress",
+        labels: []
+      }
+
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      pr_runner = fn
+        ["pr", "view" | _], _cwd ->
+          call = Agent.get_and_update(counter, fn count -> {count, count + 1} end)
+          head = if call == 0, do: "head-before-review", else: "head-after-review"
+
+          {Jason.encode!(%{
+             "id" => "PR_head_change",
+             "number" => 64,
+             "body" => "Body.",
+             "headRefOid" => head
+           }), 0}
+
+        ["api", "graphql" | _], _cwd ->
+          {"", 0}
+      end
+
+      review_runner = fn ctx ->
+        File.mkdir_p!(Path.dirname(ctx.verdict_path))
+        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        {:ok, %{}}
+      end
+
+      linear_client = fn query, variables, _opts ->
+        send(test_pid, {:unexpected_handoff_mutation, query, variables})
+        {:ok, %{"data" => %{}}}
+      end
+
+      review_workflow = %{
+        config: %{"review" => %{}},
+        prompt: "Review {{ issue.identifier }}",
+        prompt_template: "Review {{ issue.identifier }}"
+      }
+
+      request = %{
+        query: "mutation { issueUpdate(input: {stateId: \"in-review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: review_workflow,
+        review_opts: [
+          pr_runner: pr_runner,
+          session_runner: review_runner,
+          comment_fn: fn _id, _body -> :ok end,
+          linear_client: linear_client
+        ],
+        linear_client: linear_client
+      }
+
+      Application.put_env(:symphony_elixir, :deferred_requests_for_test, [request])
+
+      on_exit(fn ->
+        if Process.alive?(counter), do: Agent.stop(counter)
+        Application.delete_env(:symphony_elixir, :deferred_requests_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {DeferredBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      refute_received {:unexpected_handoff_mutation, _, _}
+      assert Agent.get(counter, & &1) == 2
+    end
+
+    test "enters pending review before blocking PR target resolution" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-review-preflight-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      test_pid = self()
+      {:ok, recipient} = LifecycleRecipient.start_link(test_pid)
+
+      issue = %Issue{
+        id: "issue-preflight",
+        identifier: "UDPE-6460",
+        title: "Track review preflight",
+        state: "In Progress",
+        labels: []
+      }
+
+      pr_runner = fn
+        ["pr", "view" | _], _cwd ->
+          unless Process.get(:preflight_released) do
+            send(test_pid, {:review_preflight_waiting, self()})
+
+            receive do
+              :release_review_preflight -> Process.put(:preflight_released, true)
+            end
+          end
+
+          {Jason.encode!(%{
+             "id" => "PR_preflight",
+             "number" => 65,
+             "body" => "Body.",
+             "headRefOid" => "head-preflight"
+           }), 0}
+
+        ["api", "graphql" | _], _cwd ->
+          {"", 0}
+      end
+
+      review_runner = fn ctx ->
+        File.mkdir_p!(Path.dirname(ctx.verdict_path))
+        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        {:ok, %{}}
+      end
+
+      linear_client = fn _query, _variables, _opts -> {:ok, %{"data" => %{}}} end
+
+      review_workflow = %{
+        config: %{"review" => %{}},
+        prompt: "Review {{ issue.identifier }}",
+        prompt_template: "Review {{ issue.identifier }}"
+      }
+
+      request = %{
+        query: "mutation { issueUpdate(input: {stateId: \"in-review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: review_workflow,
+        review_opts: [
+          pr_runner: pr_runner,
+          session_runner: review_runner,
+          comment_fn: fn _id, _body -> :ok end,
+          linear_client: linear_client
+        ],
+        linear_client: linear_client
+      }
+
+      Application.put_env(:symphony_elixir, :deferred_requests_for_test, [request])
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :deferred_requests_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+
+      task =
+        Task.async(fn ->
+          AgentRunner.run_codex_turns_for_test(
+            workspace,
+            issue,
+            recipient,
+            [
+              agent_backend: {DeferredBackend, %{}},
+              issue_state_fetcher: state_fetcher,
+              max_turns: 1
+            ],
+            nil
+          )
+        end)
+
+      assert_receive {:lifecycle_call, {:agent_lifecycle, "issue-preflight", :handoff_pending_review, %{review_key: {:resolving_review_target, "issue-preflight"}}}},
+                     1_000
+
+      assert_receive {:review_preflight_waiting, runner_pid}, 1_000
+      send(runner_pid, :release_review_preflight)
+
+      assert :ok = Task.await(task, 2_000)
+    end
+
+    test "live orchestrator does not redispatch while the shared runner reviews" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        codex_stall_timeout_ms: 1_000
+      )
+
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-live-review-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      {_, 0} = System.cmd("git", ["-C", workspace, "init", "--quiet"])
+      File.write!(Path.join(workspace, "README.md"), "live review target\n")
+      {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          workspace,
+          "-c",
+          "user.name=Symphony Test",
+          "-c",
+          "user.email=symphony@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "live review target"
+        ])
+
+      test_pid = self()
+
+      issue = %Issue{
+        id: "issue-live-review",
+        identifier: "UDPE-6460",
+        title: "Pause during review",
+        state: "In Progress",
+        labels: []
+      }
+
+      review_runner = fn ctx ->
+        review_event_at = DateTime.utc_now()
+
+        ctx.on_message.(%{
+          event: :notification,
+          timestamp: review_event_at,
+          payload: %{"method" => "review/heartbeat"}
+        })
+
+        send(test_pid, {:review_runner_waiting, self(), review_event_at})
+
+        receive do
+          :finish_review -> :ok
+        end
+
+        File.mkdir_p!(Path.dirname(ctx.verdict_path))
+        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        {:ok, %{}}
+      end
+
+      no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
+      linear_client = fn _query, _variables, _opts -> {:ok, %{"data" => %{}}} end
+
+      review_workflow = %{
+        config: %{"review" => %{"require_pr" => false}},
+        prompt: "Review {{ issue.identifier }}",
+        prompt_template: "Review {{ issue.identifier }}"
+      }
+
+      request = %{
+        query: "mutation { issueUpdate(input: {stateId: \"in-review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: review_workflow,
+        review_opts: [
+          pr_runner: no_pr,
+          session_runner: review_runner,
+          comment_fn: fn _id, _body -> :ok end,
+          linear_client: linear_client
+        ],
+        linear_client: linear_client
+      }
+
+      Application.put_env(:symphony_elixir, :blocking_deferred_request_for_test, request)
+      Application.put_env(:symphony_elixir, :blocking_deferred_recipient_for_test, test_pid)
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :LiveReviewOrchestrator)
+      {:ok, orchestrator} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(orchestrator), do: Process.exit(orchestrator, :normal)
+        Application.delete_env(:symphony_elixir, :blocking_deferred_request_for_test)
+        Application.delete_env(:symphony_elixir, :blocking_deferred_recipient_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+
+      task =
+        Task.async(fn ->
+          AgentRunner.run_codex_turns_for_test(
+            workspace,
+            issue,
+            orchestrator,
+            [
+              agent_backend: {BlockingDeferredBackend, %{}},
+              issue_state_fetcher: state_fetcher,
+              max_turns: 1
+            ],
+            nil
+          )
+        end)
+
+      assert_receive {:implementor_turn_ready, worker_pid}, 1_000
+      stale_at = DateTime.add(DateTime.utc_now(), -5, :second)
+      initial_state = :sys.get_state(orchestrator)
+
+      running_entry = %{
+        pid: worker_pid,
+        ref: make_ref(),
+        identifier: issue.identifier,
+        issue: issue,
+        session_id: "live-review-session",
+        last_codex_timestamp: stale_at,
+        lifecycle_state: :implementing,
+        lifecycle_started_at: stale_at,
+        started_at: stale_at
+      }
+
+      :sys.replace_state(orchestrator, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue.id => running_entry})
+        |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue.id))
+      end)
+
+      send(worker_pid, :finish_implementor_turn)
+      assert_receive {:review_runner_waiting, ^worker_pid, review_event_at}, 1_000
+
+      send(orchestrator, :tick)
+      Process.sleep(100)
+      state = :sys.get_state(orchestrator)
+
+      assert Process.alive?(worker_pid)
+      assert state.running[issue.id].lifecycle_state == :handoff_pending_review
+      assert state.running[issue.id].last_codex_timestamp == review_event_at
+      assert MapSet.member?(state.claimed, issue.id)
+      refute Map.has_key?(state.retry_attempts, issue.id)
+
+      send(worker_pid, :finish_review)
+      assert :ok = Task.await(task, 2_000)
     end
   end
 end

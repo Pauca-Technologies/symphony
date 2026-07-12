@@ -237,6 +237,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
           :ok -> :ok
           {:blocked, prompt, findings} -> {:review_blocked, prompt, findings}
+          {:skipped, _reason} -> :ok
         end
     end
   end
