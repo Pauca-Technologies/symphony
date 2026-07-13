@@ -496,10 +496,20 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         end
       )
 
-    assert response["success"] == false
+    assert response["success"] == true
     output = Jason.decode!(response["output"])
-    assert get_in(output, ["error", "review", "deferred"]) == true
-    assert get_in(output, ["error", "remediation"]) =~ "Do not retry the Linear handoff mutation"
+
+    assert %{
+             "success" => true,
+             "status" => "deferred_review_started",
+             "issueIdentifier" => "UDPE-4",
+             "review" => %{"deferred" => true},
+             "instructions" => instructions
+           } = output
+
+    assert instructions =~ "Do not retry the Linear handoff mutation"
+    assert instructions =~ "End the turn now"
+    assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
 
     assert_received {:deferred_review, request}
     assert request.query == query

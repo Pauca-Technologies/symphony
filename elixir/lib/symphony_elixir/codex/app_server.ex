@@ -993,7 +993,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ -> :tool_call_failed
       end
 
-    emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
+    emit_message(
+      on_message,
+      event,
+      %{
+        payload: payload,
+        raw: payload_string,
+        details: %{result: observable_dynamic_tool_result(result)}
+      },
+      metadata
+    )
 
     :approved
   end
@@ -1124,6 +1133,21 @@ defmodule SymphonyElixir.Codex.AppServer do
       "contentItems" => dynamic_tool_content_items(inspect(result))
     }
   end
+
+  defp observable_dynamic_tool_result(result) do
+    result
+    |> Map.take(["success", "output"])
+    |> Map.update("output", nil, &decode_dynamic_tool_output/1)
+  end
+
+  defp decode_dynamic_tool_output(output) when is_binary(output) do
+    case Jason.decode(output) do
+      {:ok, decoded} -> decoded
+      {:error, _reason} -> output
+    end
+  end
+
+  defp decode_dynamic_tool_output(output), do: output
 
   defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
   defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)

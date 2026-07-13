@@ -45,6 +45,14 @@ when the prompt is built; correlate these events by issue, workspace, attempt, a
 `prompt_chars` and `prompt_bytes` measure only the newly submitted turn text. Retained thread history
 and effective model-input cost remain represented by the backend's context/input-token telemetry.
 
+## Dynamic Tool Outcomes
+
+Codex `tool_call_completed` and `tool_call_failed` session events include the normalized tool result
+under `details.result`. The record keeps the result's `success` flag and decoded structured `output`
+without duplicating `contentItems`. For deferred handoff reviews, inspect
+`details.result.output.status == "deferred_review_started"`; reviewer blocks and actual tool or
+GraphQL failures remain failed events with their distinct structured error output.
+
 ## Checklist For New Logs
 
 - Is this event tied to a Linear issue? Include `issue_id` and `issue_identifier`.

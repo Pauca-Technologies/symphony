@@ -96,14 +96,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           }
         })
 
-      {:review_deferred, prompt} ->
-        failure_response(%{
-          "error" => %{
-            "message" => "Automated reviewer deferred the In Review handoff until after this Codex turn.",
-            "remediation" => prompt,
-            "review" => %{"deferred" => true}
-          }
-        })
+      {:review_deferred, result} ->
+        success_response(result)
 
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
@@ -231,7 +225,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           linear_client: request.linear_client
         })
 
-        {:review_deferred, deferred_review_prompt(issue)}
+        {:review_deferred, deferred_review_result(issue)}
 
       nil ->
         case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
@@ -244,6 +238,18 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp deferred_review_callback(context) do
     Map.get(context, :deferred_review_callback) || Map.get(context, "deferred_review_callback")
+  end
+
+  defp deferred_review_result(issue) do
+    %{
+      "success" => true,
+      "status" => "deferred_review_started",
+      "issueIdentifier" =>
+        Map.get(issue, :identifier) || Map.get(issue, "identifier") || Map.get(issue, :id) ||
+          Map.get(issue, "id"),
+      "review" => %{"deferred" => true},
+      "instructions" => deferred_review_prompt(issue)
+    }
   end
 
   defp deferred_review_prompt(issue) do
@@ -412,6 +418,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp failure_response(payload) do
     dynamic_tool_response(false, encode_payload(payload))
+  end
+
+  defp success_response(payload) do
+    dynamic_tool_response(true, encode_payload(payload))
   end
 
   defp dynamic_tool_response(success, output) when is_boolean(success) and is_binary(output) do

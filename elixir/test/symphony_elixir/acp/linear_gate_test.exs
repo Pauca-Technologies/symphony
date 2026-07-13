@@ -48,9 +48,7 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
   describe "tools/call routing" do
     test "dispatches into the session process and returns the tool result" do
       executor = fn "linear_graphql", _args ->
-        DynamicTool.execute("linear_graphql", %{"query" => "query { viewer { id } }"},
-          linear_client: fn _q, _v, _o -> {:ok, %{"data" => %{"viewer" => %{"id" => "usr_1"}}}} end
-        )
+        DynamicTool.execute("linear_graphql", %{"query" => "query { viewer { id } }"}, linear_client: fn _q, _v, _o -> {:ok, %{"data" => %{"viewer" => %{"id" => "usr_1"}}}} end)
       end
 
       %{url: url} = start_gate(executor)
@@ -155,6 +153,49 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
       assert get_in(output, ["error", "remediation"]) =~ "app/x.ts"
     end
 
+    test "accepted deferred review returns a successful structured result" do
+      workspace = make_workspace("deferred-review")
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
+
+      review_workflow = %{
+        config: %{"review" => %{}},
+        prompt: "Review {{ issue.identifier }}",
+        prompt_template: "Review {{ issue.identifier }}"
+      }
+
+      issue = %Issue{id: "issue-acp-deferred", identifier: "ACP-3", title: "Review later", state: "In Progress"}
+      test_pid = self()
+
+      executor =
+        handoff_executor(issue, workspace,
+          review_workflow: review_workflow,
+          deferred_review_callback: fn request -> send(test_pid, {:deferred_review, request}) end,
+          linear_client: fn
+            _query, %{"issueId" => "issue-acp-deferred"}, [] -> {:ok, transition_response("In Progress")}
+            _query, _variables, [] -> flunk("deferred handoff mutation must not reach Linear before review")
+          end
+        )
+
+      %{url: url} = start_gate(executor)
+
+      resp = tools_call(url, issue.id)
+
+      assert get_in(resp.body, ["result", "isError"]) == false
+
+      assert %{
+               "success" => true,
+               "status" => "deferred_review_started",
+               "issueIdentifier" => "ACP-3",
+               "review" => %{"deferred" => true},
+               "instructions" => instructions
+             } = tool_call_output(resp)
+
+      assert instructions =~ "End the turn now"
+      assert instructions =~ "Do not retry the Linear handoff mutation"
+      assert_received {:deferred_review, %{issue: ^issue}}
+    end
+
     test "the gate runs in the session process (process-dictionary state is honored)" do
       # Deferred-review/iteration counters live in the session process's
       # dictionary; prove the tool actually executes there, not in the HTTP
@@ -219,6 +260,7 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
       %{issue: issue, workspace: workspace, worker_host: nil}
       |> maybe_put(:review_workflow, Keyword.get(opts, :review_workflow))
       |> maybe_put(:review_opts, Keyword.get(opts, :review_opts))
+      |> maybe_put(:deferred_review_callback, Keyword.get(opts, :deferred_review_callback))
 
     fn "linear_graphql", args ->
       DynamicTool.execute("linear_graphql", args, linear_client: linear_client, handoff_gate_context: context)

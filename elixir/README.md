@@ -28,8 +28,10 @@ does not auto-approve native Linear MCP `save_issue` calls because they cannot r
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
 mutation, the active implementor turn closes, and Symphony runs the reviewer before applying that
-mutation. If the Linear issue has an attached GitHub PR URL, the review gate uses that PR directly
-for the human-review section; otherwise it falls back to the current workspace branch's PR.
+mutation. An accepted deferred review returns a successful `deferred_review_started` tool result
+with explicit instructions to end the turn without retrying the mutation. If the Linear issue has
+an attached GitHub PR URL, the review gate uses that PR directly for the human-review section;
+otherwise it falls back to the current workspace branch's PR.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.

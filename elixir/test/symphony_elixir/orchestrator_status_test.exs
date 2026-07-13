@@ -384,6 +384,33 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        }}
     )
 
+    deferred_result = %{
+      "success" => true,
+      "status" => "deferred_review_started",
+      "issueIdentifier" => issue.identifier,
+      "review" => %{"deferred" => true},
+      "instructions" => "End the turn now. Do not retry the Linear handoff mutation."
+    }
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :tool_call_completed,
+         payload: %{
+           "method" => "item/tool/call",
+           "params" => %{"tool" => "linear_graphql"}
+         },
+         details: %{
+           result: %{
+             "success" => true,
+             "output" => deferred_result
+           }
+         },
+         timestamp: now
+       }}
+    )
+
     send(
       pid,
       {:codex_worker_update, issue_id,
@@ -411,9 +438,23 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> String.split("\n", trim: true)
       |> Enum.map(&Jason.decode!/1)
 
-    assert Enum.map(lines, & &1["event"]) == ["session_started", "notification", "notification"]
+    assert Enum.map(lines, & &1["event"]) == [
+             "session_started",
+             "notification",
+             "tool_call_completed",
+             "notification"
+           ]
+
     assert Enum.all?(lines, &(&1["issue_id"] == issue_id))
     assert Enum.all?(lines, &(&1["session_id"] == "thread-log-turn-log"))
+
+    persisted_tool_result =
+      lines
+      |> Enum.find(&(&1["event"] == "tool_call_completed"))
+      |> get_in(["details", "result"])
+
+    assert persisted_tool_result["success"] == true
+    assert persisted_tool_result["output"] == deferred_result
     assert List.last(lines)["summary"] == "thread/compacted"
   end
 

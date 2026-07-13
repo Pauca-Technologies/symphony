@@ -1125,6 +1125,8 @@ Optional client-side tool extension:
   - transport success + no top-level GraphQL `errors` -> `success=true`
   - top-level GraphQL `errors` present -> `success=false`, but preserve the GraphQL response body
     for debugging
+  - an accepted deferred handoff review -> `success=true` with a distinct status and explicit
+    instructions to end the turn without retrying the mutation
   - invalid input, missing auth, or transport failure -> `success=false` with an error payload
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
@@ -2075,8 +2077,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - the tool is advertised to the session
   - valid `query` / `variables` inputs execute against configured Linear auth
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
+  - accepted deferred handoff reviews produce `success=true` with structured end-turn instructions
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
+  - session observability records retain normalized tool result details so deferred handoffs and
+    failure categories remain distinguishable
 
 ### 17.6 Observability
 
