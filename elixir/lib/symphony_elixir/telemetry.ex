@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Telemetry do
   @type event_kind ::
           :run_start
           | :run_end
+          | :prompt_built
           | :gate
           | :routing_skip
           | :cardinality_skip

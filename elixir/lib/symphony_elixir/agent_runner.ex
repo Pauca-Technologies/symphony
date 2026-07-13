@@ -22,6 +22,7 @@ defmodule SymphonyElixir.AgentRunner do
   }
 
   @type worker_host :: String.t() | nil
+  @prompt_built_telemetry_event [:symphony_elixir, :agent, :prompt_built]
   @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
   @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
 
@@ -323,6 +324,10 @@ defmodule SymphonyElixir.AgentRunner do
     run_codex_turns(workspace, issue, recipient, opts, worker_host)
   end
 
+  @doc false
+  @spec prompt_built_telemetry_event() :: [atom()]
+  def prompt_built_telemetry_event, do: @prompt_built_telemetry_event
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
@@ -341,7 +346,19 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(backend, app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    {prompt, included_sections} = build_turn_prompt(issue, opts, turn_number, max_turns)
+
+    emit_prompt_built(
+      prompt,
+      included_sections,
+      issue,
+      workspace,
+      app_session.worker_host,
+      opts,
+      turn_number,
+      max_turns
+    )
+
     tool_executor = dynamic_tool_executor(issue, workspace, app_session.worker_host, opts)
 
     case backend.run_turn(
@@ -422,25 +439,90 @@ defmodule SymphonyElixir.AgentRunner do
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
     session_start_prompt = Keyword.get(opts, :session_start_prompt)
 
-    [session_start_prompt, handoff_tool_guidance(opts), PromptBuilder.build_prompt(issue, opts)]
-    |> Enum.reject(&(is_nil(&1) or String.trim(&1) == ""))
-    |> Enum.join("\n\n")
+    [
+      {"session_start", session_start_prompt},
+      {"handoff_tool_guidance", handoff_tool_guidance(opts)},
+      {"task_prompt", PromptBuilder.build_prompt(issue, opts)}
+    ]
+    |> compose_prompt_sections()
   end
 
   defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
     handoff_gate_prompt = Keyword.get(opts, :handoff_gate_prompt)
+    handoff_guidance = handoff_tool_guidance(opts)
 
-    """
-    #{handoff_gate_prompt_section(handoff_gate_prompt)}
-    #{handoff_tool_guidance(opts)}
-    Continuation guidance:
+    prompt =
+      """
+      #{handoff_gate_prompt_section(handoff_gate_prompt)}
+      #{handoff_guidance}
+      Continuation guidance:
 
-    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
-    - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
-    """
+      - The previous Codex turn completed normally, but the Linear issue is still in an active state.
+      - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
+      - Resume from the current workspace and workpad state instead of restarting from scratch.
+      - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+      - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+      """
+
+    included_sections =
+      [
+        {"handoff_gate_remediation", handoff_gate_prompt},
+        {"handoff_tool_guidance", handoff_guidance},
+        {"continuation_guidance", "included"}
+      ]
+      |> included_prompt_section_names()
+
+    {prompt, included_sections}
+  end
+
+  defp compose_prompt_sections(sections) do
+    included_sections =
+      Enum.reject(sections, fn {_name, content} ->
+        is_nil(content) or String.trim(content) == ""
+      end)
+
+    prompt = Enum.map_join(included_sections, "\n\n", fn {_name, content} -> content end)
+    {prompt, Enum.map(included_sections, fn {name, _content} -> name end)}
+  end
+
+  defp included_prompt_section_names(sections) do
+    sections
+    |> Enum.reject(fn {_name, content} -> is_nil(content) or String.trim(content) == "" end)
+    |> Enum.map(fn {name, _content} -> name end)
+  end
+
+  defp emit_prompt_built(prompt, included_sections, issue, workspace, worker_host, opts, turn_number, max_turns) do
+    prompt_kind = if turn_number == 1, do: "initial", else: "continuation"
+    prompt_chars = String.length(prompt)
+    prompt_bytes = byte_size(prompt)
+
+    measurements = %{
+      count: 1,
+      prompt_bytes: prompt_bytes,
+      prompt_chars: prompt_chars
+    }
+
+    metadata = %{
+      event: "agent.prompt_built",
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      workspace: workspace,
+      worker_host: worker_host,
+      attempt: Keyword.get(opts, :attempt),
+      turn_number: turn_number,
+      max_turns: max_turns,
+      prompt_kind: prompt_kind,
+      included_sections: included_sections
+    }
+
+    :telemetry.execute(@prompt_built_telemetry_event, measurements, metadata)
+    Telemetry.emit(:prompt_built, Map.merge(metadata, measurements))
+
+    Logger.info(
+      "agent.prompt_built #{issue_context(issue)} workspace=#{workspace} worker_host=#{worker_host_for_log(worker_host)} " <>
+        "attempt=#{inspect(metadata.attempt)} turn=#{turn_number}/#{max_turns} prompt_kind=#{prompt_kind} " <>
+        "prompt_chars=#{prompt_chars} prompt_bytes=#{prompt_bytes} included_sections=#{Enum.join(included_sections, ",")}"
+    )
   end
 
   defp dynamic_tool_executor(issue, workspace, worker_host, opts) do

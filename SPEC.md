@@ -647,6 +647,11 @@ Important nuance:
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
+- Each turn SHOULD emit prompt observability with the prompt kind, character and byte counts, and
+  symbolic included-section names. This observability MUST NOT contain raw prompt content.
+- Compact continuation guidance applies only while reusing the same live backend thread. The first
+  turn of a newly started backend session SHOULD retain the full task prompt unless that backend has
+  restored verified prior-thread context; a retry attempt alone is not proof of restored context.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.

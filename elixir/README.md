@@ -133,6 +133,11 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+  The first turn receives the full rendered task prompt; later turns on the same live thread receive
+  only compact continuation guidance plus any actionable handoff or reviewer findings. Symphony
+  records prompt character/byte counts and included section names without storing raw prompt text.
+  A newly started backend thread still receives the full first-turn prompt, including on retries,
+  because it cannot safely rely on context retained by a previous process.
 - `agent.backend` selects the coding-agent backend: `codex` (default, the Codex app-server described
   above), `acp` (the Agent Client Protocol, e.g. `opencode acp`), or `claude_code` (native Claude Code
   `claude -p` stream-json). All backends honor the same handoff gate and observability transcript.

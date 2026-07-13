@@ -1575,6 +1575,22 @@ defmodule SymphonyElixir.CoreTest do
         "symphony-elixir-agent-runner-continuation-#{System.unique_integer([:positive])}"
       )
 
+    telemetry_handler_id =
+      "agent-runner-prompt-built-#{System.unique_integer([:positive])}"
+
+    parent = self()
+
+    :telemetry.attach(
+      telemetry_handler_id,
+      AgentRunner.prompt_built_telemetry_event(),
+      fn event, measurements, metadata, _config ->
+        send(parent, {:prompt_built_telemetry, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(telemetry_handler_id) end)
+
     try do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
@@ -1629,10 +1645,11 @@ defmodule SymphonyElixir.CoreTest do
         workspace_root: workspace_root,
         hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
         codex_command: "#{codex_binary} app-server",
-        max_turns: 3
+        max_turns: 3,
+        prompt:
+          "You are an agent for this repository.\n" <>
+            String.duplicate("Static repository instruction fixture.\n", 100)
       )
-
-      parent = self()
 
       state_fetcher = fn [_issue_id] ->
         attempt = Process.get(:agent_turn_fetch_count, 0) + 1
@@ -1668,6 +1685,8 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
+      Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
@@ -1693,6 +1712,49 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert String.length(Enum.at(turn_texts, 1)) < String.length(Enum.at(turn_texts, 0))
+      assert String.length(Enum.at(turn_texts, 1)) < 1_000
+
+      prompt_event = AgentRunner.prompt_built_telemetry_event()
+
+      assert_receive {:prompt_built_telemetry, ^prompt_event, %{count: 1, prompt_chars: initial_chars, prompt_bytes: initial_bytes},
+                      %{
+                        event: "agent.prompt_built",
+                        issue_id: "issue-continue",
+                        issue_identifier: "MT-247",
+                        prompt_kind: "initial",
+                        included_sections: ["task_prompt"],
+                        turn_number: 1,
+                        max_turns: 3
+                      }}
+
+      assert initial_chars == String.length(Enum.at(turn_texts, 0))
+      assert initial_bytes == byte_size(Enum.at(turn_texts, 0))
+
+      assert_receive {:prompt_built_telemetry, ^prompt_event, %{count: 1, prompt_chars: continuation_chars, prompt_bytes: continuation_bytes},
+                      %{
+                        event: "agent.prompt_built",
+                        issue_id: "issue-continue",
+                        issue_identifier: "MT-247",
+                        prompt_kind: "continuation",
+                        included_sections: ["continuation_guidance"],
+                        turn_number: 2,
+                        max_turns: 3
+                      }}
+
+      assert continuation_chars == String.length(Enum.at(turn_texts, 1))
+      assert continuation_bytes == byte_size(Enum.at(turn_texts, 1))
+
+      persisted_prompt_events =
+        SymphonyElixir.Telemetry.read_events(nil, nil)
+        |> Enum.filter(&(&1["event"] == "prompt_built"))
+
+      assert Enum.map(persisted_prompt_events, & &1["prompt_kind"]) == [
+               "initial",
+               "continuation"
+             ]
+
+      assert Enum.all?(persisted_prompt_events, &(not Map.has_key?(&1, "prompt")))
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -1705,6 +1767,22 @@ defmodule SymphonyElixir.CoreTest do
         System.tmp_dir!(),
         "symphony-elixir-agent-runner-handoff-gate-#{System.unique_integer([:positive])}"
       )
+
+    telemetry_handler_id =
+      "agent-runner-remediation-prompt-built-#{System.unique_integer([:positive])}"
+
+    parent = self()
+
+    :telemetry.attach(
+      telemetry_handler_id,
+      AgentRunner.prompt_built_telemetry_event(),
+      fn _event, _measurements, metadata, _config ->
+        send(parent, {:remediation_prompt_built, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(telemetry_handler_id) end)
 
     try do
       workspace_root = Path.join(test_root, "workspaces")
@@ -1758,8 +1836,6 @@ defmodule SymphonyElixir.CoreTest do
         exit 2
         """
       )
-
-      parent = self()
 
       state_fetcher = fn [_issue_id] ->
         attempt = Process.get(:agent_handoff_fetch_count, 0) + 1
@@ -1830,6 +1906,24 @@ defmodule SymphonyElixir.CoreTest do
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 1) =~ "the following gates failed:"
       assert Enum.at(turn_texts, 1) =~ "landable-check: Review threads remain open"
+      refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
+
+      assert_receive {:remediation_prompt_built,
+                      %{
+                        prompt_kind: "initial",
+                        included_sections: ["task_prompt"],
+                        turn_number: 1
+                      }}
+
+      assert_receive {:remediation_prompt_built,
+                      %{
+                        prompt_kind: "continuation",
+                        included_sections: [
+                          "handoff_gate_remediation",
+                          "continuation_guidance"
+                        ],
+                        turn_number: 2
+                      }}
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
