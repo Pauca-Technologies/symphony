@@ -112,9 +112,70 @@ defmodule SymphonyElixir.BareCloneTest do
              BareClone.ensure_worktree(clone, wt, branch, "develop")
 
     assert start == "origin/#{branch}"
-    # Tracked file reset to latest pushed PR state (local scratch discarded).
+    # Tracked file reset to latest pushed PR state (local scratch is no longer
+    # in the worktree — it's preserved on a rescue branch, see below).
     assert File.read!(Path.join(wt, "feature.txt")) == "pr work v2\n"
     # Gitignored artifact survived the reuse.
     assert File.read!(artifact) == "cached\n"
+
+    # The local scratch edit was snapshotted onto a rescue branch rather than
+    # silently discarded by `checkout --force`.
+    rescue_branch = only_rescue_branch(wt)
+    assert git!(wt, ["show", "#{rescue_branch}:feature.txt"]) == "local scratch"
+  end
+
+  test "reusing a dirty worktree preserves uncommitted tracked changes on a rescue branch" do
+    branch = "udpe-4-feature"
+    origin = make_origin(feature_branch: branch)
+    root = tmp!("root")
+    repo = routed(origin)
+    wt = Path.join(root, "UDPE-4")
+
+    assert {:ok, clone} = BareClone.ensure_and_fetch(root, repo, branch)
+    assert {:ok, %{reused: false}} = BareClone.ensure_worktree(clone, wt, branch, "develop")
+
+    # An interrupted prior run left both a tracked edit and a brand-new tracked
+    # file staged in the worktree.
+    File.write!(Path.join(wt, "feature.txt"), "half-finished work\n")
+    write!(wt, "new_tracked.txt", "new file from the run\n")
+    git!(wt, ["add", "new_tracked.txt"])
+
+    # Re-dispatch reuses the worktree in place and resets tracked files...
+    assert {:ok, %{reused: true}} = BareClone.ensure_worktree(clone, wt, branch, "develop")
+    assert File.read!(Path.join(wt, "feature.txt")) == "pr work\n"
+
+    # ...but the uncommitted work is recoverable from the rescue branch.
+    rescue_branch = only_rescue_branch(wt)
+    assert rescue_branch =~ ~r/^symphony\/rescue\/#{branch}-[0-9a-f]{12}$/
+    assert git!(wt, ["show", "#{rescue_branch}:feature.txt"]) == "half-finished work"
+    assert git!(wt, ["show", "#{rescue_branch}:new_tracked.txt"]) == "new file from the run"
+  end
+
+  test "reusing a clean worktree creates no rescue branch" do
+    branch = "udpe-5-feature"
+    origin = make_origin(feature_branch: branch)
+    root = tmp!("root")
+    repo = routed(origin)
+    wt = Path.join(root, "UDPE-5")
+
+    assert {:ok, clone} = BareClone.ensure_and_fetch(root, repo, branch)
+    assert {:ok, %{reused: false}} = BareClone.ensure_worktree(clone, wt, branch, "develop")
+
+    # No local edits; the reuse resets cleanly with nothing to rescue.
+    assert {:ok, %{reused: true}} = BareClone.ensure_worktree(clone, wt, branch, "develop")
+
+    assert rescue_branches(wt) == []
+  end
+
+  # All `symphony/rescue/*` branches visible from the worktree's clone.
+  defp rescue_branches(worktree) do
+    worktree
+    |> git!(["for-each-ref", "--format=%(refname:short)", "refs/heads/symphony/rescue"])
+    |> String.split("\n", trim: true)
+  end
+
+  defp only_rescue_branch(worktree) do
+    assert [rescue_branch] = rescue_branches(worktree)
+    rescue_branch
   end
 end

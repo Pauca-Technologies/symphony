@@ -25,6 +25,8 @@ defmodule SymphonyElixir.BareClone do
 
   @lock_dir_relative "_repos/.locks"
   @repos_dir_relative "_repos"
+  @rescue_branch_prefix "symphony/rescue"
+  @rescue_stash_message "symphony: rescue uncommitted work before worktree reset"
 
   @typedoc "Subset of RepoConfig.repo_entry the worktree pipeline needs."
   @type routed_repo :: %{
@@ -82,6 +84,13 @@ defmodule SymphonyElixir.BareClone do
   alone. That preserves expensive build artifacts (node_modules, compiled
   assets, …) across dispatches instead of recloning from scratch.
 
+  Before that reset, any uncommitted *tracked* changes an interrupted prior
+  run left behind are snapshotted onto a `#{@rescue_branch_prefix}/…` branch
+  so `git checkout --force` never silently discards real work (untracked and
+  gitignored files survive the reset untouched and need no rescue). If the
+  snapshot can't be captured, the reset is refused rather than risk losing
+  the changes.
+
   The canonical clone is a normal (non-bare) clone and worktrees share its
   object store + `refs/remotes/origin/*`, so the `origin/<branch>` form
   resolves both in the clone and inside the worktree.
@@ -99,6 +108,15 @@ defmodule SymphonyElixir.BareClone do
       case refresh_worktree(worktree_path, branch_name, start_point) do
         :ok ->
           {:ok, %{start_point: start_point, reused: true}}
+
+        {:error, {:rescue_failed, _detail} = reason} ->
+          # The worktree carries uncommitted tracked changes we could NOT
+          # snapshot. Resetting (or recreating, which also wipes the dir)
+          # would discard them, so refuse and surface the failure. The
+          # worktree is left exactly as-is for a human to recover from.
+          Logger.error("Refusing to reset reused worktree with unpreserved local changes: #{worktree_path} (#{inspect(reason)})")
+
+          {:error, reason}
 
         {:error, reason} ->
           Logger.warning("Worktree refresh failed (#{inspect(reason)}); recreating from scratch: #{worktree_path}")
@@ -168,7 +186,18 @@ defmodule SymphonyElixir.BareClone do
   # local tracked edits left over from an aborted prior run; `-B` (re)points
   # the branch at the start point. origin/* is already current (the shared
   # clone was just fetched), so this is the "pull latest" step.
+  #
+  # Because `--force` would otherwise silently drop an interrupted run's
+  # uncommitted tracked changes, snapshot them onto a rescue branch first (see
+  # `preserve_uncommitted_changes/2`). If that snapshot can't be captured we
+  # return `{:error, {:rescue_failed, _}}` and the caller refuses to reset.
   defp refresh_worktree(worktree_path, branch_name, start_point) do
+    with :ok <- preserve_uncommitted_changes(worktree_path, branch_name) do
+      force_reset_worktree(worktree_path, branch_name, start_point)
+    end
+  end
+
+  defp force_reset_worktree(worktree_path, branch_name, start_point) do
     args = ["-C", worktree_path, "checkout", "--force", "-B", branch_name, start_point]
 
     case System.cmd("git", args, stderr_to_stdout: true) do
@@ -178,6 +207,84 @@ defmodule SymphonyElixir.BareClone do
       {output, status} ->
         {:error, {:worktree_checkout_failed, status, String.trim(IO.iodata_to_binary(output))}}
     end
+  end
+
+  # Untracked and gitignored files survive `git checkout --force`, so only
+  # uncommitted *tracked* changes are at risk. When present, capture them onto
+  # a `symphony/rescue/...` branch before the reset so nothing is silently lost.
+  defp preserve_uncommitted_changes(worktree_path, branch_name) do
+    if worktree_has_tracked_changes?(worktree_path) do
+      rescue_uncommitted_changes(worktree_path, branch_name)
+    else
+      :ok
+    end
+  end
+
+  defp worktree_has_tracked_changes?(worktree_path) do
+    case System.cmd(
+           "git",
+           ["-C", worktree_path, "status", "--porcelain", "--untracked-files=no"],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> String.trim(IO.iodata_to_binary(output)) != ""
+      # Can't determine cleanliness (unusual) — treat as clean and let the
+      # checkout itself surface any real error; matches prior behavior.
+      _ -> false
+    end
+  end
+
+  # `git stash create` builds a commit object capturing the current tracked
+  # WIP WITHOUT touching the working tree or the stash ref, and prints its
+  # SHA. We point a rescue branch at that commit so a human can recover the
+  # work (`git checkout <rescue-branch>`), then let the caller reset.
+  defp rescue_uncommitted_changes(worktree_path, branch_name) do
+    case System.cmd(
+           "git",
+           ["-C", worktree_path, "stash", "create", @rescue_stash_message],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        case String.trim(IO.iodata_to_binary(output)) do
+          "" ->
+            # Dirty per `status` but nothing to snapshot: refuse rather than
+            # risk discarding whatever `status` saw.
+            {:error, {:rescue_failed, :empty_snapshot}}
+
+          sha ->
+            create_rescue_branch(worktree_path, branch_name, sha)
+        end
+
+      {output, status} ->
+        {:error, {:rescue_failed, {:stash_create_failed, status, String.trim(IO.iodata_to_binary(output))}}}
+    end
+  end
+
+  defp create_rescue_branch(worktree_path, branch_name, sha) do
+    rescue_branch = rescue_branch_name(branch_name, sha)
+
+    case System.cmd(
+           "git",
+           ["-C", worktree_path, "branch", "--force", rescue_branch, sha],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} ->
+        Logger.warning("Preserved uncommitted tracked changes in reused worktree #{worktree_path} on rescue branch '#{rescue_branch}' before resetting to the start point")
+
+        :ok
+
+      {output, status} ->
+        {:error, {:rescue_failed, {:branch_create_failed, status, String.trim(IO.iodata_to_binary(output))}}}
+    end
+  end
+
+  # `symphony/rescue/<sanitized-branch>-<short-sha>`. The branch name is
+  # sanitized (slashes → dashes) so the rescue ref can never collide with a
+  # real branch ref path, and the short SHA makes repeated rescues of distinct
+  # dirty states land on distinct branches (identical states dedupe).
+  defp rescue_branch_name(branch_name, sha) do
+    sanitized = String.replace(branch_name, "/", "-")
+    short = String.slice(sha, 0, 12)
+    "#{@rescue_branch_prefix}/#{sanitized}-#{short}"
   end
 
   defp recreate_worktree(clone_path, worktree_path, branch_name, start_point) do
