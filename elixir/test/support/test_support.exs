@@ -119,6 +119,7 @@ defmodule SymphonyElixir.TestSupport do
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
+          max_retries: nil,
           max_concurrent_agents_by_state: %{},
           agent_backend: nil,
           agent_pre_command: nil,
@@ -178,6 +179,7 @@ defmodule SymphonyElixir.TestSupport do
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
+    max_retries = Keyword.get(config, :max_retries)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     agent_backend = Keyword.get(config, :agent_backend)
     agent_pre_command = Keyword.get(config, :agent_pre_command)
@@ -240,6 +242,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
+        max_retries && "  max_retries: #{yaml_value(max_retries)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         agent_backend && "  backend: #{yaml_value(agent_backend)}",
         agent_pre_command && "  pre_command: #{yaml_value(agent_pre_command)}",

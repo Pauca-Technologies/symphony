@@ -17,6 +17,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_retries == 10
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -36,6 +37,9 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_retries: 3)
+    assert Config.settings!().agent.max_retries == 3
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -652,6 +656,114 @@ defmodule SymphonyElixir.CoreTest do
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, start_ms, 10_000)
+  end
+
+  test "a persistently failing issue is marked Blocked once retries are exhausted" do
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    previous_labels = Application.get_env(:symphony_elixir, :memory_tracker_available_labels)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retries: 3
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    Application.put_env(:symphony_elixir, :memory_tracker_available_labels, :all)
+
+    issue_id = "issue-exhausted"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :RetriesExhaustedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+      restore_app_env(:memory_tracker_available_labels, previous_labels)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    issue = %Issue{id: issue_id, identifier: "MT-6954", state: "In Progress", labels: []}
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-6954",
+      issue: issue,
+      retry_attempt: 3,
+      started_at: DateTime.utc_now()
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    # Already three consecutive failures deep — the next failure is the fourth,
+    # exceeding max_retries: 3, so instead of a fourth retry the issue gives up.
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:failure_counts, %{issue_id => 3})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+
+    # The Blocked give-up runs off the GenServer loop; its best-effort Linear
+    # writes land on us as the memory-tracker recipient.
+    assert_receive {:memory_tracker_comment, ^issue_id, body}, 1_000
+    assert body =~ "<!-- symphony:blocked-on-giveup -->"
+    assert body =~ "agent.max_retries=3"
+    assert_receive {:memory_tracker_add_label, ^issue_id, "needs-human-input"}, 1_000
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}, 1_000
+
+    state = :sys.get_state(pid)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute Map.has_key?(state.failure_counts, issue_id)
+  end
+
+  test "a failing issue keeps retrying while under the max_retries cap" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retries: 10
+    )
+
+    issue_id = "issue-under-cap"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :UnderCapOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    issue = %Issue{id: issue_id, identifier: "MT-6955", state: "In Progress", labels: []}
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-6955",
+      issue: issue,
+      retry_attempt: 2,
+      started_at: DateTime.utc_now()
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:failure_counts, %{issue_id => 2})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    # Third failure (3 <= 10): a retry is scheduled and the failure count grows.
+    assert %{attempt: 3, error: "agent exited: :boom"} = state.retry_attempts[issue_id]
+    assert state.failure_counts[issue_id] == 3
+    assert MapSet.member?(state.claimed, issue_id)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do

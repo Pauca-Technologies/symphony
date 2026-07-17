@@ -173,6 +173,13 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
+      # Hard cap on consecutive failed/stalled agent runs for one issue before
+      # Symphony gives up and marks it Blocked (`:retries_exhausted`). The
+      # exponential backoff (`max_retry_backoff_ms`) only bounds the *delay*
+      # between retries — without this count cap a persistently failing issue
+      # would retry forever. Reset whenever the issue completes a turn normally,
+      # so only genuine stuck loops trip it.
+      field(:max_retries, :integer, default: 10)
       field(:max_concurrent_agents_by_state, :map, default: %{})
       # Selects the coding-agent backend. "codex" = Codex app-server (default,
       # unchanged behavior); "acp" = Agent Client Protocol; "claude_code" =
@@ -194,13 +201,14 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state, :backend, :pre_command],
+        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_retries, :max_concurrent_agents_by_state, :backend, :pre_command],
         empty_values: []
       )
       |> cast_embed(:label_presets, with: &LabelPreset.changeset/2)
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> validate_number(:max_retries, greater_than: 0)
       |> validate_inclusion(:backend, @backend_names)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)

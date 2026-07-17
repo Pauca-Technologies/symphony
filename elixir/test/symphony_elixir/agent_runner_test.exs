@@ -63,6 +63,26 @@ defmodule SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.TurnCountingBackend do
+  @moduledoc false
+  # Records every turn it runs so a test can assert how many continuation turns
+  # the loop actually drove. Each turn completes normally.
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, _prompt, _issue, _opts) do
+    recipient = Application.fetch_env!(:symphony_elixir, :turn_count_recipient_for_test)
+    send(recipient, :turn_ran)
+    {:ok, %{session_id: "turn-counting-session"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.LifecycleRecipient do
   @moduledoc false
   use GenServer
@@ -93,6 +113,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.DeferredBackend
   alias SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
+  alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
   alias SymphonyElixir.Linear.Issue
 
   @idempotency_label "symphony:routing-warned"
@@ -701,6 +722,54 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       send(worker_pid, :finish_review)
       assert :ok = Task.await(task, 2_000)
+    end
+  end
+
+  describe "blocked mid-run halts continuation" do
+    test "an agent transitioning its issue to Blocked stops being continued that turn" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-blocked-halt-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+
+      Application.put_env(:symphony_elixir, :turn_count_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      issue = %Issue{
+        id: "issue-blocked-halt",
+        identifier: "UDPE-6954",
+        title: "Stuck and self-reporting Blocked",
+        state: "In Progress",
+        labels: []
+      }
+
+      # The agent transitions the issue to Blocked during turn 1 (its sanctioned
+      # "stop dispatching me" channel). The turn loop's post-turn state refresh
+      # must observe the now-inactive state and end the run instead of driving
+      # the remaining continuation turns.
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Blocked"}]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {TurnCountingBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 5
+                 ],
+                 nil
+               )
+
+      # Exactly one turn ran: the Blocked transition ended the run rather than
+      # burning the other four continuation turns.
+      assert_received :turn_ran
+      refute_received :turn_ran
     end
   end
 end

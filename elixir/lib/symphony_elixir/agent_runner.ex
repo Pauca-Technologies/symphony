@@ -856,6 +856,14 @@ defmodule SymphonyElixir.AgentRunner do
             {:continue, refreshed_issue}
 
           true ->
+            # The issue left the active states mid-run. This is the sanctioned
+            # "blocked" channel: an agent that knows it is stuck transitions the
+            # issue to Blocked (via the gated linear_graphql tool), and that
+            # transition ends the run here — the current turn finishes and we do
+            # NOT dispatch another. Any non-active terminal (Done/Cancelled/…)
+            # ends it the same way.
+            Logger.info("Issue #{issue_context(refreshed_issue)} left active states (now #{inspect(refreshed_issue.state)}); ending run without further continuation")
+
             {:done, refreshed_issue}
         end
 
@@ -1008,6 +1016,8 @@ defmodule SymphonyElixir.AgentRunner do
     reason = Map.get(context, :reason, :unknown)
     turn_number = Map.get(context, :turn_number)
     max_turns = Map.get(context, :max_turns)
+    retries = Map.get(context, :retries)
+    max_retries = Map.get(context, :max_retries)
     workspace = Map.get(context, :workspace)
     error = Map.get(context, :error)
 
@@ -1015,6 +1025,9 @@ defmodule SymphonyElixir.AgentRunner do
       case reason do
         :max_turns_exhausted ->
           "Symphony reached agent.max_turns (#{turn_number}/#{max_turns}) without resolving the issue."
+
+        :retries_exhausted when is_integer(retries) and is_integer(max_retries) ->
+          "Symphony exhausted all agent-run retries on this issue after #{retries} consecutive failed runs (agent.max_retries=#{max_retries})."
 
         :retries_exhausted ->
           "Symphony exhausted all agent-run retries on this issue."

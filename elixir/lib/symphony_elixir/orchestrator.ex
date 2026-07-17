@@ -95,6 +95,13 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
+      # issue_id => count of consecutive failed/stalled agent runs since the
+      # issue last completed a turn normally. Only genuine run failures (crash,
+      # stall, handoff-review timeout, spawn failure) bump it; capacity waits
+      # and transient tracker errors don't. When it exceeds agent.max_retries we
+      # give up and mark the issue Blocked (`:retries_exhausted`). Kept separate
+      # from `retry_attempts` (which drives backoff timing) on purpose.
+      failure_counts: %{},
       # issue_id => monotonic ms of the last warning attempt. Fallback
       # flood guard for the routing/cardinality/version gates when the
       # persistent `symphony:routing-warned` marker can't be written.
@@ -234,8 +241,9 @@ defmodule SymphonyElixir.Orchestrator do
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              schedule_failure_retry(state, issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
+                issue: Map.get(running_entry, :issue),
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path),
@@ -646,7 +654,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            failure_counts: Map.delete(state.failure_counts, issue_id)
         }
 
       _ ->
@@ -703,8 +712,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       state
       |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
+      |> schedule_failure_retry(issue_id, next_attempt, %{
         identifier: identifier,
+        issue: Map.get(running_entry, :issue),
         error: "handoff review timed out after #{elapsed_ms}ms without reviewer activity"
       })
     else
@@ -725,8 +735,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       state
       |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
+      |> schedule_failure_retry(issue_id, next_attempt, %{
         identifier: identifier,
+        issue: Map.get(running_entry, :issue),
         error: "stalled for #{elapsed_ms}ms without codex activity"
       })
     else
@@ -1225,8 +1236,9 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
-        schedule_issue_retry(state, issue.id, next_attempt, %{
+        schedule_failure_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
+          issue: issue,
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
@@ -1254,10 +1266,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id) do
+    # A normal turn completion is the "made progress" signal that resets the
+    # consecutive-failure count, so only genuine stuck loops reach max_retries.
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        failure_counts: Map.delete(state.failure_counts, issue_id)
     }
   end
 
@@ -1304,6 +1319,92 @@ defmodule SymphonyElixir.Orchestrator do
             recent_codex_transcript_blocks: recent_codex_transcript_blocks
           })
     }
+  end
+
+  # Schedule a retry for a *genuine* agent-run failure (crash, stall,
+  # handoff-review timeout, spawn failure), counting it against the
+  # `agent.max_retries` cap. Once an issue accumulates more consecutive
+  # failures than the cap, give up: mark it Blocked (`:retries_exhausted`),
+  # same terminal treatment as max-turns exhaustion. Capacity waits and
+  # transient tracker/refresh errors call `schedule_issue_retry` directly and
+  # never count here, so backpressure and infra blips can't block an issue.
+  defp schedule_failure_retry(%State{} = state, issue_id, next_attempt, metadata)
+       when is_binary(issue_id) and is_map(metadata) do
+    {failures, state} = bump_failure_count(state, issue_id)
+    max_retries = max_retries_setting()
+
+    if is_integer(max_retries) and max_retries > 0 and failures > max_retries do
+      give_up_retries_exhausted(state, issue_id, failures - 1, max_retries, metadata)
+    else
+      schedule_issue_retry(state, issue_id, next_attempt, metadata)
+    end
+  end
+
+  defp give_up_retries_exhausted(%State{} = state, issue_id, retries, max_retries, metadata) do
+    identifier = metadata[:identifier] || issue_id
+
+    Logger.warning(
+      "Retries exhausted for issue_id=#{issue_id} issue_identifier=#{identifier} after #{retries} retries (max_retries=#{max_retries}); marking Blocked with :retries_exhausted and releasing claim"
+    )
+
+    spawn_retries_exhausted_block(giveup_issue(metadata, issue_id, identifier), retries, max_retries, metadata)
+
+    state
+    |> drop_retry_attempt(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
+  # Mark the issue Blocked off the GenServer loop: the Linear writes are
+  # network I/O and best-effort, so they must not block dispatch. Reuses the
+  # same give-up path as max-turns exhaustion (Blocked + needs-human-input +
+  # one comment), keyed on the `:retries_exhausted` reason.
+  defp spawn_retries_exhausted_block(%Issue{} = issue, retries, max_retries, metadata) do
+    context = %{
+      reason: :retries_exhausted,
+      retries: retries,
+      max_retries: max_retries,
+      workspace: metadata[:workspace_path],
+      error: metadata[:error]
+    }
+
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           AgentRunner.mark_blocked_on_giveup(issue, context)
+         end) do
+      {:ok, _pid} ->
+        :ok
+
+      other ->
+        Logger.warning("Failed to spawn retries-exhausted Blocked transition for #{issue_context(issue)}: #{inspect(other)}")
+        # Fall back to a synchronous best-effort mark so the give-up isn't lost.
+        AgentRunner.mark_blocked_on_giveup(issue, context)
+    end
+  end
+
+  defp giveup_issue(metadata, issue_id, identifier) when is_map(metadata) do
+    case metadata[:issue] do
+      %Issue{} = issue -> issue
+      _ -> %Issue{id: issue_id, identifier: identifier, labels: []}
+    end
+  end
+
+  defp bump_failure_count(%State{failure_counts: failure_counts} = state, issue_id) do
+    count = Map.get(failure_counts, issue_id, 0) + 1
+    {count, %{state | failure_counts: Map.put(failure_counts, issue_id, count)}}
+  end
+
+  # Cancel any pending retry timer for the issue and drop its retry entry, so a
+  # give-up leaves nothing scheduled to re-dispatch it.
+  defp drop_retry_attempt(%State{retry_attempts: retry_attempts} = state, issue_id) do
+    case Map.get(retry_attempts, issue_id) do
+      %{timer_ref: ref} when is_reference(ref) -> Process.cancel_timer(ref)
+      _ -> :ok
+    end
+
+    %{state | retry_attempts: Map.delete(retry_attempts, issue_id)}
+  end
+
+  defp max_retries_setting do
+    Config.settings!().agent.max_retries
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -1470,7 +1571,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+    # Releasing the claim means we're done working the issue for now (gone,
+    # terminal, left active states, or gave up), so drop its failure count too.
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        failure_counts: Map.delete(state.failure_counts, issue_id)
+    }
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
