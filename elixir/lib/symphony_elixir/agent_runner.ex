@@ -11,6 +11,7 @@ defmodule SymphonyElixir.AgentRunner do
     Config,
     Linear.Client,
     Linear.Issue,
+    Orchestrator,
     PromptBuilder,
     RepoConfig,
     ReviewGate,
@@ -849,6 +850,20 @@ defmodule SymphonyElixir.AgentRunner do
         cond do
           repo_label_drifted?(issue, refreshed_issue) ->
             Logger.info("Label drift detected mid-flight for #{issue_context(refreshed_issue)}; finishing current turn cleanly and halting (no reroute)")
+
+            {:done, refreshed_issue}
+
+          Orchestrator.review_state?(refreshed_issue.state) ->
+            # The issue moved into a review/merge state mid-run (Human
+            # Review, In Review, Merging, Ready to Merge). The repo prompt
+            # forbids the agent from touching the PR there — humans merge —
+            # so continuing would only burn no-op turns until agent.max_turns
+            # trips mark_blocked_on_giveup(:max_turns_exhausted) and demotes a
+            # merge-ready issue to a false Blocked. Finish the current turn
+            # cleanly and halt. Mirrors the dispatch-side guard in
+            # Orchestrator.candidate_issue?/3 and is authoritative even if a
+            # host misconfigures such a state as active (UDPE-6950).
+            Logger.info("Issue #{issue_context(refreshed_issue)} entered review/merge state (now #{inspect(refreshed_issue.state)}); ending run without further continuation")
 
             {:done, refreshed_issue}
 

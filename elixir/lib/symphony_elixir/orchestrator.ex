@@ -37,6 +37,24 @@ defmodule SymphonyElixir.Orchestrator do
                        "ready to merge"
                      ])
 
+  @doc """
+  True when `state_name` is a review/merge state — one where the human is
+  the actor and the repo prompt (`WORKFLOW.md`) forbids the agent from
+  modifying, merging, or transitioning the PR.
+
+  This is the single source of truth for "the agent's contract in this
+  state is to do nothing": it drives both the reviewer-request path
+  (`maybe_request_owner_review/1`) and the dispatch guard in
+  `candidate_issue?/3`, and is reused by `AgentRunner` to stop an in-flight
+  run that lands in one of these states. Case/whitespace-insensitive.
+  """
+  @spec review_state?(String.t()) :: boolean()
+  def review_state?(state_name) when is_binary(state_name) do
+    MapSet.member?(@review_states_set, normalize_issue_state(state_name))
+  end
+
+  def review_state?(_state_name), do: false
+
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Fallback flood guard for issue warnings (routing / cardinality /
@@ -575,7 +593,7 @@ defmodule SymphonyElixir.Orchestrator do
   # is a no-op), so we do not persist "we already asked for this" — calling
   # on every poll where the issue sits in a review state is fine.
   defp maybe_request_owner_review(%Issue{state: state_name} = issue) when is_binary(state_name) do
-    if MapSet.member?(@review_states_set, String.downcase(state_name)) do
+    if review_state?(state_name) do
       mapping = Config.settings!().linear_to_github || []
       ReviewerRequest.request_for_issue(issue, mapping)
     else
@@ -1076,9 +1094,25 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        )
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
+    # Never dispatch an implementor to a review/merge state (Human
+    # Review, In Review, Merging, Ready to Merge). In those states the
+    # human is the actor and the repo prompt (WORKFLOW.md) forbids the
+    # agent from modifying/merging/transitioning the PR — humans merge.
+    # Symphony has no merge logic of its own, so an agent dispatched here
+    # can only no-op every turn: AgentRunner.do_run_codex_turns keeps
+    # continuing while the tracker state stays "active", exhausts
+    # agent.max_turns, and mark_blocked_on_giveup(:max_turns_exhausted)
+    # demotes a human-approved, merge-ready issue to Blocked after ~40
+    # wasted turns (UDPE-6950). This guard is authoritative regardless of
+    # tracker.active_states: even if a host's config lists such a state as
+    # active (the historical misconfiguration this fixes), we refuse to
+    # pick it up as implementor work. These states are instead serviced by
+    # the reviewer-request path (maybe_request_owner_review/1), which asks
+    # the issue owner to review the PR and never spawns an agent.
     issue_routable_to_worker?(issue) and
       active_issue_state?(state_name, active_states) and
-      !terminal_issue_state?(state_name, terminal_states)
+      !terminal_issue_state?(state_name, terminal_states) and
+      !review_state?(state_name)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false

@@ -646,6 +646,87 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
   end
 
+  # UDPE-6950: `Ready to Merge` (and the other @review_states_set states) is a
+  # human-actor handoff where the repo prompt forbids the agent from touching
+  # the PR. Dispatching an implementor there wastes ~40 no-op turns and ends in
+  # a false Blocked via mark_blocked_on_giveup(:max_turns_exhausted). The code
+  # guard in candidate_issue?/3 must refuse the pickup even when a host's config
+  # (mis)lists the state as active — so this test deliberately configures it as
+  # active and proves it is still not dispatched.
+  test "Ready to Merge issue with agent labels is not dispatched even when misconfigured as active" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Ready to Merge"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    ready_to_merge_issue = %Issue{
+      id: "rtm-1",
+      identifier: "MT-6950",
+      title: "Approved, waiting on human merge",
+      state: "Ready to Merge",
+      labels: ["agent:claude:opus4.8", "symphony"],
+      assigned_to_worker: true
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(ready_to_merge_issue, state)
+
+    # Control: the same setup still dispatches a genuinely active issue, so the
+    # guard is specific to review/merge states rather than a blanket refusal.
+    in_progress_issue = %{ready_to_merge_issue | id: "ip-1", identifier: "MT-6951", state: "In Progress"}
+    assert Orchestrator.should_dispatch_issue_for_test(in_progress_issue, state)
+  end
+
+  # UDPE-6950: the continuation/retry path revalidates against the tracker via
+  # retry_candidate_issue? (-> candidate_issue?/3) before re-dispatching. A
+  # Ready to Merge issue must be skipped there too, so the do_run_codex_turns
+  # loop can never keep re-running it up to agent.max_turns and demote it to
+  # Blocked. Active_states lists the state so the skip is attributable to the
+  # review-state guard, not to the state simply being non-active.
+  test "dispatch revalidation skips a Ready to Merge issue so the max_turns->Blocked path is unreachable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Ready to Merge"]
+    )
+
+    ready_to_merge_issue = %Issue{
+      id: "rtm-2",
+      identifier: "MT-6952",
+      title: "Approved, waiting on human merge",
+      state: "Ready to Merge",
+      labels: ["agent:claude:opus4.8"],
+      assigned_to_worker: true
+    }
+
+    fetcher = fn ["rtm-2"] -> {:ok, [ready_to_merge_issue]} end
+
+    assert {:skip, %Issue{} = skipped_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(ready_to_merge_issue, fetcher)
+
+    assert skipped_issue.identifier == "MT-6952"
+  end
+
+  test "review_state?/1 identifies the human-actor review/merge states (UDPE-6950)" do
+    for state <- ["Human Review", "In Review", "Merging", "Ready to Merge"] do
+      assert Orchestrator.review_state?(state), "#{state} should be a review state"
+    end
+
+    # Case- and whitespace-insensitive (states arrive normalized elsewhere).
+    assert Orchestrator.review_state?("  ready to merge  ")
+    assert Orchestrator.review_state?("READY TO MERGE")
+
+    # Genuine work states and non-strings are not review states.
+    refute Orchestrator.review_state?("Todo")
+    refute Orchestrator.review_state?("In Progress")
+    refute Orchestrator.review_state?("Rework")
+    refute Orchestrator.review_state?(nil)
+  end
+
   test "workspace remove returns error information for missing directory" do
     random_path =
       Path.join(
