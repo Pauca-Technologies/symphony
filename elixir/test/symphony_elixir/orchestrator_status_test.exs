@@ -2599,6 +2599,136 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute rendered =~ "Timestamp:"
   end
 
+  test "poll cycle survives a transiently-invalid config and recovers when it becomes valid (UDPE-6990)" do
+    workflow_path = Workflow.workflow_file_path()
+
+    # Drive network-free poll cycles: the in-memory tracker returns no
+    # candidates, so a valid cycle stays entirely local.
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    write_workflow_file!(workflow_path, tracker_kind: "memory", poll_interval_ms: 30_000)
+
+    orchestrator_name = Module.concat(__MODULE__, :InvalidConfigPollOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      # Leave a valid config behind for the shared default orchestrator.
+      write_workflow_file!(workflow_path, tracker_kind: "memory", poll_interval_ms: 30_000)
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    # Neutralize the tick scheduled at init so only the messages we send drive
+    # the loop (a stale {:tick, token} no longer matches tick_token).
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | poll_interval_ms: 30_000,
+          tick_timer_ref: nil,
+          tick_token: nil,
+          poll_check_in_progress: false,
+          next_poll_due_at_ms: nil
+      }
+    end)
+
+    supervisor_pid = Process.whereis(SymphonyElixir.Supervisor)
+    default_orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
+
+    # A half-saved / write-in-flight config: `Config.settings!/0` would raise
+    # ArgumentError ("codex.command can't be blank") on this exact input.
+    write_workflow_file!(workflow_path, tracker_kind: "memory", codex_command: "")
+    assert {:error, {:invalid_workflow_config, _message}} = Config.settings()
+
+    log =
+      capture_log(fn ->
+        send(pid, :run_poll_cycle)
+        # FIFO mailbox: the poll cycle is fully handled before this returns.
+        :sys.get_state(pid)
+      end)
+
+    assert log =~ "Skipping poll cycle"
+    assert Process.alive?(pid)
+
+    # Criterion 1: the app supervisor (and the sibling default orchestrator
+    # under the same one_for_one strategy) is untouched — no crash cascade.
+    assert Process.alive?(supervisor_pid)
+    assert Process.whereis(SymphonyElixir.Supervisor) == supervisor_pid
+
+    if is_pid(default_orchestrator_pid) do
+      assert Process.alive?(default_orchestrator_pid)
+      assert Process.whereis(SymphonyElixir.Orchestrator) == default_orchestrator_pid
+    end
+
+    # Criterion 2: last-good runtime values are kept while config is invalid.
+    assert :sys.get_state(pid).poll_interval_ms == 30_000
+
+    # Config becomes valid again with a distinct interval: polling resumes and
+    # the fresh value is adopted on the next cycle.
+    write_workflow_file!(workflow_path, tracker_kind: "memory", poll_interval_ms: 45_000)
+    assert {:ok, _settings} = Config.settings()
+
+    send(pid, :run_poll_cycle)
+    recovered_state = :sys.get_state(pid)
+
+    assert recovered_state.poll_interval_ms == 45_000
+    assert recovered_state.poll_check_in_progress == false
+    assert Process.alive?(pid)
+  end
+
+  test "tick handler survives a transiently-invalid config without crashing (UDPE-6990)" do
+    workflow_path = Workflow.workflow_file_path()
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    write_workflow_file!(workflow_path, tracker_kind: "memory", poll_interval_ms: 30_000)
+
+    orchestrator_name = Module.concat(__MODULE__, :InvalidConfigTickOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      write_workflow_file!(workflow_path, tracker_kind: "memory", poll_interval_ms: 30_000)
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | poll_interval_ms: 30_000,
+          tick_timer_ref: nil,
+          tick_token: nil,
+          poll_check_in_progress: false,
+          next_poll_due_at_ms: nil
+      }
+    end)
+
+    # `max_turns: 0` fails schema validation (`agent.max_turns` must be > 0),
+    # so `Config.settings!/0` would raise on the tick's config read.
+    write_workflow_file!(workflow_path, tracker_kind: "memory", max_turns: 0)
+    assert {:error, {:invalid_workflow_config, _message}} = Config.settings()
+
+    log =
+      capture_log(fn ->
+        send(pid, :tick)
+        :sys.get_state(pid)
+      end)
+
+    assert log =~ "Skipping poll cycle"
+    assert Process.alive?(pid)
+
+    # The skipped tick keeps the loop idle and does NOT hand off to a poll
+    # cycle (no `poll_check_in_progress` flip on the invalid path).
+    state = :sys.get_state(pid)
+    assert state.poll_check_in_progress == false
+    assert state.poll_interval_ms == 30_000
+
+    # Recovery: a valid config lets the next tick begin a poll check again.
+    write_workflow_file!(workflow_path, tracker_kind: "memory", poll_interval_ms: 45_000)
+
+    send(pid, :tick)
+    recovered_state = :sys.get_state(pid)
+
+    assert recovered_state.poll_check_in_progress == true
+    assert recovered_state.poll_interval_ms == 45_000
+    assert Process.alive?(pid)
+  end
+
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)

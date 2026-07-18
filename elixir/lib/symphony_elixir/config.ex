@@ -98,6 +98,16 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  Human-readable description of a `settings/0` error `reason`, identical to
+  the message `settings!/0` would raise. Lets callers that deliberately take
+  the non-raising `settings/0` path — e.g. the orchestrator poll loop, which
+  must tolerate a transiently-invalid config instead of crashing (UDPE-6990)
+  — log the same detail without triggering the crash.
+  """
+  @spec describe_error(term()) :: String.t()
+  def describe_error(reason), do: format_config_error(reason)
+
   @spec max_concurrent_agents_for_state(term()) :: pos_integer()
   def max_concurrent_agents_for_state(state_name) when is_binary(state_name) do
     config = settings!()

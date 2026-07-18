@@ -162,47 +162,40 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
-    state = refresh_runtime_config(state)
+    case refresh_runtime_config(state) do
+      {:ok, state} ->
+        {:noreply, begin_poll_check(state)}
 
-    state = %{
-      state
-      | poll_check_in_progress: true,
-        next_poll_due_at_ms: nil,
-        tick_timer_ref: nil,
-        tick_token: nil
-    }
-
-    notify_dashboard()
-    :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+      {:error, reason} ->
+        {:noreply, skip_poll_cycle_on_invalid_config(state, reason)}
+    end
   end
 
   def handle_info({:tick, _tick_token}, state), do: {:noreply, state}
 
   def handle_info(:tick, state) do
-    state = refresh_runtime_config(state)
+    case refresh_runtime_config(state) do
+      {:ok, state} ->
+        {:noreply, begin_poll_check(state)}
 
-    state = %{
-      state
-      | poll_check_in_progress: true,
-        next_poll_due_at_ms: nil,
-        tick_timer_ref: nil,
-        tick_token: nil
-    }
-
-    notify_dashboard()
-    :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+      {:error, reason} ->
+        {:noreply, skip_poll_cycle_on_invalid_config(state, reason)}
+    end
   end
 
   def handle_info(:run_poll_cycle, state) do
-    state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
-    state = schedule_tick(state, poll_delay_ms(state))
-    state = %{state | poll_check_in_progress: false, poll_backoff_until_ms: nil}
+    case refresh_runtime_config(state) do
+      {:ok, state} ->
+        state = maybe_dispatch(state)
+        state = schedule_tick(state, poll_delay_ms(state))
+        state = %{state | poll_check_in_progress: false, poll_backoff_until_ms: nil}
 
-    notify_dashboard()
-    {:noreply, state}
+        notify_dashboard()
+        {:noreply, state}
+
+      {:error, reason} ->
+        {:noreply, skip_poll_cycle_on_invalid_config(state, reason)}
+    end
   end
 
   def handle_info(:write_heartbeat, state) do
@@ -1825,7 +1818,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call(:snapshot, _from, state) do
-    state = refresh_runtime_config(state)
+    # Non-raising on a transiently-invalid config: keep the last-good runtime
+    # values so a dashboard poll can't crash the orchestrator either (UDPE-6990).
+    state =
+      case refresh_runtime_config(state) do
+        {:ok, refreshed_state} -> refreshed_state
+        {:error, _reason} -> state
+      end
+
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
 
@@ -2991,14 +2991,60 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp record_session_completion_totals(state, _running_entry), do: state
 
-  defp refresh_runtime_config(%State{} = state) do
-    config = Config.settings!()
-
-    %{
+  # Shared body for a valid-config tick: flip the loop into "checking now…",
+  # clear the fired tick timer, and hand off to the poll cycle.
+  defp begin_poll_check(%State{} = state) do
+    state = %{
       state
-      | poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: config.agent.max_concurrent_agents
+      | poll_check_in_progress: true,
+        next_poll_due_at_ms: nil,
+        tick_timer_ref: nil,
+        tick_token: nil
     }
+
+    notify_dashboard()
+    :ok = schedule_poll_cycle_start()
+    state
+  end
+
+  # Transiently-invalid config on the polled path (UDPE-6990): log a warning
+  # and skip this cycle instead of letting `Config.settings!/0` crash the
+  # GenServer. Keep the last-good `poll_interval_ms`/`max_concurrent_agents`
+  # already in state, reschedule the next tick, and mark the loop idle so
+  # polling resumes on its own the moment the config parses again.
+  defp skip_poll_cycle_on_invalid_config(%State{} = state, reason) do
+    Logger.warning(
+      "Skipping poll cycle; WORKFLOW.md config is currently invalid: #{Config.describe_error(reason)}. Keeping last-good poll_interval_ms=#{state.poll_interval_ms} max_concurrent_agents=#{state.max_concurrent_agents}; retrying next tick"
+    )
+
+    state = schedule_tick(state, poll_delay_ms(state))
+    state = %{state | poll_check_in_progress: false, poll_backoff_until_ms: nil}
+
+    notify_dashboard()
+    state
+  end
+
+  # Resolve live config at the poll boundary WITHOUT raising. A momentarily-
+  # invalid WORKFLOW.md/host config (a half-saved edit, or a write in flight)
+  # makes `Config.settings/0` return `{:error, reason}` where `settings!/0`
+  # would raise `ArgumentError`. Returning the error lets the caller keep the
+  # last-good `poll_interval_ms`/`max_concurrent_agents` already in state and
+  # skip the cycle, so a transient bad config can't crash the GenServer and —
+  # via the supervisor's restart intensity — take the whole app down
+  # (UDPE-6990).
+  defp refresh_runtime_config(%State{} = state) do
+    case Config.settings() do
+      {:ok, config} ->
+        {:ok,
+         %{
+           state
+           | poll_interval_ms: config.polling.interval_ms,
+             max_concurrent_agents: config.agent.max_concurrent_agents
+         }}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
