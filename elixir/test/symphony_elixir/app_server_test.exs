@@ -2086,4 +2086,191 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "withholds Linear credentials from the Codex agent process env" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-withhold-linear-#{System.unique_integer([:positive])}"
+      )
+
+    secret = "lin_test_secret_value_#{System.unique_integer([:positive])}"
+    previous_linear = System.get_env("LINEAR_API_KEY")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-95")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-withhold-linear.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+
+        if is_binary(previous_linear) do
+          System.put_env("LINEAR_API_KEY", previous_linear)
+        else
+          System.delete_env("LINEAR_API_KEY")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      System.put_env("LINEAR_API_KEY", secret)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-withhold-linear.trace}"
+      printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace_file"
+
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-95"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-95"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      # Default config: codex.withhold_linear_credentials defaults to true.
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-withhold-linear",
+        identifier: "MT-95",
+        title: "Withhold Linear credentials",
+        description: "Ensure the Codex agent process cannot inherit Linear credentials",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-95",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Withhold Linear credentials", issue)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "ENV:LINEAR_API_KEY=[]"
+      refute trace =~ secret
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "leaves Linear credentials in the Codex env when withholding is disabled" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-withhold-linear-off-#{System.unique_integer([:positive])}"
+      )
+
+    secret = "lin_test_secret_value_#{System.unique_integer([:positive])}"
+    previous_linear = System.get_env("LINEAR_API_KEY")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-96")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-withhold-linear-off.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+
+        if is_binary(previous_linear) do
+          System.put_env("LINEAR_API_KEY", previous_linear)
+        else
+          System.delete_env("LINEAR_API_KEY")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      System.put_env("LINEAR_API_KEY", secret)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-withhold-linear-off.trace}"
+      printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace_file"
+
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-96"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-96"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_withhold_linear_credentials: false
+      )
+
+      issue = %Issue{
+        id: "issue-withhold-linear-off",
+        identifier: "MT-96",
+        title: "Leave Linear credentials in place",
+        description: "Ensure disabling the flag leaves Linear credentials in the agent env",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-96",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Leave Linear credentials in place", issue)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "ENV:LINEAR_API_KEY=[#{secret}]"
+    after
+      File.rm_rf(test_root)
+    end
+  end
 end

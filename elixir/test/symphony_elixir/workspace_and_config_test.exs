@@ -1143,6 +1143,67 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert cc.withhold_linear_credentials == true
   end
 
+  test "backend_stall_timeout_ms/1 resolves per-backend, falling back to codex (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 111_000,
+      acp_stall_timeout_ms: 333_000,
+      claude_code_stall_timeout_ms: 555_000
+    )
+
+    assert Config.backend_stall_timeout_ms("codex") == 111_000
+    assert Config.backend_stall_timeout_ms("acp") == 333_000
+    assert Config.backend_stall_timeout_ms("claude_code") == 555_000
+    # nil (backend not yet reported) and unknown names fall back to codex.
+    assert Config.backend_stall_timeout_ms(nil) == 111_000
+    assert Config.backend_stall_timeout_ms("gemini") == 111_000
+  end
+
+  test "backend_turn_timeout_ms/1 resolves per-backend, falling back to codex (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_turn_timeout_ms: 222_000,
+      acp_prompt_timeout_ms: 444_000,
+      claude_code_prompt_timeout_ms: 666_000
+    )
+
+    assert Config.backend_turn_timeout_ms("codex") == 222_000
+    # ACP/Claude Code expose the turn-timeout equivalent as prompt_timeout_ms.
+    assert Config.backend_turn_timeout_ms("acp") == 444_000
+    assert Config.backend_turn_timeout_ms("claude_code") == 666_000
+    assert Config.backend_turn_timeout_ms(nil) == 222_000
+    assert Config.backend_turn_timeout_ms("gemini") == 222_000
+  end
+
+  test "backend_review_timeout_ms/1 prefers the stall timeout when positive (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 111_000,
+      codex_turn_timeout_ms: 222_000,
+      acp_stall_timeout_ms: 333_000,
+      acp_prompt_timeout_ms: 444_000,
+      claude_code_stall_timeout_ms: 555_000,
+      claude_code_prompt_timeout_ms: 666_000
+    )
+
+    assert Config.backend_review_timeout_ms("codex") == 111_000
+    assert Config.backend_review_timeout_ms("acp") == 333_000
+    assert Config.backend_review_timeout_ms("claude_code") == 555_000
+    assert Config.backend_review_timeout_ms(nil) == 111_000
+    assert Config.backend_review_timeout_ms("gemini") == 111_000
+  end
+
+  test "backend_review_timeout_ms/1 falls back to the turn timeout when stall is 0 (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 0,
+      codex_turn_timeout_ms: 222_000,
+      acp_stall_timeout_ms: 0,
+      acp_prompt_timeout_ms: 444_000
+    )
+
+    assert Config.backend_review_timeout_ms("codex") == 222_000
+    assert Config.backend_review_timeout_ms("acp") == 444_000
+    # nil/unknown still resolve through codex (stall 0 -> turn timeout).
+    assert Config.backend_review_timeout_ms(nil) == 222_000
+  end
+
   test "rejects an unknown claude_code permission_mode" do
     assert {:error, {:invalid_workflow_config, _message}} =
              Schema.parse(%{"claude_code" => %{"permission_mode" => "yolo"}})

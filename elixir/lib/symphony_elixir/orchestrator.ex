@@ -675,14 +675,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
-
     if map_size(state.running) == 0 do
       state
     else
       now = DateTime.utc_now()
 
       Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+        # UDPE-6952: resolve the stall timeout from the issue's RUNNING backend
+        # namespace. `running_entry.backend` is a name string ("codex"/"acp"/
+        # "claude_code"), or nil before the backend reports in — nil correctly
+        # falls back to codex.
+        timeout_ms = Config.backend_stall_timeout_ms(Map.get(running_entry, :backend))
         reconcile_running_issue_timeout(state_acc, issue_id, running_entry, now, timeout_ms)
       end)
     end

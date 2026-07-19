@@ -377,7 +377,8 @@ defmodule SymphonyElixir.AgentRunner do
           maybe_run_deferred_review_handoff(
             pop_deferred_review_handoff(),
             handoff_gate_prompt,
-            codex_update_recipient
+            codex_update_recipient,
+            backend
           )
 
         case continue_with_issue?(issue, issue_state_fetcher) do
@@ -429,7 +430,8 @@ defmodule SymphonyElixir.AgentRunner do
         maybe_run_deferred_review_handoff(
           pop_deferred_review_handoff(),
           nil,
-          codex_update_recipient
+          codex_update_recipient,
+          backend
         )
 
         Logger.warning("Agent turn ended abnormally for #{issue_context(issue)} turn=#{turn_number}/#{max_turns} reason=#{inspect(reason)}")
@@ -583,17 +585,17 @@ defmodule SymphonyElixir.AgentRunner do
     store_deferred_review_handoff(request)
   end
 
-  defp maybe_run_deferred_review_handoff(nil, handoff_gate_prompt, _recipient),
+  defp maybe_run_deferred_review_handoff(nil, handoff_gate_prompt, _recipient, _backend),
     do: handoff_gate_prompt
 
-  defp maybe_run_deferred_review_handoff(%{} = request, _handoff_gate_prompt, recipient) do
+  defp maybe_run_deferred_review_handoff(%{} = request, _handoff_gate_prompt, recipient, backend) do
     issue = Map.fetch!(request, :issue)
     workspace = Map.fetch!(request, :workspace)
     worker_host = Map.get(request, :worker_host)
     review_workflow = Map.fetch!(request, :review_workflow)
     review_job_id = System.unique_integer([:positive, :monotonic])
     review_opts = review_opts_with_progress(request, recipient, issue, review_job_id)
-    review_timeout_ms = handoff_review_timeout_ms()
+    review_timeout_ms = handoff_review_timeout_ms(AgentBackend.backend_name(backend))
 
     Logger.info("review.gate deferred starting #{issue_context(issue)} workspace=#{workspace}")
 
@@ -668,15 +670,11 @@ defmodule SymphonyElixir.AgentRunner do
   defp review_key_pinned?({:workspace, _issue_id, head_oid}),
     do: is_binary(head_oid) and head_oid != ""
 
-  defp handoff_review_timeout_ms do
-    codex = Config.settings!().codex
-
-    if codex.stall_timeout_ms > 0 do
-      codex.stall_timeout_ms
-    else
-      codex.turn_timeout_ms
-    end
-  end
+  # UDPE-6952: resolve the deferred-review timeout from the RUNNING backend's
+  # own config namespace (stall timeout when positive, else turn timeout),
+  # falling back to codex where the backend has no value.
+  defp handoff_review_timeout_ms(backend_name),
+    do: Config.backend_review_timeout_ms(backend_name)
 
   defp review_opts_with_progress(request, recipient, issue, review_job_id) do
     review_opts = Map.get(request, :review_opts, [])

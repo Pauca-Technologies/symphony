@@ -37,6 +37,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @linear_save_issue_denial_tool "save issue"
   @source_env_pattern ~r/(?:^|[\s;&|('"])(?:\.|source)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/
+  # Same vars the Claude/ACP paths scrub; the agent reaches Linear only through
+  # the gated dynamic tool, which holds the token server-side. Unlike those
+  # backends, `codex app-server` inherits the parent env, so without this scrub
+  # the agent could curl Linear directly and bypass the handoff gate.
+  @linear_credential_env_vars [
+    ~c"LINEAR_API_KEY",
+    ~c"LINEAR_TOKEN",
+    ~c"LINEAR_API_TOKEN",
+    ~c"LINEAR_ACCESS_TOKEN"
+  ]
 
   @type session :: %{
           port: port(),
@@ -296,10 +306,18 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp agent_env do
-    [
+    base = [
       {~c"SYMPHONY_RUN", ~c"1"},
       {~c"SYMPHONY_AGENT", ~c"1"}
     ]
+
+    if Config.settings!().codex.withhold_linear_credentials do
+      # A `false` value tells Port.open's `env:` option to unset the variable in
+      # the child, so the agent cannot inherit Linear creds and bypass the gate.
+      base ++ Enum.map(@linear_credential_env_vars, &{&1, false})
+    else
+      base
+    end
   end
 
   defp prepare_sourced_env_files(workspace, nil) when is_binary(workspace) do
@@ -386,13 +404,28 @@ defmodule SymphonyElixir.Codex.AppServer do
     # SSH does not forward our local env, so the inner-agent markers have to
     # be inlined into the remote shell command. Matches `agent_env/0` for the
     # local Port.open path.
+    #
+    # SSH does not carry our local `{var, false}` scrub either, and the remote
+    # worker host may itself have Linear creds in its shell env that
+    # `codex app-server` would inherit. Prepend an `unset` step (mirroring the
+    # local scrub) so remote runs can't bypass the gate. When withholding is
+    # off the command is byte-for-byte unchanged from today.
     [
       "cd #{shell_escape(workspace)}",
+      remote_unset_linear_credentials(),
       "export SYMPHONY_RUN=1",
       "export SYMPHONY_AGENT=1",
       AgentTransport.with_pre_command("exec #{Config.settings!().codex.command}")
     ]
+    |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
+  end
+
+  defp remote_unset_linear_credentials do
+    if Config.settings!().codex.withhold_linear_credentials do
+      vars = Enum.map_join(@linear_credential_env_vars, " ", &to_string/1)
+      "unset #{vars}"
+    end
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do

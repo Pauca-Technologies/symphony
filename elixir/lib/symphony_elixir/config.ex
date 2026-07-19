@@ -224,6 +224,67 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  Resolve the stall timeout (ms) for the RUNNING backend named `backend`
+  (UDPE-6952).
+
+  Stall/turn/review timeouts were historically codex-namespaced but governed
+  every backend. Resolve them from the running backend's own config namespace
+  instead, falling back to the codex value only where the backend has none.
+  `nil`/unknown backend names are treated as codex.
+  """
+  @spec backend_stall_timeout_ms(String.t() | nil) :: integer()
+  def backend_stall_timeout_ms(backend),
+    do: resolve_backend_stall_timeout_ms(settings!(), backend)
+
+  @doc """
+  Resolve the turn timeout (ms) for the RUNNING backend named `backend`
+  (UDPE-6952).
+
+  ACP and Claude Code expose the turn-timeout equivalent as `prompt_timeout_ms`;
+  codex uses `turn_timeout_ms`. `nil`/unknown backend names fall back to the
+  codex `turn_timeout_ms`.
+  """
+  @spec backend_turn_timeout_ms(String.t() | nil) :: integer()
+  def backend_turn_timeout_ms(backend),
+    do: resolve_backend_turn_timeout_ms(settings!(), backend)
+
+  @doc """
+  Resolve the deferred-review timeout (ms) for the RUNNING backend named
+  `backend` (UDPE-6952).
+
+  Mirrors the codex-only rule, but per backend: use the backend's stall timeout
+  when positive, otherwise its turn timeout. `nil`/unknown backend names fall
+  back to codex. Both timeouts come from a single `settings!/0` read.
+  """
+  @spec backend_review_timeout_ms(String.t() | nil) :: integer()
+  def backend_review_timeout_ms(backend) do
+    settings = settings!()
+    stall = resolve_backend_stall_timeout_ms(settings, backend)
+
+    if stall > 0 do
+      stall
+    else
+      resolve_backend_turn_timeout_ms(settings, backend)
+    end
+  end
+
+  defp resolve_backend_stall_timeout_ms(settings, "codex"), do: settings.codex.stall_timeout_ms
+  defp resolve_backend_stall_timeout_ms(settings, "acp"), do: settings.acp.stall_timeout_ms
+
+  defp resolve_backend_stall_timeout_ms(settings, "claude_code"),
+    do: settings.claude_code.stall_timeout_ms
+
+  defp resolve_backend_stall_timeout_ms(settings, _backend), do: settings.codex.stall_timeout_ms
+
+  defp resolve_backend_turn_timeout_ms(settings, "codex"), do: settings.codex.turn_timeout_ms
+  defp resolve_backend_turn_timeout_ms(settings, "acp"), do: settings.acp.prompt_timeout_ms
+
+  defp resolve_backend_turn_timeout_ms(settings, "claude_code"),
+    do: settings.claude_code.prompt_timeout_ms
+
+  defp resolve_backend_turn_timeout_ms(settings, _backend), do: settings.codex.turn_timeout_ms
+
   defp validate_semantics(settings) do
     with :ok <- validate_agent_backend(settings) do
       validate_tracker_semantics(settings)

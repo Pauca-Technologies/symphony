@@ -239,6 +239,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      # Load-bearing safety property (§5.5/§14.3), same as the ACP/ClaudeCode
+      # paths: never expose Linear credentials to the agent process; the gated
+      # dynamic tool holds the token server-side.
+      field(:withhold_linear_credentials, :boolean, default: true)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -253,7 +257,8 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :withhold_linear_credentials
         ],
         empty_values: []
       )
