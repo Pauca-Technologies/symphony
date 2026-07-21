@@ -1486,6 +1486,43 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, _reason} = HttpServer.start_link(host: "bad host", port: 0)
   end
 
+  test "http server falls back to loopback when a well-formed host does not resolve" do
+    snapshot = static_snapshot()
+    orchestrator_name = Module.concat(__MODULE__, :UnresolvableHostOrchestrator)
+
+    refresh = %{
+      queued: true,
+      coalesced: false,
+      requested_at: DateTime.utc_now(),
+      operations: ["poll"]
+    }
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh})
+
+    server_opts = [
+      # `.invalid` is reserved (RFC 6761) and never resolves — models a
+      # Tailscale MagicDNS host while tailscaled is logged out.
+      host: "symphony-test.invalid",
+      port: 0,
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50
+    ]
+
+    log =
+      capture_log(fn ->
+        start_supervised!({HttpServer, server_opts})
+        assert is_integer(wait_for_bound_port())
+      end)
+
+    assert log =~ "symphony-test.invalid"
+    assert log =~ "binding to 127.0.0.1 instead"
+
+    port = HttpServer.bound_port()
+    response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
+    assert response.status == 200
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+  end
+
   test "http server also listens on loopback when bound to a non-loopback host" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :LoopbackOrchestrator)
