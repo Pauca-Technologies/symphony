@@ -1,14 +1,14 @@
 defmodule SymphonyElixir.Acp.LinearGate do
   @moduledoc """
-  In-VM MCP endpoint that exposes Symphony's gated `linear_graphql` tool to an
-  ACP agent — the load-bearing piece of the ACP handoff gate
+  In-VM MCP endpoint that exposes Symphony's server-authenticated Linear tools
+  to an ACP agent — the load-bearing piece of the ACP handoff gate
   (`docs/acp-support-plan.md` §5.5).
 
   ACP has no equivalent of Codex `dynamicTools`; an agent reaches custom tools
   through an MCP server listed in `session/new.mcpServers`. So each ACP session
   spins up a tiny per-session HTTP listener here, speaking the MCP
   Streamable-HTTP transport, and advertises it to the agent as the **only**
-  sanctioned Linear path. When the agent calls `linear_graphql`, the request
+  sanctioned Linear path. When the agent calls one of these tools, the request
   lands on this endpoint and is dispatched **back into the owning session
   process** (`dispatch_tool_call/4`), where `SymphonyElixir.Codex.DynamicTool`
   runs the before_handoff + reviewer gates with the run's
@@ -49,7 +49,7 @@ defmodule SymphonyElixir.Acp.LinearGate do
       tool (defaults to the caller).
     * `:token` — path token (generated if omitted).
     * `:server_name` — the `mcpServers[].name` the agent sees; OpenCode
-      namespaces the tool as `<server_name>_linear_graphql`.
+      namespaces each tool as `<server_name>_<tool_name>`.
     * `:tool_timeout_ms` — how long a tool dispatch may block.
   """
   @spec start(keyword()) :: {:ok, t()} | {:error, term()}
@@ -155,7 +155,7 @@ defmodule SymphonyElixir.Acp.LinearGate do
   def dispatch_tool_call(_session_pid, _tool_name, _arguments, _timeout),
     do: {:error, :session_not_running}
 
-  @doc "The MCP `tools/list` payload (the gated `linear_graphql` tool spec)."
+  @doc "The MCP `tools/list` payload for Symphony's server-authenticated Linear tools."
   @spec tool_specs() :: [map()]
   def tool_specs, do: DynamicTool.tool_specs()
 
@@ -274,7 +274,14 @@ defmodule SymphonyElixir.Acp.LinearGate do
           {:ok,
            tool_call_content(%{
              "success" => false,
-             "output" => Jason.encode!(%{"error" => %{"message" => "linear_graphql dispatch failed", "reason" => inspect(reason)}})
+             "output" =>
+               Jason.encode!(%{
+                 "error" => %{
+                   "message" => "Linear tool dispatch failed",
+                   "tool" => tool_name,
+                   "reason" => inspect(reason)
+                 }
+               })
            })}
       end
     end

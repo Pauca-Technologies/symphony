@@ -1090,7 +1090,7 @@ Unsupported dynamic tool calls:
 Optional client-side tool extension:
 
 - An implementation MAY expose a limited set of client-side tools to the app-server session.
-- Current standardized optional tool: `linear_graphql`.
+- Current standardized optional tools: `linear_get_issue` and `linear_graphql`.
 - If implemented, supported tools SHOULD be advertised to the app-server session during startup
   using the protocol mechanism supported by the targeted Codex app-server version.
 - Unsupported tool names SHOULD still return a failure result using the targeted protocol and
@@ -1130,6 +1130,19 @@ Optional client-side tool extension:
   - invalid input, missing auth, or transport failure -> `success=false` with an error payload
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
+
+`linear_get_issue` extension contract:
+
+- Purpose: optionally retrieve detailed context for the current or a specified Linear issue when
+  the rendered task prompt does not contain enough information.
+- The preferred input is an object with an OPTIONAL non-empty `issue_id` string. When omitted, the
+  implementation MUST resolve the current task from the agent-run context; if neither is available,
+  return a structured failure.
+- The tool MUST be read-only and SHOULD return the issue's identifier, title, URL, description,
+  people, state, labels, hierarchy, attachments, recent comments, and relations.
+- A missing issue, invalid input, GraphQL error, missing auth, or transport failure MUST produce
+  `success=false` with a structured error or preserved GraphQL response.
+- The result MUST NOT contain or expose the tracker API credential.
 
 User-input-required policy:
 
@@ -2082,6 +2095,13 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - unsupported tool names still fail without stalling the session
   - session observability records retain normalized tool result details so deferred handoffs and
     failure categories remain distinguishable
+- If the `linear_get_issue` client-side tool extension is implemented:
+  - the tool is advertised to the session as a distinct read-only operation
+  - an omitted `issue_id` resolves to the current task
+  - explicit issue UUIDs and identifiers are supported
+  - detailed issue context is fetched with configured Linear auth without exposing credentials
+  - invalid input, missing context, missing issues, GraphQL errors, missing auth, and transport
+    failures return structured failure payloads
 
 ### 17.6 Observability
 
@@ -2151,6 +2171,8 @@ Use the same validation profiles as Section 17:
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
+- `linear_get_issue` client-side tool extension exposes a read-only detailed issue lookup through
+  the app-server session using configured Symphony auth.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.

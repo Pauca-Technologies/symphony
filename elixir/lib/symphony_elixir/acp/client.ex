@@ -11,9 +11,9 @@ defmodule SymphonyElixir.Acp.Client do
   `session/update` notifications are forwarded verbatim and rendered natively
   by the observability pipeline (`docs/acp-support-plan.md` §2.2, §6 Option B).
 
-  ## Handoff gate
+  ## Linear tools and handoff gate
 
-  ACP has no `dynamicTools`, so Symphony's gated `linear_graphql` tool is
+  ACP has no `dynamicTools`, so Symphony's server-authenticated Linear tools are
   exposed through an in-VM MCP HTTP endpoint (`SymphonyElixir.Acp.LinearGate`)
   listed in `session/new.mcpServers`. Tool calls route back into *this*
   process — the one running `run_turn/4`, which is `AgentRunner`'s run process
@@ -39,7 +39,7 @@ defmodule SymphonyElixir.Acp.Client do
 
   # Linear credential env vars scrubbed from the agent process when
   # `acp.withhold_linear_credentials` is true. The agent reaches Linear only
-  # through Symphony's gated MCP tool, which holds the token server-side.
+  # through Symphony's gated MCP tools, which hold the token server-side.
   @linear_credential_env_vars [
     ~c"LINEAR_API_KEY",
     ~c"LINEAR_TOKEN",

@@ -18,12 +18,13 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   dashboard/CLI renderer needs no Claude-specific code (the same synthetic
   methods the ACP backend emits).
 
-  ## Handoff gate
+  ## Linear tools and handoff gate
 
-  Reuses the ACP work wholesale. The gated `linear_graphql` tool is served by an
-  in-VM MCP HTTP endpoint (`SymphonyElixir.Acp.LinearGate`) advertised to Claude
-  Code via `--mcp-config` (HTTP server, first-class) + `--strict-mcp-config` (so
-  the agent uses *only* that server — an explicit lock, stronger than the ACP
+  Reuses the ACP work wholesale. Symphony's server-authenticated Linear tools
+  are served by an in-VM MCP HTTP endpoint (`SymphonyElixir.Acp.LinearGate`)
+  advertised to Claude Code via `--mcp-config` (HTTP server, first-class) +
+  `--strict-mcp-config` (so the agent uses *only* that server — an explicit
+  lock, stronger than the ACP
   path's implicit "we just didn't pass a Linear MCP"). Tool calls dispatch back
   into *this* process — the one running `run_turn/4` — so
   `SymphonyElixir.Codex.DynamicTool` runs the before_handoff + reviewer gates
@@ -41,7 +42,7 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config}
 
   # Same vars the ACP path scrubs; the agent reaches Linear only through the
-  # gated MCP tool, which holds the token server-side.
+  # gated MCP tools, which hold the token server-side.
   @linear_credential_env_vars [
     ~c"LINEAR_API_KEY",
     ~c"LINEAR_TOKEN",

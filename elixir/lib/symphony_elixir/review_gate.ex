@@ -255,7 +255,7 @@ defmodule SymphonyElixir.ReviewGate do
           worker_host: worker_host,
           prompt: prompt,
           verdict_path: verdict_path,
-          tool_executor: review_tool_executor(Keyword.get(opts, :linear_client)),
+          tool_executor: review_tool_executor(Keyword.get(opts, :linear_client), issue),
           on_message: Keyword.get(opts, :on_message)
         }
 
@@ -363,12 +363,13 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp maybe_put_on_message(opts, _on_message), do: opts
 
-  # The reviewer talks to Linear read-only and without a handoff gate
-  # context: read-only blocks any `issueUpdate`/mutation so the reviewer
-  # cannot move the issue itself, and the absent gate context stops the
-  # reviewer's own tool calls from re-entering this gate (recursion guard,
-  # the analog of UDP's `UDP_NESTED_CODEX` skip in before-handoff.sh).
-  defp review_tool_executor(linear_client) do
+  # The reviewer talks to Linear read-only and without a handoff gate context:
+  # read-only blocks any `issueUpdate`/mutation so the reviewer cannot move the
+  # issue itself, while `linear_issue` lets its dedicated read tool default to
+  # the issue under review. The absent gate context stops the reviewer's own
+  # tool calls from re-entering this gate (recursion guard, the analog of UDP's
+  # `UDP_NESTED_CODEX` skip in before-handoff.sh).
+  defp review_tool_executor(linear_client, issue) do
     client = linear_client || (&Client.graphql/3)
 
     read_only_client = fn query, variables, request_opts ->
@@ -380,7 +381,7 @@ defmodule SymphonyElixir.ReviewGate do
     end
 
     fn tool, arguments ->
-      DynamicTool.execute(tool, arguments, linear_client: read_only_client)
+      DynamicTool.execute(tool, arguments, linear_client: read_only_client, linear_issue: issue)
     end
   end
 

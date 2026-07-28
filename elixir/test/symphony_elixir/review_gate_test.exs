@@ -394,9 +394,14 @@ defmodule SymphonyElixir.ReviewGateTest do
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner(),
-               linear_client: fn query, _vars, _opts ->
-                 send(test_pid, {:linear_called, query})
-                 {:ok, %{"data" => %{"viewer" => %{"id" => "u1"}}}}
+               linear_client: fn query, variables, _opts ->
+                 send(test_pid, {:linear_called, query, variables})
+
+                 if query =~ "SymphonyGetIssue" do
+                   {:ok, %{"data" => %{"issue" => %{"identifier" => "UDPE-900"}}}}
+                 else
+                   {:ok, %{"data" => %{"viewer" => %{"id" => "u1"}}}}
+                 end
                end
              )
 
@@ -405,7 +410,12 @@ defmodule SymphonyElixir.ReviewGateTest do
     # A read query is forwarded to the (test) Linear client.
     read = tool_executor.("linear_graphql", %{"query" => "query Viewer { viewer { id } }"})
     assert read["success"] == true
-    assert_received {:linear_called, "query Viewer { viewer { id } }"}
+    assert_received {:linear_called, "query Viewer { viewer { id } }", %{}}
+
+    issue_read = tool_executor.("linear_get_issue", %{})
+    assert issue_read["success"] == true
+    assert_received {:linear_called, issue_query, %{"issueId" => "UDPE-1"}}
+    assert issue_query =~ "SymphonyGetIssue"
 
     # A mutation is rejected before it can reach Linear.
     mutation =
@@ -414,7 +424,7 @@ defmodule SymphonyElixir.ReviewGateTest do
       })
 
     assert mutation["success"] == false
-    refute_received {:linear_called, _}
+    refute_received {:linear_called, _, _}
   end
 
   test "writes the human-review section to the PR on approve", %{workspace: workspace} do

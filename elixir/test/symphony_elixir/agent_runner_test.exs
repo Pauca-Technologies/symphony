@@ -83,6 +83,28 @@ defmodule SymphonyElixir.AgentRunnerTest.TurnCountingBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.HandoffPromptBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, prompt, _issue, opts) do
+    recipient = Application.fetch_env!(:symphony_elixir, :handoff_prompt_recipient_for_test)
+    send(recipient, {:handoff_prompt, prompt})
+
+    issue_result = Keyword.fetch!(opts, :tool_executor).("linear_get_issue", %{})
+    send(recipient, {:linear_get_issue_result, issue_result})
+
+    {:ok, %{session_id: "handoff-prompt-session"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.LifecycleRecipient do
   @moduledoc false
   use GenServer
@@ -112,6 +134,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend
   alias SymphonyElixir.AgentRunnerTest.DeferredBackend
   alias SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend
+  alias SymphonyElixir.AgentRunnerTest.HandoffPromptBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
   alias SymphonyElixir.Linear.Issue
@@ -131,6 +154,68 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end)
 
     :ok
+  end
+
+  describe "handoff prompt guidance" do
+    test "keeps issue lookup optional while routing review handoffs through the gated tool" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-handoff-prompt-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      Application.put_env(:symphony_elixir, :handoff_prompt_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :handoff_prompt_recipient_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      issue = %Issue{
+        id: "issue-handoff-prompt",
+        identifier: "UDPE-7062",
+        title: "Use the host-side handoff gate",
+        state: "In Progress",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+      test_pid = self()
+
+      linear_client = fn query, variables, _opts ->
+        send(test_pid, {:linear_get_issue_called, query, variables})
+        {:ok, %{"data" => %{"issue" => %{"identifier" => "UDPE-7062"}}}}
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {HandoffPromptBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 1,
+                   per_repo_before_handoff: "scripts/hooks/before-handoff.sh",
+                   linear_client: linear_client
+                 ],
+                 nil
+               )
+
+      assert_receive {:handoff_prompt, prompt}
+      assert prompt =~ "use Symphony's `linear_graphql` tool"
+      assert prompt =~ "before_handoff and automated review gates"
+      refute prompt =~ "LINEAR_API_KEY"
+      refute prompt =~ "Symphony Linear access:"
+
+      {task_prompt_position, _length} = :binary.match(prompt, "You are an agent for this repository.")
+      {handoff_guidance_position, _length} = :binary.match(prompt, "Symphony handoff requirement:")
+      assert handoff_guidance_position > task_prompt_position
+
+      assert_receive {:linear_get_issue_called, issue_query, %{"issueId" => "UDPE-7062"}}
+      assert issue_query =~ "query SymphonyGetIssue"
+
+      assert_receive {:linear_get_issue_result, %{"success" => true, "output" => output}}
+      assert get_in(Jason.decode!(output), ["data", "issue", "identifier"]) == "UDPE-7062"
+    end
   end
 
   describe "mark_blocked_on_giveup/2" do

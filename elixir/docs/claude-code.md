@@ -79,13 +79,14 @@ user-message line starts a new turn that ends in its own `result`.
 
 Identical guarantee to the ACP path — and structurally lower-risk:
 
-- The gated `linear_graphql` tool is served by the **same in-VM MCP HTTP
-  endpoint** (`SymphonyElixir.Acp.LinearGate`) advertised to Claude Code via
-  `--mcp-config` (HTTP MCP servers are documented and first-class). When the
-  agent calls the tool, the call is dispatched **back into the run's own
-  process**, where `DynamicTool.execute/3` runs the `before_handoff` hook +
-  reviewer gate with the run's context and counters intact — byte-for-byte the
-  same gate as Codex.
+- The read-only `linear_get_issue` lookup and gated `linear_graphql` tool are
+  served by the **same in-VM MCP HTTP endpoint**
+  (`SymphonyElixir.Acp.LinearGate`) advertised to Claude Code via
+  `--mcp-config` (HTTP MCP servers are documented and first-class). Calls are
+  dispatched **back into the run's own process**, so issue lookup defaults to
+  the current task and `DynamicTool.execute/3` runs the `before_handoff` hook +
+  reviewer gate for review-state mutations with the run's context and counters
+  intact — byte-for-byte the same gate as Codex.
 - **`--strict-mcp-config`** makes the agent use *only* the servers Symphony
   passed, ignoring every other MCP source — an explicit lock, stronger than the
   ACP path's implicit "we just didn't pass a Linear MCP".

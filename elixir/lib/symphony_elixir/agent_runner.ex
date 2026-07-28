@@ -444,8 +444,8 @@ defmodule SymphonyElixir.AgentRunner do
 
     [
       {"session_start", session_start_prompt},
-      {"handoff_tool_guidance", handoff_tool_guidance(opts)},
-      {"task_prompt", PromptBuilder.build_prompt(issue, opts)}
+      {"task_prompt", PromptBuilder.build_prompt(issue, opts)},
+      {"handoff_tool_guidance", handoff_tool_guidance(opts)}
     ]
     |> compose_prompt_sections()
   end
@@ -457,7 +457,6 @@ defmodule SymphonyElixir.AgentRunner do
     prompt =
       """
       #{handoff_gate_prompt_section(handoff_gate_prompt)}
-      #{handoff_guidance}
       Continuation guidance:
 
       - The previous Codex turn completed normally, but the Linear issue is still in an active state.
@@ -465,13 +464,15 @@ defmodule SymphonyElixir.AgentRunner do
       - Resume from the current workspace and workpad state instead of restarting from scratch.
       - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
       - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+
+      #{handoff_guidance}
       """
 
     included_sections =
       [
         {"handoff_gate_remediation", handoff_gate_prompt},
-        {"handoff_tool_guidance", handoff_guidance},
-        {"continuation_guidance", "included"}
+        {"continuation_guidance", "included"},
+        {"handoff_tool_guidance", handoff_guidance}
       ]
       |> included_prompt_section_names()
 
@@ -543,6 +544,7 @@ defmodule SymphonyElixir.AgentRunner do
       result =
         DynamicTool.execute(tool, arguments,
           linear_client: linear_client,
+          linear_issue: issue,
           handoff_gate_context: handoff_context
         )
 
@@ -834,6 +836,7 @@ defmodule SymphonyElixir.AgentRunner do
       Symphony handoff requirement:
 
       - To move this issue from In Progress to In Review or Human Review, use Symphony's `linear_graphql` tool for the Linear `issueUpdate` mutation.
+      - If that tool returns gate remediation, keep the issue In Progress and address the reported gate failures.
       - Do not use the native Linear MCP `save_issue` tool for that handoff; it cannot run Symphony's before_handoff and automated review gates.
       """
       |> String.trim()

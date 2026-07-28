@@ -20,10 +20,13 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
-During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls. Handoff state changes must use this gated tool; Symphony
-does not auto-approve native Linear MCP `save_issue` calls because they cannot run
-`hooks.before_handoff` or the automated review gate.
+During app-server sessions, Symphony serves two client-side Linear tools. The rendered task prompt
+already contains the issue's identifier, title, state, URL, and description. When more context is
+useful, `linear_get_issue` provides an optional read-only lookup that defaults to the current task
+and adds people, labels, hierarchy, attachments, comments, and relations; callers may pass
+`issue_id` to read another issue. `linear_graphql` handles other raw Linear reads and mutations.
+Handoff state changes must use the latter gated tool; Symphony does not auto-approve native Linear
+MCP `save_issue` calls because they cannot run `hooks.before_handoff` or the automated review gate.
 
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
@@ -44,8 +47,8 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
+   - The `linear` skill can use `linear_get_issue` when it needs more context than the rendered task
+     prompt, and `linear_graphql` for raw operations such as comment editing or upload flows.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
