@@ -24,6 +24,8 @@ defmodule SymphonyElixir.Workspace do
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <-
              ensure_workspace(workspace, worker_host, routed_repo, issue_or_identifier),
+           {:ok, _issue_context_file} <-
+             prepare_issue_context(workspace, issue_or_identifier, worker_host),
            :ok <-
              maybe_run_host_after_create_hook(
                routed_repo,
@@ -40,6 +42,29 @@ defmodule SymphonyElixir.Workspace do
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
         {:error, error}
     end
+  end
+
+  @doc """
+  Write the current issue snapshot outside the agent-writable workspace.
+
+  The returned path is safe to expose to repository hooks and agent processes;
+  it contains task context, never Symphony's Linear credentials.
+  """
+  @spec prepare_issue_context(Path.t(), map() | String.t() | nil, worker_host()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def prepare_issue_context(workspace, issue_or_identifier, worker_host \\ nil)
+      when is_binary(workspace) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, payload} <- encode_issue_context(issue_or_identifier),
+         :ok <- write_issue_context(workspace, payload, worker_host) do
+      {:ok, issue_context_path(workspace)}
+    end
+  end
+
+  @doc "Return the trusted issue-context file path associated with a workspace."
+  @spec issue_context_path(Path.t()) :: Path.t()
+  def issue_context_path(workspace) when is_binary(workspace) do
+    Path.join([Path.dirname(workspace), ".symphony-context", Path.basename(workspace) <> ".json"])
   end
 
   @doc """
@@ -176,14 +201,18 @@ defmodule SymphonyElixir.Workspace do
         case validate_workspace_path(workspace, nil) do
           :ok ->
             maybe_run_before_remove_hook(workspace, nil)
-            File.rm_rf(workspace)
+            result = File.rm_rf(workspace)
+            remove_issue_context(workspace)
+            result
 
           {:error, reason} ->
             {:error, reason, ""}
         end
 
       false ->
-        File.rm_rf(workspace)
+        result = File.rm_rf(workspace)
+        remove_issue_context(workspace)
+        result
     end
   end
 
@@ -193,7 +222,10 @@ defmodule SymphonyElixir.Workspace do
     script =
       [
         remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
+        remote_shell_assign("context_file", issue_context_path(workspace)),
+        "rm -rf \"$workspace\"",
+        "rm -f \"$context_file\"",
+        "rmdir \"$(dirname \"$context_file\")\" 2>/dev/null || true"
       ]
       |> Enum.join("\n")
 
@@ -284,12 +316,15 @@ defmodule SymphonyElixir.Workspace do
     issue_context = issue_context(issue_or_identifier)
     command = resolve_hook_command(:before_handoff, Keyword.get(opts, :hook_command))
 
-    case command do
-      nil ->
-        {:ok, ""}
+    with {:ok, _issue_context_file} <-
+           prepare_issue_context(workspace, issue_or_identifier, worker_host) do
+      case command do
+        nil ->
+          {:ok, ""}
 
-      command ->
-        run_hook(command, workspace, issue_context, "before_handoff", worker_host, capture_output: true)
+        command ->
+          run_hook(command, workspace, issue_context, "before_handoff", worker_host, capture_output: true)
+      end
     end
   end
 
@@ -466,7 +501,11 @@ defmodule SymphonyElixir.Workspace do
         # .claude/hooks/github-app-session-start.sh) can gate on it. We
         # intentionally do NOT set SYMPHONY_AGENT here — that var is reserved
         # for inner codex/claude agent processes in Codex.AppServer.
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true, env: hook_env())
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: hook_env(workspace)
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -490,7 +529,8 @@ defmodule SymphonyElixir.Workspace do
 
     case run_remote_command(
            worker_host,
-           "cd #{shell_escape(workspace)} && export SYMPHONY_RUN=1 && #{command}",
+           "cd #{shell_escape(workspace)} && export SYMPHONY_RUN=1 && " <>
+             "export SYMPHONY_ISSUE_CONTEXT_FILE=#{shell_escape(issue_context_path(workspace))} && #{command}",
            timeout_ms
          ) do
       {:ok, cmd_result} ->
@@ -630,8 +670,111 @@ defmodule SymphonyElixir.Workspace do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
-  defp hook_env do
-    [{"SYMPHONY_RUN", "1"}]
+  defp hook_env(workspace) do
+    [
+      {"SYMPHONY_RUN", "1"},
+      {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)}
+    ]
+  end
+
+  defp encode_issue_context(issue_or_identifier) do
+    Jason.encode(%{
+      "version" => 1,
+      "capturedAt" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      "issue" => issue_snapshot(issue_or_identifier)
+    })
+  end
+
+  defp issue_snapshot(issue) when is_map(issue) do
+    %{
+      "id" => issue_value(issue, :id),
+      "identifier" => issue_value(issue, :identifier),
+      "title" => issue_value(issue, :title),
+      "description" => issue_value(issue, :description),
+      "url" => issue_value(issue, :url),
+      "state" => issue_value(issue, :state),
+      "labels" => issue_value(issue, :labels) || [],
+      "updatedAt" => encode_datetime(issue_value(issue, :updated_at))
+    }
+  end
+
+  defp issue_snapshot(identifier) when is_binary(identifier) do
+    %{
+      "id" => nil,
+      "identifier" => identifier,
+      "title" => nil,
+      "description" => nil,
+      "url" => nil,
+      "state" => nil,
+      "labels" => [],
+      "updatedAt" => nil
+    }
+  end
+
+  defp issue_snapshot(_issue), do: issue_snapshot("issue")
+
+  defp issue_value(issue, key) do
+    Map.get(issue, key) || Map.get(issue, Atom.to_string(key))
+  end
+
+  defp encode_datetime(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp encode_datetime(value) when is_binary(value), do: value
+  defp encode_datetime(_value), do: nil
+
+  defp write_issue_context(workspace, payload, nil) do
+    context_file = issue_context_path(workspace)
+    context_dir = Path.dirname(context_file)
+    temporary_file = context_file <> ".tmp.#{System.unique_integer([:positive])}"
+
+    result =
+      with :ok <- File.mkdir_p(context_dir),
+           :ok <- File.write(temporary_file, payload, [:binary]),
+           :ok <- File.chmod(temporary_file, 0o600),
+           do: File.rename(temporary_file, context_file)
+
+    if result != :ok, do: File.rm(temporary_file)
+    result
+  end
+
+  defp write_issue_context(workspace, payload, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("context_file", issue_context_path(workspace)),
+        "context_dir=$(dirname \"$context_file\")",
+        "mkdir -p \"$context_dir\"",
+        "temporary_file=\"$context_file.tmp.$$\"",
+        "trap 'rm -f \"$temporary_file\"' EXIT",
+        "umask 077",
+        "printf '%s' #{shell_escape(payload)} > \"$temporary_file\"",
+        "chmod 600 \"$temporary_file\"",
+        "mv \"$temporary_file\" \"$context_file\"",
+        "trap - EXIT"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} ->
+        :ok
+
+      {:ok, {output, status}} ->
+        {:error, {:issue_context_write_failed, worker_host, status, output}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc "Remove the trusted issue-context snapshot associated with a local workspace."
+  @spec remove_issue_context(Path.t()) :: :ok
+  def remove_issue_context(workspace) when is_binary(workspace) do
+    if validate_workspace_path(workspace, nil) == :ok do
+      context_file = issue_context_path(workspace)
+      File.rm(context_file)
+      File.rmdir(Path.dirname(context_file))
+    end
+
+    :ok
   end
 
   defp worker_host_for_log(nil), do: "local"

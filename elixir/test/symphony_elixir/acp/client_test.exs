@@ -185,11 +185,17 @@ defmodule SymphonyElixir.Acp.ClientTest do
 
     with_acp_env(fn workspace, trace ->
       write_fake_agent!(workspace.agent_path, updates: [])
+      issue_context_file = Path.join(workspace.root, "issue-context.json")
 
-      assert {:ok, _} = run(workspace, on_message: collector())
+      assert {:ok, _} =
+               run(workspace,
+                 on_message: collector(),
+                 issue_context_file: issue_context_file
+               )
 
-      env_line = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.find(&String.starts_with?(&1, "ENV:LINEAR_API_KEY="))
-      assert env_line == "ENV:LINEAR_API_KEY=[]"
+      env_lines = trace |> File.read!() |> String.split("\n", trim: true)
+      assert "ENV:LINEAR_API_KEY=[]" in env_lines
+      assert "ENV:SYMPHONY_ISSUE_CONTEXT_FILE=[#{issue_context_file}]" in env_lines
     end)
   end
 
@@ -409,6 +415,7 @@ defmodule SymphonyElixir.Acp.ClientTest do
       case "$line" in
         *'"method":"initialize"'*)
           [ -n "$trace" ] && printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace"
+          [ -n "$trace" ] && printf 'ENV:SYMPHONY_ISSUE_CONTEXT_FILE=[%s]\\n' "$SYMPHONY_ISSUE_CONTEXT_FILE" >> "$trace"
           [ -n "$trace" ] && printf 'ENV:OPENCODE_CONFIG_CONTENT=[%s]\\n' "$OPENCODE_CONFIG_CONTENT" >> "$trace"
           emit '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
           ;;

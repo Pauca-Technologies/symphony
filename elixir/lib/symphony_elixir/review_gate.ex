@@ -65,7 +65,8 @@ defmodule SymphonyElixir.ReviewGate do
     Linear.Client,
     Linear.Issue,
     PromptBuilder,
-    Tracker
+    Tracker,
+    Workspace
   }
 
   @telemetry_event [:symphony_elixir, :gate, :review]
@@ -255,7 +256,7 @@ defmodule SymphonyElixir.ReviewGate do
           worker_host: worker_host,
           prompt: prompt,
           verdict_path: verdict_path,
-          tool_executor: review_tool_executor(Keyword.get(opts, :linear_client), issue),
+          tool_executor: review_tool_executor(Keyword.get(opts, :linear_client)),
           on_message: Keyword.get(opts, :on_message)
         }
 
@@ -352,7 +353,11 @@ defmodule SymphonyElixir.ReviewGate do
          on_message: on_message
        }) do
     opts =
-      [worker_host: worker_host, tool_executor: tool_executor]
+      [
+        worker_host: worker_host,
+        tool_executor: tool_executor,
+        issue_context_file: Workspace.issue_context_path(workspace)
+      ]
       |> maybe_put_on_message(on_message)
 
     AppServer.run(workspace, prompt, issue, opts)
@@ -365,11 +370,10 @@ defmodule SymphonyElixir.ReviewGate do
 
   # The reviewer talks to Linear read-only and without a handoff gate context:
   # read-only blocks any `issueUpdate`/mutation so the reviewer cannot move the
-  # issue itself, while `linear_issue` lets its dedicated read tool default to
-  # the issue under review. The absent gate context stops the reviewer's own
+  # issue itself. The absent gate context stops the reviewer's own
   # tool calls from re-entering this gate (recursion guard, the analog of UDP's
   # `UDP_NESTED_CODEX` skip in before-handoff.sh).
-  defp review_tool_executor(linear_client, issue) do
+  defp review_tool_executor(linear_client) do
     client = linear_client || (&Client.graphql/3)
 
     read_only_client = fn query, variables, request_opts ->
@@ -381,7 +385,7 @@ defmodule SymphonyElixir.ReviewGate do
     end
 
     fn tool, arguments ->
-      DynamicTool.execute(tool, arguments, linear_client: read_only_client, linear_issue: issue)
+      DynamicTool.execute(tool, arguments, linear_client: read_only_client)
     end
   end
 

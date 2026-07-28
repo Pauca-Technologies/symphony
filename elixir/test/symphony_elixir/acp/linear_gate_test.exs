@@ -27,8 +27,7 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
 
       list = mcp(url, %{"jsonrpc" => "2.0", "id" => 2, "method" => "tools/list"})
       tools = get_in(list.body, ["result", "tools"])
-      assert Enum.any?(tools, &(&1["name"] == "linear_graphql"))
-      assert Enum.any?(tools, &(&1["name"] == "linear_get_issue"))
+      assert Enum.map(tools, & &1["name"]) == ["linear_graphql"]
     end
 
     test "an initialized notification gets a 202 with no body" do
@@ -66,35 +65,6 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
       assert get_in(resp.body, ["result", "isError"]) == false
       text = resp.body |> get_in(["result", "content"]) |> List.first() |> Map.get("text")
       assert text =~ "usr_1"
-    end
-
-    test "dispatches linear_get_issue through the same server-authenticated bridge" do
-      issue = %Issue{id: "issue-read", identifier: "ACP-READ", title: "Read me"}
-
-      executor = fn "linear_get_issue", args ->
-        DynamicTool.execute("linear_get_issue", args,
-          linear_issue: issue,
-          linear_client: fn query, variables, _opts ->
-            assert query =~ "SymphonyGetIssue"
-            assert variables == %{"issueId" => "ACP-READ"}
-            {:ok, %{"data" => %{"issue" => %{"identifier" => "ACP-READ"}}}}
-          end
-        )
-      end
-
-      %{url: url} = start_gate(executor)
-
-      resp =
-        mcp(url, %{
-          "jsonrpc" => "2.0",
-          "id" => 31,
-          "method" => "tools/call",
-          "params" => %{"name" => "linear_get_issue", "arguments" => %{}}
-        })
-
-      assert resp.status == 200
-      assert get_in(resp.body, ["result", "isError"]) == false
-      assert get_in(tool_call_output(resp), ["data", "issue", "identifier"]) == "ACP-READ"
     end
   end
 

@@ -6,117 +6,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   alias SymphonyElixir.{HandoffGate, Linear.Client, ReviewGate}
 
   @linear_graphql_tool "linear_graphql"
-  @linear_get_issue_tool "linear_get_issue"
-  @linear_get_issue_query """
-  query SymphonyGetIssue($issueId: String!) {
-    issue(id: $issueId) {
-      id
-      identifier
-      title
-      url
-      description
-      priority
-      branchName
-      createdAt
-      updatedAt
-      assignee {
-        id
-        displayName
-        email
-      }
-      creator {
-        id
-        displayName
-        email
-      }
-      team {
-        id
-      }
-      state {
-        id
-        name
-        type
-      }
-      labels {
-        nodes {
-          name
-          parent {
-            name
-          }
-        }
-      }
-      parent {
-        id
-        identifier
-        title
-        url
-        state {
-          name
-          type
-        }
-      }
-      children(first: 100) {
-        nodes {
-          id
-          identifier
-          title
-          url
-          state {
-            name
-            type
-          }
-        }
-      }
-      attachments {
-        nodes {
-          title
-          subtitle
-          url
-        }
-      }
-      comments(first: 100) {
-        nodes {
-          body
-          createdAt
-          updatedAt
-          user {
-            name
-          }
-        }
-      }
-      relations {
-        nodes {
-          type
-          relatedIssue {
-            id
-            identifier
-            title
-            url
-            state {
-              name
-              type
-            }
-          }
-        }
-      }
-      inverseRelations(first: 100) {
-        nodes {
-          type
-          issue {
-            id
-            identifier
-            title
-            url
-            state {
-              name
-              type
-            }
-          }
-        }
-      }
-    }
-  }
-  """
   @issue_transition_query """
   query SymphonyResolveIssueTransition($issueId: String!) {
     issue(id: $issueId) {
@@ -153,29 +42,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   }
-  @linear_get_issue_description """
-  Fetch detailed Linear issue context when the task prompt does not contain enough information. This read-only tool defaults to the current task and returns its core fields, people, state, labels, hierarchy, attachments, comments, and relations. Pass issue_id only to fetch a different issue by UUID or identifier.
-  """
-  @linear_get_issue_input_schema %{
-    "type" => "object",
-    "additionalProperties" => false,
-    "required" => [],
-    "properties" => %{
-      "issue_id" => %{
-        "type" => "string",
-        "description" => "Optional Linear issue UUID or identifier. Omit to fetch the current task."
-      }
-    }
-  }
-
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
-
-      @linear_get_issue_tool ->
-        execute_linear_get_issue(arguments, opts)
 
       other ->
         failure_response(%{
@@ -194,24 +65,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
-      },
-      %{
-        "name" => @linear_get_issue_tool,
-        "description" => @linear_get_issue_description,
-        "inputSchema" => @linear_get_issue_input_schema
       }
     ]
-  end
-
-  defp execute_linear_get_issue(arguments, opts) do
-    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
-
-    with {:ok, issue_id} <- normalize_linear_get_issue_arguments(arguments, opts),
-         {:ok, response} <- linear_client.(@linear_get_issue_query, %{"issueId" => issue_id}, []) do
-      linear_issue_response(response, issue_id)
-    else
-      {:error, reason} -> failure_response(linear_get_issue_error_payload(reason))
-    end
   end
 
   defp execute_linear_graphql(arguments, opts) do
@@ -529,68 +384,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp normalize_linear_graphql_arguments(_arguments), do: {:error, :invalid_arguments}
 
-  defp normalize_linear_get_issue_arguments(arguments, opts)
-
-  defp normalize_linear_get_issue_arguments(nil, opts), do: current_issue_id(opts)
-
-  defp normalize_linear_get_issue_arguments(arguments, opts) when is_map(arguments) do
-    case fetch_issue_id(arguments) do
-      :missing -> current_issue_id(opts)
-      {:ok, issue_id} -> normalize_issue_id(issue_id)
-    end
-  end
-
-  defp normalize_linear_get_issue_arguments(issue_id, _opts) when is_binary(issue_id) do
-    normalize_issue_id(issue_id)
-  end
-
-  defp normalize_linear_get_issue_arguments(_arguments, _opts),
-    do: {:error, :invalid_get_issue_arguments}
-
-  defp fetch_issue_id(arguments) when is_map(arguments) do
-    Enum.find_value(["issue_id", :issue_id, "issueId", :issueId], :missing, fn key ->
-      case Map.fetch(arguments, key) do
-        {:ok, value} -> {:ok, value}
-        :error -> nil
-      end
-    end)
-  end
-
-  defp current_issue_id(opts) do
-    context =
-      case Keyword.get(opts, :handoff_gate_context, %{}) do
-        context when is_map(context) -> context
-        _context -> %{}
-      end
-
-    issue =
-      Keyword.get(opts, :linear_issue) || Map.get(context, :issue) || Map.get(context, "issue") ||
-        %{}
-
-    issue_id = current_issue_identifier(issue)
-
-    case normalize_issue_id(issue_id) do
-      {:ok, normalized} -> {:ok, normalized}
-      {:error, _reason} -> {:error, :missing_issue_context}
-    end
-  end
-
-  defp current_issue_identifier(issue) when is_map(issue) do
-    Map.get(issue, :identifier) || Map.get(issue, "identifier") || Map.get(issue, :id) ||
-      Map.get(issue, "id")
-  end
-
-  defp current_issue_identifier(_issue), do: nil
-
-  defp normalize_issue_id(issue_id) when is_binary(issue_id) do
-    case String.trim(issue_id) do
-      "" -> {:error, :invalid_issue_id}
-      normalized -> {:ok, normalized}
-    end
-  end
-
-  defp normalize_issue_id(_issue_id), do: {:error, :invalid_issue_id}
-
   defp normalize_query(arguments) do
     case Map.get(arguments, "query") || Map.get(arguments, :query) do
       query when is_binary(query) ->
@@ -615,26 +408,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     dynamic_tool_response(not graphql_errors?(response), encode_payload(response))
   end
 
-  defp linear_issue_response(response, issue_id) do
-    cond do
-      graphql_errors?(response) ->
-        graphql_response(response)
-
-      is_map(response_issue(response)) ->
-        graphql_response(response)
-
-      true ->
-        failure_response(linear_get_issue_error_payload({:issue_not_found, issue_id}))
-    end
-  end
-
   defp graphql_errors?(%{"errors" => errors}) when is_list(errors) and errors != [], do: true
   defp graphql_errors?(%{errors: errors}) when is_list(errors) and errors != [], do: true
   defp graphql_errors?(_response), do: false
-
-  defp response_issue(%{"data" => %{"issue" => issue}}), do: issue
-  defp response_issue(%{data: %{issue: issue}}), do: issue
-  defp response_issue(_response), do: nil
 
   defp failure_response(payload) do
     dynamic_tool_response(false, encode_payload(payload))
@@ -721,41 +497,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   end
-
-  defp linear_get_issue_error_payload(:missing_issue_context) do
-    %{
-      "error" => %{
-        "message" => "`linear_get_issue` needs an `issue_id` because no current Linear issue is available in this session."
-      }
-    }
-  end
-
-  defp linear_get_issue_error_payload(:invalid_issue_id) do
-    %{
-      "error" => %{
-        "message" => "`linear_get_issue.issue_id` must be a non-empty Linear issue UUID or identifier."
-      }
-    }
-  end
-
-  defp linear_get_issue_error_payload(:invalid_get_issue_arguments) do
-    %{
-      "error" => %{
-        "message" => "`linear_get_issue` expects an object with an optional `issue_id` string."
-      }
-    }
-  end
-
-  defp linear_get_issue_error_payload({:issue_not_found, issue_id}) do
-    %{
-      "error" => %{
-        "message" => "Linear issue #{issue_id} was not found.",
-        "issueId" => issue_id
-      }
-    }
-  end
-
-  defp linear_get_issue_error_payload(reason), do: tool_error_payload(reason)
 
   defp supported_tool_names do
     Enum.map(tool_specs(), & &1["name"])

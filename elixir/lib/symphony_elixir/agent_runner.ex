@@ -135,6 +135,7 @@ defmodule SymphonyElixir.AgentRunner do
         opts =
           opts
           |> Keyword.put(:session_start_prompt, session_start.prompt)
+          |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
           |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
           |> maybe_put(:per_repo_workflow, repo_workflow)
           |> maybe_put(:per_repo_review_workflow, review_workflow)
@@ -335,7 +336,11 @@ defmodule SymphonyElixir.AgentRunner do
     {backend, overrides} = Keyword.get(opts, :agent_backend) || AgentBackend.resolve_for_issue(issue)
 
     with {:ok, session} <-
-           backend.start_session(workspace, worker_host: worker_host, overrides: overrides) do
+           backend.start_session(workspace,
+             worker_host: worker_host,
+             overrides: overrides,
+             issue_context_file: Keyword.get(opts, :issue_context_file)
+           ) do
       send_agent_backend_info(codex_update_recipient, issue, backend, session)
 
       try do
@@ -544,7 +549,6 @@ defmodule SymphonyElixir.AgentRunner do
       result =
         DynamicTool.execute(tool, arguments,
           linear_client: linear_client,
-          linear_issue: issue,
           handoff_gate_context: handoff_context
         )
 

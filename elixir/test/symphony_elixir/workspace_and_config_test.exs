@@ -56,6 +56,67 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Path.basename(first_workspace) == "MT_Det"
   end
 
+  test "workspace publishes and refreshes trusted issue context for hooks and agents" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-issue-context-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-context-1",
+        identifier: "UDPE-7011",
+        title: "Keep repository gates informed",
+        description: "Original scope",
+        url: "https://linear.app/example/issue/UDPE-7011",
+        state: "In Progress",
+        labels: ["repo:udp-dashboard-v2"],
+        updated_at: ~U[2026-07-28 09:30:00Z]
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      context_file = Workspace.issue_context_path(workspace)
+      refute String.starts_with?(context_file, workspace <> "/")
+      assert File.regular?(context_file)
+
+      assert %{
+               "version" => 1,
+               "capturedAt" => captured_at,
+               "issue" => %{
+                 "id" => "issue-context-1",
+                 "identifier" => "UDPE-7011",
+                 "title" => "Keep repository gates informed",
+                 "description" => "Original scope",
+                 "url" => "https://linear.app/example/issue/UDPE-7011",
+                 "state" => "In Progress",
+                 "labels" => ["repo:udp-dashboard-v2"],
+                 "updatedAt" => "2026-07-28T09:30:00Z"
+               }
+             } = context_file |> File.read!() |> Jason.decode!()
+
+      assert {:ok, _captured_at, 0} = DateTime.from_iso8601(captured_at)
+
+      assert {:ok, ^context_file} =
+               Workspace.run_session_start_hook(workspace, issue, nil, hook_command: "printf '%s' \"$SYMPHONY_ISSUE_CONTEXT_FILE\"")
+
+      updated_issue = %{issue | description: "Updated scope"}
+
+      assert {:ok, ""} =
+               Workspace.run_before_handoff_hook(workspace, updated_issue, nil, hook_command: "true")
+
+      assert get_in(context_file |> File.read!() |> Jason.decode!(), ["issue", "description"]) ==
+               "Updated scope"
+
+      assert {:ok, _removed} = Workspace.remove(workspace)
+      refute File.exists?(context_file)
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace reuses existing issue directory without deleting local changes" do
     workspace_root =
       Path.join(

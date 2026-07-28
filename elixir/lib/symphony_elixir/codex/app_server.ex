@@ -79,7 +79,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          :ok <- prepare_sourced_env_files(expanded_workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
+         {:ok, port} <-
+           start_port(expanded_workspace, worker_host, Keyword.get(opts, :issue_context_file)) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -271,7 +272,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil) do
+  defp start_port(workspace, nil, issue_context_file) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -292,7 +293,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             # running me as an outer hook". UDP's before-handoff Stop hook
             # reads both vars and skips when SYMPHONY_RUN=1 AND SYMPHONY_AGENT=1.
             # See docs/symphony.md in the consumer repo.
-            env: agent_env()
+            env: agent_env(issue_context_file)
           ]
         )
 
@@ -300,16 +301,17 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
+  defp start_port(workspace, worker_host, issue_context_file) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, issue_context_file)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp agent_env do
-    base = [
-      {~c"SYMPHONY_RUN", ~c"1"},
-      {~c"SYMPHONY_AGENT", ~c"1"}
-    ]
+  defp agent_env(issue_context_file) do
+    base =
+      [
+        {~c"SYMPHONY_RUN", ~c"1"},
+        {~c"SYMPHONY_AGENT", ~c"1"}
+      ] ++ issue_context_env(issue_context_file)
 
     if Config.settings!().codex.withhold_linear_credentials do
       # A `false` value tells Port.open's `env:` option to unset the variable in
@@ -400,7 +402,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp remote_launch_command(workspace) when is_binary(workspace) do
+  defp remote_launch_command(workspace, issue_context_file) when is_binary(workspace) do
     # SSH does not forward our local env, so the inner-agent markers have to
     # be inlined into the remote shell command. Matches `agent_env/0` for the
     # local Port.open path.
@@ -415,6 +417,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       remote_unset_linear_credentials(),
       "export SYMPHONY_RUN=1",
       "export SYMPHONY_AGENT=1",
+      remote_issue_context_export(issue_context_file),
       AgentTransport.with_pre_command("exec #{Config.settings!().codex.command}")
     ]
     |> Enum.reject(&is_nil/1)
@@ -427,6 +430,18 @@ defmodule SymphonyElixir.Codex.AppServer do
       "unset #{vars}"
     end
   end
+
+  defp issue_context_env(path) when is_binary(path) and path != "" do
+    [{~c"SYMPHONY_ISSUE_CONTEXT_FILE", String.to_charlist(path)}]
+  end
+
+  defp issue_context_env(_path), do: []
+
+  defp remote_issue_context_export(path) when is_binary(path) and path != "" do
+    "export SYMPHONY_ISSUE_CONTEXT_FILE=#{shell_escape(path)}"
+  end
+
+  defp remote_issue_context_export(_path), do: nil
 
   defp port_metadata(port, worker_host) when is_port(port) do
     base_metadata =

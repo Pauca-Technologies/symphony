@@ -78,8 +78,7 @@ defmodule SymphonyElixir.Acp.LinearGate do
          {:ok, {_address, port}} when is_integer(port) <- ThousandIsland.listener_info(pid) do
       url = "http://127.0.0.1:#{port}/mcp/#{token}"
 
-      {:ok,
-       %{pid: pid, port: port, token: token, url: url, server_name: server_name}}
+      {:ok, %{pid: pid, port: port, token: token, url: url, server_name: server_name}}
     else
       {:error, reason} ->
         {:error, reason}

@@ -82,7 +82,13 @@ defmodule SymphonyElixir.ClaudeCode.Client do
          {:ok, expanded_workspace} <- AgentTransport.validate_workspace_cwd(workspace, worker_host),
          :ok <- AgentTransport.prepare_sourced_env_files(expanded_workspace, worker_host, cc.command) do
       maybe_warn_remote_gate(worker_host)
-      start_agent_session(expanded_workspace, worker_host, cc)
+
+      start_agent_session(
+        expanded_workspace,
+        worker_host,
+        cc,
+        Keyword.get(opts, :issue_context_file)
+      )
     end
   end
 
@@ -147,17 +153,22 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   # only after the first user message. So `start_session` just spawns the port;
   # the session id is discovered per-turn from the stream.
 
-  defp start_agent_session(workspace, worker_host, cc) do
+  defp start_agent_session(workspace, worker_host, cc, issue_context_file) do
     case LinearGate.start(session_pid: self()) do
-      {:ok, gate} -> start_agent_port(workspace, worker_host, cc, gate)
+      {:ok, gate} -> start_agent_port(workspace, worker_host, cc, gate, issue_context_file)
       {:error, reason} -> {:error, {:gate_start_failed, reason}}
     end
   end
 
-  defp start_agent_port(workspace, worker_host, cc, gate) do
+  defp start_agent_port(workspace, worker_host, cc, gate, issue_context_file) do
     command = build_command(cc, workspace, gate)
 
-    case AgentTransport.start_port(workspace, worker_host, command, agent_env(cc)) do
+    case AgentTransport.start_port(
+           workspace,
+           worker_host,
+           command,
+           agent_env(cc, issue_context_file)
+         ) do
       {:ok, port} ->
         {:ok,
          %{
@@ -470,11 +481,12 @@ defmodule SymphonyElixir.ClaudeCode.Client do
 
   # ── env / shell ──────────────────────────────────────────────────────────────
 
-  defp agent_env(cc) do
-    base = [
-      {~c"SYMPHONY_RUN", ~c"1"},
-      {~c"SYMPHONY_AGENT", ~c"1"}
-    ]
+  defp agent_env(cc, issue_context_file) do
+    base =
+      [
+        {~c"SYMPHONY_RUN", ~c"1"},
+        {~c"SYMPHONY_AGENT", ~c"1"}
+      ] ++ issue_context_env(issue_context_file)
 
     if cc.withhold_linear_credentials do
       base ++ Enum.map(@linear_credential_env_vars, &{&1, false})
@@ -482,6 +494,12 @@ defmodule SymphonyElixir.ClaudeCode.Client do
       base
     end
   end
+
+  defp issue_context_env(path) when is_binary(path) and path != "" do
+    [{~c"SYMPHONY_ISSUE_CONTEXT_FILE", String.to_charlist(path)}]
+  end
+
+  defp issue_context_env(_path), do: []
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

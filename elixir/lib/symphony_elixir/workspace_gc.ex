@@ -138,6 +138,7 @@ defmodule SymphonyElixir.WorkspaceGc do
   defp attempt_remove(%Issue{} = issue, worktree_path, remove_fn) do
     case remove_fn.(worktree_path) do
       :ok ->
+        Workspace.remove_issue_context(worktree_path)
         Logger.info("WorkspaceGc removed worktree identifier=#{issue.identifier} path=#{worktree_path}")
 
         Telemetry.emit(:gc_removed, %{

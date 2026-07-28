@@ -89,13 +89,12 @@ legitimately long-but-quiet operations).
 The Codex path enforces the `In Progress → In Review` handoff gate by
 intercepting Linear writes through Symphony's `linear_graphql` dynamic tool.
 ACP has no `dynamicTools`, so Symphony exposes the **same server-authenticated
-Linear tools** through an in-VM MCP HTTP endpoint listed in
+Linear tool** through an in-VM MCP HTTP endpoint listed in
 `session/new.mcpServers`:
 
 - The endpoint runs on Symphony's loopback (a per-session listener). When the
-  agent calls `linear_get_issue` or `linear_graphql`, the call is dispatched
-  **back into the run's own process**. The former provides a read-only detailed
-  issue lookup that defaults to the current task; the latter runs the
+  agent calls `linear_graphql`, the call is dispatched **back into the run's
+  own process**. The tool runs the
   `before_handoff` hook + reviewer gate for review-state mutations with the
   run's context and counters intact — byte-for-byte the same gate as Codex.
 - **Credential withholding is the hard guarantee.** The agent is given no Linear

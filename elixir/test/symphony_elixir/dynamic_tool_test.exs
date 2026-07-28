@@ -30,21 +30,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert graphql_description =~ "before_handoff"
 
-    assert %{
-             "description" => get_issue_description,
-             "inputSchema" => %{
-               "additionalProperties" => false,
-               "properties" => %{"issue_id" => %{"type" => "string"}},
-               "required" => [],
-               "type" => "object"
-             },
-             "name" => "linear_get_issue"
-           } = Enum.find(specs, &(&1["name"] == "linear_get_issue"))
-
-    assert get_issue_description =~ "read-only"
-    assert get_issue_description =~ "defaults to the current task"
-    assert get_issue_description =~ "when the task prompt does not contain enough information"
-    assert get_issue_description =~ "comments"
+    assert Enum.map(specs, & &1["name"]) == ["linear_graphql"]
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -55,7 +41,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql", "linear_get_issue"]
+               "supportedTools" => ["linear_graphql"]
              }
            }
 
@@ -65,104 +51,6 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "text" => response["output"]
              }
            ]
-  end
-
-  test "linear_get_issue fetches detailed context for the current task with server auth" do
-    test_pid = self()
-    issue = %Issue{id: "internal-id", identifier: "UDPE-7062", title: "Read context"}
-
-    linear_response = %{
-      "data" => %{
-        "issue" => %{
-          "identifier" => "UDPE-7062",
-          "description" => "Ticket details",
-          "comments" => %{"nodes" => [%{"body" => "Latest requirement"}]},
-          "relations" => %{"nodes" => []}
-        }
-      }
-    }
-
-    response =
-      DynamicTool.execute(
-        "linear_get_issue",
-        %{},
-        linear_issue: issue,
-        linear_client: fn query, variables, opts ->
-          send(test_pid, {:linear_get_issue_called, query, variables, opts})
-          {:ok, linear_response}
-        end
-      )
-
-    assert_received {:linear_get_issue_called, query, %{"issueId" => "UDPE-7062"}, []}
-    assert query =~ "query SymphonyGetIssue"
-    assert query =~ "comments(first: 100)"
-    assert query =~ "attachments"
-    assert query =~ "children(first: 100)"
-    assert query =~ "relations"
-    assert query =~ "inverseRelations(first: 100)"
-    assert response["success"] == true
-    assert Jason.decode!(response["output"]) == linear_response
-  end
-
-  test "linear_get_issue accepts an explicit issue identifier" do
-    response =
-      DynamicTool.execute(
-        "linear_get_issue",
-        %{"issue_id" => " ENG-42 "},
-        linear_issue: %Issue{identifier: "UDPE-7062"},
-        linear_client: fn _query, variables, _opts ->
-          assert variables == %{"issueId" => "ENG-42"}
-          {:ok, %{"data" => %{"issue" => %{"identifier" => "ENG-42"}}}}
-        end
-      )
-
-    assert response["success"] == true
-  end
-
-  test "linear_get_issue validates context and reports missing issues" do
-    no_context = DynamicTool.execute("linear_get_issue", %{}, linear_client: fn _, _, _ -> flunk() end)
-    assert no_context["success"] == false
-
-    assert Jason.decode!(no_context["output"]) == %{
-             "error" => %{
-               "message" => "`linear_get_issue` needs an `issue_id` because no current Linear issue is available in this session."
-             }
-           }
-
-    invalid =
-      DynamicTool.execute("linear_get_issue", %{"issue_id" => "  "}, linear_client: fn _, _, _ -> flunk() end)
-
-    assert get_in(Jason.decode!(invalid["output"]), ["error", "message"]) =~ "must be a non-empty"
-
-    not_found =
-      DynamicTool.execute("linear_get_issue", %{"issue_id" => "ENG-404"}, linear_client: fn _, _, _ -> {:ok, %{"data" => %{"issue" => nil}}} end)
-
-    assert not_found["success"] == false
-
-    assert Jason.decode!(not_found["output"]) == %{
-             "error" => %{
-               "issueId" => "ENG-404",
-               "message" => "Linear issue ENG-404 was not found."
-             }
-           }
-  end
-
-  test "linear_get_issue preserves GraphQL errors and formats auth failures" do
-    graphql_error =
-      DynamicTool.execute("linear_get_issue", %{"issue_id" => "ENG-1"},
-        linear_client: fn _, _, _ ->
-          {:ok, %{"errors" => [%{"message" => "Not authorized"}], "data" => %{"issue" => nil}}}
-        end
-      )
-
-    assert graphql_error["success"] == false
-    assert get_in(Jason.decode!(graphql_error["output"]), ["errors", Access.at(0), "message"]) == "Not authorized"
-
-    auth_error =
-      DynamicTool.execute("linear_get_issue", %{"issue_id" => "ENG-1"}, linear_client: fn _, _, _ -> {:error, :missing_linear_api_token} end)
-
-    assert auth_error["success"] == false
-    assert get_in(Jason.decode!(auth_error["output"]), ["error", "message"]) =~ "Symphony is missing Linear auth"
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do

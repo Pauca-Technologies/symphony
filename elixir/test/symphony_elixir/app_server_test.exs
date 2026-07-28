@@ -104,6 +104,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-supported-turn-policies.trace}"
+      printf 'ISSUE_CONTEXT:%s\n' "$SYMPHONY_ISSUE_CONTEXT_FILE" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -150,6 +151,8 @@ defmodule SymphonyElixir.AppServerTest do
         %{"type" => "futureSandbox", "nested" => %{"flag" => true}}
       ]
 
+      issue_context_file = Path.join(test_root, "issue-context.json")
+
       Enum.each(policy_cases, fn configured_policy ->
         File.rm(trace_file)
 
@@ -163,7 +166,10 @@ defmodule SymphonyElixir.AppServerTest do
         on_message = fn message -> send(test_pid, {:codex_message, message}) end
 
         assert {:ok, _result} =
-                 AppServer.run(workspace, "Validate supported turn policy", issue, on_message: on_message)
+                 AppServer.run(workspace, "Validate supported turn policy", issue,
+                   on_message: on_message,
+                   issue_context_file: issue_context_file
+                 )
 
         assert_receive {:codex_message,
                         %{
@@ -174,6 +180,7 @@ defmodule SymphonyElixir.AppServerTest do
 
         trace = File.read!(trace_file)
         lines = String.split(trace, "\n", trim: true)
+        assert "ISSUE_CONTEXT:#{issue_context_file}" in lines
 
         assert Enum.any?(lines, fn line ->
                  if String.starts_with?(line, "JSON:") do
@@ -632,8 +639,7 @@ defmodule SymphonyElixir.AppServerTest do
 
                      _ ->
                        false
-                   end) and
-                   Enum.any?(tools, &(&1["name"] == "linear_get_issue"))
+                   end) and length(tools) == 1
                else
                  false
                end

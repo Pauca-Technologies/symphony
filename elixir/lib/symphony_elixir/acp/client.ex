@@ -81,7 +81,13 @@ defmodule SymphonyElixir.Acp.Client do
          {:ok, expanded_workspace} <- AgentTransport.validate_workspace_cwd(workspace, worker_host),
          :ok <- AgentTransport.prepare_sourced_env_files(expanded_workspace, worker_host, acp.command) do
       maybe_warn_remote_gate(worker_host)
-      start_agent_session(expanded_workspace, worker_host, acp)
+
+      start_agent_session(
+        expanded_workspace,
+        worker_host,
+        acp,
+        Keyword.get(opts, :issue_context_file)
+      )
     end
   end
 
@@ -193,15 +199,20 @@ defmodule SymphonyElixir.Acp.Client do
 
   # ── session bring-up ────────────────────────────────────────────────────
 
-  defp start_agent_session(workspace, worker_host, acp) do
+  defp start_agent_session(workspace, worker_host, acp, issue_context_file) do
     case LinearGate.start(session_pid: self()) do
-      {:ok, gate} -> start_agent_port(workspace, worker_host, acp, gate)
+      {:ok, gate} -> start_agent_port(workspace, worker_host, acp, gate, issue_context_file)
       {:error, reason} -> {:error, {:gate_start_failed, reason}}
     end
   end
 
-  defp start_agent_port(workspace, worker_host, acp, gate) do
-    case AgentTransport.start_port(workspace, worker_host, acp.command, agent_env(acp)) do
+  defp start_agent_port(workspace, worker_host, acp, gate, issue_context_file) do
+    case AgentTransport.start_port(
+           workspace,
+           worker_host,
+           acp.command,
+           agent_env(acp, issue_context_file)
+         ) do
       {:ok, port} ->
         finish_session_bringup(workspace, worker_host, acp, gate, port)
 
@@ -390,9 +401,7 @@ defmodule SymphonyElixir.Acp.Client do
     idle_ms = System.monotonic_time(:millisecond) - last
     count = state.heartbeats + 1
 
-    Logger.info(
-      "ACP turn idle #{idle_ms}ms (no agent output) session_id=#{session.session_id} heartbeat=#{count} stall_timeout_ms=#{stall}"
-    )
+    Logger.info("ACP turn idle #{idle_ms}ms (no agent output) session_id=#{session.session_id} heartbeat=#{count} stall_timeout_ms=#{stall}")
 
     emit_message(session, state.on_message, :notification, %{
       kind: :idle_heartbeat,
@@ -410,7 +419,9 @@ defmodule SymphonyElixir.Acp.Client do
 
   defp dispatch_line(state, line) do
     case Jason.decode(line) do
-      {:ok, decoded} -> dispatch_message(state, decoded, line)
+      {:ok, decoded} ->
+        dispatch_message(state, decoded, line)
+
       {:error, _reason} ->
         log_non_json_line(line)
         receive_loop(state)
@@ -657,12 +668,12 @@ defmodule SymphonyElixir.Acp.Client do
 
   # ── env / config ─────────────────────────────────────────────────────────
 
-  defp agent_env(acp) do
+  defp agent_env(acp, issue_context_file) do
     base =
       [
         {~c"SYMPHONY_RUN", ~c"1"},
         {~c"SYMPHONY_AGENT", ~c"1"}
-      ] ++ model_env(acp)
+      ] ++ issue_context_env(issue_context_file) ++ model_env(acp)
 
     if acp.withhold_linear_credentials do
       base ++ Enum.map(@linear_credential_env_vars, &{&1, false})
@@ -670,6 +681,12 @@ defmodule SymphonyElixir.Acp.Client do
       base
     end
   end
+
+  defp issue_context_env(path) when is_binary(path) and path != "" do
+    [{~c"SYMPHONY_ISSUE_CONTEXT_FILE", String.to_charlist(path)}]
+  end
+
+  defp issue_context_env(_path), do: []
 
   # OpenCode reads its model from config, not from a flag: `opencode acp` rejects
   # `--model` and ignores OPENCODE_MODEL, but honors inline config via

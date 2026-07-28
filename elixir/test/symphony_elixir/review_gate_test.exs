@@ -397,11 +397,7 @@ defmodule SymphonyElixir.ReviewGateTest do
                linear_client: fn query, variables, _opts ->
                  send(test_pid, {:linear_called, query, variables})
 
-                 if query =~ "SymphonyGetIssue" do
-                   {:ok, %{"data" => %{"issue" => %{"identifier" => "UDPE-900"}}}}
-                 else
-                   {:ok, %{"data" => %{"viewer" => %{"id" => "u1"}}}}
-                 end
+                 {:ok, %{"data" => %{"viewer" => %{"id" => "u1"}}}}
                end
              )
 
@@ -411,11 +407,6 @@ defmodule SymphonyElixir.ReviewGateTest do
     read = tool_executor.("linear_graphql", %{"query" => "query Viewer { viewer { id } }"})
     assert read["success"] == true
     assert_received {:linear_called, "query Viewer { viewer { id } }", %{}}
-
-    issue_read = tool_executor.("linear_get_issue", %{})
-    assert issue_read["success"] == true
-    assert_received {:linear_called, issue_query, %{"issueId" => "UDPE-1"}}
-    assert issue_query =~ "SymphonyGetIssue"
 
     # A mutation is rejected before it can reach Linear.
     mutation =

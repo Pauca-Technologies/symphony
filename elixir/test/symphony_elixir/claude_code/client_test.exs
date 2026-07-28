@@ -65,17 +65,13 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
 
       assert {:ok, _} = run(workspace, on_message: collector())
 
-      assert_received {:cc_message,
-                       %{event: :notification, payload: %{"method" => "item/reasoning/textDelta", "params" => %{"textDelta" => "planning the change"}}}}
+      assert_received {:cc_message, %{event: :notification, payload: %{"method" => "item/reasoning/textDelta", "params" => %{"textDelta" => "planning the change"}}}}
 
-      assert_received {:cc_message,
-                       %{event: :notification, payload: %{"method" => "item/tool/call", "params" => %{"name" => "Read"}}}}
+      assert_received {:cc_message, %{event: :notification, payload: %{"method" => "item/tool/call", "params" => %{"name" => "Read"}}}}
 
-      assert_received {:cc_message,
-                       %{event: :notification, payload: %{"method" => "item/commandExecution/outputDelta", "params" => %{"output" => "1\thello"}}}}
+      assert_received {:cc_message, %{event: :notification, payload: %{"method" => "item/commandExecution/outputDelta", "params" => %{"output" => "1\thello"}}}}
 
-      assert_received {:cc_message,
-                       %{event: :notification, payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => "Done."}}}}
+      assert_received {:cc_message, %{event: :notification, payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => "Done."}}}}
     end)
   end
 
@@ -185,13 +181,17 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
 
     with_cc_env(fn workspace, trace ->
       write_fake_agent!(workspace.agent_path, events: [system_init()])
+      issue_context_file = Path.join(workspace.root, "issue-context.json")
 
-      assert {:ok, _} = run(workspace, on_message: collector())
+      assert {:ok, _} =
+               run(workspace,
+                 on_message: collector(),
+                 issue_context_file: issue_context_file
+               )
 
-      env_line =
-        trace |> File.read!() |> String.split("\n", trim: true) |> Enum.find(&String.starts_with?(&1, "ENV:LINEAR_API_KEY="))
-
-      assert env_line == "ENV:LINEAR_API_KEY=[]"
+      env_lines = trace |> File.read!() |> String.split("\n", trim: true)
+      assert "ENV:LINEAR_API_KEY=[]" in env_lines
+      assert "ENV:SYMPHONY_ISSUE_CONTEXT_FILE=[#{issue_context_file}]" in env_lines
     end)
   end
 
@@ -354,6 +354,7 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
     if [ -n "$trace" ]; then
       printf 'ARGV:%s\\n' "$*" >> "$trace"
       printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace"
+      printf 'ENV:SYMPHONY_ISSUE_CONTEXT_FILE=[%s]\\n' "$SYMPHONY_ISSUE_CONTEXT_FILE" >> "$trace"
       printf 'ENV:CC_PRECMD=[%s]\\n' "$CC_PRECMD" >> "$trace"
     fi
     IFS= read -r line

@@ -91,12 +91,9 @@ defmodule SymphonyElixir.AgentRunnerTest.HandoffPromptBackend do
   def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
 
   @impl true
-  def run_turn(_session, prompt, _issue, opts) do
+  def run_turn(_session, prompt, _issue, _opts) do
     recipient = Application.fetch_env!(:symphony_elixir, :handoff_prompt_recipient_for_test)
     send(recipient, {:handoff_prompt, prompt})
-
-    issue_result = Keyword.fetch!(opts, :tool_executor).("linear_get_issue", %{})
-    send(recipient, {:linear_get_issue_result, issue_result})
 
     {:ok, %{session_id: "handoff-prompt-session"}}
   end
@@ -157,7 +154,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "handoff prompt guidance" do
-    test "keeps issue lookup optional while routing review handoffs through the gated tool" do
+    test "routes review handoffs through the gated GraphQL tool" do
       workspace =
         Path.join(System.tmp_dir!(), "symphony-handoff-prompt-#{System.unique_integer([:positive])}")
 
@@ -178,12 +175,6 @@ defmodule SymphonyElixir.AgentRunnerTest do
       }
 
       state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
-      test_pid = self()
-
-      linear_client = fn query, variables, _opts ->
-        send(test_pid, {:linear_get_issue_called, query, variables})
-        {:ok, %{"data" => %{"issue" => %{"identifier" => "UDPE-7062"}}}}
-      end
 
       assert :ok =
                AgentRunner.run_codex_turns_for_test(
@@ -194,8 +185,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                    agent_backend: {HandoffPromptBackend, %{}},
                    issue_state_fetcher: state_fetcher,
                    max_turns: 1,
-                   per_repo_before_handoff: "scripts/hooks/before-handoff.sh",
-                   linear_client: linear_client
+                   per_repo_before_handoff: "scripts/hooks/before-handoff.sh"
                  ],
                  nil
                )
@@ -209,12 +199,6 @@ defmodule SymphonyElixir.AgentRunnerTest do
       {task_prompt_position, _length} = :binary.match(prompt, "You are an agent for this repository.")
       {handoff_guidance_position, _length} = :binary.match(prompt, "Symphony handoff requirement:")
       assert handoff_guidance_position > task_prompt_position
-
-      assert_receive {:linear_get_issue_called, issue_query, %{"issueId" => "UDPE-7062"}}
-      assert issue_query =~ "query SymphonyGetIssue"
-
-      assert_receive {:linear_get_issue_result, %{"success" => true, "output" => output}}
-      assert get_in(Jason.decode!(output), ["data", "issue", "identifier"]) == "UDPE-7062"
     end
   end
 

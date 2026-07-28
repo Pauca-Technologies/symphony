@@ -52,6 +52,7 @@ if System.get_env("LIVE_CLAUDE_CODE") == "1" do
 
         assert {:ok, %{session_id: session_id, stop_reason: stop_reason}} = result
         assert is_binary(session_id) and session_id != ""
+
         assert stop_reason in ["end_turn", "max_tokens"],
                "unexpected stop_reason=#{inspect(stop_reason)}; events=#{inspect(event_names(events))}"
 

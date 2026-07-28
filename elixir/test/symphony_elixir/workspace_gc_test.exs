@@ -2,7 +2,7 @@ defmodule SymphonyElixir.WorkspaceGcTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Linear.Issue
-  alias SymphonyElixir.WorkspaceGc
+  alias SymphonyElixir.{Workspace, WorkspaceGc}
 
   defmodule FailingTracker do
     @moduledoc false
@@ -35,6 +35,10 @@ defmodule SymphonyElixir.WorkspaceGcTest do
       tmp = make_tmp_dir!()
       worktree = Path.join(tmp, "UDPE-101")
       File.mkdir_p!(worktree)
+      write_workflow_file!(SymphonyElixir.Workflow.workflow_file_path(), tracker_kind: "memory", workspace_root: tmp)
+
+      assert {:ok, context_file} = Workspace.prepare_issue_context(worktree, issue("UDPE-101"))
+      assert File.exists?(context_file)
 
       Application.put_env(
         :symphony_elixir,
@@ -60,6 +64,7 @@ defmodule SymphonyElixir.WorkspaceGcTest do
       assert summary.removed == 1
       assert summary.skipped == 0
       assert [{^worktree, true}] = :ets.tab2list(removed)
+      refute File.exists?(context_file)
     end
 
     test "silently skips when the worktree path doesn't exist" do
