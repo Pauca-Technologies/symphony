@@ -9,7 +9,9 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.{
     AgentBackend,
     Config,
+    IssueActivityPrompt,
     Linear.Client,
+    Linear.Comment,
     Linear.Issue,
     Orchestrator,
     PromptBuilder,
@@ -87,7 +89,6 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
-
     routed_repo = resolve_routed_repo(issue)
 
     workspace_opts =
@@ -122,33 +123,20 @@ defmodule SymphonyElixir.AgentRunner do
             )
         end
 
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
-
-        session_start =
-          SessionStartHook.run(
-            workspace,
-            issue,
-            worker_host,
-            hook_command: Map.get(repo_hook_opts, :session_start)
-          )
-
-        opts =
-          opts
-          |> Keyword.put(:session_start_prompt, session_start.prompt)
-          |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
-          |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
-          |> maybe_put(:per_repo_workflow, repo_workflow)
-          |> maybe_put(:per_repo_review_workflow, review_workflow)
-
         try do
-          with :ok <-
-                 Workspace.run_before_run_hook(
-                   workspace,
-                   issue,
-                   worker_host,
-                   hook_command: Map.get(repo_hook_opts, :before_run)
-                 ) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          with {:ok, issue_with_comments} <- attach_issue_comments(issue, opts),
+               {:ok, _context_file} <-
+                 Workspace.prepare_issue_context(workspace, issue_with_comments, worker_host) do
+            run_prepared_agent(%{
+              workspace: workspace,
+              issue: issue_with_comments,
+              codex_update_recipient: codex_update_recipient,
+              opts: opts,
+              worker_host: worker_host,
+              repo_workflow: repo_workflow,
+              review_workflow: review_workflow,
+              repo_hook_opts: repo_hook_opts
+            })
           end
         after
           Workspace.run_after_run_hook(
@@ -163,6 +151,67 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason}
     end
   end
+
+  defp run_prepared_agent(%{
+         workspace: workspace,
+         issue: issue,
+         codex_update_recipient: codex_update_recipient,
+         opts: opts,
+         worker_host: worker_host,
+         repo_workflow: repo_workflow,
+         review_workflow: review_workflow,
+         repo_hook_opts: repo_hook_opts
+       }) do
+    send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+
+    session_start =
+      SessionStartHook.run(
+        workspace,
+        issue,
+        worker_host,
+        hook_command: Map.get(repo_hook_opts, :session_start)
+      )
+
+    opts =
+      opts
+      |> Keyword.put(:session_start_prompt, session_start.prompt)
+      |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
+      |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
+      |> maybe_put(:per_repo_workflow, repo_workflow)
+      |> maybe_put(:per_repo_review_workflow, review_workflow)
+
+    with :ok <-
+           Workspace.run_before_run_hook(
+             workspace,
+             issue,
+             worker_host,
+             hook_command: Map.get(repo_hook_opts, :before_run)
+           ) do
+      run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+    end
+  end
+
+  defp attach_issue_comments(%Issue{id: issue_id} = issue, opts) when is_binary(issue_id) do
+    comments_fetcher = Keyword.get(opts, :issue_comments_fetcher, &Tracker.fetch_issue_comments/1)
+
+    case comments_fetcher.(issue_id) do
+      {:ok, %{comments: comments, truncated: truncated?}}
+      when is_list(comments) and is_boolean(truncated?) ->
+        if Enum.all?(comments, &match?(%Comment{}, &1)) do
+          {:ok, %{issue | comments: comments, comments_truncated: truncated?}}
+        else
+          {:error, {:issue_comments_fetch_failed, :invalid_comments}}
+        end
+
+      {:ok, unexpected} ->
+        {:error, {:issue_comments_fetch_failed, {:invalid_result, unexpected}}}
+
+      {:error, reason} ->
+        {:error, {:issue_comments_fetch_failed, reason}}
+    end
+  end
+
+  defp attach_issue_comments(issue, _opts), do: {:ok, issue}
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
@@ -450,6 +499,7 @@ defmodule SymphonyElixir.AgentRunner do
     [
       {"session_start", session_start_prompt},
       {"task_prompt", PromptBuilder.build_prompt(issue, opts)},
+      {"issue_activity", IssueActivityPrompt.render(issue)},
       {"handoff_tool_guidance", handoff_tool_guidance(opts)}
     ]
     |> compose_prompt_sections()
@@ -852,6 +902,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
+        refreshed_issue = preserve_issue_comments(issue, refreshed_issue)
+
         cond do
           repo_label_drifted?(issue, refreshed_issue) ->
             Logger.info("Label drift detected mid-flight for #{issue_context(refreshed_issue)}; finishing current turn cleanly and halting (no reroute)")
@@ -896,6 +948,14 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp preserve_issue_comments(%Issue{} = previous_issue, %Issue{} = refreshed_issue) do
+    %{
+      refreshed_issue
+      | comments: previous_issue.comments,
+        comments_truncated: previous_issue.comments_truncated
+    }
+  end
 
   # Audit §9.4 (Symphony multi-repo, sub-step 6): if the routed issue's
   # `repo:<name>` label disappears or changes during a run, finish the

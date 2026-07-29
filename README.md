@@ -7,6 +7,10 @@ work instead of supervising coding agents.
 
 _In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
 
+Before each outer agent dispatch, the reference implementation captures a bounded current Linear
+comment window and includes it in the initial task context. Workpads and human unblock decisions are
+therefore deterministic agent input without exposing the tracker credential to repository code.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

@@ -82,7 +82,8 @@ Work only in the provided repository copy. Do not touch any other path.
 
 ## Linear tools
 
-The issue context above is normally sufficient. If additional live Linear activity would materially affect the work, use `linear_graphql` for an explicit query.
+The issue details above plus the Symphony-captured Linear activity appended to the first turn are normally sufficient. Read the captured comments before acting; they include the current workpad and human decisions available immediately before dispatch. If the activity is truncated or newer live Linear activity would materially affect the work, use `linear_graphql` for an explicit query.
+If `needs-human-input` is present, reconcile the human response after the blocker into the workpad before any repository work, then remove the label only after consuming that response.
 When moving an issue from `In Progress` to `In Review` or `Human Review`, use `linear_graphql` for the Linear `issueUpdate` mutation so Symphony can run the handoff gates. Do not use native Linear MCP `save_issue` for that state change.
 
 ## Default posture
@@ -119,6 +120,7 @@ When moving an issue from `In Progress` to `In Review` or `Human Review`, use `l
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
+- `Blocked` -> inactive; waiting for a human response recorded in a separate Linear comment. A human reactivates the issue by moving it to `In Progress` after replying.
 - `Human Review` -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
@@ -199,11 +201,11 @@ Use this only when completion is blocked by missing required tools or missing au
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
 - Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
-- If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
+- If a non-GitHub required tool is missing, required non-GitHub auth is unavailable, or a product decision is required, add `needs-human-input` and move the ticket to `Blocked` with a short blocker brief in the workpad that includes:
   - what is missing,
   - why it blocks required acceptance/validation,
   - exact human action needed to unblock.
-- Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
+- Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad. The human response belongs in a separate Linear comment; on redispatch, reconcile it into the workpad and remove `needs-human-input` before resuming.
 
 ## Step 2: Execution phase (Todo -> In Progress -> Human Review)
 
@@ -244,7 +246,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
 12. Only then move issue to `Human Review`.
-    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
+    - Exception: if blocked by missing required non-GitHub tools/auth or product input per the blocked-access escape hatch, move to `Blocked` with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.

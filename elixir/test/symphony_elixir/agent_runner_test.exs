@@ -91,9 +91,9 @@ defmodule SymphonyElixir.AgentRunnerTest.HandoffPromptBackend do
   def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
 
   @impl true
-  def run_turn(_session, prompt, _issue, _opts) do
+  def run_turn(_session, prompt, issue, _opts) do
     recipient = Application.fetch_env!(:symphony_elixir, :handoff_prompt_recipient_for_test)
-    send(recipient, {:handoff_prompt, prompt})
+    send(recipient, {:handoff_prompt, prompt, issue})
 
     {:ok, %{session_id: "handoff-prompt-session"}}
   end
@@ -134,6 +134,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.HandoffPromptBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
+  alias SymphonyElixir.Linear.Comment
   alias SymphonyElixir.Linear.Issue
 
   @idempotency_label "symphony:routing-warned"
@@ -190,7 +191,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                  nil
                )
 
-      assert_receive {:handoff_prompt, prompt}
+      assert_receive {:handoff_prompt, prompt, ^issue}
       assert prompt =~ "use Symphony's `linear_graphql` tool"
       assert prompt =~ "before_handoff and automated review gates"
       refute prompt =~ "LINEAR_API_KEY"
@@ -199,6 +200,145 @@ defmodule SymphonyElixir.AgentRunnerTest do
       {task_prompt_position, _length} = :binary.match(prompt, "You are an agent for this repository.")
       {handoff_guidance_position, _length} = :binary.match(prompt, "Symphony handoff requirement:")
       assert handoff_guidance_position > task_prompt_position
+    end
+  end
+
+  describe "injected issue activity" do
+    test "fails the worker attempt instead of starting without required comments" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-issue-activity-failure-#{System.unique_integer([:positive])}")
+
+      write_workflow_file!(SymphonyElixir.Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root
+      )
+
+      on_exit(fn -> File.rm_rf(workspace_root) end)
+
+      issue = %Issue{
+        id: "issue-comments-unavailable",
+        identifier: "UDPE-7011",
+        title: "Do not start with incomplete input",
+        state: "In Progress"
+      }
+
+      assert_raise RuntimeError, ~r/issue_comments_fetch_failed.*linear_unavailable/, fn ->
+        AgentRunner.run(issue, nil,
+          issue_comments_fetcher: fn "issue-comments-unavailable" ->
+            {:error, :linear_unavailable}
+          end
+        )
+      end
+    end
+
+    test "places current Linear comments and blocked-resume guidance in the first turn" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-issue-activity-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      Application.put_env(:symphony_elixir, :handoff_prompt_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :handoff_prompt_recipient_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      issue = %Issue{
+        id: "issue-resumed",
+        identifier: "UDPE-7011",
+        title: "Resume after a product decision",
+        state: "In Progress",
+        labels: ["needs-human-input"],
+        comments: [
+          %Comment{
+            id: "comment-workpad",
+            body: "## Codex Workpad\n\nBlocked on the product decision.",
+            author_name: "UDPAgent",
+            created_at: ~U[2026-07-29 09:00:00Z]
+          },
+          %Comment{
+            id: "comment-decision",
+            body: "Decision: use option B and continue.",
+            author_name: "Product owner",
+            created_at: ~U[2026-07-29 10:00:00Z]
+          }
+        ],
+        comments_truncated: true
+      }
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {HandoffPromptBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_receive {:handoff_prompt, prompt, ^issue}
+      assert prompt =~ "Symphony-captured Linear activity:"
+      assert prompt =~ "Decision: use option B and continue."
+      assert prompt =~ "This issue is marked `needs-human-input`"
+      assert prompt =~ "Remove the label only after consuming that response."
+      assert prompt =~ "Earlier Linear comments were omitted"
+    end
+
+    test "preserves injected comments when state refresh builds a continuation issue" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-issue-activity-refresh-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      Application.put_env(:symphony_elixir, :handoff_prompt_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :handoff_prompt_recipient_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      issue = %Issue{
+        id: "issue-refresh",
+        identifier: "UDPE-7011",
+        title: "Preserve comment context",
+        state: "In Progress",
+        comments: [%Comment{id: "comment-1", body: "Decision: continue."}]
+      }
+
+      state_fetcher = fn
+        [_issue_id] ->
+          call_count = Process.get(:comment_refresh_call_count, 0)
+          Process.put(:comment_refresh_call_count, call_count + 1)
+
+          if call_count == 0 do
+            {:ok, [%Issue{issue | comments: [], state: "In Progress"}]}
+          else
+            {:ok, [%Issue{issue | comments: [], state: "Done"}]}
+          end
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {HandoffPromptBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 2
+                 ],
+                 nil
+               )
+
+      assert_receive {:handoff_prompt, first_prompt, ^issue}
+      assert first_prompt =~ "Decision: continue."
+      assert_receive {:handoff_prompt, second_prompt, second_issue}
+      refute second_prompt =~ "Symphony-captured Linear activity:"
+      assert Enum.map(second_issue.comments, & &1.id) == ["comment-1"]
     end
   end
 

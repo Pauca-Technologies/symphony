@@ -4,9 +4,10 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.{Config, Linear.Comment, Linear.Issue}
 
   @issue_page_size 50
+  @issue_comment_limit 50
   @max_error_body_log_bytes 1_000
 
   @query """
@@ -516,6 +517,28 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @issue_comments_query """
+  query SymphonyLinearIssueComments($issueId: String!, $first: Int!) {
+    issue(id: $issueId) {
+      comments(first: $first, orderBy: updatedAt) {
+        nodes {
+          id
+          body
+          createdAt
+          updatedAt
+          user {
+            id
+            name
+          }
+        }
+        pageInfo {
+          hasNextPage
+        }
+      }
+    }
+  }
+  """
+
   @viewer_query """
   query SymphonyLinearViewer {
     viewer {
@@ -707,6 +730,12 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @spec fetch_issue_comments(String.t()) ::
+          {:ok, %{comments: [Comment.t()], truncated: boolean()}} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    do_fetch_issue_comments(issue_id, &graphql/2)
+  end
+
   @doc """
   Return terminal-state issues that transitioned within the last
   `lookback_days` days. Backs the issue-state-driven worktree GC
@@ -878,6 +907,14 @@ defmodule SymphonyElixir.Linear.Client do
       ids ->
         do_fetch_issue_states(ids, nil, graphql_fun)
     end
+  end
+
+  @doc false
+  @spec fetch_issue_comments_for_test(String.t(), (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, %{comments: [Comment.t()], truncated: boolean()}} | {:error, term()}
+  def fetch_issue_comments_for_test(issue_id, graphql_fun)
+      when is_binary(issue_id) and is_function(graphql_fun, 2) do
+    do_fetch_issue_comments(issue_id, graphql_fun)
   end
 
   defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
@@ -1096,6 +1133,79 @@ defmodule SymphonyElixir.Linear.Client do
   defp do_fetch_issue_states(ids, assignee_filter) do
     do_fetch_issue_states(ids, assignee_filter, &graphql/2)
   end
+
+  defp do_fetch_issue_comments(issue_id, graphql_fun)
+       when is_binary(issue_id) and is_function(graphql_fun, 2) do
+    with {:ok, body} <-
+           graphql_fun.(@issue_comments_query, %{issueId: issue_id, first: @issue_comment_limit}),
+         {:ok, comments, truncated?} <- decode_issue_comments_response(body) do
+      {:ok, %{comments: comments, truncated: truncated?}}
+    end
+  end
+
+  defp decode_issue_comments_response(%{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => comments,
+               "pageInfo" => %{"hasNextPage" => has_next_page}
+             }
+           }
+         }
+       })
+       when is_list(comments) do
+    case normalize_comments(comments) do
+      {:ok, normalized_comments} ->
+        {:ok, Enum.sort_by(normalized_comments, &comment_sort_key/1), has_next_page == true}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_issue_comments_response(%{"data" => %{"issue" => nil}}),
+    do: {:error, :linear_issue_not_found}
+
+  defp decode_issue_comments_response(_response), do: {:error, :linear_invalid_comments_payload}
+
+  defp normalize_comment(%{"body" => body} = comment) when is_binary(body) do
+    author = Map.get(comment, "user")
+
+    %Comment{
+      id: Map.get(comment, "id"),
+      body: body,
+      author_id: user_field(author, "id"),
+      author_name: user_field(author, "name"),
+      created_at: parse_datetime(Map.get(comment, "createdAt")),
+      updated_at: parse_datetime(Map.get(comment, "updatedAt"))
+    }
+  end
+
+  defp normalize_comment(_comment), do: nil
+
+  defp normalize_comments(comments) when is_list(comments) do
+    Enum.reduce_while(comments, {:ok, []}, fn comment, {:ok, normalized} ->
+      case normalize_comment(comment) do
+        %Comment{} = value -> {:cont, {:ok, [value | normalized]}}
+        nil -> {:halt, {:error, :linear_invalid_comment}}
+      end
+    end)
+    |> case do
+      {:ok, normalized} -> {:ok, Enum.reverse(normalized)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp comment_sort_key(%Comment{} = comment) do
+    {
+      encode_sort_datetime(comment.updated_at || comment.created_at),
+      encode_sort_datetime(comment.created_at),
+      comment.id || ""
+    }
+  end
+
+  defp encode_sort_datetime(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp encode_sort_datetime(_value), do: ""
 
   defp do_fetch_issue_states(ids, assignee_filter, graphql_fun)
        when is_list(ids) and is_function(graphql_fun, 2) do

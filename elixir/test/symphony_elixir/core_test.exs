@@ -1421,7 +1421,8 @@ defmodule SymphonyElixir.CoreTest do
                AgentRunner.run(
                  issue,
                  test_pid,
-                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                 issue_comments_fetcher: &empty_issue_comments/1
                )
 
       assert_receive {:codex_worker_update, "issue-live-updates",
@@ -1526,8 +1527,17 @@ defmodule SymphonyElixir.CoreTest do
 
       state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 issue_comments_fetcher: &empty_issue_comments/1
+               )
+
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 issue_comments_fetcher: &empty_issue_comments/1
+               )
 
       assert File.read!(hook_count) == "call\ncall\n"
 
@@ -1799,7 +1809,12 @@ defmodule SymphonyElixir.CoreTest do
 
       Application.put_env(:symphony_elixir, :telemetry_enabled, true)
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 issue_comments_fetcher: &empty_issue_comments/1
+               )
+
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
 
@@ -1998,7 +2013,13 @@ defmodule SymphonyElixir.CoreTest do
           {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
       end
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher, linear_client: linear_client)
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 issue_comments_fetcher: &empty_issue_comments/1,
+                 linear_client: linear_client
+               )
+
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
 
@@ -2128,7 +2149,11 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
-      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 issue_state_fetcher: state_fetcher,
+                 issue_comments_fetcher: &empty_issue_comments/1
+               )
 
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1
@@ -2493,4 +2518,7 @@ defmodule SymphonyElixir.CoreTest do
       File.rm_rf(test_root)
     end
   end
+
+  defp empty_issue_comments(_issue_id),
+    do: {:ok, %{comments: [], truncated: false}}
 end

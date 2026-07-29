@@ -21,10 +21,17 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During agent sessions, Symphony renders the issue's identifier, title, state, URL, and description
-directly into the task prompt. It also writes that same issue snapshot outside the agent-writable
-workspace and exposes its path as `SYMPHONY_ISSUE_CONTEXT_FILE` to lifecycle hooks and the agent
-process. Consumer-repository scripts can therefore use current task context without receiving a
-Linear credential. `linear_graphql` remains available when live Linear data or an operation is
+directly into the task prompt. Immediately before each outer dispatch it also fetches a bounded,
+most-recently-updated Linear comment window and appends that activity to the first turn, so the
+current workpad and human unblock decisions are deterministic task input. A truncation marker tells
+the agent when an older focused lookup may still be required. If the comment read fails, the worker
+attempt fails and retries rather than starting with incomplete context.
+
+Symphony writes the same issue and comment snapshot outside the agent-writable workspace and exposes
+its path as `SYMPHONY_ISSUE_CONTEXT_FILE` to lifecycle hooks and the agent process. Version 2 adds
+`issue.comments` and `issue.commentsTruncated`; the file never contains a Linear credential.
+Consumer-repository scripts can therefore use current task context without receiving that
+credential. `linear_graphql` remains available when newer live Linear data or an operation is
 materially needed. Handoff state changes must use that gated tool; Symphony does not auto-approve
 native Linear MCP `save_issue` calls because they cannot run `hooks.before_handoff` or the automated
 review gate.

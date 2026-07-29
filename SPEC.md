@@ -175,6 +175,11 @@ Fields:
     - `state` (string or null)
 - `created_at` (timestamp or null)
 - `updated_at` (timestamp or null)
+- `comments` (list of normalized comment records)
+  - Bounded activity captured immediately before an outer agent dispatch.
+  - Each record contains `id`, `body`, `author_id`, `author_name`, `created_at`, and `updated_at`.
+- `comments_truncated` (boolean)
+  - True when older comments exist outside the captured activity window.
 
 #### 4.1.2 Workflow Definition
 
@@ -913,14 +918,15 @@ Execution contract:
 - Set `SYMPHONY_RUN=1` and expose the current task snapshot path as
   `SYMPHONY_ISSUE_CONTEXT_FILE` to issue lifecycle hooks. The versioned JSON snapshot MUST be
   written outside the agent-writable workspace, MUST NOT contain tracker credentials, and SHOULD
-  be refreshed from the same normalized issue used to render the prompt before session startup and
-  before `hooks.before_handoff`.
+  be refreshed from the same normalized issue and comment activity used to assemble the first turn
+  before session startup and before `hooks.before_handoff`.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 - Emit `gate.before_handoff` telemetry when `before_handoff` fires, including the per-gate
   pass/fail breakdown parsed from hook JSON output when available.
 
-The version 1 issue-context document has this shape (nullable issue fields remain present):
+Version 1 readers used this issue-only shape. Implementations adding comment activity SHOULD emit
+version 2 while accepting version 1 during rolling deployment. Nullable fields remain present.
 
 ```json
 {
@@ -935,6 +941,35 @@ The version 1 issue-context document has this shape (nullable issue fields remai
     "state": "In Progress",
     "labels": ["repo:example"],
     "updatedAt": "2026-07-28T09:29:00Z"
+  }
+}
+```
+
+Version 2 adds bounded comment activity to `issue`:
+
+```json
+{
+  "version": 2,
+  "capturedAt": "2026-07-29T10:01:00Z",
+  "issue": {
+    "id": "issue-uuid",
+    "identifier": "ENG-123",
+    "title": "Short summary",
+    "description": "Rendered task scope",
+    "url": "https://linear.app/example/issue/ENG-123",
+    "state": "In Progress",
+    "labels": ["repo:example", "needs-human-input"],
+    "comments": [
+      {
+        "id": "comment-uuid",
+        "body": "Decision: use option B.",
+        "author": {"id": "user-uuid", "name": "Product owner"},
+        "createdAt": "2026-07-29T10:00:00Z",
+        "updatedAt": "2026-07-29T10:00:00Z"
+      }
+    ],
+    "commentsTruncated": false,
+    "updatedAt": "2026-07-29T10:00:00Z"
   }
 }
 ```
@@ -1023,6 +1058,11 @@ client to:
 - Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
   targeted protocol accepts cwd.
 - Start the first turn with the rendered issue prompt.
+- Fetch a bounded, most-recently-updated issue-comment window immediately before each outer agent
+  dispatch and append it to the first turn as required issue activity. If this required read fails,
+  fail the worker attempt so the orchestrator can retry rather than starting with incomplete input.
+- Mark truncated activity explicitly so the workflow can request older comments through an
+  available live tracker tool only when necessary.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
 - Supply the implementation's documented approval and sandbox policy using fields supported by the
@@ -1219,6 +1259,10 @@ An implementation MUST support these tracker adapter operations:
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
+4. `fetch_issue_comments(issue_id)`
+   - Used once immediately before an outer agent dispatch to assemble required issue activity.
+   - Returns normalized comments plus a truncation marker.
+
 ### 11.2 Query Semantics (Linear)
 
 Linear-specific requirements for `tracker.kind == "linear"`:
@@ -1229,6 +1273,8 @@ Linear-specific requirements for `tracker.kind == "linear"`:
 - `tracker.project_slug` maps to Linear project `slugId`
 - Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
 - Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
+- Issue-comment query requests at most `50` comments ordered by `updatedAt`, then presents the
+  captured window chronologically in the first turn.
 - Pagination REQUIRED for candidate issues
 - Page size default: `50`
 - Network timeout: `30000 ms`
@@ -1292,6 +1338,11 @@ Inputs to prompt rendering:
 - `workflow.prompt_template`
 - normalized `issue` object
 - OPTIONAL `attempt` integer (retry/continuation metadata)
+
+The first turn is assembled from the rendered template plus the normalized comment activity fetched
+immediately before dispatch. Repository templates do not need to reconstruct that activity. Later
+in-worker turns retain the original activity and use the live tracker tool only for newer or omitted
+context.
 
 ### 12.2 Rendering Rules
 

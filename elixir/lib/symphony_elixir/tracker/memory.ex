@@ -46,6 +46,19 @@ defmodule SymphonyElixir.Tracker.Memory do
     end
   end
 
+  @spec fetch_issue_comments(String.t()) ::
+          {:ok, %{comments: [term()], truncated: boolean()}} | {:error, term()}
+  def fetch_issue_comments(issue_id) do
+    comments_by_issue =
+      Application.get_env(:symphony_elixir, :memory_tracker_comments_by_issue, %{})
+
+    {:ok,
+     Map.get(comments_by_issue, issue_id, %{
+       comments: [],
+       truncated: false
+     })}
+  end
+
   @spec recently_terminal_issues(pos_integer()) :: {:ok, [Issue.t()]} | {:error, term()}
   def recently_terminal_issues(_lookback_days) do
     # Tests configure this list directly under

@@ -80,6 +80,10 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
 
+  @spec fetch_issue_comments(String.t()) ::
+          {:ok, %{comments: [term()], truncated: boolean()}} | {:error, term()}
+  def fetch_issue_comments(issue_id), do: client_module().fetch_issue_comments(issue_id)
+
   @spec recently_terminal_issues(pos_integer()) :: {:ok, [term()]} | {:error, term()}
   def recently_terminal_issues(lookback_days),
     do: client_module().recently_terminal_issues(lookback_days)

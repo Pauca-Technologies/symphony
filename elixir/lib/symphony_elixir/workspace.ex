@@ -679,7 +679,7 @@ defmodule SymphonyElixir.Workspace do
 
   defp encode_issue_context(issue_or_identifier) do
     Jason.encode(%{
-      "version" => 1,
+      "version" => 2,
       "capturedAt" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
       "issue" => issue_snapshot(issue_or_identifier)
     })
@@ -694,6 +694,8 @@ defmodule SymphonyElixir.Workspace do
       "url" => issue_value(issue, :url),
       "state" => issue_value(issue, :state),
       "labels" => issue_value(issue, :labels) || [],
+      "comments" => Enum.map(issue_value(issue, :comments) || [], &comment_snapshot/1),
+      "commentsTruncated" => issue_value(issue, :comments_truncated) == true,
       "updatedAt" => encode_datetime(issue_value(issue, :updated_at))
     }
   end
@@ -707,11 +709,26 @@ defmodule SymphonyElixir.Workspace do
       "url" => nil,
       "state" => nil,
       "labels" => [],
+      "comments" => [],
+      "commentsTruncated" => false,
       "updatedAt" => nil
     }
   end
 
   defp issue_snapshot(_issue), do: issue_snapshot("issue")
+
+  defp comment_snapshot(comment) when is_map(comment) do
+    %{
+      "id" => issue_value(comment, :id),
+      "body" => issue_value(comment, :body) || "",
+      "author" => %{
+        "id" => issue_value(comment, :author_id),
+        "name" => issue_value(comment, :author_name)
+      },
+      "createdAt" => encode_datetime(issue_value(comment, :created_at)),
+      "updatedAt" => encode_datetime(issue_value(comment, :updated_at))
+    }
+  end
 
   defp issue_value(issue, key) do
     Map.get(issue, key) || Map.get(issue, Atom.to_string(key))

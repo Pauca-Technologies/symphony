@@ -4,6 +4,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.Comment
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -74,6 +75,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         url: "https://linear.app/example/issue/UDPE-7011",
         state: "In Progress",
         labels: ["repo:udp-dashboard-v2"],
+        comments: [
+          %Comment{
+            id: "comment-workpad",
+            body: "## Codex Workpad\n\nWaiting for a decision.",
+            author_id: "agent-1",
+            author_name: "UDPAgent",
+            created_at: ~U[2026-07-28 09:31:00Z],
+            updated_at: ~U[2026-07-28 09:32:00Z]
+          }
+        ],
+        comments_truncated: true,
         updated_at: ~U[2026-07-28 09:30:00Z]
       }
 
@@ -83,7 +95,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.regular?(context_file)
 
       assert %{
-               "version" => 1,
+               "version" => 2,
                "capturedAt" => captured_at,
                "issue" => %{
                  "id" => "issue-context-1",
@@ -93,6 +105,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                  "url" => "https://linear.app/example/issue/UDPE-7011",
                  "state" => "In Progress",
                  "labels" => ["repo:udp-dashboard-v2"],
+                 "comments" => [
+                   %{
+                     "id" => "comment-workpad",
+                     "body" => "## Codex Workpad\n\nWaiting for a decision.",
+                     "author" => %{"id" => "agent-1", "name" => "UDPAgent"},
+                     "createdAt" => "2026-07-28T09:31:00Z",
+                     "updatedAt" => "2026-07-28T09:32:00Z"
+                   }
+                 ],
+                 "commentsTruncated" => true,
                  "updatedAt" => "2026-07-28T09:30:00Z"
                }
              } = context_file |> File.read!() |> Jason.decode!()
@@ -550,6 +572,70 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert query =~ "SymphonyLinearIssuesById"
 
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
+  end
+
+  test "linear client fetches a bounded, chronological issue comment snapshot" do
+    graphql_fun = fn query, variables ->
+      send(self(), {:fetch_issue_comments, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => [
+                 %{
+                   "id" => "comment-2",
+                   "body" => "Decision: use option B.",
+                   "createdAt" => "2026-07-29T10:00:00Z",
+                   "updatedAt" => "2026-07-29T10:00:00Z",
+                   "user" => %{"id" => "user-1", "name" => "Product owner"}
+                 },
+                 %{
+                   "id" => "comment-1",
+                   "body" => "## Codex Workpad\n\nBlocked on the product decision.",
+                   "createdAt" => "2026-07-29T09:00:00Z",
+                   "updatedAt" => "2026-07-29T09:30:00Z",
+                   "user" => %{"id" => "agent-1", "name" => "UDPAgent"}
+                 }
+               ],
+               "pageInfo" => %{"hasNextPage" => true}
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:ok, %{comments: [workpad, decision], truncated: true}} =
+             Client.fetch_issue_comments_for_test("issue-1", graphql_fun)
+
+    assert workpad.id == "comment-1"
+    assert workpad.author_name == "UDPAgent"
+    assert decision.id == "comment-2"
+    assert decision.body == "Decision: use option B."
+
+    assert_receive {:fetch_issue_comments, query, %{issueId: "issue-1", first: 50}}
+    assert query =~ "SymphonyLinearIssueComments"
+    assert query =~ "orderBy: updatedAt"
+  end
+
+  test "linear client rejects malformed comments instead of dropping required activity" do
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => [%{"id" => "comment-without-body"}],
+               "pageInfo" => %{"hasNextPage" => false}
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:error, :linear_invalid_comment} =
+             Client.fetch_issue_comments_for_test("issue-1", graphql_fun)
   end
 
   test "linear client logs response bodies for non-200 graphql responses" do
