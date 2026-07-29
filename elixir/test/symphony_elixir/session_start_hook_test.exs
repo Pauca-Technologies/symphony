@@ -11,11 +11,11 @@ defmodule SymphonyElixir.SessionStartHookTest do
 
     assert SessionStartHook.telemetry_event() == [:symphony_elixir, :gate, :session_start]
 
-    assert %{outcome: :skipped, prompt: "", output: "", workpad_files: [], script_timings: []} =
+    assert %{outcome: :skipped, output: "", workpad_files: [], artifacts: [], script_timings: []} =
              SessionStartHook.run(workspace, issue)
   end
 
-  test "passes without advisory prompt when no workpad files are found" do
+  test "passes when no workpad files are found" do
     workspace = temp_workspace!("session-start-empty")
     issue = issue("MT-EMPTY")
 
@@ -24,7 +24,7 @@ defmodule SymphonyElixir.SessionStartHookTest do
       hook_session_start: "printf '%s\\n' plain-output"
     )
 
-    assert %{outcome: :passed, prompt: "", output: "plain-output\n", workpad_files: [], script_timings: []} =
+    assert %{outcome: :passed, output: "plain-output\n", workpad_files: [], artifacts: [], script_timings: []} =
              SessionStartHook.run(workspace, issue)
   end
 
@@ -51,7 +51,8 @@ defmodule SymphonyElixir.SessionStartHookTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: Path.dirname(workspace),
-      hook_session_start: "printf '%s\\n' '{\"timings\":{\"session:check-base\":2.6}}'"
+      hook_session_start:
+        "printf '%s\\n' '{\"timings\":{\"session:check-base\":2.6}}' '{\"artifacts\":[{\"path\":\"docs/agent-workpad/feature/session-start/local.md\",\"description\":\"local branch context\"},{\"path\":\"../outside.md\",\"description\":\"reject me\"}]}'"
     )
 
     result = SessionStartHook.run(workspace, issue)
@@ -59,11 +60,13 @@ defmodule SymphonyElixir.SessionStartHookTest do
     assert result.outcome == :passed
 
     assert result.workpad_files == [
-             "docs/agent-workpad/feature/session-start/local.md",
-             "docs/agent-workpad/feature_session-start/sanitized.md"
+             "docs/agent-workpad/feature/session-start/local.md"
            ]
 
-    assert result.prompt =~ "docs/agent-workpad/feature/session-start/local.md"
+    assert result.artifacts == [
+             %{path: "docs/agent-workpad/feature/session-start/local.md", description: "local branch context"}
+           ]
+
     assert result.script_timings == [%{name: "session:check-base", duration_ms: 3, status: nil}]
   end
 
@@ -225,7 +228,7 @@ defmodule SymphonyElixir.SessionStartHookTest do
 
     assert result.outcome == :passed
     assert result.workpad_files == []
-    assert result.prompt == ""
+    refute Map.has_key?(result, :prompt)
   end
 
   test "remote session_start failures remain informational" do
@@ -263,7 +266,7 @@ defmodule SymphonyElixir.SessionStartHookTest do
 
     assert result.outcome == :failed
     assert result.workpad_files == []
-    assert result.prompt =~ "No session_start workpad files were found."
+    refute Map.has_key?(result, :prompt)
   end
 
   test "non-hook-command failures remain informational" do

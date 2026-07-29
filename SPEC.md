@@ -399,9 +399,14 @@ Fields:
 - `session_start` (multiline shell script string, OPTIONAL)
   - Runs before each fresh or resumed coding-agent session after workspace preparation and before
     launching the coding agent.
-  - Failure is logged and surfaced to the first turn but does not abort the current attempt.
+  - Failure is logged and surfaced in the first-turn task context but does not abort the current
+    attempt.
   - Implementations SHOULD surface generated Markdown links under `docs/agent-workpad/<branch>/` to
-    the first turn as advisory startup context.
+    the first turn as annotated startup artifacts.
+  - A repository MAY describe those artifacts by emitting a one-line JSON object containing an
+    `artifacts` array. Each entry contains a repository-relative `path` under
+    `docs/agent-workpad/` and a short `description`. Implementations MUST reject paths outside that
+    root and SHOULD retain path-only discovery for hooks that do not emit this metadata.
 - `before_run` (multiline shell script string, OPTIONAL)
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
@@ -474,7 +479,8 @@ fields locally if they want stricter startup checks.
 
 ### 5.4 Prompt Template Contract
 
-The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
+The Markdown body of `WORKFLOW.md` is the repository workflow prompt template. The host-owned task
+context supplies issue details and tracker activity independently of this template.
 
 Rendering requirements:
 
@@ -649,14 +655,16 @@ Important nuance:
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
-- The first turn SHOULD use the full rendered task prompt.
+- The first turn SHOULD use the canonical task context followed by the full rendered repository
+  workflow prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
+  original first-turn prompt that is already present in thread history.
 - Each turn SHOULD emit prompt observability with the prompt kind, character and byte counts, and
   symbolic included-section names. This observability MUST NOT contain raw prompt content.
 - Compact continuation guidance applies only while reusing the same live backend thread. The first
-  turn of a newly started backend session SHOULD retain the full task prompt unless that backend has
-  restored verified prior-thread context; a retry attempt alone is not proof of restored context.
+  turn of a newly started backend session SHOULD retain the full task context and repository
+  workflow unless that backend has restored verified prior-thread context; a retry attempt alone is
+  not proof of restored context.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
@@ -1057,12 +1065,17 @@ client to:
 - Create or resume a coding-agent thread according to the targeted protocol.
 - Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
   targeted protocol accepts cwd.
-- Start the first turn with the rendered issue prompt.
+- Start the first turn with a canonical host-owned task context containing the normalized issue
+  details.
 - Fetch a bounded, most-recently-updated issue-comment window immediately before each outer agent
-  dispatch and append it to the first turn as required issue activity. If this required read fails,
-  fail the worker attempt so the orchestrator can retry rather than starting with incomplete input.
+  dispatch and place it immediately after the issue details as required issue activity. If this
+  required read fails, fail the worker attempt so the orchestrator can retry rather than starting
+  with incomplete input.
 - Mark truncated activity explicitly so the workflow can request older comments through an
   available live tracker tool only when necessary.
+- Place annotated Markdown artifacts produced by `session_start` after current tracker activity,
+  then place the rendered repository workflow after the complete task context. Hook stdout SHOULD
+  remain diagnostic output rather than prompt content.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
 - Supply the implementation's documented approval and sandbox policy using fields supported by the
@@ -1339,10 +1352,17 @@ Inputs to prompt rendering:
 - normalized `issue` object
 - OPTIONAL `attempt` integer (retry/continuation metadata)
 
-The first turn is assembled from the rendered template plus the normalized comment activity fetched
-immediately before dispatch. Repository templates do not need to reconstruct that activity. Later
-in-worker turns retain the original activity and use the live tracker tool only for newer or omitted
-context.
+The first turn is assembled in this order:
+
+1. A canonical host-owned task context containing normalized issue details.
+2. The normalized comment activity fetched immediately before dispatch.
+3. Annotated Markdown startup artifacts produced by `session_start`, when present.
+4. The rendered repository workflow template.
+5. Any host-owned handoff-tool guidance.
+
+Repository templates do not need to reconstruct issue details, activity, or startup-artifact
+meaning. Later in-worker turns retain the original task context and use the live tracker tool only
+for newer or omitted context.
 
 ### 12.2 Rendering Rules
 
@@ -2088,7 +2108,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - OPTIONAL workspace population/synchronization errors are surfaced
 - `after_create` hook runs only on new workspace creation
 - `session_start` hook runs before each fresh or resumed agent session; failures are non-fatal and
-  produce advisory first-turn context plus `gate.session_start` telemetry
+  are represented in canonical first-turn task context plus `gate.session_start` telemetry
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored

@@ -282,7 +282,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                )
 
       assert_receive {:handoff_prompt, prompt, ^issue}
-      assert prompt =~ "Symphony-captured Linear activity:"
+      assert prompt =~ "## Current Linear activity"
       assert prompt =~ "Decision: use option B and continue."
       assert prompt =~ "This issue is marked `needs-human-input`"
       assert prompt =~ "Remove the label only after consuming that response."
@@ -337,7 +337,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert_receive {:handoff_prompt, first_prompt, ^issue}
       assert first_prompt =~ "Decision: continue."
       assert_receive {:handoff_prompt, second_prompt, second_issue}
-      refute second_prompt =~ "Symphony-captured Linear activity:"
+      refute second_prompt =~ "## Current Linear activity"
       assert Enum.map(second_issue.comments, & &1.id) == ["comment-1"]
     end
   end

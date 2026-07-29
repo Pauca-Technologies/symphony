@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.SessionStartHook do
   @moduledoc """
-  Runs the non-blocking session_start lifecycle hook and formats first-turn guidance.
+  Runs the non-blocking session_start lifecycle hook and returns structured results.
   """
 
   require Logger
@@ -9,11 +9,12 @@ defmodule SymphonyElixir.SessionStartHook do
 
   @telemetry_event [:symphony_elixir, :gate, :session_start]
 
+  @type artifact :: %{path: String.t(), description: String.t() | nil}
   @type result :: %{
-          prompt: String.t(),
           outcome: :skipped | :passed | :failed,
           output: String.t(),
           workpad_files: [String.t()],
+          artifacts: [artifact()],
           script_timings: [map()]
         }
 
@@ -46,13 +47,16 @@ defmodule SymphonyElixir.SessionStartHook do
               {:failed, hook_failure_output(reason)}
           end
 
-        workpad_files = discover_workpad_files(workspace, issue, worker_host)
-        script_timings = extract_script_timings(output)
+        report = decode_hook_report(output)
+        discovered_files = discover_workpad_files(workspace, issue, worker_host)
+        artifacts = resolve_artifacts(report, discovered_files)
+        workpad_files = Enum.map(artifacts, & &1.path)
+        script_timings = timings_from_report(report)
         duration_ms = elapsed_ms(started_at)
 
         emit_telemetry(issue, workspace, worker_host, outcome, duration_ms, script_timings, workpad_files)
 
-        result(outcome, output, workpad_files, script_timings)
+        result(outcome, output, artifacts, script_timings)
     end
   end
 
@@ -65,48 +69,20 @@ defmodule SymphonyElixir.SessionStartHook do
 
   defp hook_failure_output(reason), do: inspect(reason)
 
-  defp result(outcome, output, workpad_files, script_timings \\ [])
+  defp result(outcome, output, artifacts, script_timings \\ [])
 
-  defp result(:skipped, _output, workpad_files, script_timings) do
-    %{prompt: "", outcome: :skipped, output: "", workpad_files: workpad_files, script_timings: script_timings}
+  defp result(:skipped, _output, artifacts, script_timings) do
+    %{outcome: :skipped, output: "", workpad_files: [], artifacts: artifacts, script_timings: script_timings}
   end
 
-  defp result(outcome, output, workpad_files, script_timings) do
+  defp result(outcome, output, artifacts, script_timings) do
     %{
-      prompt: advisory_prompt(outcome, workpad_files),
       outcome: outcome,
       output: output,
-      workpad_files: workpad_files,
+      workpad_files: Enum.map(artifacts, & &1.path),
+      artifacts: artifacts,
       script_timings: script_timings
     }
-  end
-
-  defp advisory_prompt(:passed, []), do: ""
-
-  defp advisory_prompt(:passed, workpad_files) do
-    """
-    System message:
-
-    The session_start lifecycle hook ran before this turn. Review these generated workpad files before reading source:
-    #{format_file_links(workpad_files)}
-    """
-    |> String.trim()
-  end
-
-  defp advisory_prompt(:failed, workpad_files) do
-    """
-    System message:
-
-    The session_start lifecycle hook failed, but it is informational and must not block this session. Continue with the task and account for any available workpad files:
-    #{format_file_links(workpad_files)}
-    """
-    |> String.trim()
-  end
-
-  defp format_file_links([]), do: "- No session_start workpad files were found."
-
-  defp format_file_links(files) do
-    Enum.map_join(files, "\n", &"- #{&1}")
   end
 
   defp emit_telemetry(%Issue{} = issue, workspace, worker_host, outcome, duration_ms, script_timings, workpad_files) do
@@ -236,22 +212,96 @@ defmodule SymphonyElixir.SessionStartHook do
     String.replace(branch, ~r/[^a-zA-Z0-9._-]/, "_")
   end
 
-  defp extract_script_timings(output) when is_binary(output) do
-    output
-    |> decode_hook_report()
-    |> timings_from_report()
-  end
-
   defp decode_hook_report(output) do
     trimmed = String.trim(output)
 
-    with {:error, _reason} <- Jason.decode(trimmed),
-         {:ok, candidate} <- json_object_candidate(trimmed),
-         {:error, _reason} <- Jason.decode(candidate) do
-      %{}
+    case Jason.decode(trimmed) do
+      {:ok, decoded} when is_map(decoded) ->
+        decoded
+
+      _ ->
+        case decoded_line_reports(trimmed) do
+          [] -> decode_embedded_report(trimmed)
+          reports -> Enum.reduce(reports, %{}, &Map.merge/2)
+        end
+    end
+  end
+
+  defp decoded_line_reports(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn line ->
+      case Jason.decode(String.trim(line)) do
+        {:ok, decoded} when is_map(decoded) -> [decoded]
+        _ -> []
+      end
+    end)
+  end
+
+  defp decode_embedded_report(output) do
+    with {:ok, candidate} <- json_object_candidate(output),
+         {:ok, decoded} when is_map(decoded) <- Jason.decode(candidate) do
+      decoded
     else
-      {:ok, decoded} when is_map(decoded) -> decoded
       _ -> %{}
+    end
+  end
+
+  defp resolve_artifacts(report, discovered_files) do
+    case reported_artifacts(report) do
+      {:present, artifacts} -> artifacts
+      :missing -> Enum.map(discovered_files, &%{path: &1, description: nil})
+    end
+  end
+
+  defp reported_artifacts(report) do
+    if map_has_key?(report, "artifacts") do
+      artifacts =
+        case map_get(report, "artifacts") do
+          entries when is_list(entries) ->
+            entries
+            |> Enum.map(&artifact_entry/1)
+            |> Enum.reject(&is_nil/1)
+            |> Enum.uniq_by(& &1.path)
+
+          _ ->
+            []
+        end
+
+      {:present, artifacts}
+    else
+      :missing
+    end
+  end
+
+  defp artifact_entry(entry) when is_map(entry) do
+    with path when is_binary(path) <- map_string(entry, ["path"], nil),
+         true <- valid_artifact_path?(path) do
+      %{path: path, description: artifact_description(entry)}
+    else
+      _ -> nil
+    end
+  end
+
+  defp artifact_entry(_entry), do: nil
+
+  defp valid_artifact_path?(path) do
+    case Path.split(path) do
+      ["docs", "agent-workpad" | rest] -> rest != [] and Enum.all?(rest, &(&1 not in [".", "..", ""]))
+      _ -> false
+    end
+  end
+
+  defp artifact_description(entry) do
+    case map_string(entry, ["description"], nil) do
+      nil ->
+        nil
+
+      description ->
+        case description |> String.replace(~r/\s+/, " ") |> String.trim() |> String.slice(0, 240) do
+          "" -> nil
+          normalized -> normalized
+        end
     end
   end
 
@@ -318,6 +368,16 @@ defmodule SymphonyElixir.SessionStartHook do
 
   defp map_get(map, key) when is_map(map) do
     Map.get(map, key) || map_get_existing_atom(map, key)
+  end
+
+  defp map_has_key?(map, key) when is_map(map) do
+    Map.has_key?(map, key) or map_has_existing_atom?(map, key)
+  end
+
+  defp map_has_existing_atom?(map, key) do
+    Map.has_key?(map, String.to_existing_atom(key))
+  rescue
+    ArgumentError -> false
   end
 
   defp map_get_existing_atom(map, key) do

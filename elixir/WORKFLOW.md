@@ -25,7 +25,7 @@ hooks:
     fi
   # session_start runs before each Codex app-server session, including when an
   # existing workspace/branch is resumed. It is informational: failures are
-  # logged and surfaced to the first turn but do not block the agent.
+  # logged and included in the first-turn task context but do not block the agent.
   session_start: |
     if [ -x scripts/hooks/session-start.sh ]; then
       scripts/hooks/session-start.sh
@@ -47,29 +47,17 @@ codex:
     type: workspaceWrite
 ---
 
-You are working on a Linear ticket `{{ issue.identifier }}`
+# Repository workflow
+
+This workflow governs work in the Symphony repository for the issue described in the task context above.
 
 {% if attempt %}
-Continuation context:
+Retry context:
 
 - This is retry attempt #{{ attempt }} because the ticket is still in an active state.
 - Resume from the current workspace state instead of restarting from scratch.
 - Do not repeat already-completed investigation or validation unless needed for new code changes.
 - Do not end the turn while the issue remains in an active state unless you are blocked by missing required permissions/secrets.
-  {% endif %}
-
-Issue context:
-Identifier: {{ issue.identifier }}
-Title: {{ issue.title }}
-Current status: {{ issue.state }}
-Labels: {{ issue.labels }}
-URL: {{ issue.url }}
-
-Description:
-{% if issue.description %}
-{{ issue.description }}
-{% else %}
-No description provided.
 {% endif %}
 
 Instructions:
@@ -82,7 +70,7 @@ Work only in the provided repository copy. Do not touch any other path.
 
 ## Linear tools
 
-The issue details above plus the Symphony-captured Linear activity appended to the first turn are normally sufficient. Read the captured comments before acting; they include the current workpad and human decisions available immediately before dispatch. If the activity is truncated or newer live Linear activity would materially affect the work, use `linear_graphql` for an explicit query.
+The Symphony-owned task context above is normally sufficient. Read its issue details, current Linear activity, and any annotated startup artifacts before acting. If the activity is truncated or newer live Linear activity would materially affect the work, use `linear_graphql` for an explicit query.
 If `needs-human-input` is present, reconcile the human response after the blocker into the workpad before any repository work, then remove the label only after consuming that response.
 When moving an issue from `In Progress` to `In Review` or `Human Review`, use `linear_graphql` for the Linear `issueUpdate` mutation so Symphony can run the handoff gates. Do not use native Linear MCP `save_issue` for that state change.
 

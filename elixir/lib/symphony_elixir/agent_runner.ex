@@ -9,7 +9,6 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.{
     AgentBackend,
     Config,
-    IssueActivityPrompt,
     Linear.Client,
     Linear.Comment,
     Linear.Issue,
@@ -19,6 +18,7 @@ defmodule SymphonyElixir.AgentRunner do
     ReviewGate,
     Router,
     SessionStartHook,
+    TaskContextPrompt,
     Telemetry,
     Tracker,
     Workspace
@@ -174,7 +174,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     opts =
       opts
-      |> Keyword.put(:session_start_prompt, session_start.prompt)
+      |> Keyword.put(:session_start_result, session_start)
       |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
       |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
       |> maybe_put(:per_repo_workflow, repo_workflow)
@@ -494,12 +494,9 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
-    session_start_prompt = Keyword.get(opts, :session_start_prompt)
-
     [
-      {"session_start", session_start_prompt},
-      {"task_prompt", PromptBuilder.build_prompt(issue, opts)},
-      {"issue_activity", IssueActivityPrompt.render(issue)},
+      {"task_context", TaskContextPrompt.render(issue, Keyword.get(opts, :session_start_result))},
+      {"repository_workflow", PromptBuilder.build_prompt(issue, opts)},
       {"handoff_tool_guidance", handoff_tool_guidance(opts)}
     ]
     |> compose_prompt_sections()

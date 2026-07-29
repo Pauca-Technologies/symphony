@@ -20,12 +20,14 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
-During agent sessions, Symphony renders the issue's identifier, title, state, URL, and description
-directly into the task prompt. Immediately before each outer dispatch it also fetches a bounded,
-most-recently-updated Linear comment window and appends that activity to the first turn, so the
-current workpad and human unblock decisions are deterministic task input. A truncation marker tells
-the agent when an older focused lookup may still be required. If the comment read fails, the worker
-attempt fails and retries rather than starting with incomplete context.
+During agent sessions, Symphony owns a canonical first-turn task context. It contains the issue's
+identifier, title, state, labels, URL, and description followed by a bounded, most-recently-updated
+Linear comment window fetched immediately before each outer dispatch. The current workpad and human
+unblock decisions are therefore deterministic task input. Any Markdown files produced by
+`hooks.session_start` appear next in an annotated startup-artifact section, followed by the rendered
+repository workflow. A truncation marker tells the agent when an older focused lookup may still be
+required. If the comment read fails, the worker attempt fails and retries rather than starting with
+incomplete context.
 
 Symphony writes the same issue and comment snapshot outside the agent-writable workspace and exposes
 its path as `SYMPHONY_ISSUE_CONTEXT_FILE` to lifecycle hooks and the agent process. Version 2 adds
@@ -146,7 +148,8 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
-  The first turn receives the full rendered task prompt; later turns on the same live thread receive
+  The first turn receives the canonical task context followed by the rendered repository workflow;
+  later turns on the same live thread receive
   only compact continuation guidance plus any actionable handoff or reviewer findings. Symphony
   records prompt character/byte counts and included section names without storing raw prompt text.
   A newly started backend thread still receives the full first-turn prompt, including on retries,
@@ -198,13 +201,18 @@ Notes:
   legacy flat label with the same qualified name (e.g. group `repo`/`udp-dashboard-v2` vs a flat
   `repo:udp-dashboard-v2`) collapse to one entry, so you can migrate issues onto the grouped label
   without changing config.
-- If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
-  identifier, title, and body.
+- If the Markdown body is blank, Symphony uses a default repository workflow prompt. The canonical
+  task context supplies the issue details independently of that template.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - Use `hooks.session_start` to run non-blocking repo-local startup discovery before every fresh or
   resumed Codex session. Symphony captures generated Markdown links under
-  `docs/agent-workpad/<branch>/` and prepends them to the first turn as an advisory system message.
+  `docs/agent-workpad/<branch>/` and annotates them in the startup-artifact section of the canonical
+  first-turn task context. Raw hook stdout is retained for diagnostics and is not copied into the
+  prompt. A hook can own the meaning of its artifacts by emitting a one-line JSON report with an
+  `artifacts` array of `path` and `description` objects; paths must remain under
+  `docs/agent-workpad/`. Hooks without that report retain path-only discovery as a compatibility
+  fallback.
   The hook emits `[:symphony_elixir, :gate, :session_start]` telemetry with total duration and any
   per-script timings reported by the hook output.
 - Use `hooks.before_handoff` to run a repo-local gate before an agent moves a Linear issue from

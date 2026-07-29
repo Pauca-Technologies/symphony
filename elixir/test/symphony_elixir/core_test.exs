@@ -1233,18 +1233,18 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
-    assert prompt =~ "Issue context:"
-    assert prompt =~ "Identifier: MT-616"
-    assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
-    assert prompt =~ "Current status: In Progress"
-    assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
+    assert prompt =~ "# Repository workflow"
+    assert prompt =~ "issue described in the task context above"
+    assert prompt =~ "Retry context:"
+    refute prompt =~ "Identifier: MT-616"
+    refute prompt =~ "Title: Use rich templates for WORKFLOW.md"
+    refute prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
     assert prompt =~ "This is an unattended orchestration session."
     assert prompt =~ "Only stop early for a true blocker"
     assert prompt =~ "Do not include \"next steps for user\""
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
-    assert prompt =~ "Continuation context:"
+    assert prompt =~ "Retry context:"
     assert prompt =~ "retry attempt #2"
   end
 
@@ -1510,6 +1510,7 @@ defmodule SymphonyElixir.CoreTest do
         printf 'call\\n' >> #{hook_count}
         printf 'base hint\\n' > docs/agent-workpad/feature_session-start/base.md
         printf '%s\\n' '{"scripts":[{"name":"session:check-base","duration_ms":12,"status":"passed"},{"name":"session:reuse-scan","duration_ms":7,"status":"passed"}]}'
+        printf '%s\\n' '{"artifacts":[{"path":"docs/agent-workpad/feature_session-start/base.md","description":"branch readiness context"}]}'
         """,
         codex_command: "#{codex_binary} app-server"
       )
@@ -1555,10 +1556,24 @@ defmodule SymphonyElixir.CoreTest do
         end)
 
       assert length(turn_texts) == 2
-      assert Enum.all?(turn_texts, &String.contains?(&1, "System message:"))
-      assert Enum.all?(turn_texts, &String.contains?(&1, "session_start lifecycle hook ran"))
+      assert Enum.all?(turn_texts, &String.contains?(&1, "# Task context"))
+      assert Enum.all?(turn_texts, &String.contains?(&1, "## Current Linear activity"))
+      assert Enum.all?(turn_texts, &String.contains?(&1, "## Startup artifacts generated for this task"))
       assert Enum.all?(turn_texts, &String.contains?(&1, "docs/agent-workpad/feature_session-start/base.md"))
+      assert Enum.all?(turn_texts, &String.contains?(&1, "branch readiness context"))
       assert Enum.all?(turn_texts, &String.contains?(&1, "You are an agent for this repository."))
+      assert Enum.all?(turn_texts, &(not String.contains?(&1, "System message:")))
+
+      Enum.each(turn_texts, fn prompt ->
+        {task_context_position, _length} = :binary.match(prompt, "# Task context")
+        {activity_position, _length} = :binary.match(prompt, "## Current Linear activity")
+        {artifacts_position, _length} = :binary.match(prompt, "## Startup artifacts generated for this task")
+        {workflow_position, _length} = :binary.match(prompt, "You are an agent for this repository.")
+
+        assert task_context_position < activity_position
+        assert activity_position < artifacts_position
+        assert artifacts_position < workflow_position
+      end)
 
       assert_receive {:session_start_telemetry, ^telemetry_event, %{count: 1, duration_ms: duration_ms},
                       %{
@@ -1613,7 +1628,7 @@ defmodule SymphonyElixir.CoreTest do
       result = SymphonyElixir.SessionStartHook.run(workspace, issue)
 
       assert result.outcome == :failed
-      assert result.prompt =~ "session_start lifecycle hook failed"
+      refute Map.has_key?(result, :prompt)
       assert result.script_timings == [%{name: "session:check-base", duration_ms: 9, status: "failed"}]
     after
       File.rm_rf(test_root)
@@ -1850,7 +1865,7 @@ defmodule SymphonyElixir.CoreTest do
                         issue_id: "issue-continue",
                         issue_identifier: "MT-247",
                         prompt_kind: "initial",
-                        included_sections: ["task_prompt"],
+                        included_sections: ["task_context", "repository_workflow"],
                         turn_number: 1,
                         max_turns: 3
                       }}
@@ -2044,7 +2059,7 @@ defmodule SymphonyElixir.CoreTest do
       assert_receive {:remediation_prompt_built,
                       %{
                         prompt_kind: "initial",
-                        included_sections: ["task_prompt"],
+                        included_sections: ["task_context", "repository_workflow"],
                         turn_number: 1
                       }}
 
