@@ -46,6 +46,14 @@ with explicit instructions to end the turn without retrying the mutation. If the
 an attached GitHub PR URL, the review gate uses that PR directly for the human-review section;
 otherwise it falls back to the current workspace branch's PR.
 
+Each pass starts a fresh, ephemeral reviewer thread with no implementor transcript or canonical
+issue-context file. Symphony gives it a versioned JSON packet pinned to the resolved base and head
+SHAs and a diff fingerprint. The packet carries the compact issue contract, changed-file manifest,
+area-specific repository rules, risk/lens rationale, exact-head validation attestations, prior open
+findings with their reviewed SHA, and a bounded follow-up delta. Packet compaction never removes
+the commands for reading the authoritative full diff or the applicable security/tenant/auth rule
+paths. High-risk follow-ups must finish with another complete base-to-head pass.
+
 The reviewer is fail-safe. Its terminal outcomes are `approved`, `request_changes`,
 `automation_inconclusive`, `infrastructure_unavailable`, and
 `budget_exhausted_with_findings`. Only `approved` for the exact pinned candidate SHA may apply the
@@ -300,6 +308,35 @@ Notes:
   production, then start a fresh orchestration run (or attach/update the candidate head). For
   `budget_exhausted_with_findings`, a human must explicitly resolve or accept the recorded findings;
   Symphony never converts the cost limit into automated approval.
+- Configure bounded review evidence and execution in the `review` front matter of the target
+  repository's `WORKFLOW_REVIEW.md`:
+
+  ```yaml
+  review:
+    max_iterations: 3
+    verdict_path: .artifacts/symphony-review/verdict.json
+    packet_path: .artifacts/symphony-review/packet.v1.json
+    packet_max_bytes: 48000
+    context_budget_tokens: 12000
+    turn_budget: 1
+    turn_timeout_ms: 900000
+    tool_output_max_bytes: 4000
+    model: gpt-5.5
+    reasoning_effort: high
+    require_pr: true
+  ```
+
+  Symphony clamps unsafe values and always enforces one Codex turn per fresh reviewer attempt.
+  It enforces the context budget over the final rendered workflow, guards, and packet using a
+  conservative three UTF-8 bytes per configured token; an oversized prompt is explicitly
+  inconclusive rather than truncated. Successful reviewer dynamic-tool responses larger than
+  `tool_output_max_bytes` are replaced in both response text fields with a bounded preview plus the
+  original size and narrow-query/raw-artifact recovery instructions. Failure responses remain
+  intact so diagnostics are never hidden.
+  The verdict must report the packet's exact `reviewed_sha`, a non-empty `inspected` list, and
+  `attestations.reused` / `attestations.rerun`; missing or stale candidate evidence is
+  `automation_inconclusive`. Parent reviewer and delegated lens threads emit independent local
+  telemetry with packet/head identity, tokens, duration, model, reasoning effort, and findings.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

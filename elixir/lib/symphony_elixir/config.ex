@@ -50,6 +50,38 @@ defmodule SymphonyElixir.Config do
           withhold_linear_credentials: boolean()
         }
 
+  @type review_settings :: %{
+          max_iterations: pos_integer(),
+          verdict_path: Path.t(),
+          packet_path: Path.t(),
+          packet_max_bytes: pos_integer(),
+          context_budget_tokens: pos_integer(),
+          turn_budget: pos_integer(),
+          turn_timeout_ms: pos_integer(),
+          tool_output_max_bytes: pos_integer(),
+          model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
+          require_pr: boolean(),
+          pr_section_enabled: boolean(),
+          section_heading: String.t()
+        }
+
+  @default_review_settings %{
+    max_iterations: 3,
+    verdict_path: ".artifacts/symphony-review/verdict.json",
+    packet_path: ".artifacts/symphony-review/packet.v1.json",
+    packet_max_bytes: 48_000,
+    context_budget_tokens: 12_000,
+    turn_budget: 1,
+    turn_timeout_ms: 900_000,
+    tool_output_max_bytes: 4_000,
+    model: nil,
+    reasoning_effort: nil,
+    require_pr: true,
+    pr_section_enabled: true,
+    section_heading: "## 🤖 How to review this PR"
+  }
+
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
     # T27 follow-up: host-level Symphony config lives in
@@ -157,6 +189,44 @@ defmodule SymphonyElixir.Config do
 
   def agent_routing_settings(_workflow),
     do: {:error, {:invalid_agent_routing, "repository workflow must contain a config map"}}
+
+  @doc """
+  Resolve repository-owned automated-review settings from `WORKFLOW_REVIEW.md`.
+
+  Review configuration is deliberately separate from host runtime settings: the
+  repository owns its review evidence contract and budgets, while Symphony
+  enforces safe minima and the one-turn fresh-thread contract.
+  """
+  @spec review_settings(Workflow.loaded_workflow() | nil) :: review_settings()
+  def review_settings(%{config: config}) when is_map(config) do
+    raw = Map.get(config, "review", %{}) || %{}
+
+    @default_review_settings
+    |> Map.put(:max_iterations, bounded_integer(raw, "max_iterations", 1, 20, 3))
+    |> Map.put(:verdict_path, non_blank(raw, "verdict_path", @default_review_settings.verdict_path))
+    |> Map.put(:packet_path, non_blank(raw, "packet_path", @default_review_settings.packet_path))
+    |> Map.put(:packet_max_bytes, bounded_integer(raw, "packet_max_bytes", 8_192, 262_144, 48_000))
+    |> Map.put(
+      :context_budget_tokens,
+      bounded_integer(raw, "context_budget_tokens", 6_144, 65_536, 12_000)
+    )
+    |> Map.put(:turn_budget, 1)
+    |> Map.put(:turn_timeout_ms, bounded_integer(raw, "turn_timeout_ms", 30_000, 3_600_000, 900_000))
+    |> Map.put(
+      :tool_output_max_bytes,
+      bounded_integer(raw, "tool_output_max_bytes", 512, 32_768, 4_000)
+    )
+    |> Map.put(:model, optional_non_blank(raw, "model"))
+    |> Map.put(:reasoning_effort, optional_non_blank(raw, "reasoning_effort"))
+    |> Map.put(:require_pr, boolean_value(raw, "require_pr", true))
+    |> Map.put(:pr_section_enabled, boolean_value(raw, "pr_section_enabled", true))
+    |> Map.put(
+      :section_heading,
+      non_blank(raw, "section_heading", @default_review_settings.section_heading)
+    )
+  end
+
+  def review_settings(_workflow), do: @default_review_settings
 
   @spec server_port() :: non_neg_integer() | nil
   def server_port do
@@ -370,6 +440,34 @@ defmodule SymphonyElixir.Config do
 
       other ->
         "Invalid WORKFLOW.md config: #{inspect(other)}"
+    end
+  end
+
+  defp bounded_integer(map, key, min, max, default) do
+    case Map.get(map, key) do
+      value when is_integer(value) -> value |> Kernel.max(min) |> Kernel.min(max)
+      _value -> default
+    end
+  end
+
+  defp non_blank(map, key, default) do
+    case Map.get(map, key) do
+      value when is_binary(value) -> if String.trim(value) == "", do: default, else: value
+      _value -> default
+    end
+  end
+
+  defp optional_non_blank(map, key) do
+    case non_blank(map, key, nil) do
+      value when is_binary(value) -> value
+      _value -> nil
+    end
+  end
+
+  defp boolean_value(map, key, default) do
+    case Map.get(map, key) do
+      value when is_boolean(value) -> value
+      _value -> default
     end
   end
 end

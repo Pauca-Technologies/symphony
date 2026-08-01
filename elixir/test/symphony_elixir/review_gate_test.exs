@@ -32,10 +32,26 @@ defmodule SymphonyElixir.ReviewGateTest do
   # returns success — mimicking a reviewer agent that produced a verdict file.
   defp verdict_runner(verdict) do
     fn ctx ->
-      File.mkdir_p!(Path.dirname(ctx.verdict_path))
-      File.write!(ctx.verdict_path, Jason.encode!(verdict))
+      write_verdict(ctx, verdict)
       {:ok, %{}}
     end
+  end
+
+  defp write_verdict(ctx, verdict) do
+    complete =
+      Map.merge(
+        %{
+          "packet_id" => ctx.packet.packet_id,
+          "reviewed_sha" => ctx.reviewed_sha,
+          "inspected" => ["authoritative full diff"],
+          "attestations" => %{"reused" => [], "rerun" => []},
+          "full_diff_inspected" => true
+        },
+        verdict
+      )
+
+    File.mkdir_p!(Path.dirname(ctx.verdict_path))
+    File.write!(ctx.verdict_path, Jason.encode!(complete))
   end
 
   defp capture_comments(test_pid) do
@@ -82,6 +98,109 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert outcome.outcome == :approved
     assert outcome.authoritative
     assert outcome.reviewed_sha == "head-7"
+  end
+
+  test "fresh reviewer receives a bounded exact-head packet without implementor transcript", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+    issue = %{issue() | comments: [%{body: "IMPLEMENTOR-TRANSCRIPT-MUST-NOT-LEAK"}]}
+
+    runner = fn ctx ->
+      send(test_pid, {:review_context, ctx})
+
+      write_verdict(ctx, %{
+        "verdict" => "approve",
+        "inspected" => ["git diff --find-renames base...head-7", "lib/"],
+        "attestations" => %{"reused" => ["mix test"], "rerun" => ["mix test test/unit"]}
+      })
+
+      {:ok, %{}}
+    end
+
+    workflow =
+      review_workflow(%{
+        "packet_max_bytes" => 12_000,
+        "context_budget_tokens" => 3_000,
+        "turn_budget" => 99,
+        "tool_output_max_bytes" => 2_000
+      })
+
+    assert {:approved, outcome} =
+             ReviewGate.run(workspace, issue, nil, workflow,
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:review_context, ctx}
+    assert ctx.packet.schema_version == 1
+    assert ctx.packet.candidate.head_sha == "head-7"
+    assert byte_size(Jason.encode!(ctx.packet)) <= 12_000
+    assert ctx.review_settings.turn_budget == 1
+    assert ctx.prompt =~ "This is a fresh reviewer thread"
+    assert ctx.prompt =~ "fork_turns: \"none\""
+    assert ctx.prompt =~ "authoritative full-diff commands"
+    refute ctx.prompt =~ "IMPLEMENTOR-TRANSCRIPT-MUST-NOT-LEAK"
+    assert outcome.packet_id == ctx.packet.packet_id
+    assert outcome.inspected == ["git diff --find-renames base...head-7", "lib/"]
+    assert outcome.attestation_report == %{reused: ["mix test"], rerun: ["mix test test/unit"]}
+  end
+
+  test "changed or missing verdict head is inconclusive and retried, never approved", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    runner = fn ctx ->
+      send(test_pid, :mismatched_review_attempt)
+
+      write_verdict(ctx, %{
+        "verdict" => "approve",
+        "reviewed_sha" => "older-head",
+        "inspected" => ["complete diff"]
+      })
+
+      {:ok, %{}}
+    end
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received :mismatched_review_attempt
+    assert_received :mismatched_review_attempt
+
+    assert {:verdict_unreadable, {:verdict_head_mismatch, %{expected: "head-7", reported: "older-head"}}} =
+             outcome.failure_reason
+
+    refute outcome.authoritative
+  end
+
+  test "high-risk follow-up cannot approve without a final full-diff attestation", %{
+    workspace: workspace
+  } do
+    runner = fn ctx ->
+      write_verdict(ctx, %{
+        "verdict" => "approve",
+        "full_diff_inspected" => false
+      })
+
+      {:ok, %{}}
+    end
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner(),
+               risk: :high
+             )
+
+    assert outcome.failure_reason ==
+             {:verdict_unreadable, :verdict_missing_high_risk_full_diff_attestation}
+
+    refute outcome.authoritative
   end
 
   test "resolved PR without head SHA does not borrow workspace HEAD authority", %{
@@ -166,7 +285,7 @@ defmodule SymphonyElixir.ReviewGateTest do
       }
 
       File.mkdir_p!(Path.dirname(ctx.verdict_path))
-      File.write!(ctx.verdict_path, Jason.encode!(verdict))
+      write_verdict(ctx, verdict)
       {:ok, %{}}
     end
 
@@ -286,7 +405,7 @@ defmodule SymphonyElixir.ReviewGateTest do
 
       Process.put(:stale_approval_pass, Process.get(:stale_approval_pass, 0) + 1)
       File.mkdir_p!(Path.dirname(ctx.verdict_path))
-      File.write!(ctx.verdict_path, Jason.encode!(verdict))
+      write_verdict(ctx, verdict)
       {:ok, %{}}
     end
 
@@ -316,16 +435,14 @@ defmodule SymphonyElixir.ReviewGateTest do
       if attempt == 1 do
         {:error, {:turn_aborted, %{"reason" => "interrupted", "turn_id" => "turn-1"}}}
       else
-        File.mkdir_p!(Path.dirname(ctx.verdict_path))
-
-        File.write!(
-          ctx.verdict_path,
-          Jason.encode!(%{
+        write_verdict(
+          ctx,
+          %{
             "verdict" => "approve",
             "review_effort" => "focused",
             "human_review" => "Session retry completed the review.",
             "comments" => []
-          })
+          }
         )
 
         {:ok, %{}}
@@ -386,14 +503,14 @@ defmodule SymphonyElixir.ReviewGateTest do
       if attempt == 2 do
         File.mkdir_p!(Path.dirname(ctx.verdict_path))
 
-        File.write!(
-          ctx.verdict_path,
-          Jason.encode!(%{
+        write_verdict(
+          ctx,
+          %{
             "verdict" => "approve",
             "review_effort" => "focused",
             "human_review" => "Retry produced the review guidance.",
             "comments" => []
-          })
+          }
         )
       end
 
@@ -466,7 +583,7 @@ defmodule SymphonyElixir.ReviewGateTest do
           }
         end
 
-      File.write!(ctx.verdict_path, Jason.encode!(verdict))
+      write_verdict(ctx, verdict)
       {:ok, %{}}
     end
 
@@ -510,7 +627,7 @@ defmodule SymphonyElixir.ReviewGateTest do
     runner = fn ctx ->
       ctx.on_message.(%{event: :notification, timestamp: DateTime.utc_now()})
       File.mkdir_p!(Path.dirname(ctx.verdict_path))
-      File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+      write_verdict(ctx, %{"verdict" => "approve"})
       {:ok, %{}}
     end
 
@@ -544,7 +661,7 @@ defmodule SymphonyElixir.ReviewGateTest do
     runner = fn ctx ->
       send(test_pid, {:tool_executor, ctx.tool_executor})
       File.mkdir_p!(Path.dirname(ctx.verdict_path))
-      File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+      write_verdict(ctx, %{"verdict" => "approve"})
       {:ok, %{}}
     end
 
@@ -574,6 +691,116 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     assert mutation["success"] == false
     refute_received {:linear_called, _, _}
+  end
+
+  test "successful reviewer tool output is compacted to the configured hard bound", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    runner = fn ctx ->
+      response =
+        ctx.tool_executor.("linear_graphql", %{
+          "query" => "query Large { viewer { id } }"
+        })
+
+      failure =
+        ctx.tool_executor.("linear_graphql", %{
+          "query" => "query LargeFailure { viewer { id } }"
+        })
+
+      send(test_pid, {:bounded_tool_response, response, failure})
+      write_verdict(ctx, %{"verdict" => "approve"})
+      {:ok, %{}}
+    end
+
+    workflow = review_workflow(%{"tool_output_max_bytes" => 512})
+
+    assert {:approved, _outcome} =
+             ReviewGate.run(workspace, issue(), nil, workflow,
+               session_runner: runner,
+               pr_runner: pr_runner(),
+               linear_client: fn query, _variables, _opts ->
+                 if query =~ "LargeFailure" do
+                   {:ok, %{"errors" => [%{"message" => String.duplicate("failure detail", 200)}]}}
+                 else
+                   {:ok, %{"data" => %{"rows" => String.duplicate("évidence", 2_000)}}}
+                 end
+               end
+             )
+
+    assert_received {:bounded_tool_response, response, failure}
+    assert response["success"]
+    assert byte_size(response["output"]) <= 512
+    assert [%{"text" => text}] = response["contentItems"]
+    assert text == response["output"]
+
+    assert %{
+             "compacted" => true,
+             "original_bytes" => original_bytes,
+             "max_bytes" => 512,
+             "recovery" => recovery,
+             "preview" => _preview
+           } = Jason.decode!(response["output"])
+
+    assert original_bytes > 512
+    assert recovery =~ "narrower query"
+    refute failure["success"]
+    assert byte_size(failure["output"]) > 512
+    assert [%{"text" => failure_text}] = failure["contentItems"]
+    assert failure_text == failure["output"]
+    assert %{"errors" => [%{"message" => message}]} = Jason.decode!(failure["output"])
+    assert message =~ "failure detail"
+  end
+
+  test "oversized review workflow fails closed at the final context ceiling", %{
+    workspace: workspace
+  } do
+    runner = fn _ctx -> flunk("review session must not start over the context ceiling") end
+    huge_prompt = "Review {{ issue.identifier }}\n" <> String.duplicate("workflow evidence ", 20_000)
+
+    workflow = %{
+      config: %{"review" => %{"context_budget_tokens" => 6_144}},
+      prompt: huge_prompt,
+      prompt_template: huge_prompt
+    }
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(workspace, issue(), nil, workflow,
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert {:review_prompt_unavailable, {:review_context_budget_exceeded, actual_bytes, max_bytes}} = outcome.failure_reason
+
+    assert actual_bytes > max_bytes
+    assert max_bytes == 6_144 * 3
+  end
+
+  test "minimum context budget admits a normal packet without truncating the candidate", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    runner = fn ctx ->
+      send(test_pid, {:minimum_context_prompt, byte_size(ctx.prompt), ctx.packet})
+      write_verdict(ctx, %{"verdict" => "approve"})
+      {:ok, %{}}
+    end
+
+    workflow = review_workflow(%{"context_budget_tokens" => 6_144, "packet_max_bytes" => 8_192})
+
+    assert {:approved, _outcome} =
+             ReviewGate.run(workspace, issue(), nil, workflow,
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:minimum_context_prompt, prompt_bytes, packet}
+    assert prompt_bytes <= 6_144 * 3
+    assert packet.budgets.candidate_reduction_allowed == false
+    assert packet.candidate.head_sha == "head-7"
+    assert packet.diff.authoritative_full_diff.pull_request_command == "gh pr diff 7"
   end
 
   test "writes the human-review section to the PR on approve", %{workspace: workspace} do
@@ -621,7 +848,7 @@ defmodule SymphonyElixir.ReviewGateTest do
         "view",
         "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
         "--json",
-        "id,number,body,headRefOid"
+        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
       ],
       _cwd ->
         {Jason.encode!(%{
@@ -631,7 +858,13 @@ defmodule SymphonyElixir.ReviewGateTest do
            "headRefOid" => "head-1358"
          }), 0}
 
-      ["pr", "view", "--json", "id,number,body,headRefOid"], _cwd ->
+      [
+        "pr",
+        "view",
+        "--json",
+        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
+      ],
+      _cwd ->
         flunk("must not rely on current branch PR detection when Linear has a PR attachment")
 
       ["api", "graphql" | _] = args, _cwd ->

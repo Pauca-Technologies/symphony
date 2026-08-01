@@ -44,7 +44,12 @@ defmodule SymphonyElixir.Github.PrReviewSection do
           required(:number) => pos_integer(),
           required(:body) => String.t(),
           optional(:id) => String.t() | nil,
-          optional(:head_oid) => String.t() | nil
+          optional(:head_oid) => String.t() | nil,
+          optional(:base_oid) => String.t() | nil,
+          optional(:base_ref) => String.t() | nil,
+          optional(:url) => String.t() | nil,
+          optional(:repository) => String.t() | nil,
+          optional(:changed_files) => non_neg_integer() | nil
         }
   # (gh args, cwd) -> {output, exit_status}; mirrors Github.ReviewerRequest.
   @type runner :: ([String.t()], Path.t() -> {String.t(), non_neg_integer()})
@@ -65,7 +70,8 @@ defmodule SymphonyElixir.Github.PrReviewSection do
 
     args =
       ["pr", "view"] ++
-        explicit_pr_ref_args(opts) ++ ["--json", "id,number,body,headRefOid"]
+        explicit_pr_ref_args(opts) ++
+        ["--json", "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"]
 
     case safe_run(runner, args, workspace) do
       {output, 0} -> parse_pr(output)
@@ -166,7 +172,12 @@ defmodule SymphonyElixir.Github.PrReviewSection do
            id: string_or_nil(Map.get(decoded, "id")),
            number: number,
            body: string_or_empty(Map.get(decoded, "body")),
-           head_oid: string_or_nil(Map.get(decoded, "headRefOid"))
+           head_oid: string_or_nil(Map.get(decoded, "headRefOid")),
+           base_oid: string_or_nil(Map.get(decoded, "baseRefOid")),
+           base_ref: string_or_nil(Map.get(decoded, "baseRefName")),
+           url: string_or_nil(Map.get(decoded, "url")),
+           repository: repository_name(Map.get(decoded, "headRepository")),
+           changed_files: integer_or_nil(Map.get(decoded, "changedFiles"))
          }}
 
       _ ->
@@ -243,6 +254,13 @@ defmodule SymphonyElixir.Github.PrReviewSection do
 
   defp string_or_nil(value) when is_binary(value), do: value
   defp string_or_nil(_value), do: nil
+
+  defp integer_or_nil(value) when is_integer(value), do: value
+  defp integer_or_nil(_value), do: nil
+
+  defp repository_name(%{"nameWithOwner" => value}) when is_binary(value), do: value
+  defp repository_name(%{"name" => value}) when is_binary(value), do: value
+  defp repository_name(_repository), do: nil
 
   defp truncate(text) when is_binary(text), do: String.slice(text, 0, 400)
   defp truncate(other), do: inspect(other)

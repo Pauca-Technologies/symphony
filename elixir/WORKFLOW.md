@@ -36,6 +36,9 @@ hooks:
   #   scripts/hooks/before-handoff.sh
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
+# Automated-review packet/context/turn budgets are repository-owned. Configure
+# them under `review:` in that target repository's WORKFLOW_REVIEW.md; Symphony
+# always starts a fresh one-turn reviewer and requires an exact-head verdict.
 agent:
   max_concurrent_agents: 10
   max_turns: 20

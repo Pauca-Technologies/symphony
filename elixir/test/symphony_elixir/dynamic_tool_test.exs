@@ -28,6 +28,23 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     }
   end
 
+  defp write_review_verdict(ctx, verdict) do
+    exact =
+      Map.merge(
+        %{
+          "packet_id" => ctx.packet.packet_id,
+          "reviewed_sha" => ctx.reviewed_sha,
+          "inspected" => ["authoritative full diff"],
+          "attestations" => %{"reused" => [], "rerun" => []},
+          "full_diff_inspected" => true
+        },
+        verdict
+      )
+
+    File.mkdir_p!(Path.dirname(ctx.verdict_path))
+    File.write!(ctx.verdict_path, Jason.encode!(exact))
+  end
+
   test "tool_specs advertises the server-authenticated Linear tool contracts" do
     specs = DynamicTool.tool_specs()
 
@@ -335,15 +352,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     session_runner = fn ctx ->
       send(test_pid, {:review_issue_state, ctx.issue.state})
-      File.mkdir_p!(Path.dirname(ctx.verdict_path))
 
-      File.write!(
-        ctx.verdict_path,
-        Jason.encode!(%{
+      write_review_verdict(
+        ctx,
+        %{
           "verdict" => "request_changes",
           "summary" => "missing test",
           "comments" => [%{"severity" => "major", "file" => "app/x.ts", "body" => "add a test"}]
-        })
+        }
       )
 
       {:ok, %{}}
@@ -414,8 +430,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     }
 
     session_runner = fn ctx ->
-      File.mkdir_p!(Path.dirname(ctx.verdict_path))
-      File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve", "comments" => []}))
+      write_review_verdict(ctx, %{"verdict" => "approve", "comments" => []})
       {:ok, %{}}
     end
 
@@ -482,15 +497,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     session_runner = fn ctx ->
       send(test_pid, :budget_reviewer_started)
-      File.mkdir_p!(Path.dirname(ctx.verdict_path))
 
-      File.write!(
-        ctx.verdict_path,
-        Jason.encode!(%{
+      write_review_verdict(
+        ctx,
+        %{
           "verdict" => "request_changes",
           "summary" => "blocking finding remains",
           "comments" => [%{"severity" => "blocker", "body" => "fix tenant isolation"}]
-        })
+        }
       )
 
       {:ok, %{}}

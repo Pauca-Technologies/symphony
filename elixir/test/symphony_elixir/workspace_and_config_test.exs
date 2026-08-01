@@ -1351,6 +1351,49 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.backend_review_timeout_ms(nil) == 222_000
   end
 
+  test "review_settings/1 bounds repository-owned packet and fresh-thread budgets" do
+    workflow = %{
+      config: %{
+        "review" => %{
+          "max_iterations" => 99,
+          "packet_path" => ".review/packet.json",
+          "packet_max_bytes" => 1,
+          "context_budget_tokens" => 999_999,
+          "turn_budget" => 12,
+          "turn_timeout_ms" => 10,
+          "tool_output_max_bytes" => 99,
+          "model" => "gpt-review",
+          "reasoning_effort" => "high",
+          "require_pr" => false
+        }
+      },
+      prompt: "review",
+      prompt_template: "review"
+    }
+
+    settings = Config.review_settings(workflow)
+
+    assert settings.max_iterations == 20
+    assert settings.packet_path == ".review/packet.json"
+    assert settings.packet_max_bytes == 8_192
+    assert settings.context_budget_tokens == 65_536
+    assert settings.turn_budget == 1
+    assert settings.turn_timeout_ms == 30_000
+    assert settings.tool_output_max_bytes == 512
+    assert settings.model == "gpt-review"
+    assert settings.reasoning_effort == "high"
+    refute settings.require_pr
+
+    minimum =
+      Config.review_settings(%{
+        config: %{"review" => %{"context_budget_tokens" => 1}},
+        prompt: "review",
+        prompt_template: "review"
+      })
+
+    assert minimum.context_budget_tokens == 6_144
+  end
+
   test "rejects an unknown claude_code permission_mode" do
     assert {:error, {:invalid_workflow_config, _message}} =
              Schema.parse(%{"claude_code" => %{"permission_mode" => "yolo"}})

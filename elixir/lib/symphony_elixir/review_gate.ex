@@ -52,6 +52,14 @@ defmodule SymphonyElixir.ReviewGate do
       review:
         max_iterations: 3                  # request-changes passes before human escalation
         verdict_path: .artifacts/symphony-review/verdict.json
+        packet_path: .artifacts/symphony-review/packet.v1.json
+        packet_max_bytes: 48000            # deterministic hard bound
+        context_budget_tokens: 12000       # packet + review instructions
+        turn_budget: 1                     # clamped to one fresh turn
+        turn_timeout_ms: 900000
+        tool_output_max_bytes: 4000
+        model: gpt-5.5                      # optional reviewer override
+        reasoning_effort: high             # optional reviewer override
         require_pr: true                   # no PR at handoff -> automation_inconclusive
         pr_section_enabled: true           # write the human-review PR section
         section_heading: "## 🤖 How to review this PR"
@@ -63,20 +71,20 @@ defmodule SymphonyElixir.ReviewGate do
     Cardinality,
     Codex.AppServer,
     Codex.DynamicTool,
+    Config,
     Github.PrReviewSection,
     Linear.Client,
     Linear.Issue,
     PromptBuilder,
     ReviewOutcome,
-    Tracker,
-    Workspace
+    ReviewPacket,
+    ReviewTelemetry,
+    Tracker
   }
 
   @telemetry_event [:symphony_elixir, :gate, :review]
-  @default_max_iterations 3
-  @default_verdict_path ".artifacts/symphony-review/verdict.json"
-  @default_section_heading "## 🤖 How to review this PR"
   @max_verdict_attempts 2
+  @context_bytes_per_token 3
 
   @iteration_key {__MODULE__, :iteration}
   @latest_outcome_key {__MODULE__, :latest_outcome}
@@ -170,7 +178,7 @@ defmodule SymphonyElixir.ReviewGate do
   @spec run(Path.t(), Issue.t(), term(), map(), keyword()) :: result()
   def run(workspace, %Issue{id: issue_id} = issue, worker_host, review_workflow, opts)
       when is_binary(workspace) and is_binary(issue_id) and is_map(review_workflow) do
-    settings = review_settings(review_workflow)
+    settings = Config.review_settings(review_workflow)
     iteration = current_iteration(issue_id)
     pr_opts = review_pr_opts(issue, opts)
 
@@ -197,7 +205,7 @@ defmodule SymphonyElixir.ReviewGate do
   def run(_workspace, _issue, _worker_host, _review_workflow, _opts) do
     outcome =
       inconclusive_outcome(
-        default_review_settings(),
+        Config.review_settings(nil),
         0,
         nil,
         :invalid_review_context,
@@ -277,7 +285,31 @@ defmodule SymphonyElixir.ReviewGate do
     {:budget_exhausted_with_findings, outcome}
   end
 
-  defp run_unlatched_review(context), do: run_iteration(context, 1, nil)
+  defp run_unlatched_review(context) do
+    prior_outcome = latest_outcome(context.issue.id)
+
+    case ReviewPacket.build(
+           context.workspace,
+           context.issue,
+           context.pr,
+           context.reviewed_sha,
+           prior_outcome,
+           context.settings,
+           context.opts
+         ) do
+      {:ok, packet_result} ->
+        run_iteration(Map.put(context, :packet_result, packet_result), 1, nil)
+
+      {:error, reason} ->
+        conclude_inconclusive(
+          context.issue,
+          context,
+          1,
+          {:review_packet_unavailable, reason},
+          "Repair exact-candidate packet generation, then start a fresh orchestration run and re-attempt review for the candidate SHA."
+        )
+    end
+  end
 
   @spec telemetry_event() :: [atom()]
   def telemetry_event, do: @telemetry_event
@@ -347,23 +379,45 @@ defmodule SymphonyElixir.ReviewGate do
     verdict_path = Path.join(workspace, settings.verdict_path)
     prepare_verdict_path(verdict_path)
 
-    case render_review_prompt(issue, review_workflow, attempt, previous_reason, settings.verdict_path) do
+    packet_result = Map.fetch!(review_context, :packet_result)
+
+    case render_review_prompt(
+           issue,
+           review_workflow,
+           attempt,
+           previous_reason,
+           settings.verdict_path,
+           packet_result,
+           settings
+         ) do
       {:ok, prompt} ->
+        {telemetry_handle, on_message} =
+          ReviewTelemetry.start(issue, packet_result.packet, Keyword.get(opts, :on_message))
+
         ctx = %{
           workspace: workspace,
           issue: issue,
           worker_host: worker_host,
           prompt: prompt,
+          packet: packet_result.packet,
+          packet_path: packet_result.path,
+          reviewed_sha: review_context.reviewed_sha,
           verdict_path: verdict_path,
-          tool_executor: review_tool_executor(Keyword.get(opts, :linear_client)),
-          on_message: Keyword.get(opts, :on_message)
+          tool_executor:
+            review_tool_executor(
+              Keyword.get(opts, :linear_client),
+              settings.tool_output_max_bytes
+            ),
+          on_message: on_message,
+          review_settings: settings
         }
 
         case run_review_session(ctx, opts) do
-          {:ok, _session} ->
-            evaluate_verdict(verdict_path, review_context, attempt)
+          {:ok, session} ->
+            evaluate_verdict(verdict_path, review_context, attempt, telemetry_handle, session)
 
           {:error, reason} ->
+            ReviewTelemetry.finish(telemetry_handle, :session_failed)
             handle_review_session_failure(review_context, attempt, reason)
         end
 
@@ -398,9 +452,23 @@ defmodule SymphonyElixir.ReviewGate do
   # review_effort tier + prose (effort is orthogonal to the verdict — a change
   # needing a thorough review can still approve). Keeping it fresh through the
   # request_changes loop means the final pass's assessment wins.
-  defp evaluate_verdict(verdict_path, %{workspace: workspace, issue: %Issue{} = issue, settings: settings, pr: pr, opts: opts} = review_context, attempt) do
-    case read_verdict(verdict_path) do
+  defp evaluate_verdict(
+         verdict_path,
+         %{workspace: workspace, issue: %Issue{} = issue, settings: settings, pr: pr, opts: opts} = review_context,
+         attempt,
+         telemetry_handle,
+         _session
+       ) do
+    packet = review_context.packet_result.packet
+
+    case read_verdict(
+           verdict_path,
+           review_context.reviewed_sha,
+           packet.packet_id,
+           packet.diff.mode
+         ) do
       {:ok, %{verdict: :approve} = verdict} ->
+        ReviewTelemetry.finish(telemetry_handle, :approved, verdict)
         outcome = approved_outcome(review_context, verdict, attempt)
         clear_latest_outcome(issue.id)
         maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
@@ -408,9 +476,12 @@ defmodule SymphonyElixir.ReviewGate do
         {:approved, outcome}
 
       {:ok, %{verdict: :request_changes} = verdict} ->
+        ReviewTelemetry.finish(telemetry_handle, :request_changes, verdict)
         conclude_request_changes(review_context, verdict, attempt)
 
       {:error, reason} ->
+        ReviewTelemetry.finish(telemetry_handle, :automation_inconclusive)
+
         if attempt < @max_verdict_attempts do
           Logger.warning("review.gate verdict unreadable #{issue_context(issue)} reason=#{inspect(reason)} attempt=#{attempt}; retrying")
 
@@ -520,18 +591,30 @@ defmodule SymphonyElixir.ReviewGate do
          worker_host: worker_host,
          prompt: prompt,
          tool_executor: tool_executor,
-         on_message: on_message
+         on_message: on_message,
+         review_settings: settings
        }) do
     opts =
       [
         worker_host: worker_host,
         tool_executor: tool_executor,
-        issue_context_file: Workspace.issue_context_path(workspace)
+        ephemeral: true,
+        overrides: review_overrides(settings),
+        turn_timeout_ms: settings.turn_timeout_ms
       ]
       |> maybe_put_on_message(on_message)
 
     AppServer.run(workspace, prompt, issue, opts)
   end
+
+  defp review_overrides(settings) do
+    %{}
+    |> maybe_put_override(:model, settings.model)
+    |> maybe_put_override(:reasoning_effort, settings.reasoning_effort)
+  end
+
+  defp maybe_put_override(overrides, _key, nil), do: overrides
+  defp maybe_put_override(overrides, key, value), do: Map.put(overrides, key, value)
 
   defp maybe_put_on_message(opts, on_message) when is_function(on_message, 1),
     do: Keyword.put(opts, :on_message, on_message)
@@ -543,7 +626,7 @@ defmodule SymphonyElixir.ReviewGate do
   # issue itself. The absent gate context stops the reviewer's own
   # tool calls from re-entering this gate (recursion guard, the analog of UDP's
   # `UDP_NESTED_CODEX` skip in before-handoff.sh).
-  defp review_tool_executor(linear_client) do
+  defp review_tool_executor(linear_client, max_output_bytes) do
     client = linear_client || (&Client.graphql/3)
 
     read_only_client = fn query, variables, request_opts ->
@@ -555,8 +638,68 @@ defmodule SymphonyElixir.ReviewGate do
     end
 
     fn tool, arguments ->
-      DynamicTool.execute(tool, arguments, linear_client: read_only_client)
+      tool
+      |> DynamicTool.execute(arguments, linear_client: read_only_client)
+      |> compact_successful_tool_response(max_output_bytes, tool)
     end
+  end
+
+  defp compact_successful_tool_response(%{"success" => true, "output" => output} = response, max_bytes, tool)
+       when is_binary(output) and is_integer(max_bytes) and byte_size(output) > max_bytes do
+    compacted = compacted_tool_output(output, max_bytes, tool)
+
+    response
+    |> Map.put("output", compacted)
+    |> Map.update("contentItems", [], fn items ->
+      Enum.map(items, fn
+        %{"text" => ^output} = item -> Map.put(item, "text", compacted)
+        item -> item
+      end)
+    end)
+  end
+
+  defp compact_successful_tool_response(response, _max_bytes, _tool), do: response
+
+  defp compacted_tool_output(output, max_bytes, tool) do
+    metadata = %{
+      "compacted" => true,
+      "original_bytes" => byte_size(output),
+      "max_bytes" => max_bytes,
+      "recovery" => "Re-run #{tool} with a narrower query/selection set or request a specific raw artifact; do not infer omitted data."
+    }
+
+    fit_tool_preview(output, metadata, max_bytes, 0, byte_size(output), "")
+    |> case do
+      "" -> Jason.encode!(Map.take(metadata, ["compacted", "original_bytes", "recovery"]))
+      compacted -> compacted
+    end
+  end
+
+  defp fit_tool_preview(_output, _metadata, _max_bytes, low, high, best) when low > high,
+    do: best
+
+  defp fit_tool_preview(output, metadata, max_bytes, low, high, best) do
+    midpoint = div(low + high, 2)
+    candidate = metadata |> Map.put("preview", utf8_prefix(output, midpoint)) |> Jason.encode!()
+
+    if byte_size(candidate) <= max_bytes do
+      fit_tool_preview(output, metadata, max_bytes, midpoint + 1, high, candidate)
+    else
+      fit_tool_preview(output, metadata, max_bytes, low, midpoint - 1, best)
+    end
+  end
+
+  defp utf8_prefix(_output, 0), do: ""
+
+  defp utf8_prefix(output, bytes) do
+    prefix = binary_part(output, 0, bytes)
+
+    case :unicode.characters_to_binary(prefix) do
+      value when is_binary(value) -> value
+      _invalid -> utf8_prefix(output, bytes - 1)
+    end
+  rescue
+    _error -> utf8_prefix(output, max(bytes - 1, 0))
   end
 
   defp mutation_query?(query) when is_binary(query) do
@@ -568,20 +711,80 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp mutation_query?(_query), do: false
 
-  defp render_review_prompt(%Issue{} = issue, review_workflow, attempt, previous_reason, verdict_path) do
-    prompt = PromptBuilder.build_prompt(issue, per_repo_workflow: review_workflow)
+  defp render_review_prompt(
+         %Issue{} = issue,
+         review_workflow,
+         attempt,
+         previous_reason,
+         verdict_path,
+         packet_result,
+         settings
+       ) do
+    thin_issue = %{
+      issue
+      | description: "Exact issue outcome and acceptance criteria are in the bounded Symphony review packet.",
+        comments: [],
+        children: [],
+        attachment_urls: []
+    }
+
+    prompt = PromptBuilder.build_prompt(thin_issue, per_repo_workflow: review_workflow)
+    prompt = add_review_packet_contract(prompt, packet_result, settings)
     prompt = add_review_runtime_stability_guard(prompt)
     prompt = add_review_tool_output_guard(prompt)
     prompt = add_verdict_reliability_guard(prompt, verdict_path)
     prompt = maybe_add_verdict_retry_instructions(prompt, attempt, previous_reason, verdict_path)
 
-    if String.trim(prompt) == "" do
-      {:error, :empty_review_prompt}
-    else
-      {:ok, prompt}
-    end
+    validate_review_prompt_budget(prompt, settings)
   rescue
     error -> {:error, Exception.message(error)}
+  end
+
+  defp validate_review_prompt_budget(prompt, settings) do
+    max_bytes = settings.context_budget_tokens * @context_bytes_per_token
+
+    cond do
+      String.trim(prompt) == "" -> {:error, :empty_review_prompt}
+      byte_size(prompt) > max_bytes -> {:error, {:review_context_budget_exceeded, byte_size(prompt), max_bytes}}
+      true -> {:ok, prompt}
+    end
+  end
+
+  defp add_review_packet_contract(prompt, packet_result, settings) do
+    """
+    #{prompt}
+
+    ## Symphony exact-candidate review packet
+
+    This is a fresh reviewer thread. It does not contain and must not request the implementor's
+    conversation transcript. The complete bounded packet is at `#{packet_result.path}` and is
+    reproduced below. Packet id: `#{packet_result.packet.packet_id}`; schema version:
+    `#{packet_result.packet.schema_version}`; exact head: `#{packet_result.packet.candidate.head_sha || "unavailable"}`.
+
+    ```json
+    #{packet_result.encoded}
+    ```
+
+    The packet is bounded to #{settings.packet_max_bytes} bytes and this review has a
+    #{settings.context_budget_tokens}-token context budget (enforced conservatively as at most
+    #{@context_bytes_per_token} rendered UTF-8 bytes per token), #{settings.turn_budget} Codex turn, a
+    #{settings.turn_timeout_ms}ms timeout, and #{settings.tool_output_max_bytes} bytes per successful
+    tool-output summary. Compact successful output as the budget approaches. Never silently truncate
+    or sample the candidate: use the packet's authoritative full-diff commands and independently
+    inspect the complete meaningful change. If evidence is insufficient, request/read the raw
+    artifact or return a non-approval verdict.
+
+    Any delegated lens must start with `fork_turns: "none"` and receive only the packet path, exact
+    head, requested lens, budget, and relevant repository-rule paths. Do not fork the parent review
+    transcript. Every lens must report what it inspected, its exact head, findings, model/reasoning
+    effort when known, and attestations it reused or reran.
+
+    The final verdict JSON must include `packet_id`, `reviewed_sha` equal to the packet exact head, a
+    non-empty `inspected` array describing the complete diff/areas actually read, and `attestations`
+    with `reused` and `rerun` arrays. A changed or missing identity is inconclusive, never approval.
+    High-risk `high_risk_final_full_diff` mode additionally requires `full_diff_inspected: true`
+    after a final complete base-to-head diff pass following delta reconciliation.
+    """
   end
 
   defp add_review_runtime_stability_guard(prompt) do
@@ -683,13 +886,41 @@ defmodule SymphonyElixir.ReviewGate do
 
   # --- verdict parsing -----------------------------------------------------
 
-  defp read_verdict(verdict_path) do
+  defp read_verdict(verdict_path, expected_sha, expected_packet_id, review_mode) do
     with {:ok, raw} <- File.read(verdict_path),
          {:ok, decoded} <- Jason.decode(raw),
-         :ok <- reject_interim_verdict(decoded) do
-      normalize_verdict(decoded)
+         :ok <- reject_interim_verdict(decoded),
+         {:ok, verdict} <- normalize_verdict(decoded),
+         :ok <- validate_verdict_candidate(verdict, expected_sha, expected_packet_id, review_mode) do
+      {:ok, verdict}
     end
   end
+
+  defp validate_verdict_candidate(verdict, expected_sha, expected_packet_id, review_mode)
+       when is_binary(expected_sha) and expected_sha != "" do
+    cond do
+      verdict.packet_id != expected_packet_id ->
+        {:error, {:verdict_packet_mismatch, %{expected: expected_packet_id, reported: verdict.packet_id}}}
+
+      verdict.reviewed_sha != expected_sha ->
+        {:error, {:verdict_head_mismatch, %{expected: expected_sha, reported: verdict.reviewed_sha}}}
+
+      verdict.inspected == [] ->
+        {:error, :verdict_missing_inspected_scope}
+
+      not verdict.attestation_contract? ->
+        {:error, :verdict_missing_attestation_report}
+
+      review_mode == "high_risk_final_full_diff" and not verdict.full_diff_inspected ->
+        {:error, :verdict_missing_high_risk_full_diff_attestation}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_verdict_candidate(_verdict, _expected_sha, _expected_packet_id, _review_mode),
+    do: :ok
 
   defp reject_interim_verdict(%{"symphony_interim" => true}), do: {:error, :interim_verdict}
 
@@ -742,7 +973,13 @@ defmodule SymphonyElixir.ReviewGate do
            summary: string_or_default(Map.get(decoded, "summary"), ""),
            review_effort: normalize_effort(Map.get(decoded, "review_effort") || Map.get(decoded, "risk")),
            human_review: string_or_default(Map.get(decoded, "human_review"), ""),
-           comments: normalize_comments(Map.get(decoded, "comments"))
+           comments: normalize_comments(Map.get(decoded, "comments")),
+           packet_id: string_or_nil(Map.get(decoded, "packet_id")),
+           reviewed_sha: string_or_nil(Map.get(decoded, "reviewed_sha")),
+           inspected: normalize_string_list(Map.get(decoded, "inspected")),
+           attestations: normalize_attestation_report(Map.get(decoded, "attestations")),
+           attestation_contract?: valid_attestation_report?(Map.get(decoded, "attestations")),
+           full_diff_inspected: Map.get(decoded, "full_diff_inspected") == true
          }}
 
       :error ->
@@ -790,6 +1027,31 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp normalize_comments(_comments), do: []
+
+  defp normalize_string_list(values) when is_list(values) do
+    values
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp normalize_string_list(_values), do: []
+
+  defp normalize_attestation_report(report) when is_map(report) do
+    %{
+      reused: normalize_string_list(Map.get(report, "reused") || Map.get(report, :reused)),
+      rerun: normalize_string_list(Map.get(report, "rerun") || Map.get(report, :rerun))
+    }
+  end
+
+  defp normalize_attestation_report(_report), do: %{reused: [], rerun: []}
+
+  defp valid_attestation_report?(report) when is_map(report) do
+    is_list(Map.get(report, "reused") || Map.get(report, :reused)) and
+      is_list(Map.get(report, "rerun") || Map.get(report, :rerun))
+  end
+
+  defp valid_attestation_report?(_report), do: false
 
   defp normalize_comment(comment) when is_map(comment) do
     body = string_or_default(Map.get(comment, "body") || Map.get(comment, "message"), "")
@@ -852,24 +1114,31 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp comment_location(_comment), do: ""
 
-  defp approved_outcome(%{settings: settings, iteration: iteration, reviewed_sha: reviewed_sha}, verdict, attempt) do
+  defp approved_outcome(
+         %{settings: settings, iteration: iteration, reviewed_sha: reviewed_sha} = context,
+         verdict,
+         attempt
+       ) do
     %ReviewOutcome{
       outcome: :approved,
       iteration: iteration + 1,
       max_iterations: settings.max_iterations,
       reviewed_sha: reviewed_sha,
+      packet_id: context_packet_id(context),
       summary: verdict.summary,
       review_effort: verdict.review_effort,
       attempts: attempt,
       authoritative: present_sha?(reviewed_sha),
       findings: verdict.comments,
+      inspected: verdict.inspected,
+      attestation_report: verdict.attestations,
       severity_counts: severity_counts(verdict.comments),
       resume_condition: "Apply the deferred handoff only if this reviewed SHA is still the exact candidate head."
     }
   end
 
   defp request_changes_outcome(
-         %{settings: settings, reviewed_sha: reviewed_sha},
+         %{settings: settings, reviewed_sha: reviewed_sha} = context,
          verdict,
          iteration,
          attempt
@@ -879,14 +1148,19 @@ defmodule SymphonyElixir.ReviewGate do
       iteration: iteration,
       max_iterations: settings.max_iterations,
       reviewed_sha: reviewed_sha,
+      packet_id: context_packet_id(context),
       summary: verdict.summary,
       review_effort: verdict.review_effort,
       attempts: attempt,
       findings: verdict.comments,
+      inspected: verdict.inspected,
+      attestation_report: verdict.attestations,
       severity_counts: severity_counts(verdict.comments),
       resume_condition: "Resolve or explicitly rebut every blocking finding, update the candidate head if needed, and re-attempt automated review."
     }
   end
+
+  defp context_packet_id(context), do: get_in(context, [:packet_result, :packet, :packet_id])
 
   defp inconclusive_outcome(settings, iteration, reviewed_sha, reason, resume_condition) do
     %ReviewOutcome{
@@ -917,10 +1191,13 @@ defmodule SymphonyElixir.ReviewGate do
       iteration: iteration,
       max_iterations: settings.max_iterations,
       reviewed_sha: latest.reviewed_sha || reviewed_sha,
+      packet_id: latest.packet_id,
       summary: latest.summary,
       failure_reason: :review_budget_exhausted,
       review_effort: :thorough,
       findings: latest.findings,
+      inspected: latest.inspected,
+      attestation_report: latest.attestation_report,
       severity_counts: latest.severity_counts,
       resume_condition:
         "A human must resolve or explicitly accept the listed findings. After that decision and any required code/head change, start a fresh orchestration run for a new exact-head review."
@@ -949,6 +1226,7 @@ defmodule SymphonyElixir.ReviewGate do
         reason,
         resume_condition
       )
+      |> Map.put(:packet_id, context_packet_id(review_context))
       |> Map.put(:attempts, attempt)
 
     Logger.warning("review.gate inconclusive #{issue_context(issue)} reason=#{inspect(reason)}; withholding handoff")
@@ -970,6 +1248,7 @@ defmodule SymphonyElixir.ReviewGate do
         "Restore reviewer tool/auth/runtime availability, then start a fresh orchestration run and re-attempt review for the candidate SHA.",
         attempt
       )
+      |> Map.put(:packet_id, context_packet_id(review_context))
 
     Logger.warning("review.gate infrastructure unavailable #{issue_context(issue)} reason=#{inspect(reason)}; withholding handoff")
     note_nonapproval(issue, outcome, opts)
@@ -1085,34 +1364,6 @@ defmodule SymphonyElixir.ReviewGate do
     :ok
   end
 
-  # --- settings ------------------------------------------------------------
-
-  defp review_settings(%{config: config}) when is_map(config) do
-    raw = Map.get(config, "review", %{}) || %{}
-
-    %{
-      max_iterations: positive_integer(raw, "max_iterations", @default_max_iterations),
-      verdict_path: string_or_default(Map.get(raw, "verdict_path"), @default_verdict_path),
-      require_pr: boolean_or_default(raw, "require_pr", true),
-      pr_section_enabled: boolean_or_default(raw, "pr_section_enabled", true),
-      section_heading: string_or_default(Map.get(raw, "section_heading"), @default_section_heading)
-    }
-  end
-
-  defp review_settings(_review_workflow) do
-    default_review_settings()
-  end
-
-  defp default_review_settings do
-    %{
-      max_iterations: @default_max_iterations,
-      verdict_path: @default_verdict_path,
-      require_pr: true,
-      pr_section_enabled: true,
-      section_heading: @default_section_heading
-    }
-  end
-
   # --- telemetry -----------------------------------------------------------
 
   defp emit_outcome_telemetry(%Issue{} = issue, %ReviewOutcome{} = outcome) do
@@ -1146,20 +1397,6 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   # --- small helpers -------------------------------------------------------
-
-  defp positive_integer(map, key, default) do
-    case Map.get(map, key) do
-      value when is_integer(value) and value > 0 -> value
-      _ -> default
-    end
-  end
-
-  defp boolean_or_default(map, key, default) do
-    case Map.get(map, key) do
-      value when is_boolean(value) -> value
-      _ -> default
-    end
-  end
 
   defp string_or_default(value, _default) when is_binary(value) and value != "", do: value
   defp string_or_default(_value, default), do: default

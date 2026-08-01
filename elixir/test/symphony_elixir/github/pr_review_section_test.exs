@@ -64,11 +64,27 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
            "id" => "PR_9",
            "number" => 9,
            "body" => "B",
-           "headRefOid" => "abc123"
+           "url" => "https://github.example/org/repo/pull/9",
+           "headRefOid" => "abc123",
+           "baseRefOid" => "base123",
+           "baseRefName" => "main",
+           "changedFiles" => 4,
+           "headRepository" => %{"nameWithOwner" => "org/repo"}
          }), 0}
       end
 
-      assert {:ok, %{id: "PR_9", number: 9, body: "B", head_oid: "abc123"}} =
+      assert {:ok,
+              %{
+                id: "PR_9",
+                number: 9,
+                body: "B",
+                url: "https://github.example/org/repo/pull/9",
+                head_oid: "abc123",
+                base_oid: "base123",
+                base_ref: "main",
+                changed_files: 4,
+                repository: "org/repo"
+              }} =
                PrReviewSection.resolve_pr("/tmp", pr_runner: runner)
     end
 
@@ -92,7 +108,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
                          "view",
                          "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
                          "--json",
-                         "id,number,body,headRefOid"
+                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
                        ]}
     end
 
@@ -107,7 +123,13 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
       assert {:ok, %{id: "PR_9", number: 9, body: "B"}} =
                PrReviewSection.resolve_pr("/tmp", pr_url: "  ", pr_runner: runner)
 
-      assert_received {:args, ["pr", "view", "--json", "id,number,body,headRefOid"]}
+      assert_received {:args,
+                       [
+                         "pr",
+                         "view",
+                         "--json",
+                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
+                       ]}
     end
 
     test "treats a null body as empty" do

@@ -854,6 +854,27 @@ Part A: Stall detection
 - A pending review is keyed to the issue and reviewed PR head. Repeated requests while that job is
   pending coalesce into the existing review. Before applying the captured tracker transition,
   re-resolve the PR head; if it changed, clear pending state and require a fresh review.
+- Each reviewer attempt MUST start a fresh thread that does not inherit the implementor transcript.
+  Its only task context is a bounded, versioned packet for the exact candidate. The packet records
+  project/repository and PR identity, resolved base/head SHAs and fingerprint, issue outcome and
+  acceptance/non-goals, changed-file/stat manifest, authoritative full-diff commands, applicable
+  repository rules, risk/lens rationale, exact-head attestations, prior unresolved findings with
+  their reviewed SHA, implementation risks/skipped proof/evidence, and a bounded follow-up delta.
+- Packet size and reviewer context/tool-output/timeout settings are repository-configurable with a
+  deterministic hard bound and compaction order. Compaction MUST NOT remove access to the complete
+  meaningful diff or applicable security/tenant/auth rules. Budget pressure is handled by explicit
+  synthesis or a non-approval outcome, never silent candidate reduction. Reviewer attempts use one
+  turn; delegated lenses start without parent transcript and receive only their packet slice.
+  The final rendered prompt (repository workflow, packet, and runtime/verdict guards) MUST be
+  checked against a documented conservative token-to-byte ceiling and fail inconclusively when it
+  cannot fit. Successful reviewer tool responses over their configured byte limit MUST compact both
+  duplicate text fields with original-size and narrow-query/raw-artifact recovery metadata; failure
+  responses MUST remain intact. Reproducible delta-stat prose MUST also be independently bounded.
+- Follow-up reviews receive prior open findings plus the prior-head-to-current-head delta. A
+  high-risk follow-up MUST perform a final complete base-to-head diff pass. Verdict evidence records
+  the packet id, exact reviewed head, inspected scope, and attestations reused versus rerun.
+- Parent reviewer and lens threads are attributed independently in telemetry, including packet/head,
+  token usage, duration, model, reasoning effort, outcome, and finding count.
 - Reviewer request-changes or timeout clears pending state. Request-changes returns control to the
   implementor. Only an authoritative `approved` verdict for the exact pinned candidate head may
   apply the captured tracker transition. Missing/malformed verdicts, reviewer infrastructure or

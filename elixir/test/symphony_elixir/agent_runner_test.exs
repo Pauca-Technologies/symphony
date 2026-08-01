@@ -127,6 +127,23 @@ end
 defmodule SymphonyElixir.AgentRunnerTest do
   use SymphonyElixir.TestSupport
 
+  defp write_review_verdict(ctx, verdict) do
+    exact =
+      Map.merge(
+        %{
+          "packet_id" => ctx.packet.packet_id,
+          "reviewed_sha" => ctx.reviewed_sha,
+          "inspected" => ["authoritative full diff"],
+          "attestations" => %{"reused" => [], "rerun" => []},
+          "full_diff_inspected" => true
+        },
+        verdict
+      )
+
+    File.mkdir_p!(Path.dirname(ctx.verdict_path))
+    File.write!(ctx.verdict_path, Jason.encode!(exact))
+  end
+
   alias SymphonyElixir.AgentRunner
   alias SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend
   alias SymphonyElixir.AgentRunnerTest.DeferredBackend
@@ -526,8 +543,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       review_runner = fn ctx ->
         send(test_pid, :review_session_started)
-        File.mkdir_p!(Path.dirname(ctx.verdict_path))
-        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        write_review_verdict(ctx, %{"verdict" => "approve"})
         {:ok, %{}}
       end
 
@@ -618,8 +634,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       end
 
       review_runner = fn ctx ->
-        File.mkdir_p!(Path.dirname(ctx.verdict_path))
-        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        write_review_verdict(ctx, %{"verdict" => "approve"})
         {:ok, %{}}
       end
 
@@ -715,8 +730,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       end
 
       review_runner = fn ctx ->
-        File.mkdir_p!(Path.dirname(ctx.verdict_path))
-        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        write_review_verdict(ctx, %{"verdict" => "approve"})
         {:ok, %{}}
       end
 
@@ -846,8 +860,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
           :finish_review -> :ok
         end
 
-        File.mkdir_p!(Path.dirname(ctx.verdict_path))
-        File.write!(ctx.verdict_path, Jason.encode!(%{"verdict" => "approve"}))
+        write_review_verdict(ctx, %{"verdict" => "approve"})
         {:ok, %{}}
       end
 

@@ -21,6 +21,7 @@ defmodule SymphonyElixir.ReviewOutcome do
     :iteration,
     :max_iterations,
     :reviewed_sha,
+    :packet_id,
     :summary,
     :failure_reason,
     :resume_condition,
@@ -28,6 +29,8 @@ defmodule SymphonyElixir.ReviewOutcome do
     :attempts,
     authoritative: false,
     findings: [],
+    inspected: [],
+    attestation_report: %{reused: [], rerun: []},
     severity_counts: %{}
   ]
 
@@ -36,6 +39,7 @@ defmodule SymphonyElixir.ReviewOutcome do
           iteration: non_neg_integer(),
           max_iterations: pos_integer(),
           reviewed_sha: String.t() | nil,
+          packet_id: String.t() | nil,
           summary: String.t() | nil,
           failure_reason: term() | nil,
           resume_condition: String.t(),
@@ -43,6 +47,8 @@ defmodule SymphonyElixir.ReviewOutcome do
           attempts: pos_integer() | nil,
           authoritative: boolean(),
           findings: [map()],
+          inspected: [String.t()],
+          attestation_report: %{reused: [String.t()], rerun: [String.t()]},
           severity_counts: %{optional(String.t()) => non_neg_integer()}
         }
 
@@ -56,6 +62,7 @@ defmodule SymphonyElixir.ReviewOutcome do
       iteration: outcome.iteration,
       max_iterations: outcome.max_iterations,
       reviewed_sha: outcome.reviewed_sha,
+      packet_id: outcome.packet_id,
       summary: outcome.summary,
       failure_reason: format_reason(outcome.failure_reason),
       resume_condition: outcome.resume_condition,
@@ -63,6 +70,8 @@ defmodule SymphonyElixir.ReviewOutcome do
       attempts: outcome.attempts,
       authoritative: outcome.authoritative,
       findings: outcome.findings,
+      inspected: outcome.inspected,
+      attestation_report: outcome.attestation_report,
       severity_counts: outcome.severity_counts
     }
   end
