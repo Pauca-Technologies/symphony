@@ -23,6 +23,8 @@ defmodule SymphonyElixir.Telemetry do
           :run_start
           | :run_end
           | :prompt_built
+          | :retry_policy
+          | :quota_circuit
           | :gate
           | :routing_skip
           | :cardinality_skip

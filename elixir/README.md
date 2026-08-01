@@ -154,6 +154,25 @@ Notes:
   records prompt character/byte counts and included section names without storing raw prompt text.
   A newly started backend thread still receives the full first-turn prompt, including on retries,
   because it cannot safely rely on context retained by a previous process.
+- Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
+  or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
+  provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local
+  JSONL telemetry records the failure class and retry-policy action (`scheduled`, `suppressed`,
+  `parked`, or `probed`) rather than requiring operators to parse exception text. A retry blocked
+  by an open circuit emits `suppressed` immediately before it enters the persistent parked queue.
+- An authoritative Codex `usageLimitExceeded` result opens a Codex account quota circuit. The
+  account boundary is the execution credential boundary (`local` or the specific SSH worker host),
+  so a circuit on one worker does not suppress the same backend on a worker using another account.
+  Symphony parks already-claimed retries without incrementing `failure_counts`, suppresses new
+  Codex work, and continues dispatching issues explicitly routed to other backends. At the provider reset time
+  (or a bounded fallback deadline when no usable reset is supplied), exactly one parked issue is
+  admitted as a probe. A successful probe or a newer rate-limit update that positively reports
+  available capacity closes the circuit and releases parked issues in FIFO order. Ambiguous errors
+  never open the circuit and continue through the normal bounded per-issue retry path.
+- Active quota circuits are checkpointed to `~/.symphony/quota-circuits.json`. This deliberately
+  small snapshot preserves outage deadlines and parked issue order across an orchestrator restart;
+  it does not persist running agent processes or the general retry queue. Circuit state, reset/probe
+  deadlines, account scope, and parked counts are exposed by the runtime API and status dashboard.
 - `agent.backend` selects the coding-agent backend: `codex` (default, the Codex app-server described
   above), `acp` (the Agent Client Protocol, e.g. `opencode acp`), or `claude_code` (native Claude Code
   `claude -p` stream-json). All backends honor the same handoff gate and observability transcript.

@@ -43,9 +43,11 @@ defmodule SymphonyElixir.TestSupport do
         # them on every dispatch tick.
         repo_config_path = Path.join(workflow_root, "repos.yaml")
         telemetry_dir = Path.join(workflow_root, "telemetry")
+        quota_circuit_state_path = Path.join(workflow_root, "quota-circuits.json")
         Application.put_env(:symphony_elixir, :repo_config_path, repo_config_path)
         Application.put_env(:symphony_elixir, :telemetry_dir, telemetry_dir)
         Application.put_env(:symphony_elixir, :telemetry_enabled, false)
+        Application.put_env(:symphony_elixir, :quota_circuit_state_path, quota_circuit_state_path)
 
         on_exit(fn ->
           Application.delete_env(:symphony_elixir, :workflow_file_path)
@@ -56,6 +58,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :repo_config_path)
           Application.delete_env(:symphony_elixir, :telemetry_dir)
           Application.delete_env(:symphony_elixir, :telemetry_enabled)
+          Application.delete_env(:symphony_elixir, :quota_circuit_state_path)
           File.rm_rf(workflow_root)
         end)
 

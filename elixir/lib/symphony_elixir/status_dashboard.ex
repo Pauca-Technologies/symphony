@@ -317,6 +317,7 @@ defmodule SymphonyElixir.StatusDashboard do
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
+             quota_circuits: Map.get(snapshot, :quota_circuits, []),
              polling: Map.get(snapshot, :polling)
            }},
           update_token_samples(token_samples, now_ms, total_tokens)
@@ -334,6 +335,7 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
+        quota_circuit_lines = format_quota_circuits(Map.get(snapshot, :quota_circuits, []))
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -363,6 +365,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           quota_circuit_lines,
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
@@ -562,6 +565,7 @@ defmodule SymphonyElixir.StatusDashboard do
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
+             quota_circuits: Map.get(snapshot, :quota_circuits, []),
              polling: Map.get(snapshot, :polling)
            }}
 
@@ -669,14 +673,36 @@ defmodule SymphonyElixir.StatusDashboard do
     due_in_ms = retry_entry.due_in_ms || 0
     error = format_retry_error(retry_entry.error)
 
-    "│  #{colorize("↻", @ansi_orange)} " <>
+    parked? = Map.get(retry_entry, :status) == :parked
+    marker = if parked?, do: "⏸", else: "↻"
+    timing = if parked?, do: " probe ", else: " in "
+
+    "│  #{colorize(marker, @ansi_orange)} " <>
       colorize("#{identifier}", @ansi_red) <>
       " " <>
       colorize("attempt=#{attempt}", @ansi_yellow) <>
-      colorize(" in ", @ansi_dim) <>
+      colorize(timing, @ansi_dim) <>
       colorize(next_in_words(due_in_ms), @ansi_cyan) <>
       error
   end
+
+  defp format_quota_circuits([]), do: []
+
+  defp format_quota_circuits(circuits) when is_list(circuits) do
+    Enum.map(circuits, fn circuit ->
+      backend = Map.get(circuit, :backend, "unknown")
+      account = Map.get(circuit, :account_scope, "default")
+      state = Map.get(circuit, :state, :open)
+      parked = Map.get(circuit, :parked_issue_count, 0)
+      next_probe = next_in_words(Map.get(circuit, :next_probe_in_ms, 0))
+
+      colorize("│ Quota Circuit: ", @ansi_bold) <>
+        colorize("#{backend}/#{account} #{state}", @ansi_red) <>
+        colorize(" | parked=#{parked} | next_probe=#{next_probe}", @ansi_dim)
+    end)
+  end
+
+  defp format_quota_circuits(_circuits), do: []
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
     secs = div(due_in_ms, 1000)

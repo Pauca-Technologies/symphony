@@ -8,6 +8,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   alias SymphonyElixir.{
     AgentBackend,
+    AgentFailure,
     AgentRouter,
     Config,
     Linear.Client,
@@ -52,28 +53,53 @@ defmodule SymphonyElixir.AgentRunner do
     result = run_on_worker_host(issue, codex_update_recipient, opts, worker_host)
     duration_ms = System.monotonic_time(:millisecond) - started_at_ms
 
-    Telemetry.emit(
-      :run_end,
-      telemetry_issue_attrs(issue, worker_host)
-      |> Map.merge(%{
-        duration_ms: duration_ms,
-        outcome:
-          case result do
-            :ok -> "ok"
-            {:error, reason} -> "error:#{inspect(reason)}"
-          end
-      })
-    )
+    run_end_attrs =
+      case result do
+        :ok ->
+          %{duration_ms: duration_ms, outcome: "ok", failure_class: nil}
+
+        {:error, reason} ->
+          failure = classify_run_failure(reason, issue)
+
+          %{
+            duration_ms: duration_ms,
+            outcome: "error",
+            failure_class: Atom.to_string(failure.class),
+            failure_scope: Atom.to_string(failure.scope),
+            trusted_failure: failure.trusted,
+            reset_at: failure.reset_at && DateTime.to_iso8601(failure.reset_at),
+            retry_after_ms: failure.retry_after_ms
+          }
+      end
+
+    Telemetry.emit(:run_end, Map.merge(telemetry_issue_attrs(issue, worker_host), run_end_attrs))
 
     case result do
       :ok ->
         :ok
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+        failure = classify_run_failure(reason, issue)
+        Logger.error("Agent run failed for #{issue_context(issue)} class=#{failure.class}: #{failure.message}")
+        send_worker_run_failure(codex_update_recipient, issue, failure)
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
   end
+
+  defp classify_run_failure(%AgentFailure{} = failure, _issue), do: failure
+
+  defp classify_run_failure(reason, issue) do
+    {backend, _overrides} = AgentBackend.resolve_for_issue(issue)
+    AgentFailure.classify(reason, backend: AgentBackend.backend_name(backend))
+  end
+
+  defp send_worker_run_failure(recipient, %Issue{id: issue_id}, %AgentFailure{} = failure)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:worker_run_failure, issue_id, self(), failure})
+    :ok
+  end
+
+  defp send_worker_run_failure(_recipient, _issue, _failure), do: :ok
 
   defp telemetry_issue_attrs(%Issue{} = issue, worker_host) do
     %{
@@ -403,29 +429,42 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
-         {:ok, session} <-
-           route.backend.start_session(workspace,
-             worker_host: worker_host,
-             overrides: route.overrides,
-             issue_context_file: Keyword.get(opts, :issue_context_file)
-           ) do
-      send_agent_backend_info(codex_update_recipient, issue, route, session)
+    with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host) do
+      result =
+        with {:ok, session} <-
+               route.backend.start_session(workspace,
+                 worker_host: worker_host,
+                 overrides: route.overrides,
+                 issue_context_file: Keyword.get(opts, :issue_context_file)
+               ) do
+          send_agent_backend_info(codex_update_recipient, issue, route, session)
 
-      try do
-        do_run_codex_turns(
-          route.backend,
-          session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          opts,
-          issue_state_fetcher,
-          1,
-          max_turns
-        )
-      after
-        route.backend.stop_session(session)
+          try do
+            do_run_codex_turns(
+              route.backend,
+              session,
+              workspace,
+              issue,
+              codex_update_recipient,
+              opts,
+              issue_state_fetcher,
+              1,
+              max_turns
+            )
+          after
+            route.backend.stop_session(session)
+          end
+        end
+
+      case {result, Keyword.has_key?(opts, :agent_backend)} do
+        {{:error, reason}, false} ->
+          {:error,
+           AgentFailure.classify(reason,
+             backend: AgentBackend.backend_name(route.backend)
+           )}
+
+        _ ->
+          result
       end
     end
   end

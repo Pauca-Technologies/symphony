@@ -363,6 +363,29 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <% end %>
           </section>
 
+          <section :if={@dashboard_payload.quota_circuits != []} class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Provider quota circuits</h2>
+                <p class="section-copy">
+                  Dispatch is parked for the affected backend/account until one controlled probe can run.
+                </p>
+              </div>
+            </div>
+
+            <div class="rate-limit-grid">
+              <div :for={circuit <- @dashboard_payload.quota_circuits} class="rate-limit-tile">
+                <span class="rate-limit-label"><%= circuit.backend %> / <%= circuit.account_scope %></span>
+                <span class="rate-limit-value"><%= circuit.state %> · <%= circuit.parked_issue_count %> parked</span>
+                <span class="metric-detail">
+                  Opened <%= full_time(circuit.opened_at) %> · next probe <%= full_time(circuit.next_probe_at) %><%= if circuit.reset_at, do: " · provider reset #{full_time(circuit.reset_at)}" %>
+                </span>
+                <span :if={circuit.provider_limit_id} class="metric-detail">Provider limit <%= circuit.provider_limit_id %></span>
+                <span class="metric-detail"><%= circuit.reason %></span>
+              </div>
+            </div>
+          </section>
+
           <section class="section-card">
             <div class="section-header">
               <div>
@@ -494,6 +517,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <thead>
                     <tr>
                       <th>Issue</th>
+                      <th>Status</th>
                       <th>Attempt</th>
                       <th>Due at</th>
                       <th>Error</th>
@@ -515,6 +539,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           </div>
                         </div>
                       </td>
+                      <td><%= entry.status %></td>
                       <td><%= entry.attempt %></td>
                       <td>
                         <%= if entry.due_at do %>

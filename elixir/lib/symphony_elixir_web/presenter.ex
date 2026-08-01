@@ -20,7 +20,11 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          quota_circuits:
+            snapshot
+            |> Map.get(:quota_circuits, [])
+            |> Enum.map(&quota_circuit_payload/1)
         }
 
       :timeout ->
@@ -153,10 +157,30 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: entry.identifier,
       title: Map.get(entry, :title),
       attempt: entry.attempt,
+      status: to_string(Map.get(entry, :status, :scheduled)),
       due_at: due_at_iso8601(entry.due_in_ms),
       error: entry.error,
+      backend: Map.get(entry, :backend),
+      failure_class: stringify_atom(Map.get(entry, :failure_class)),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
+    }
+  end
+
+  defp quota_circuit_payload(circuit) do
+    %{
+      backend: Map.get(circuit, :backend),
+      account_scope: Map.get(circuit, :account_scope),
+      worker_host: Map.get(circuit, :worker_host),
+      provider_limit_id: Map.get(circuit, :provider_limit_id),
+      state: stringify_atom(Map.get(circuit, :state)),
+      reason: Map.get(circuit, :reason),
+      opened_at: iso8601(Map.get(circuit, :opened_at)),
+      reset_at: iso8601(Map.get(circuit, :reset_at)),
+      next_probe_at: iso8601(Map.get(circuit, :next_probe_at)),
+      next_probe_in_ms: Map.get(circuit, :next_probe_in_ms),
+      probe_issue_id: Map.get(circuit, :probe_issue_id),
+      parked_issue_count: Map.get(circuit, :parked_issue_count, 0)
     }
   end
 
@@ -204,6 +228,11 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp blank_to_nil(_value), do: nil
 
+  defp stringify_atom(nil), do: nil
+  defp stringify_atom(value) when is_atom(value), do: Atom.to_string(value)
+  defp stringify_atom(value) when is_binary(value), do: value
+  defp stringify_atom(_value), do: nil
+
   defp context_payload(entry) do
     tokens = Map.get(entry, :codex_context_tokens, 0)
     window = Map.get(entry, :codex_context_window)
@@ -225,8 +254,11 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_issue_payload(retry) do
     %{
       attempt: retry.attempt,
+      status: to_string(Map.get(retry, :status, :scheduled)),
       due_at: due_at_iso8601(retry.due_in_ms),
       error: retry.error,
+      backend: Map.get(retry, :backend),
+      failure_class: stringify_atom(Map.get(retry, :failure_class)),
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
     }

@@ -477,8 +477,11 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_identifier" => "MT-RETRY",
                  "title" => "Retry the flaky migration",
                  "attempt" => 2,
+                 "status" => "scheduled",
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
+                 "backend" => nil,
+                 "failure_class" => nil,
                  "worker_host" => nil,
                  "workspace_path" => nil
                }
@@ -489,7 +492,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "quota_circuits" => []
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")

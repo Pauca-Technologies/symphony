@@ -8,11 +8,14 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{
+    AgentBackend,
+    AgentFailure,
     AgentRunner,
     Cardinality,
     Config,
     LogFile,
     OrchestratorVersion,
+    QuotaCircuitStore,
     RepoConfig,
     Router,
     StatusDashboard,
@@ -57,6 +60,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @quota_probe_default_ms 300_000
+  @quota_probe_max_ms 1_800_000
+  @quota_resume_spacing_ms 100
   # Fallback flood guard for issue warnings (routing / cardinality /
   # version gates). The persistent `symphony:routing-warned` label is the
   # primary idempotency marker, but if that label write itself fails
@@ -125,7 +131,10 @@ defmodule SymphonyElixir.Orchestrator do
       # persistent `symphony:routing-warned` marker can't be written.
       warned_at: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      # "backend::account-scope" => provider/account quota circuit. Parked
+      # retries remain claimed but have no per-issue timer while unavailable.
+      quota_circuits: %{}
     ]
   end
 
@@ -140,6 +149,8 @@ defmodule SymphonyElixir.Orchestrator do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
+    quota_circuits = QuotaCircuitStore.load()
+
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
       max_concurrent_agents: config.agent.max_concurrent_agents,
@@ -148,8 +159,12 @@ defmodule SymphonyElixir.Orchestrator do
       tick_timer_ref: nil,
       tick_token: nil,
       codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      quota_circuits: quota_circuits,
+      claimed: restored_quota_claims(quota_circuits)
     }
+
+    state = arm_all_quota_circuits(state)
 
     run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
@@ -237,10 +252,13 @@ defmodule SymphonyElixir.Orchestrator do
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
+              |> maybe_close_successful_quota_probe(running_entry)
               |> complete_issue(issue_id)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
+                issue: Map.get(running_entry, :issue),
                 delay_type: :continuation,
+                backend: Map.get(running_entry, :backend),
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path),
                 codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
@@ -248,19 +266,30 @@ defmodule SymphonyElixir.Orchestrator do
               })
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
+              failure = failure_from_exit(reason, running_entry)
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_failure_retry(state, issue_id, next_attempt, %{
+              metadata = %{
                 identifier: running_entry.identifier,
                 issue: Map.get(running_entry, :issue),
-                error: "agent exited: #{inspect(reason)}",
+                error: failure_error(reason, running_entry, failure),
+                backend: failure.backend || Map.get(running_entry, :backend),
+                failure: failure,
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path),
                 codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
                 recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
-              })
+              }
+
+              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} failure_class=#{failure.class} reason=#{failure.message}; scheduling policy action")
+
+              handle_typed_run_failure(
+                state,
+                issue_id,
+                next_attempt,
+                metadata,
+                Map.get(running_entry, :quota_probe) == true
+              )
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -292,6 +321,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {:worker_run_failure, issue_id, worker_pid, %AgentFailure{} = failure},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_pid(worker_pid) do
+    case Map.get(running, issue_id) do
+      %{pid: ^worker_pid} = running_entry ->
+        updated = Map.put(running_entry, :run_failure, failure)
+        {:noreply, %{state | running: Map.put(running, issue_id, updated)}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
         {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
       ) do
@@ -306,7 +350,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           state
           |> apply_codex_token_delta(token_delta)
-          |> apply_codex_rate_limits(update)
+          |> apply_codex_rate_limits(update, running_entry)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -346,6 +390,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
+
+  def handle_info({:quota_probe_due, circuit_key, timer_token}, state)
+      when is_binary(circuit_key) and is_reference(timer_token) do
+    state = handle_quota_probe_due(state, circuit_key, timer_token)
+    notify_dashboard()
+    {:noreply, state}
+  end
 
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
@@ -731,7 +782,12 @@ defmodule SymphonyElixir.Orchestrator do
       |> schedule_failure_retry(issue_id, next_attempt, %{
         identifier: identifier,
         issue: Map.get(running_entry, :issue),
-        error: "handoff review timed out after #{elapsed_ms}ms without reviewer activity"
+        error: "handoff review timed out after #{elapsed_ms}ms without reviewer activity",
+        backend: Map.get(running_entry, :backend),
+        failure:
+          AgentFailure.classify(:handoff_review_timeout,
+            backend: Map.get(running_entry, :backend)
+          )
       })
     else
       state
@@ -754,7 +810,9 @@ defmodule SymphonyElixir.Orchestrator do
       |> schedule_failure_retry(issue_id, next_attempt, %{
         identifier: identifier,
         issue: Map.get(running_entry, :issue),
-        error: "stalled for #{elapsed_ms}ms without codex activity"
+        error: "stalled for #{elapsed_ms}ms without codex activity",
+        backend: Map.get(running_entry, :backend),
+        failure: AgentFailure.classify(:stalled, backend: Map.get(running_entry, :backend))
       })
     else
       state
@@ -1054,6 +1112,7 @@ defmodule SymphonyElixir.Orchestrator do
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
+      backend_dispatch_available?(state, predicted_backend(issue)) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -1204,8 +1263,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
+    backend = predicted_backend(issue)
 
-    case select_worker_host(state, preferred_worker_host) do
+    case select_worker_host_for_backend(state, preferred_worker_host, backend, issue.id) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
@@ -1232,7 +1292,7 @@ defmodule SymphonyElixir.Orchestrator do
             issue: issue,
             worker_host: worker_host,
             workspace_path: nil,
-            backend: nil,
+            backend: predicted_backend(issue),
             model: nil,
             reasoning_effort: nil,
             profile: nil,
@@ -1254,6 +1314,13 @@ defmodule SymphonyElixir.Orchestrator do
             codex_context_window: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            quota_probe:
+              quota_probe_issue?(
+                state,
+                predicted_backend(issue),
+                worker_host,
+                issue.id
+              ),
             lifecycle_state: :implementing,
             lifecycle_started_at: DateTime.utc_now(),
             started_at: DateTime.utc_now()
@@ -1274,6 +1341,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: issue.identifier,
           issue: issue,
           error: "failed to spawn agent: #{inspect(reason)}",
+          backend: predicted_backend(issue),
+          failure: AgentFailure.classify({:spawn_failed, reason}, backend: predicted_backend(issue)),
           worker_host: worker_host
         })
     end
@@ -1314,13 +1383,19 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
-    delay_ms = retry_delay(next_attempt, metadata)
+    delay_ms = metadata[:delay_ms_override] || retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     title = pick_retry_title(previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
+    backend = metadata[:backend] || Map.get(previous_retry, :backend)
+
+    failure_class =
+      metadata[:failure_class] || retry_failure_class(metadata[:failure]) ||
+        Map.get(previous_retry, :failure_class)
+
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
     codex_session_logs = pick_retry_codex_session_logs(previous_retry, metadata)
@@ -1347,12 +1422,15 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: identifier,
             title: title,
             error: error,
+            backend: backend,
+            failure_class: failure_class,
             worker_host: worker_host,
             workspace_path: workspace_path,
             codex_session_logs: codex_session_logs,
             recent_codex_transcript_blocks: recent_codex_transcript_blocks
           })
     }
+    |> emit_retry_policy(issue_id, metadata, :scheduled, next_attempt, delay_ms)
   end
 
   # Schedule a retry for a *genuine* agent-run failure (crash, stall,
@@ -1373,6 +1451,9 @@ defmodule SymphonyElixir.Orchestrator do
       schedule_issue_retry(state, issue_id, next_attempt, metadata)
     end
   end
+
+  defp retry_failure_class(%AgentFailure{class: class}), do: class
+  defp retry_failure_class(_failure), do: nil
 
   defp give_up_retries_exhausted(%State{} = state, issue_id, retries, max_retries, metadata) do
     identifier = metadata[:identifier] || issue_id
@@ -1447,6 +1528,8 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          backend: Map.get(retry_entry, :backend),
+          failure_class: Map.get(retry_entry, :failure_class),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
           codex_session_logs: Map.get(retry_entry, :codex_session_logs, []),
@@ -1552,6 +1635,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
+    if backend_quota_blocked?(
+         state,
+         retry_backend(metadata, issue),
+         metadata[:worker_host]
+       ) do
+      Logger.info("Parking retry while backend quota circuit is open: #{issue_context(issue)} backend=#{retry_backend(metadata, issue)}")
+
+      metadata = Map.put(metadata, :issue, issue)
+
+      state =
+        state
+        |> emit_retry_policy(issue.id, metadata, :suppressed, attempt, nil)
+        |> park_issue_retry(issue.id, attempt, metadata)
+
+      {:noreply, state}
+    else
+      do_handle_active_retry(state, issue, attempt, metadata)
+    end
+  end
+
+  defp do_handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
@@ -1694,6 +1798,40 @@ defmodule SymphonyElixir.Orchestrator do
           true ->
             least_loaded_worker_host(state, available_hosts)
         end
+    end
+  end
+
+  defp select_worker_host_for_backend(%State{} = state, preferred_worker_host, backend, issue_id) do
+    hosts = Config.settings!().worker.ssh_hosts
+    select_worker_host_for_backend(state, preferred_worker_host, backend, issue_id, hosts)
+  end
+
+  defp select_worker_host_for_backend(state, _preferred_worker_host, backend, issue_id, []) do
+    if backend_quota_dispatch_blocked?(state, backend, nil, issue_id),
+      do: :no_worker_capacity,
+      else: nil
+  end
+
+  defp select_worker_host_for_backend(state, preferred_worker_host, backend, issue_id, hosts)
+       when is_binary(preferred_worker_host) do
+    if preferred_worker_host in hosts and
+         worker_host_slots_available?(state, preferred_worker_host) and
+         !backend_quota_dispatch_blocked?(state, backend, preferred_worker_host, issue_id) do
+      preferred_worker_host
+    else
+      :no_worker_capacity
+    end
+  end
+
+  defp select_worker_host_for_backend(state, _preferred_worker_host, backend, issue_id, hosts) do
+    hosts
+    |> Enum.filter(fn host ->
+      worker_host_slots_available?(state, host) and
+        !backend_quota_dispatch_blocked?(state, backend, host, issue_id)
+    end)
+    |> case do
+      [] -> :no_worker_capacity
+      candidates -> least_loaded_worker_host(state, candidates)
     end
   end
 
@@ -1878,9 +2016,12 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: issue_id,
           attempt: attempt,
           due_in_ms: max(0, due_at_ms - now_ms),
+          status: :scheduled,
           identifier: Map.get(retry, :identifier),
           title: Map.get(retry, :title),
           error: Map.get(retry, :error),
+          backend: Map.get(retry, :backend),
+          failure_class: Map.get(retry, :failure_class),
           worker_host: Map.get(retry, :worker_host),
           workspace_path: Map.get(retry, :workspace_path),
           codex_session_logs: Map.get(retry, :codex_session_logs, []),
@@ -1888,12 +2029,15 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    parked = quota_parked_snapshot(state.quota_circuits, now)
+
     {:reply,
      %{
        running: running,
-       retrying: retrying,
+       retrying: retrying ++ parked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       quota_circuits: quota_circuit_snapshot(state.quota_circuits, now),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -3072,6 +3216,598 @@ defmodule SymphonyElixir.Orchestrator do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)
   end
 
+  defp failure_from_exit(_reason, %{run_failure: %AgentFailure{} = failure}), do: failure
+
+  defp failure_from_exit(reason, running_entry) do
+    AgentFailure.classify(reason, backend: Map.get(running_entry, :backend))
+  end
+
+  defp failure_error(_reason, %{run_failure: %AgentFailure{}}, %AgentFailure{} = failure),
+    do: failure.message
+
+  defp failure_error(reason, _running_entry, _failure), do: "agent exited: #{inspect(reason)}"
+
+  defp handle_typed_run_failure(
+         state,
+         issue_id,
+         next_attempt,
+         %{failure: %AgentFailure{class: :usage_quota_limit, trusted: true}} = metadata,
+         _probe?
+       ) do
+    open_quota_circuit_and_park(state, issue_id, next_attempt, metadata)
+  end
+
+  defp handle_typed_run_failure(state, issue_id, next_attempt, metadata, true) do
+    handle_failed_quota_probe(state, issue_id, next_attempt, metadata)
+  end
+
+  defp handle_typed_run_failure(state, issue_id, next_attempt, metadata, false) do
+    schedule_failure_retry(state, issue_id, next_attempt, metadata)
+  end
+
+  defp open_quota_circuit_and_park(
+         %State{} = state,
+         issue_id,
+         next_attempt,
+         %{failure: %AgentFailure{} = failure} = metadata
+       ) do
+    backend = quota_failure_backend(failure, metadata)
+    worker_host = metadata[:worker_host]
+    circuit_key = quota_circuit_key(backend, worker_host)
+    now = DateTime.utc_now()
+    next_probe_at = quota_probe_at(failure, backend, now)
+    previous = Map.get(state.quota_circuits, circuit_key)
+
+    circuit =
+      quota_circuit_from_failure(
+        state,
+        previous,
+        failure,
+        backend,
+        worker_host,
+        now,
+        next_probe_at
+      )
+
+    state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
+
+    action = if previous, do: :refreshed, else: :opened
+
+    Logger.warning("Opening provider quota circuit backend=#{backend} account_scope=#{circuit.account_scope} next_probe_at=#{DateTime.to_iso8601(circuit.next_probe_at)} issue_id=#{issue_id}")
+
+    state
+    |> emit_quota_circuit(action, circuit)
+    |> park_issue_retry(issue_id, next_attempt, metadata)
+  end
+
+  defp quota_failure_backend(%AgentFailure{backend: backend}, _metadata) when is_binary(backend),
+    do: backend
+
+  defp quota_failure_backend(_failure, %{backend: backend}) when is_binary(backend), do: backend
+  defp quota_failure_backend(_failure, _metadata), do: "codex"
+
+  defp quota_circuit_from_failure(
+         state,
+         previous,
+         failure,
+         backend,
+         worker_host,
+         now,
+         next_probe_at
+       ) do
+    %{
+      backend: backend,
+      account_scope: quota_account_scope(worker_host),
+      worker_host: worker_host,
+      provider_limit_id: quota_provider_limit_id(state.codex_rate_limits),
+      status: :open,
+      reason: failure.message,
+      opened_at: previous_value(previous, :opened_at, now),
+      reset_at: later_datetime(previous_value(previous, :reset_at), failure.reset_at),
+      next_probe_at: later_datetime(previous_value(previous, :next_probe_at), next_probe_at),
+      probe_issue_id: nil,
+      parked: previous_value(previous, :parked, []),
+      timer_ref: previous_value(previous, :timer_ref),
+      timer_token: nil
+    }
+  end
+
+  defp previous_value(previous, key, fallback \\ nil)
+  defp previous_value(previous, key, fallback) when is_map(previous), do: Map.get(previous, key, fallback)
+  defp previous_value(_previous, _key, fallback), do: fallback
+
+  defp handle_failed_quota_probe(%State{} = state, issue_id, next_attempt, metadata) do
+    backend = metadata[:backend] || "codex"
+    circuit_key = quota_circuit_key(backend, metadata[:worker_host])
+    state = reopen_quota_circuit(state, circuit_key, metadata[:error])
+    {failures, state} = bump_failure_count(state, issue_id)
+    max_retries = max_retries_setting()
+
+    if is_integer(max_retries) and max_retries > 0 and failures > max_retries do
+      give_up_retries_exhausted(state, issue_id, failures - 1, max_retries, metadata)
+    else
+      park_issue_retry(state, issue_id, next_attempt, metadata)
+    end
+  end
+
+  defp reopen_quota_circuit(%State{} = state, circuit_key, reason) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        next_probe_at = fallback_quota_probe_at(circuit.backend, DateTime.utc_now())
+
+        updated = %{
+          circuit
+          | status: :open,
+            reason: reason || circuit.reason,
+            next_probe_at: next_probe_at,
+            probe_issue_id: nil,
+            timer_ref: nil,
+            timer_token: nil
+        }
+
+        state
+        |> put_quota_circuit(circuit_key, updated)
+        |> emit_quota_circuit(:probe_failed, updated)
+
+      _ ->
+        state
+    end
+  end
+
+  defp park_issue_retry(%State{} = state, issue_id, attempt, metadata) do
+    backend = metadata[:backend] || retry_backend(metadata, metadata[:issue])
+    circuit_key = quota_circuit_key(backend, metadata[:worker_host])
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        state = drop_retry_attempt(state, issue_id)
+        parked_at = DateTime.utc_now()
+
+        parked_entry = %{
+          issue_id: issue_id,
+          identifier: metadata[:identifier] || issue_identifier(metadata[:issue]) || issue_id,
+          title: metadata[:title] || title_from_issue(metadata[:issue]),
+          attempt: max(normalize_retry_attempt(attempt), 1),
+          error: metadata[:error] || circuit.reason,
+          backend: backend,
+          failure_class: metadata[:failure_class] || retry_failure_class(metadata[:failure]),
+          worker_host: metadata[:worker_host],
+          workspace_path: metadata[:workspace_path],
+          parked_at: parked_at
+        }
+
+        parked =
+          circuit.parked
+          |> Enum.reject(&(&1.issue_id == issue_id))
+          |> Kernel.++([parked_entry])
+
+        updated = %{circuit | parked: parked, status: :open, probe_issue_id: nil}
+
+        state
+        |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
+        |> put_quota_circuit(circuit_key, updated)
+        |> emit_retry_policy(issue_id, metadata, :parked, parked_entry.attempt, nil)
+
+      _ ->
+        schedule_issue_retry(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp handle_quota_probe_due(%State{} = state, circuit_key, timer_token) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :open, timer_token: ^timer_token} = circuit ->
+        circuit = %{circuit | timer_ref: nil, timer_token: nil}
+        state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
+
+        if available_slots(state) > 0 and quota_probe_slot_available?(state, circuit.worker_host) do
+          start_quota_probe(state, circuit_key)
+        else
+          defer_quota_probe(state, circuit_key)
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp start_quota_probe(%State{} = state, circuit_key) do
+    circuit = Map.fetch!(state.quota_circuits, circuit_key)
+
+    case Tracker.fetch_candidate_issues() do
+      {:ok, issues} ->
+        case select_quota_probe_issue(state, circuit_key, issues) do
+          {%Issue{} = issue, parked_entry} ->
+            begin_quota_probe(state, circuit_key, issue, parked_entry)
+
+          nil ->
+            defer_quota_probe(state, circuit_key)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Quota probe candidate lookup failed backend=#{circuit.backend} account_scope=#{circuit.account_scope}: #{inspect(reason)}")
+        defer_quota_probe(state, circuit_key)
+    end
+  end
+
+  defp select_quota_probe_issue(%State{} = state, circuit_key, issues) when is_list(issues) do
+    circuit = Map.fetch!(state.quota_circuits, circuit_key)
+
+    select_parked_probe(circuit.parked, issues, circuit.backend) ||
+      select_new_probe(issues, state, circuit.backend)
+  end
+
+  defp select_parked_probe(parked, issues, backend) do
+    Enum.find_value(parked, fn entry ->
+      issues
+      |> find_issue_by_id(entry.issue_id)
+      |> eligible_probe_tuple(entry, backend)
+    end)
+  end
+
+  defp select_new_probe(issues, state, backend) do
+    issues
+    |> sort_issues_for_dispatch()
+    |> Enum.find(&eligible_new_probe?(&1, state, backend))
+    |> eligible_probe_tuple(nil, backend)
+  end
+
+  defp eligible_new_probe?(%Issue{} = issue, state, backend) do
+    eligible_probe_issue?(issue, backend) and !Map.has_key?(state.running, issue.id) and
+      !MapSet.member?(state.claimed, issue.id)
+  end
+
+  defp eligible_new_probe?(_issue, _state, _backend), do: false
+
+  defp eligible_probe_tuple(%Issue{} = issue, entry, backend) do
+    if eligible_probe_issue?(issue, backend), do: {issue, entry}
+  end
+
+  defp eligible_probe_tuple(_issue, _entry, _backend), do: nil
+
+  defp eligible_probe_issue?(%Issue{} = issue, backend) do
+    retry_candidate_issue?(issue, terminal_state_set()) and predicted_backend(issue) == backend
+  end
+
+  defp begin_quota_probe(%State{} = state, circuit_key, issue, parked_entry) do
+    circuit = Map.fetch!(state.quota_circuits, circuit_key)
+    backend = circuit.backend
+    parked = Enum.reject(circuit.parked, &(&1.issue_id == issue.id))
+
+    updated = %{
+      circuit
+      | status: :probe,
+        probe_issue_id: issue.id,
+        parked: parked,
+        timer_ref: nil,
+        timer_token: nil
+    }
+
+    attempt = parked_entry && parked_entry.attempt
+    preferred_worker_host = (parked_entry && parked_entry.worker_host) || circuit.worker_host
+    state = put_quota_circuit(state, circuit_key, updated)
+    {_outcome, dispatched_state} = dispatch_issue_outcome(state, issue, attempt, preferred_worker_host)
+
+    if Map.has_key?(dispatched_state.running, issue.id) do
+      Logger.info("Started controlled provider quota probe backend=#{backend} issue_id=#{issue.id} issue_identifier=#{issue.identifier}")
+
+      dispatched_state
+      |> emit_retry_policy(
+        issue.id,
+        %{
+          identifier: issue.identifier,
+          backend: backend,
+          failure_class: :usage_quota_limit
+        },
+        :probed,
+        attempt || 1,
+        nil
+      )
+      |> emit_quota_circuit(:probe_started, updated)
+    else
+      metadata = %{
+        identifier: issue.identifier,
+        title: issue.title,
+        issue: issue,
+        backend: backend,
+        worker_host: preferred_worker_host,
+        error: "quota probe could not be dispatched"
+      }
+
+      dispatched_state
+      |> drop_retry_attempt(issue.id)
+      |> reopen_quota_circuit(circuit_key, metadata.error)
+      |> park_issue_retry(issue.id, attempt || 1, metadata)
+    end
+  end
+
+  defp defer_quota_probe(%State{} = state, circuit_key) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        delay_ms = max(state.poll_interval_ms || 1_000, 1_000)
+        updated = %{circuit | next_probe_at: DateTime.add(DateTime.utc_now(), delay_ms, :millisecond)}
+        put_quota_circuit(state, circuit_key, updated)
+
+      _ ->
+        state
+    end
+  end
+
+  defp maybe_close_successful_quota_probe(%State{} = state, running_entry) do
+    backend = Map.get(running_entry, :backend)
+    circuit_key = quota_circuit_key(backend, Map.get(running_entry, :worker_host))
+    issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :probe, probe_issue_id: ^issue_id} ->
+        close_quota_circuit(state, circuit_key, :successful_probe)
+
+      _ ->
+        state
+    end
+  end
+
+  defp close_quota_circuit(%State{} = state, circuit_key, recovery_reason) do
+    case Map.pop(state.quota_circuits, circuit_key) do
+      {nil, _circuits} ->
+        state
+
+      {circuit, remaining_circuits} ->
+        cancel_circuit_timer(circuit)
+        state = %{state | quota_circuits: remaining_circuits}
+        QuotaCircuitStore.save(remaining_circuits)
+
+        Logger.info("Closing provider quota circuit backend=#{circuit.backend} account_scope=#{circuit.account_scope} recovery=#{recovery_reason} parked_issues=#{length(circuit.parked)}")
+
+        state
+        |> emit_quota_circuit(:closed, circuit, recovery_reason)
+        |> resume_parked_retries(circuit.parked)
+    end
+  end
+
+  defp resume_parked_retries(%State{} = state, parked) when is_list(parked) do
+    parked
+    |> Enum.sort_by(&DateTime.to_unix(&1.parked_at, :microsecond))
+    |> Enum.with_index()
+    |> Enum.reduce(state, fn {entry, index}, state_acc ->
+      schedule_issue_retry(state_acc, entry.issue_id, entry.attempt, %{
+        identifier: entry.identifier,
+        title: entry.title,
+        error: entry.error,
+        backend: entry.backend,
+        failure_class: Map.get(entry, :failure_class),
+        worker_host: entry.worker_host,
+        workspace_path: entry.workspace_path,
+        delay_ms_override: (index + 1) * @quota_resume_spacing_ms,
+        circuit_recovery: true
+      })
+    end)
+  end
+
+  defp put_quota_circuit(%State{} = state, circuit_key, circuit, persist? \\ true) do
+    state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
+    state = arm_quota_circuit(state, circuit_key)
+    if persist?, do: QuotaCircuitStore.save(state.quota_circuits)
+    state
+  end
+
+  defp arm_all_quota_circuits(%State{} = state) do
+    Enum.reduce(Map.keys(state.quota_circuits), state, &arm_quota_circuit(&2, &1))
+  end
+
+  defp arm_quota_circuit(%State{} = state, circuit_key) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :open, next_probe_at: %DateTime{} = next_probe_at} = circuit ->
+        cancel_circuit_timer(circuit)
+        timer_token = make_ref()
+        delay_ms = max(0, DateTime.diff(next_probe_at, DateTime.utc_now(), :millisecond))
+        timer_ref = Process.send_after(self(), {:quota_probe_due, circuit_key, timer_token}, delay_ms)
+        updated = %{circuit | timer_ref: timer_ref, timer_token: timer_token}
+        %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, updated)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp cancel_circuit_timer(%{timer_ref: timer_ref}) when is_reference(timer_ref),
+    do: Process.cancel_timer(timer_ref)
+
+  defp cancel_circuit_timer(_circuit), do: :ok
+
+  defp quota_probe_at(%AgentFailure{reset_at: %DateTime{} = reset_at}, _backend, now) do
+    if DateTime.compare(reset_at, now) == :gt, do: reset_at, else: fallback_quota_probe_at("codex", now)
+  end
+
+  defp quota_probe_at(_failure, backend, now), do: fallback_quota_probe_at(backend, now)
+
+  defp fallback_quota_probe_at(backend, now) do
+    base_ms = min(@quota_probe_default_ms, @quota_probe_max_ms)
+    jitter_ms = :erlang.phash2({backend, DateTime.to_unix(now, :second)}, max(div(base_ms, 10), 1))
+    DateTime.add(now, base_ms + jitter_ms, :millisecond)
+  end
+
+  defp later_datetime(%DateTime{} = left, %DateTime{} = right) do
+    if DateTime.compare(left, right) == :lt, do: right, else: left
+  end
+
+  defp later_datetime(%DateTime{} = datetime, _other), do: datetime
+  defp later_datetime(_other, %DateTime{} = datetime), do: datetime
+  defp later_datetime(_left, _right), do: nil
+
+  defp backend_quota_blocked?(%State{} = state, backend, worker_host) when is_binary(backend) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    match?(
+      %{status: status} when status in [:open, :probe],
+      Map.get(state.quota_circuits, circuit_key)
+    )
+  end
+
+  defp backend_quota_blocked?(_state, _backend, _worker_host), do: false
+
+  defp backend_quota_dispatch_blocked?(%State{} = state, backend, worker_host, issue_id) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :probe, probe_issue_id: ^issue_id} -> false
+      %{status: status} when status in [:open, :probe] -> true
+      _ -> false
+    end
+  end
+
+  defp backend_dispatch_available?(%State{} = state, backend) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        !backend_quota_blocked?(state, backend, nil)
+
+      hosts ->
+        Enum.any?(hosts, fn host ->
+          worker_host_slots_available?(state, host) and
+            !backend_quota_blocked?(state, backend, host)
+        end)
+    end
+  end
+
+  defp quota_probe_slot_available?(%State{} = state, nil) do
+    Config.settings!().worker.ssh_hosts == [] and worker_slots_available?(state)
+  end
+
+  defp quota_probe_slot_available?(%State{} = state, worker_host) when is_binary(worker_host) do
+    worker_host_slots_available?(state, worker_host)
+  end
+
+  defp predicted_backend(%Issue{} = issue) do
+    {backend, _overrides} = AgentBackend.resolve_for_issue(issue)
+    AgentBackend.backend_name(backend)
+  end
+
+  defp retry_backend(metadata, %Issue{} = issue), do: metadata[:backend] || predicted_backend(issue)
+  defp retry_backend(metadata, _issue), do: metadata[:backend] || "codex"
+
+  defp quota_probe_issue?(%State{} = state, backend, worker_host, issue_id) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    match?(
+      %{status: :probe, probe_issue_id: ^issue_id},
+      Map.get(state.quota_circuits, circuit_key)
+    )
+  end
+
+  defp restored_quota_claims(circuits) when is_map(circuits) do
+    circuits
+    |> Enum.flat_map(fn {_backend, circuit} -> Enum.map(circuit.parked, & &1.issue_id) end)
+    |> MapSet.new()
+  end
+
+  defp quota_circuit_key(backend, worker_host) when is_binary(backend) do
+    backend <> "::" <> quota_account_scope(worker_host)
+  end
+
+  defp quota_circuit_key(_backend, worker_host), do: "unknown::" <> quota_account_scope(worker_host)
+
+  defp quota_account_scope(worker_host) when is_binary(worker_host), do: "worker:#{worker_host}"
+  defp quota_account_scope(_worker_host), do: "local"
+
+  defp quota_provider_limit_id(rate_limits) when is_map(rate_limits) do
+    Map.get(rate_limits, "limitId") || Map.get(rate_limits, :limitId) ||
+      Map.get(rate_limits, "limit_id") || Map.get(rate_limits, :limit_id) || "default"
+  end
+
+  defp quota_provider_limit_id(_rate_limits), do: nil
+
+  defp issue_identifier(%Issue{identifier: identifier}), do: identifier
+  defp issue_identifier(_issue), do: nil
+
+  defp quota_parked_snapshot(circuits, now) when is_map(circuits) do
+    Enum.flat_map(circuits, fn {_backend, circuit} ->
+      due_in_ms = max(0, DateTime.diff(circuit.next_probe_at, now, :millisecond))
+
+      Enum.map(circuit.parked, fn entry ->
+        %{
+          issue_id: entry.issue_id,
+          attempt: entry.attempt,
+          due_in_ms: due_in_ms,
+          status: :parked,
+          identifier: entry.identifier,
+          title: entry.title,
+          error: entry.error,
+          backend: entry.backend,
+          failure_class: Map.get(entry, :failure_class),
+          worker_host: entry.worker_host,
+          workspace_path: entry.workspace_path,
+          codex_session_logs: [],
+          recent_codex_transcript_blocks: []
+        }
+      end)
+    end)
+  end
+
+  defp quota_circuit_snapshot(circuits, now) when is_map(circuits) do
+    circuits
+    |> Map.values()
+    |> Enum.sort_by(&{&1.backend, &1.account_scope})
+    |> Enum.map(fn circuit ->
+      %{
+        backend: circuit.backend,
+        account_scope: circuit.account_scope,
+        worker_host: circuit.worker_host,
+        provider_limit_id: circuit.provider_limit_id,
+        state: circuit.status,
+        reason: circuit.reason,
+        opened_at: circuit.opened_at,
+        reset_at: circuit.reset_at,
+        next_probe_at: circuit.next_probe_at,
+        next_probe_in_ms: max(0, DateTime.diff(circuit.next_probe_at, now, :millisecond)),
+        probe_issue_id: circuit.probe_issue_id,
+        parked_issue_count: length(circuit.parked)
+      }
+    end)
+  end
+
+  defp emit_retry_policy(%State{} = state, issue_id, metadata, action, attempt, delay_ms) do
+    failure_class = metadata[:failure_class] || retry_failure_class(metadata[:failure])
+
+    Telemetry.emit(:retry_policy, %{
+      issue_id: issue_id,
+      issue_identifier: metadata[:identifier],
+      backend: metadata[:backend],
+      failure_class: failure_class && Atom.to_string(failure_class),
+      action: Atom.to_string(action),
+      attempt: attempt,
+      delay_ms: delay_ms,
+      retry_scheduled: action == :scheduled,
+      retry_parked: action == :parked,
+      retry_suppressed: action == :suppressed,
+      circuit_probe: action == :probed
+    })
+
+    state
+  end
+
+  defp emit_quota_circuit(%State{} = state, action, circuit, recovery_reason \\ nil) do
+    Telemetry.emit(:quota_circuit, %{
+      action: Atom.to_string(action),
+      backend: circuit.backend,
+      account_scope: circuit.account_scope,
+      worker_host: circuit.worker_host,
+      provider_limit_id: circuit.provider_limit_id,
+      reason: circuit.reason,
+      recovery_reason: recovery_reason && Atom.to_string(recovery_reason),
+      opened_at: DateTime.to_iso8601(circuit.opened_at),
+      reset_at: circuit.reset_at && DateTime.to_iso8601(circuit.reset_at),
+      next_probe_at: circuit.next_probe_at && DateTime.to_iso8601(circuit.next_probe_at),
+      parked_issue_count: length(circuit.parked)
+    })
+
+    state
+  end
+
+  @doc false
+  @spec quota_probe_at_for_test(AgentFailure.t(), String.t(), DateTime.t()) :: DateTime.t()
+  def quota_probe_at_for_test(%AgentFailure{} = failure, backend, %DateTime{} = now) do
+    quota_probe_at(failure, backend, now)
+  end
+
   defp apply_codex_token_delta(
          %{codex_totals: codex_totals} = state,
          %{input_tokens: input, output_tokens: output, total_tokens: total} = token_delta
@@ -3082,17 +3818,40 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_token_delta(state, _token_delta), do: state
 
-  defp apply_codex_rate_limits(%State{} = state, update) when is_map(update) do
+  defp apply_codex_rate_limits(%State{} = state, update, running_entry)
+       when is_map(update) and is_map(running_entry) do
     case extract_rate_limits(update) do
       %{} = rate_limits ->
-        %{state | codex_rate_limits: rate_limits}
+        state = %{state | codex_rate_limits: rate_limits}
+        backend = Map.get(running_entry, :backend) || "codex"
+        circuit_key = quota_circuit_key(backend, Map.get(running_entry, :worker_host))
+
+        if AgentFailure.recovered_rate_limits?(rate_limits) and
+             recovered_update_after_open?(state, circuit_key, update) do
+          close_quota_circuit(state, circuit_key, :authoritative_rate_limit_update)
+        else
+          state
+        end
 
       _ ->
         state
     end
   end
 
-  defp apply_codex_rate_limits(state, _update), do: state
+  defp apply_codex_rate_limits(state, _update, _running_entry), do: state
+
+  defp recovered_update_after_open?(%State{} = state, circuit_key, update) do
+    case {Map.get(state.quota_circuits, circuit_key), Map.get(update, :timestamp)} do
+      {%{opened_at: %DateTime{} = opened_at}, %DateTime{} = updated_at} ->
+        DateTime.compare(updated_at, opened_at) in [:eq, :gt]
+
+      {nil, _updated_at} ->
+        true
+
+      _ ->
+        false
+    end
+  end
 
   defp apply_token_delta(codex_totals, token_delta) do
     input_tokens = Map.get(codex_totals, :input_tokens, 0) + token_delta.input_tokens
@@ -3351,7 +4110,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp positive_or_keep(_value, fallback), do: fallback
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
-    direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
+    direct =
+      Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits) ||
+        Map.get(payload, "rateLimits") || Map.get(payload, :rateLimits)
 
     cond do
       rate_limits_map?(direct) ->
@@ -3403,8 +4164,12 @@ defmodule SymphonyElixir.Orchestrator do
     limit_id =
       Map.get(payload, "limit_id") ||
         Map.get(payload, :limit_id) ||
+        Map.get(payload, "limitId") ||
+        Map.get(payload, :limitId) ||
         Map.get(payload, "limit_name") ||
-        Map.get(payload, :limit_name)
+        Map.get(payload, :limit_name) ||
+        Map.get(payload, "limitName") ||
+        Map.get(payload, :limitName)
 
     has_buckets =
       Enum.any?(
