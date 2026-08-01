@@ -1642,6 +1642,172 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server ignores cancelled MCP startup and benign marker text" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-benign-cancelled-status-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-941")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-941"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-941"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"mcpServer/startupStatus/updated","params":{"server":"sentry","status":"cancelled","failureReason":"example mentions turn/interrupted"}}'
+            printf '%s\\n' '{"method":"item/agentMessage/delta","params":{"delta":"Document <turn_aborted> and aborted by user","threadId":"thread-941","turnId":"turn-941"}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-941","status":{"type":"completed"}}}}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-benign-cancelled-status",
+        identifier: "MT-941",
+        title: "Ignore unrelated cancelled status",
+        description: "Keep MCP startup status separate from turn control",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-941",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Ignore benign status", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :notification,
+                         payload: %{"method" => "mcpServer/startupStatus/updated"}
+                       }}
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :notification,
+                         payload: %{"method" => "item/agentMessage/delta"}
+                       }}
+
+      assert_received {:app_server_message, %{event: :turn_completed}}
+      refute_received {:app_server_message, %{event: :turn_interruption_signal}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server preserves explicit aborted and interrupted terminal events" do
+    for {method, suffix} <- [{"turn/aborted", "aborted"}, {"turn/interrupted", "interrupted"}] do
+      test_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-elixir-app-server-terminal-#{suffix}-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        workspace_root = Path.join(test_root, "workspaces")
+        workspace = Path.join(workspace_root, "MT-942-#{suffix}")
+        codex_binary = Path.join(test_root, "fake-codex")
+        File.mkdir_p!(workspace)
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-942-#{suffix}"}}}'
+              ;;
+            3)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-942-#{suffix}"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"method":"#{method}","params":{"turn":{"id":"turn-942-#{suffix}"}}}'
+              exit 0
+              ;;
+            *)
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server"
+        )
+
+        issue = %Issue{
+          id: "issue-terminal-#{suffix}",
+          identifier: "MT-942-#{suffix}",
+          title: "Classify terminal #{suffix} event",
+          description: "Preserve explicit terminal turn diagnostics",
+          state: "In Progress",
+          url: "https://example.org/issues/MT-942-#{suffix}",
+          labels: ["backend"]
+        }
+
+        test_pid = self()
+        on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+        assert {:error,
+                {:turn_interruption_signal,
+                 %{
+                   method: ^method,
+                   classification: %{kind: :terminal_method, method: ^method}
+                 }}} = AppServer.run(workspace, "Classify terminal event", issue, on_message: on_message)
+
+        assert_received {:app_server_message,
+                         %{
+                           event: :turn_interruption_signal,
+                           classification: %{kind: :terminal_method, method: ^method},
+                           payload: %{"method" => ^method}
+                         }}
+
+        refute_received {:app_server_message, %{event: :turn_completed}}
+      after
+        File.rm_rf(test_root)
+      end
+    end
+  end
+
   test "app server treats interrupted turn completed payloads as errors" do
     test_root =
       Path.join(

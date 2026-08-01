@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Codex.InterruptionClassifier
 
   @initialize_id 1
   @thread_start_id 2
@@ -995,7 +996,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_emit_interruption_signal(on_message, method, payload, payload_string, metadata) do
-    if interruption_signal?(method, payload, payload_string) do
+    if classification = InterruptionClassifier.classify(method, payload) do
       summary = interruption_summary(method, payload_string)
       Logger.warning("Codex interruption signal method=#{inspect(method)} summary=#{summary}")
 
@@ -1005,61 +1006,28 @@ defmodule SymphonyElixir.Codex.AppServer do
         %{
           payload: payload,
           raw: payload_string,
+          classification: classification,
           summary: summary
         },
         metadata
       )
 
-      {:interrupted, %{method: method, summary: summary, payload: payload}}
+      {:interrupted, %{method: method, summary: summary, payload: payload, classification: classification}}
     else
       :ok
     end
   end
 
-  defp interruption_signal?(method, payload, payload_string) do
-    method in ["turn/aborted", "turn/interrupted"] ||
-      abnormal_turn_status?(turn_status_type(payload)) ||
-      payload_string
-      |> String.downcase()
-      |> String.contains?(@interruption_markers)
-  end
-
   defp abnormal_turn_completion_reason(payload) when is_map(payload) do
-    status_type = turn_status_type(payload)
+    status_type = InterruptionClassifier.turn_status_type(payload)
 
-    if abnormal_turn_status?(status_type) do
+    if InterruptionClassifier.abnormal_turn_status?(status_type) do
       %{
         status_type: status_type,
-        status: turn_status(payload),
+        status: InterruptionClassifier.turn_status(payload),
         turn: map_at_path(payload, ["params", "turn"]) || map_at_path(payload, [:params, :turn])
       }
     end
-  end
-
-  defp abnormal_turn_status?(status_type) when is_binary(status_type) do
-    status_type
-    |> String.downcase()
-    |> then(&(&1 in ["aborted", "cancelled", "canceled", "failed", "interrupted"]))
-  end
-
-  defp abnormal_turn_status?(_status_type), do: false
-
-  defp turn_status_type(payload) when is_map(payload) do
-    case turn_status(payload) do
-      %{"type" => type} when is_binary(type) -> type
-      %{type: type} when is_binary(type) -> type
-      type when is_binary(type) -> type
-      _ -> nil
-    end
-  end
-
-  defp turn_status(payload) when is_map(payload) do
-    map_at_path(payload, ["params", "turn", "status"]) ||
-      map_at_path(payload, [:params, :turn, :status]) ||
-      map_at_path(payload, ["params", "status"]) ||
-      map_at_path(payload, [:params, :status]) ||
-      Map.get(payload, "status") ||
-      Map.get(payload, :status)
   end
 
   defp interruption_summary(method, payload_string) do
