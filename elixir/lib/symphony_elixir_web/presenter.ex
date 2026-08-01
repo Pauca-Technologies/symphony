@@ -182,14 +182,16 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  # The actual backend + model the run is using, captured from the running
+  # The actual backend + model/effort the run is using, captured from the running
   # session (not re-derived from the issue's labels). `backend` is the resolved
   # backend module's config name; `model` is what was handed to or resolved by
   # the agent (nil only until the run reports one, or when a backend omits it).
   defp agent_payload(entry) when is_map(entry) do
     %{
       backend: blank_to_nil(Map.get(entry, :backend)),
-      model: blank_to_nil(Map.get(entry, :model))
+      model: blank_to_nil(Map.get(entry, :model)),
+      reasoning_effort: blank_to_nil(Map.get(entry, :reasoning_effort)),
+      profile: blank_to_nil(Map.get(entry, :profile))
     }
   end
 

@@ -143,6 +143,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <p class="metric-detail mono" title={@issue_payload.agent.model}>
                 <%= @issue_payload.agent.model || "model n/a" %>
               </p>
+              <p :if={@issue_payload.agent.reasoning_effort} class="metric-detail mono">
+                effort <%= @issue_payload.agent.reasoning_effort %><%= if @issue_payload.agent.profile, do: " · #{@issue_payload.agent.profile}" %>
+              </p>
             </article>
 
             <article class="metric-card">
@@ -436,6 +439,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <span class="agent-backend"><%= agent_backend_label(entry.agent.backend) %></span>
                           <span :if={entry.agent.model} class="muted agent-model mono" title={entry.agent.model}>
                             <%= entry.agent.model %>
+                          </span>
+                          <span :if={entry.agent.reasoning_effort} class="muted agent-model mono">
+                            effort <%= entry.agent.reasoning_effort %><%= if entry.agent.profile, do: " · #{entry.agent.profile}" %>
                           </span>
                         </div>
                       </td>

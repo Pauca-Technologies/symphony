@@ -1,8 +1,8 @@
 defmodule SymphonyElixir.AgentBackendTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.AgentBackend
   alias SymphonyElixir.Acp.Client, as: AcpClient
+  alias SymphonyElixir.AgentBackend
   alias SymphonyElixir.ClaudeCode.Client, as: ClaudeCodeClient
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config.Schema.Agent
@@ -76,8 +76,9 @@ defmodule SymphonyElixir.AgentBackendTest do
                AgentBackend.resolve_for_labels(preset_agent(), ["agent:deep", "agent:fast"])
     end
 
-    test "a codex preset ignores any model (Codex has no per-task model)" do
-      assert {AppServer, %{}} = AgentBackend.resolve_for_labels(preset_agent(), ["agent:codex"])
+    test "a codex preset passes its model to thread/start" do
+      assert {AppServer, %{model: "ignored"}} =
+               AgentBackend.resolve_for_labels(preset_agent(), ["agent:codex"])
     end
 
     test "a preset without a model yields empty overrides" do

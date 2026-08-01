@@ -446,6 +446,28 @@ Fields:
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
+- `routing` (object, OPTIONAL extension for routed repository workflows)
+  - Allows a repository to select a Codex execution profile from the nature of each issue instead
+    of using one repository-wide model.
+  - `classifier` is REQUIRED and contains `backend` (currently `codex`), `model`,
+    `reasoning_effort`, and an optional positive `timeout_ms`. The classifier SHOULD be ephemeral,
+    schema-constrained, limited to a bounded issue snapshot, and run without repository project
+    instructions or implementation-agent dynamic tools. Issue content MUST be treated as untrusted
+    data.
+  - `profiles` is a REQUIRED non-empty map from profile name to `backend`, `model`,
+    `reasoning_effort`, and classifier-facing `description`. This extension currently supports the
+    `codex` backend.
+  - `default_profile` MUST name a configured profile.
+  - `fallback_profile` MAY name a configured quality fallback and defaults to `default_profile`.
+  - Supported reasoning-effort names are `none`, `low`, `medium`, `high`, `xhigh`, and `max`.
+  - A classifier failure SHOULD select `fallback_profile`, not silently use a weaker model.
+  - Implementations MAY promote high risk, complexity, or ambiguity to `fallback_profile` even when
+    the classifier proposed another profile.
+  - A single exact `agent:<profile>` issue label MAY bypass classification. Multiple matching
+    profile labels SHOULD select `fallback_profile`.
+  - Host/operator label presets MAY take precedence over repository-owned routing profiles.
+  - The selected model MUST be applied to Codex `thread/start`, and the selected reasoning effort
+    MUST be applied to each Codex `turn/start`; routing MUST NOT be observational-only when enabled.
 
 #### 5.3.6 `codex` (object)
 
@@ -1425,6 +1447,9 @@ SHOULD return:
 
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
+- each running row SHOULD expose the actual coding-agent backend and model when known
+- when issue-aware routing is enabled, each running row SHOULD expose the selected reasoning effort
+  and profile
 - `retrying` (list of retry queue rows)
 - `codex_totals`
   - `input_tokens`

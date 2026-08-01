@@ -12,7 +12,7 @@ defmodule SymphonyElixir.AgentBackend do
   The active backend is selected by `agent.backend` config
   ("codex" | "acp" | "claude_code") and resolved via `resolve/0`. It can also
   be chosen per task from the issue's Linear labels via `resolve_for_issue/1`
-  (see `agent.label_presets` and §15 of `docs/acp-support-plan.md`).
+  (see `agent.label_presets` in `README.md`).
   """
 
   alias SymphonyElixir.Config
@@ -62,10 +62,11 @@ defmodule SymphonyElixir.AgentBackend do
   falls through to the global `agent.backend` with empty overrides, i.e.
   identical to `{resolve(), %{}}`.
 
-  Overrides carry only keys the chosen backend consumes today — `%{model:
-  String.t()}` for "acp"/"claude_code", and always `%{}` for "codex" (Codex has
-  no per-task model). Empty overrides leave each backend's `start_session/2`
-  byte-for-byte unchanged from the global-config path.
+  Overrides carry only keys the chosen backend consumes today. A configured
+  model is passed through to all backends; Codex applies it to `thread/start`,
+  ACP/OpenCode places it in its provider configuration, and Claude Code passes
+  it through `--model`. Empty overrides leave each backend's `start_session/2`
+  unchanged from the global-config path.
   """
   @spec resolve_for_issue(Issue.t() | map() | nil) :: {module(), map()}
   def resolve_for_issue(issue) do
@@ -75,15 +76,28 @@ defmodule SymphonyElixir.AgentBackend do
   @doc false
   @spec resolve_for_labels(map(), [String.t()]) :: {module(), map()}
   def resolve_for_labels(agent, labels) when is_list(labels) do
-    presets = Map.get(agent, :label_presets) || []
-
-    case Enum.find(presets, fn preset -> preset.label in labels end) do
+    case resolve_preset_for_labels(agent, labels) do
       nil -> {resolve(agent.backend), %{}}
-      preset -> {resolve(preset.backend), overrides_for(preset)}
+      resolved -> resolved
     end
   end
 
-  defp overrides_for(%{backend: "codex"}), do: %{}
+  @doc "Return only an explicit label-preset match, without the default fallback."
+  @spec resolve_preset_for_issue(Issue.t() | map() | nil) :: {module(), map()} | nil
+  def resolve_preset_for_issue(issue) do
+    resolve_preset_for_labels(Config.settings!().agent, issue_labels(issue))
+  end
+
+  @doc false
+  @spec resolve_preset_for_labels(map(), [String.t()]) :: {module(), map()} | nil
+  def resolve_preset_for_labels(agent, labels) when is_list(labels) do
+    presets = Map.get(agent, :label_presets) || []
+
+    case Enum.find(presets, fn preset -> preset.label in labels end) do
+      nil -> nil
+      preset -> {resolve(preset.backend), overrides_for(preset)}
+    end
+  end
 
   defp overrides_for(%{model: model}) when is_binary(model) and model != "",
     do: %{model: model}

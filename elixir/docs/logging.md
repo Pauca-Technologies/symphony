@@ -45,6 +45,13 @@ when the prompt is built; correlate these events by issue, workspace, attempt, a
 `prompt_chars` and `prompt_bytes` measure only the newly submitted turn text. Retained thread history
 and effective model-input cost remain represented by the backend's context/input-token telemetry.
 
+## Agent Profile Routing
+
+Repository profile classification logs the final `profile`, the classifier's proposed profile, and
+its `risk`, `complexity`, and `ambiguity` levels. Failures and ambiguous profile-label overrides log
+the quality fallback. Every routing message includes both `issue_id` and `issue_identifier`; issue
+content and classifier reasons are deliberately excluded from logs.
+
 ## Dynamic Tool Outcomes
 
 Codex `tool_call_completed` and `tool_call_failed` session events include the normalized tool result

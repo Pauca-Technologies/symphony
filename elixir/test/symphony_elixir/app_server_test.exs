@@ -76,7 +76,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server retains its resolved model and passes explicit turn sandbox policies through unchanged" do
+  test "app server applies model/effort overrides and passes explicit turn policies through unchanged" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -116,7 +116,7 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"},"model":"gpt-5.6-sol"}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}'
             ;;
           3)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001"}}}'
@@ -153,6 +153,12 @@ defmodule SymphonyElixir.AppServerTest do
 
       issue_context_file = Path.join(test_root, "issue-context.json")
 
+      output_schema = %{
+        "type" => "object",
+        "required" => ["profile"],
+        "properties" => %{"profile" => %{"type" => "string"}}
+      }
+
       Enum.each(policy_cases, fn configured_policy ->
         File.rm(trace_file)
 
@@ -168,14 +174,18 @@ defmodule SymphonyElixir.AppServerTest do
         assert {:ok, _result} =
                  AppServer.run(workspace, "Validate supported turn policy", issue,
                    on_message: on_message,
-                   issue_context_file: issue_context_file
+                   issue_context_file: issue_context_file,
+                   overrides: %{model: "gpt-5.6-sol", reasoning_effort: "xhigh"},
+                   thread_config: %{"project_doc_max_bytes" => 0},
+                   output_schema: output_schema
                  )
 
         assert_receive {:codex_message,
                         %{
                           event: :session_started,
                           session_id: "thread-1001-turn-1001",
-                          model: "gpt-5.6-sol"
+                          model: "gpt-5.6-sol",
+                          reasoning_effort: "xhigh"
                         }}
 
         trace = File.read!(trace_file)
@@ -188,8 +198,25 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
                    |> then(fn payload ->
+                     payload["method"] == "thread/start" &&
+                       get_in(payload, ["params", "model"]) == "gpt-5.6-sol" &&
+                       get_in(payload, ["params", "config", "project_doc_max_bytes"]) == 0
+                   end)
+                 else
+                   false
+                 end
+               end)
+
+        assert Enum.any?(lines, fn line ->
+                 if String.starts_with?(line, "JSON:") do
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+                   |> then(fn payload ->
                      payload["method"] == "turn/start" &&
-                       get_in(payload, ["params", "sandboxPolicy"]) == configured_policy
+                       get_in(payload, ["params", "sandboxPolicy"]) == configured_policy &&
+                       get_in(payload, ["params", "effort"]) == "xhigh" &&
+                       get_in(payload, ["params", "outputSchema"]) == output_schema
                    end)
                  else
                    false

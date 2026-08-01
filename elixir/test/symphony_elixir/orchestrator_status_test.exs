@@ -158,8 +158,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
-    # AgentRunner reports the resolved backend + configured model out-of-band.
-    send(pid, {:worker_runtime_info, issue_id, %{backend: "claude_code", model: "opus"}})
+    # AgentRunner reports the resolved backend + configured model/effort out-of-band.
+    send(
+      pid,
+      {:worker_runtime_info, issue_id, %{backend: "claude_code", model: "opus", reasoning_effort: "high", profile: "standard"}}
+    )
 
     # The agent then reports the model it actually resolved on `:session_started`,
     # which refines the configured value.
@@ -170,6 +173,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
          event: :session_started,
          session_id: "claude-session-1",
          model: "claude-opus-4-8",
+         reasoning_effort: "xhigh",
          timestamp: DateTime.utc_now()
        }}
     )
@@ -177,6 +181,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{running: [snapshot_entry]} = GenServer.call(pid, :snapshot)
     assert snapshot_entry.backend == "claude_code"
     assert snapshot_entry.model == "claude-opus-4-8"
+    assert snapshot_entry.reasoning_effort == "xhigh"
+    assert snapshot_entry.profile == "standard"
   end
 
   test "orchestrator snapshot keeps the configured model when the agent reports none" do
@@ -222,7 +228,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
-    send(pid, {:worker_runtime_info, issue_id, %{backend: "acp", model: "opencode/north-mini-code-free"}})
+    send(
+      pid,
+      {:worker_runtime_info, issue_id, %{backend: "acp", model: "opencode/north-mini-code-free", reasoning_effort: "high"}}
+    )
 
     # A session_started without a model must not clobber the configured one.
     send(
@@ -233,6 +242,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{running: [snapshot_entry]} = GenServer.call(pid, :snapshot)
     assert snapshot_entry.backend == "acp"
     assert snapshot_entry.model == "opencode/north-mini-code-free"
+    assert snapshot_entry.reasoning_effort == "high"
   end
 
   test "orchestrator snapshot retains a bounded recent codex event history" do

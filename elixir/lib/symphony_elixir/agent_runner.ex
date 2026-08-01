@@ -8,6 +8,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   alias SymphonyElixir.{
     AgentBackend,
+    AgentRouter,
     Config,
     Linear.Client,
     Linear.Comment,
@@ -334,25 +335,29 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   # Report the *actual* backend (the resolved module the session runs on) and
-  # model, so the dashboard shows what is really running rather than re-deriving
+  # model/effort, so the dashboard shows what is really running rather than re-deriving
   # it from the issue's labels. The session holds Codex's resolved model or the
   # config/override value handed to ACP/Claude Code; backends that report their
   # real model later on the wire refine it via the `:session_started` event.
-  defp send_agent_backend_info(recipient, %Issue{id: issue_id}, backend, session)
+  defp send_agent_backend_info(recipient, %Issue{id: issue_id}, route, session)
        when is_binary(issue_id) and is_pid(recipient) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
-         backend: AgentBackend.backend_name(backend),
-         model: agent_session_model(session)
+         backend: AgentBackend.backend_name(route.backend),
+         model: agent_session_model(session) || Map.get(route.overrides, :model),
+         reasoning_effort:
+           agent_session_reasoning_effort(session) ||
+             Map.get(route.overrides, :reasoning_effort),
+         profile: route.profile
        }}
     )
 
     :ok
   end
 
-  defp send_agent_backend_info(_recipient, _issue, _backend, _session), do: :ok
+  defp send_agent_backend_info(_recipient, _issue, _route, _session), do: :ok
 
   defp agent_session_model(session) when is_map(session) do
     model =
@@ -364,6 +369,21 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp agent_session_model(_session), do: nil
+
+  defp agent_session_reasoning_effort(session) when is_map(session) do
+    case Map.get(session, :reasoning_effort) do
+      effort when is_binary(effort) ->
+        case String.trim(effort) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _effort ->
+        nil
+    end
+  end
+
+  defp agent_session_reasoning_effort(_session), do: nil
 
   @doc false
   # Test seam: drive the per-turn loop directly with an injected backend
@@ -382,21 +402,58 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
-    {backend, overrides} = Keyword.get(opts, :agent_backend) || AgentBackend.resolve_for_issue(issue)
 
-    with {:ok, session} <-
-           backend.start_session(workspace,
+    with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
+         {:ok, session} <-
+           route.backend.start_session(workspace,
              worker_host: worker_host,
-             overrides: overrides,
+             overrides: route.overrides,
              issue_context_file: Keyword.get(opts, :issue_context_file)
            ) do
-      send_agent_backend_info(codex_update_recipient, issue, backend, session)
+      send_agent_backend_info(codex_update_recipient, issue, route, session)
 
       try do
-        do_run_codex_turns(backend, session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(
+          route.backend,
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          1,
+          max_turns
+        )
       after
-        backend.stop_session(session)
+        route.backend.stop_session(session)
       end
+    end
+  end
+
+  defp resolve_agent_route(workspace, issue, opts, worker_host) do
+    case Keyword.get(opts, :agent_backend) do
+      {backend, overrides} when is_atom(backend) and is_map(overrides) ->
+        {:ok,
+         %{
+           backend: backend,
+           overrides: overrides,
+           profile: nil,
+           source: :injected
+         }}
+
+      nil ->
+        router_opts =
+          []
+          |> maybe_put(:classifier, Keyword.get(opts, :agent_classifier))
+          |> maybe_put(:issue_context_file, Keyword.get(opts, :issue_context_file))
+
+        AgentRouter.resolve(
+          workspace,
+          issue,
+          Keyword.get(opts, :per_repo_workflow),
+          worker_host,
+          router_opts
+        )
     end
   end
 

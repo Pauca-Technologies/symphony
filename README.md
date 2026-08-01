@@ -12,6 +12,11 @@ the current issue details, a bounded Linear comment window, and annotated reposi
 artifacts. That context precedes the repository workflow, so workpads and human unblock decisions
 are deterministic agent input without exposing the tracker credential to repository code.
 
+Routed repositories can also version issue-aware Codex profiles in their own `WORKFLOW.md`. A small,
+classification-only turn chooses the execution profile from bounded issue context, while
+repositories retain a quality fallback for ambiguous, risky, or failed classifications. The
+selected execution model and reasoning effort are visible in Symphony's dashboard.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

@@ -174,8 +174,8 @@ Notes:
   whose `label` is present on the issue wins (positional precedence — list order, first match), and
   an unmatched issue falls through to `agent.backend`. Each preset has `label` (a Linear label name,
   matched exactly — see the label-group note below), `backend` (`codex` | `acp` | `claude_code`), and an optional `model` (passed to
-  the chosen backend — `OPENCODE_CONFIG_CONTENT` for ACP/OpenCode, `--model` for Claude Code; ignored
-  for `codex`, which has no per-task model). Resolution happens once at run start, so a relabel takes
+  the chosen backend — Codex `thread/start`, `OPENCODE_CONFIG_CONTENT` for ACP/OpenCode, or `--model`
+  for Claude Code). Resolution happens once at run start, so a relabel takes
   effect on the next run. Example:
   ```yaml
   agent:
@@ -188,12 +188,49 @@ Notes:
         backend: claude_code
         model: opus
   ```
-  The observability dashboard surfaces the **actual** backend and model each run is using — an
-  "Agent" column in the running-issues list and an "Agent" card on the issue detail page — taken from
-  the resolved backend module and the model handed to (or reported by) the running agent, not
-  re-derived from the issue's labels. The model is the live resolved one where the agent reports it
-  (Codex's `thread/start` response and Claude Code's `system/init`) and the configured/override value
-  otherwise.
+  In multi-repo mode, a routed repository can instead define issue-aware Codex execution profiles
+  under `agent.routing` in its own `WORKFLOW.md`. The block requires a small classifier model,
+  `default_profile`, `fallback_profile`, and a non-empty `profiles` map. Each profile supplies a
+  Codex model, reasoning effort (`none` | `low` | `medium` | `high` | `xhigh` | `max`), and a concise
+  description used by the classifier. Example:
+
+  ```yaml
+  agent:
+    routing:
+      classifier:
+        backend: codex
+        model: gpt-5.6-luna
+        reasoning_effort: max
+        timeout_ms: 120000
+      default_profile: standard
+      fallback_profile: deep
+      profiles:
+        standard:
+          backend: codex
+          model: gpt-5.6-sol
+          reasoning_effort: high
+          description: Clear, bounded work with a straightforward validation path.
+        deep:
+          backend: codex
+          model: gpt-5.6-sol
+          reasoning_effort: xhigh
+          description: Risky, cross-cutting, ambiguous, or architecture-sensitive work.
+  ```
+
+  For an unlabelled issue, Symphony runs an ephemeral structured classifier turn over a bounded
+  issue snapshot, with Symphony dynamic tools disabled and repository project-doc loading set to
+  zero bytes. A classifier result with high risk, complexity, or ambiguity is promoted to
+  `fallback_profile`; a classifier failure also fails closed to that profile. A single
+  `agent:<profile>` issue label bypasses classification, while multiple matching profile labels use
+  the fallback. Existing host `agent.label_presets` remain the highest-precedence override. Routing
+  is active directly; there is no shadow decision.
+
+  The observability dashboard surfaces the **actual** backend, model, reasoning effort, and selected
+  profile each run is using. Its "Agent" column in the running-issues list and "Agent" card on the
+  issue detail page take values from the resolved backend module and the model handed to (or
+  reported by) the running agent, rather than re-deriving them from issue labels. The model is the
+  live resolved one where the agent reports it (Codex's `thread/start` response and Claude Code's
+  `system/init`) and the configured/override value otherwise.
 - **Label groups.** A Linear label nested in a label *group* (e.g. the leaf `opencode:kimi2.7` under
   group `agent`) is flattened to `<group>:<leaf>` (`agent:opencode:kimi2.7`) before matching — Symphony
   fetches the label's `parent` and joins them. So `label_presets` and repo-routing labels are written

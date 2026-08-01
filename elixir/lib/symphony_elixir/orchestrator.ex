@@ -283,6 +283,8 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
           |> maybe_put_runtime_value(:backend, runtime_info[:backend])
           |> maybe_put_runtime_value(:model, runtime_info[:model])
+          |> maybe_put_runtime_value(:reasoning_effort, runtime_info[:reasoning_effort])
+          |> maybe_put_runtime_value(:profile, runtime_info[:profile])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -1232,6 +1234,8 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: nil,
             backend: nil,
             model: nil,
+            reasoning_effort: nil,
+            profile: nil,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -1844,6 +1848,8 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(metadata, :workspace_path),
           backend: Map.get(metadata, :backend),
           model: Map.get(metadata, :model),
+          reasoning_effort: Map.get(metadata, :reasoning_effort),
+          profile: Map.get(metadata, :profile),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
@@ -1934,6 +1940,7 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_message: codex_message,
         session_id: resolved_session_id,
         model: model_for_update(Map.get(running_entry, :model), update),
+        reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
         last_codex_event: event,
         recent_codex_events: append_recent_codex_event(Map.get(running_entry, :recent_codex_events, []), codex_message),
         recent_codex_transcript_blocks:
@@ -1981,6 +1988,12 @@ defmodule SymphonyElixir.Orchestrator do
     do: model
 
   defp model_for_update(existing, _update), do: existing
+
+  defp reasoning_effort_for_update(_existing, %{reasoning_effort: effort})
+       when is_binary(effort) and effort != "",
+       do: effort
+
+  defp reasoning_effort_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

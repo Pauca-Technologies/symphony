@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Config.{AgentRouting, Schema}
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -142,6 +142,21 @@ defmodule SymphonyElixir.Config do
         @default_prompt_template
     end
   end
+
+  @doc """
+  Parse the optional repository-owned agent-routing block from a loaded
+  workflow. Host runtime settings remain in the ordinary `Config` schema;
+  routing profiles are deliberately read from the routed repository workflow.
+  """
+  @spec agent_routing_settings(Workflow.loaded_workflow() | nil) ::
+          {:ok, AgentRouting.t() | nil} | {:error, term()}
+  def agent_routing_settings(%{config: config}) when is_map(config),
+    do: AgentRouting.parse(config)
+
+  def agent_routing_settings(nil), do: {:ok, nil}
+
+  def agent_routing_settings(_workflow),
+    do: {:error, {:invalid_agent_routing, "repository workflow must contain a config map"}}
 
   @spec server_port() :: non_neg_integer() | nil
   def server_port do

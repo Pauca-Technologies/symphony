@@ -150,9 +150,9 @@ defmodule SymphonyElixir.Config.Schema do
         field(:label, :string)
         # Backend to use for issues carrying `label` (one of @backend_names).
         field(:backend, :string)
-        # Optional per-task model. Interpreted by the chosen backend: ACP/OpenCode
-        # → OPENCODE_CONFIG_CONTENT; Claude Code → --model. Ignored for "codex"
-        # (Codex has no per-task model; it picks its model from its own config).
+        # Optional per-task model. Interpreted by the chosen backend: Codex →
+        # thread/start; ACP/OpenCode → OPENCODE_CONFIG_CONTENT; Claude Code →
+        # --model.
         field(:model, :string)
       end
 

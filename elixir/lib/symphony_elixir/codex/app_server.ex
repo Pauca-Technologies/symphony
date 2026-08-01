@@ -52,6 +52,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           port: port(),
           metadata: map(),
           model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
           thread_path: Path.t() | nil,
@@ -76,6 +77,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    overrides = Keyword.get(opts, :overrides, %{})
+    thread_options = thread_options(opts, overrides)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          :ok <- prepare_sourced_env_files(expanded_workspace, worker_host),
@@ -84,7 +87,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread} <-
+             do_start_session(port, expanded_workspace, session_policies, thread_options) do
         thread_id = Map.fetch!(thread, :id)
 
         {:ok,
@@ -92,6 +96,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            port: port,
            metadata: metadata,
            model: Map.get(thread, :model),
+           reasoning_effort: Map.get(thread_options, :reasoning_effort) || Map.get(thread, :reasoning_effort),
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_path: Map.get(thread, :path),
@@ -117,6 +122,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
           model: model,
+          reasoning_effort: reasoning_effort,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           thread_path: thread_path,
@@ -133,7 +139,21 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    turn_options = %{
+      reasoning_effort: reasoning_effort,
+      output_schema: Keyword.get(opts, :output_schema)
+    }
+
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           workspace,
+           approval_policy,
+           turn_sandbox_policy,
+           turn_options
+         ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -145,12 +165,22 @@ defmodule SymphonyElixir.Codex.AppServer do
             session_id: session_id,
             thread_id: thread_id,
             turn_id: turn_id,
-            model: model
+            model: model,
+            reasoning_effort: reasoning_effort
           },
           metadata
         )
 
-        case await_turn_completion(port, on_message, turn_id, tool_executor, auto_approve_requests) do
+        timeout_ms = Keyword.get(opts, :turn_timeout_ms, Config.settings!().codex.turn_timeout_ms)
+
+        case await_turn_completion(
+               port,
+               on_message,
+               turn_id,
+               tool_executor,
+               auto_approve_requests,
+               timeout_ms
+             ) do
           {:ok, result} ->
             handle_turn_success(
               result,
@@ -491,23 +521,36 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, thread_options) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_thread(port, workspace, session_policies, thread_options)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         thread_options
+       ) do
+    params =
+      %{
+        "approvalPolicy" => approval_policy,
+        "sandbox" => thread_sandbox,
+        "cwd" => workspace
+      }
+      |> put_dynamic_tools(thread_options.dynamic_tools)
+      |> put_optional("config", thread_options.config)
+      |> put_optional("model", thread_options.model)
+      |> put_optional("ephemeral", thread_options.ephemeral)
+      |> put_optional("baseInstructions", thread_options.base_instructions)
+      |> put_optional("developerInstructions", thread_options.developer_instructions)
+
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
-      }
+      "params" => params
     })
 
     case await_response(port, @thread_start_id) do
@@ -518,7 +561,8 @@ defmodule SymphonyElixir.Codex.AppServer do
              %{
                id: thread_id,
                path: Map.get(thread_payload, "path"),
-               model: Map.get(response, "model")
+               model: Map.get(response, "model"),
+               reasoning_effort: Map.get(response, "reasoningEffort")
              }}
 
           _ ->
@@ -530,11 +574,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-    send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
-      "params" => %{
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         workspace,
+         approval_policy,
+         turn_sandbox_policy,
+         turn_options
+       ) do
+    params =
+      %{
         "threadId" => thread_id,
         "input" => [
           %{
@@ -547,6 +598,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
+      |> put_optional("effort", turn_options.reasoning_effort)
+      |> put_optional("outputSchema", turn_options.output_schema)
+
+    send_message(port, %{
+      "method" => "turn/start",
+      "id" => @turn_start_id,
+      "params" => params
     })
 
     case await_response(port, @turn_start_id) do
@@ -555,17 +613,62 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, turn_id, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         turn_id,
+         tool_executor,
+         auto_approve_requests,
+         timeout_ms
+       ) do
     receive_loop(
       port,
       on_message,
       turn_id,
-      Config.settings!().codex.turn_timeout_ms,
+      timeout_ms,
       "",
       tool_executor,
       auto_approve_requests
     )
   end
+
+  defp thread_options(opts, overrides) do
+    %{
+      model: non_blank_override(overrides, :model),
+      reasoning_effort: non_blank_override(overrides, :reasoning_effort),
+      dynamic_tools: Keyword.get(opts, :dynamic_tools, true),
+      config: Keyword.get(opts, :thread_config),
+      ephemeral: Keyword.get(opts, :ephemeral),
+      base_instructions: Keyword.get(opts, :base_instructions),
+      developer_instructions: Keyword.get(opts, :developer_instructions)
+    }
+  end
+
+  defp non_blank_override(overrides, key) when is_map(overrides) do
+    case Map.get(overrides, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _value ->
+        nil
+    end
+  end
+
+  defp non_blank_override(_overrides, _key), do: nil
+
+  defp put_dynamic_tools(params, true),
+    do: Map.put(params, "dynamicTools", DynamicTool.tool_specs())
+
+  defp put_dynamic_tools(params, tools) when is_list(tools),
+    do: Map.put(params, "dynamicTools", tools)
+
+  defp put_dynamic_tools(params, _disabled), do: params
+
+  defp put_optional(params, _key, nil), do: params
+  defp put_optional(params, key, value), do: Map.put(params, key, value)
 
   # `turn_id` is the id of the turn this loop started (`turn/start` response).
   # Subagents spawned by the agent run as child threads multiplexed onto the

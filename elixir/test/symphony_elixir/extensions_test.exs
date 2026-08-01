@@ -443,7 +443,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "state" => "In Progress",
                  "worker_host" => nil,
                  "workspace_path" => nil,
-                 "agent" => %{"backend" => "claude_code", "model" => "claude-opus-4-8"},
+                 "agent" => %{
+                   "backend" => "claude_code",
+                   "model" => "claude-opus-4-8",
+                   "reasoning_effort" => "xhigh",
+                   "profile" => "deep"
+                 },
                  "session_id" => "thread-http",
                  "turn_count" => 7,
                  "last_event" => "notification",
@@ -500,11 +505,21 @@ defmodule SymphonyElixir.ExtensionsTest do
                "host" => nil
              },
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
-             "agent" => %{"backend" => "claude_code", "model" => "claude-opus-4-8"},
+             "agent" => %{
+               "backend" => "claude_code",
+               "model" => "claude-opus-4-8",
+               "reasoning_effort" => "xhigh",
+               "profile" => "deep"
+             },
              "running" => %{
                "worker_host" => nil,
                "workspace_path" => nil,
-               "agent" => %{"backend" => "claude_code", "model" => "claude-opus-4-8"},
+               "agent" => %{
+                 "backend" => "claude_code",
+                 "model" => "claude-opus-4-8",
+                 "reasoning_effort" => "xhigh",
+                 "profile" => "deep"
+               },
                "session_id" => "thread-http",
                "turn_count" => 7,
                "state" => "In Progress",
@@ -1099,6 +1114,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "status-badge-offline"
     assert html =~ "Wire up the HTTP server"
     assert html =~ "Retry the flaky migration"
+    assert html =~ "claude-opus-4-8"
+    assert html =~ "effort xhigh"
+    assert html =~ "deep"
     assert html =~ "11 left"
     refute html =~ ~s(%{&quot;primary&quot;)
 
@@ -1582,6 +1600,8 @@ defmodule SymphonyElixir.ExtensionsTest do
           state: "In Progress",
           backend: "claude_code",
           model: "claude-opus-4-8",
+          reasoning_effort: "xhigh",
+          profile: "deep",
           session_id: "thread-http",
           turn_count: 7,
           codex_app_server_pid: nil,
