@@ -60,6 +60,14 @@ without duplicating `contentItems`. For deferred handoff reviews, inspect
 `details.result.output.status == "deferred_review_started"`; reviewer blocks and actual tool or
 GraphQL failures remain failed events with their distinct structured error output.
 
+Automated-review terminal state is emitted as `gate.review` with `outcome`, `iteration`,
+`max_iterations`, `reviewed_sha`, `authoritative`, `severity_counts`, and `failure_reason`. The same
+state appears under `running[].review_state` in the orchestrator snapshot and under
+`running[].review` in the HTTP/dashboard projection. Treat only `outcome=approved` with
+`authoritative=true` as review approval; `automation_inconclusive`, `infrastructure_unavailable`,
+and `budget_exhausted_with_findings` are operational/human-escalation states, not successful
+handoffs.
+
 ## Checklist For New Logs
 
 - Is this event tied to a Linear issue? Include `issue_id` and `issue_identifier`.

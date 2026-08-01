@@ -12,21 +12,23 @@ defmodule SymphonyElixir.ReviewGate do
   implementor's own worktree, driven by the review prompt, and reads a JSON
   verdict the reviewer writes to a known path.
 
-    * `approve` -> `:ok`, the handoff proceeds.
+    * `approve` -> `{:approved, evidence}`. The caller may proceed only when
+      that evidence is pinned to the exact current head.
     * `request_changes` (and the per-issue iteration budget is not yet
-      spent) -> `{:blocked, remediation, comments}`. `DynamicTool` turns
+      spent) -> `{:request_changes, remediation, evidence}`. `DynamicTool` turns
       that into a failed tool result whose `error.remediation` the
       `AgentRunner` feeds into the implementor's next turn — the same
       block/remediation/loop machinery the shell `before_handoff` gate
       already uses. The implementor fixes the findings and re-attempts the
       handoff, which runs the reviewer again.
-    * Budget exhausted (`max_iterations` request-changes passes) -> `:ok`,
-      with a one-time Linear note, so a human reviewer takes it from there
-      instead of looping forever.
-
-  Fail-open by design (per product decision): a reviewer that errors, times
-  out, or produces no readable verdict never wedges the pipeline — the gate
-  logs, posts a "review skipped" note, and allows the handoff.
+    * Budget exhausted (`max_iterations` request-changes passes) ->
+      `{:budget_exhausted_with_findings, evidence}` with a one-time Linear
+      escalation note. The deferred handoff remains blocked until a human
+      resolves the findings or a new candidate is reviewed.
+    * Missing or malformed reviewer output ->
+      `{:automation_inconclusive, evidence}`. Reviewer session/tool/auth/timeout
+      failures -> `{:infrastructure_unavailable, evidence}`. Neither outcome
+      is approval and neither applies the deferred handoff mutation.
 
   The iteration counter lives in the process dictionary of the `AgentRunner`
   run process (the same place the handoff-gate prompt is stashed), so it
@@ -48,9 +50,9 @@ defmodule SymphonyElixir.ReviewGate do
   ## Configuration (the consumer repo's `WORKFLOW_REVIEW.md` front matter)
 
       review:
-        max_iterations: 3                  # request-changes passes before allowing the handoff
+        max_iterations: 3                  # request-changes passes before human escalation
         verdict_path: .artifacts/symphony-review/verdict.json
-        require_pr: true                   # no PR at handoff -> skip the reviewer entirely
+        require_pr: true                   # no PR at handoff -> automation_inconclusive
         pr_section_enabled: true           # write the human-review PR section
         section_heading: "## 🤖 How to review this PR"
   """
@@ -65,6 +67,7 @@ defmodule SymphonyElixir.ReviewGate do
     Linear.Client,
     Linear.Issue,
     PromptBuilder,
+    ReviewOutcome,
     Tracker,
     Workspace
   }
@@ -76,6 +79,8 @@ defmodule SymphonyElixir.ReviewGate do
   @max_verdict_attempts 2
 
   @iteration_key {__MODULE__, :iteration}
+  @latest_outcome_key {__MODULE__, :latest_outcome}
+  @terminal_outcome_key {__MODULE__, :terminal_outcome}
   @budget_noted_key {__MODULE__, :budget_noted}
   @skip_noted_key {__MODULE__, :skip_noted}
 
@@ -91,9 +96,11 @@ defmodule SymphonyElixir.ReviewGate do
           comments: [map()]
         }
   @type result ::
-          :ok
-          | {:blocked, String.t(), [map()]}
-          | {:skipped, term()}
+          {:approved, ReviewOutcome.t()}
+          | {:request_changes, String.t(), ReviewOutcome.t()}
+          | {:automation_inconclusive, ReviewOutcome.t()}
+          | {:infrastructure_unavailable, ReviewOutcome.t()}
+          | {:budget_exhausted_with_findings, ReviewOutcome.t()}
   @type review_key ::
           {:pull_request, String.t(), String.t(), String.t() | nil}
           | {:workspace, String.t(), String.t() | nil}
@@ -117,6 +124,30 @@ defmodule SymphonyElixir.ReviewGate do
     {key, _opts} = prepare_review(workspace, issue, Keyword.delete(opts, :resolved_pr_result))
     key
   end
+
+  @doc "True only when approval evidence is pinned to the exact current candidate head."
+  @spec authoritative_for_current_head?(
+          Path.t(),
+          Issue.t(),
+          review_key(),
+          keyword(),
+          ReviewOutcome.t()
+        ) :: boolean()
+  def authoritative_for_current_head?(
+        workspace,
+        %Issue{} = issue,
+        review_key,
+        opts,
+        %ReviewOutcome{outcome: :approved} = outcome
+      )
+      when is_binary(workspace) do
+    outcome.authoritative and review_key_pinned?(review_key) and
+      outcome.reviewed_sha == review_key_sha(review_key) and
+      current_review_key(workspace, issue, opts) == review_key
+  end
+
+  def authoritative_for_current_head?(_workspace, _issue, _review_key, _opts, _outcome),
+    do: false
 
   @doc """
   Run the reviewer gate for an `In Progress -> In Review` handoff.
@@ -148,36 +179,105 @@ defmodule SymphonyElixir.ReviewGate do
         PrReviewSection.resolve_pr(workspace, pr_opts)
       end)
 
-    case pr_result do
-      {:skip, reason} when settings.require_pr ->
-        # No PR at the In Review handoff: skip the reviewer entirely (product
-        # decision). The whole feature — review + PR annotation — is PR-centric
-        # here; set `require_pr: false` to review on the diff anyway and just
-        # no-op the annotation.
-        Logger.info("review.gate skipped #{issue_context(issue)} reason=#{inspect({:no_pr, reason})}")
-        note_review_skipped(issue, {:no_pr, reason}, opts)
-        emit_telemetry(issue, iteration, :skipped, 0, nil)
-        {:skipped, {:no_pr, reason}}
+    context = %{
+      workspace: workspace,
+      issue: issue,
+      worker_host: worker_host,
+      review_workflow: review_workflow,
+      settings: settings,
+      iteration: iteration,
+      opts: pr_opts
+    }
 
-      pr_result ->
-        pr = pr_or_nil(pr_result)
+    dispatch_review(context, pr_result)
+  end
 
-        if iteration >= settings.max_iterations do
-          # Budget spent: allow the handoff, but refresh the human-facing
-          # section to "did not converge -> elevated risk" so the riskiest case
-          # is never described by stale request-changes prose.
-          maybe_write_section(workspace, pr, :thorough, budget_human_review(iteration), settings, opts)
-          note_budget_exhausted(issue, iteration, opts)
-          emit_telemetry(issue, iteration, :budget_exhausted, 0, :thorough)
-          :ok
-        else
-          run_iteration(workspace, issue, worker_host, review_workflow, settings, iteration, pr, pr_opts)
-        end
+  # Invalid gate input is not approval. This clause is primarily defensive;
+  # normal callers always provide a normalized issue and loaded workflow.
+  def run(_workspace, _issue, _worker_host, _review_workflow, _opts) do
+    outcome =
+      inconclusive_outcome(
+        default_review_settings(),
+        0,
+        nil,
+        :invalid_review_context,
+        "Repair the review workflow context, then start a fresh orchestration run and re-attempt the gated handoff."
+      )
+
+    {:automation_inconclusive, outcome}
+  end
+
+  defp dispatch_review(%{settings: %{require_pr: true}} = context, {:skip, reason}) do
+    required_pr_outcome(context, reason)
+  end
+
+  defp dispatch_review(context, pr_result) do
+    pr = pr_or_nil(pr_result)
+    reviewed_sha = candidate_sha(context.workspace, pr)
+    context = Map.merge(context, %{pr: pr, reviewed_sha: reviewed_sha})
+
+    case terminal_outcome(context.issue.id, reviewed_sha) do
+      %ReviewOutcome{} = outcome -> {outcome.outcome, outcome}
+      nil -> run_unlatched_review(context)
     end
   end
 
-  # Missing issue id / not a review workflow / bad workspace -> fail open.
-  def run(_workspace, _issue, _worker_host, _review_workflow, _opts), do: :ok
+  defp required_pr_outcome(%{issue: %Issue{} = issue} = context, reason) do
+    case terminal_outcome(issue.id, nil) do
+      %ReviewOutcome{} = outcome ->
+        {outcome.outcome, outcome}
+
+      nil ->
+        create_required_pr_outcome(context, reason)
+    end
+  end
+
+  defp create_required_pr_outcome(%{issue: %Issue{} = issue} = context, reason) do
+    failure_reason = {:no_pr, reason}
+
+    outcome =
+      inconclusive_outcome(
+        context.settings,
+        context.iteration,
+        nil,
+        failure_reason,
+        "Attach a pull request with a pinned head SHA, then start a fresh orchestration run and re-attempt the gated handoff."
+      )
+
+    put_terminal_outcome(issue.id, outcome)
+    Logger.warning("review.gate inconclusive #{issue_context(issue)} reason=#{inspect(failure_reason)}")
+    note_nonapproval(issue, outcome, context.opts)
+    emit_outcome_telemetry(issue, outcome)
+    {:automation_inconclusive, outcome}
+  end
+
+  defp run_unlatched_review(%{iteration: iteration, settings: settings} = context)
+       when iteration >= settings.max_iterations do
+    outcome =
+      budget_outcome(
+        settings,
+        iteration,
+        context.reviewed_sha,
+        latest_outcome(context.issue.id)
+      )
+
+    put_terminal_outcome(context.issue.id, outcome)
+
+    maybe_write_section(
+      context.workspace,
+      context.pr,
+      :thorough,
+      budget_human_review(iteration),
+      settings,
+      context.opts
+    )
+
+    note_budget_exhausted(context.issue, outcome, context.opts)
+    emit_outcome_telemetry(context.issue, outcome)
+    {:budget_exhausted_with_findings, outcome}
+  end
+
+  defp run_unlatched_review(context), do: run_iteration(context, 1, nil)
 
   @spec telemetry_event() :: [atom()]
   def telemetry_event, do: @telemetry_event
@@ -198,6 +298,12 @@ defmodule SymphonyElixir.ReviewGate do
   defp pr_or_nil({:ok, pr}), do: pr
   defp pr_or_nil(_pr_result), do: nil
 
+  defp candidate_sha(_workspace, %{head_oid: head_oid}) when is_binary(head_oid) and head_oid != "",
+    do: head_oid
+
+  defp candidate_sha(_workspace, %{}), do: nil
+  defp candidate_sha(workspace, nil), do: workspace_head_oid(workspace)
+
   defp review_key(_workspace, %Issue{id: issue_id}, {:ok, pr}) do
     pr_identity = Map.get(pr, :id) || Integer.to_string(pr.number)
     {:pull_request, issue_id, pr_identity, Map.get(pr, :head_oid)}
@@ -207,6 +313,16 @@ defmodule SymphonyElixir.ReviewGate do
     {:workspace, issue_id, workspace_head_oid(workspace)}
   end
 
+  defp review_key_pinned?({:pull_request, _issue_id, _pr_identity, head_oid}),
+    do: present_sha?(head_oid)
+
+  defp review_key_pinned?({:workspace, _issue_id, head_oid}), do: present_sha?(head_oid)
+  defp review_key_pinned?(_review_key), do: false
+
+  defp review_key_sha({:pull_request, _issue_id, _pr_identity, head_oid}), do: head_oid
+  defp review_key_sha({:workspace, _issue_id, head_oid}), do: head_oid
+  defp review_key_sha(_review_key), do: nil
+
   defp workspace_head_oid(workspace) do
     case System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"], stderr_to_stdout: true) do
       {output, 0} -> String.trim(output)
@@ -214,23 +330,6 @@ defmodule SymphonyElixir.ReviewGate do
     end
   rescue
     _error -> nil
-  end
-
-  defp run_iteration(workspace, %Issue{} = issue, worker_host, review_workflow, settings, iteration, pr, opts) do
-    run_iteration(
-      %{
-        workspace: workspace,
-        issue: issue,
-        worker_host: worker_host,
-        review_workflow: review_workflow,
-        settings: settings,
-        iteration: iteration,
-        pr: pr,
-        opts: opts
-      },
-      1,
-      nil
-    )
   end
 
   defp run_iteration(
@@ -269,7 +368,13 @@ defmodule SymphonyElixir.ReviewGate do
         end
 
       {:error, reason} ->
-        fail_open(issue, review_context.iteration, {:review_prompt_unavailable, reason}, opts)
+        conclude_inconclusive(
+          issue,
+          review_context,
+          1,
+          {:review_prompt_unavailable, reason},
+          "Repair the review prompt/workflow, then start a fresh orchestration run and re-attempt review for the candidate SHA."
+        )
     end
   end
 
@@ -279,7 +384,13 @@ defmodule SymphonyElixir.ReviewGate do
 
       run_iteration(review_context, attempt + 1, {:review_session_failed, reason})
     else
-      fail_open(issue, review_context.iteration, {:review_session_failed, reason}, opts)
+      conclude_infrastructure_failure(
+        issue,
+        review_context,
+        attempt,
+        {:review_session_failed, reason},
+        opts
+      )
     end
   end
 
@@ -287,19 +398,17 @@ defmodule SymphonyElixir.ReviewGate do
   # review_effort tier + prose (effort is orthogonal to the verdict — a change
   # needing a thorough review can still approve). Keeping it fresh through the
   # request_changes loop means the final pass's assessment wins.
-  defp evaluate_verdict(verdict_path, %{workspace: workspace, issue: %Issue{} = issue, settings: settings, iteration: iteration, pr: pr, opts: opts} = review_context, attempt) do
+  defp evaluate_verdict(verdict_path, %{workspace: workspace, issue: %Issue{} = issue, settings: settings, pr: pr, opts: opts} = review_context, attempt) do
     case read_verdict(verdict_path) do
       {:ok, %{verdict: :approve} = verdict} ->
+        outcome = approved_outcome(review_context, verdict, attempt)
+        clear_latest_outcome(issue.id)
         maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
-        emit_telemetry(issue, iteration, :approve, length(verdict.comments), verdict.review_effort)
-        :ok
+        emit_outcome_telemetry(issue, outcome)
+        {:approved, outcome}
 
       {:ok, %{verdict: :request_changes} = verdict} ->
-        next_iteration = iteration + 1
-        put_iteration(issue.id, next_iteration)
-        maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
-        emit_telemetry(issue, iteration, :request_changes, length(verdict.comments), verdict.review_effort)
-        {:blocked, remediation_prompt(verdict, next_iteration, settings.max_iterations), verdict.comments}
+        conclude_request_changes(review_context, verdict, attempt)
 
       {:error, reason} ->
         if attempt < @max_verdict_attempts do
@@ -307,9 +416,64 @@ defmodule SymphonyElixir.ReviewGate do
 
           run_iteration(review_context, attempt + 1, reason)
         else
-          fail_open(issue, iteration, {:verdict_unreadable, reason}, opts)
+          conclude_inconclusive(
+            issue,
+            review_context,
+            attempt,
+            {:verdict_unreadable, reason},
+            "Repair verdict production, then start a fresh orchestration run and re-attempt the gated handoff for the candidate SHA."
+          )
         end
     end
+  end
+
+  defp conclude_request_changes(%{issue: %Issue{} = issue, iteration: iteration} = context, verdict, attempt) do
+    next_iteration = iteration + 1
+    request_outcome = request_changes_outcome(context, verdict, next_iteration, attempt)
+    put_iteration(issue.id, next_iteration)
+    put_latest_outcome(issue.id, request_outcome)
+    finalize_request_changes(context, verdict, request_outcome)
+  end
+
+  defp finalize_request_changes(context, _verdict, request_outcome)
+       when request_outcome.iteration >= request_outcome.max_iterations do
+    outcome =
+      budget_outcome(
+        context.settings,
+        request_outcome.iteration,
+        context.reviewed_sha,
+        request_outcome
+      )
+
+    put_terminal_outcome(context.issue.id, outcome)
+
+    maybe_write_section(
+      context.workspace,
+      context.pr,
+      :thorough,
+      budget_human_review(outcome.iteration),
+      context.settings,
+      context.opts
+    )
+
+    note_budget_exhausted(context.issue, outcome, context.opts)
+    emit_outcome_telemetry(context.issue, outcome)
+    {:budget_exhausted_with_findings, outcome}
+  end
+
+  defp finalize_request_changes(context, verdict, outcome) do
+    maybe_write_section(
+      context.workspace,
+      context.pr,
+      verdict.review_effort,
+      verdict.human_review,
+      context.settings,
+      context.opts
+    )
+
+    emit_outcome_telemetry(context.issue, outcome)
+
+    {:request_changes, remediation_prompt(verdict, outcome.iteration, outcome.max_iterations), outcome}
   end
 
   # --- PR human-review section ---------------------------------------------
@@ -329,7 +493,7 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp budget_human_review(iterations) do
     """
-    Automated review ran #{iterations} change-request #{pluralize(iterations, "pass", "passes")} without converging, so this PR was allowed through **without a clean approval**. Treat it as elevated risk and review carefully end-to-end. The latest unresolved reviewer findings are in the run transcript and the `## Codex Workpad` comment on the linked issue.
+    Automated review ran #{iterations} change-request #{pluralize(iterations, "pass", "passes")} without converging. The handoff was **withheld and remains unapproved by automation**. A human must resolve or explicitly accept the latest findings before a fresh orchestration run may review the resulting candidate. Treat this PR as elevated risk and review carefully end-to-end. The unresolved findings are preserved in the run transcript and the linked issue escalation note.
     """
     |> String.trim()
   end
@@ -342,6 +506,12 @@ defmodule SymphonyElixir.ReviewGate do
   defp run_review_session(ctx, opts) do
     runner = Keyword.get(opts, :session_runner, &default_session_runner/1)
     runner.(ctx)
+  rescue
+    error ->
+      {:error, {:reviewer_exception, %{exception: error.__struct__, message: Exception.message(error)}}}
+  catch
+    kind, reason ->
+      {:error, {:reviewer_crash, kind, reason}}
   end
 
   defp default_session_runner(%{
@@ -660,7 +830,7 @@ defmodule SymphonyElixir.ReviewGate do
     Reviewer comments:
     #{format_comments(comments)}
 
-    Keep the issue in In Progress. Address the comments above — update code, tests, or docs, or post a justified pushback in the workpad — then re-attempt the handoff. The reviewer will run again on your next attempt; after #{max_iterations} passes the handoff proceeds to In Review for a human regardless.
+    Keep the issue in In Progress. Address the comments above — update code, tests, or docs, or post a justified pushback in the workpad — then re-attempt the handoff. The reviewer will run again on your next attempt. After #{max_iterations} request-change passes Symphony stops automated review and escalates the unresolved findings for an explicit human decision; it does not treat budget exhaustion as approval.
     """
     |> String.trim()
   end
@@ -682,43 +852,185 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp comment_location(_comment), do: ""
 
-  defp fail_open(%Issue{} = issue, iteration, reason, opts) do
-    Logger.warning("review.gate fail-open #{issue_context(issue)} reason=#{inspect(reason)}; allowing handoff")
-    note_review_skipped(issue, reason, opts)
-    emit_telemetry(issue, iteration, :skipped, 0, nil)
-    :ok
+  defp approved_outcome(%{settings: settings, iteration: iteration, reviewed_sha: reviewed_sha}, verdict, attempt) do
+    %ReviewOutcome{
+      outcome: :approved,
+      iteration: iteration + 1,
+      max_iterations: settings.max_iterations,
+      reviewed_sha: reviewed_sha,
+      summary: verdict.summary,
+      review_effort: verdict.review_effort,
+      attempts: attempt,
+      authoritative: present_sha?(reviewed_sha),
+      findings: verdict.comments,
+      severity_counts: severity_counts(verdict.comments),
+      resume_condition: "Apply the deferred handoff only if this reviewed SHA is still the exact candidate head."
+    }
   end
 
-  defp note_budget_exhausted(%Issue{} = issue, iteration, opts) do
-    note_once(@budget_noted_key, issue, opts, fn ->
+  defp request_changes_outcome(
+         %{settings: settings, reviewed_sha: reviewed_sha},
+         verdict,
+         iteration,
+         attempt
+       ) do
+    %ReviewOutcome{
+      outcome: :request_changes,
+      iteration: iteration,
+      max_iterations: settings.max_iterations,
+      reviewed_sha: reviewed_sha,
+      summary: verdict.summary,
+      review_effort: verdict.review_effort,
+      attempts: attempt,
+      findings: verdict.comments,
+      severity_counts: severity_counts(verdict.comments),
+      resume_condition: "Resolve or explicitly rebut every blocking finding, update the candidate head if needed, and re-attempt automated review."
+    }
+  end
+
+  defp inconclusive_outcome(settings, iteration, reviewed_sha, reason, resume_condition) do
+    %ReviewOutcome{
+      outcome: :automation_inconclusive,
+      iteration: iteration + 1,
+      max_iterations: settings.max_iterations,
+      reviewed_sha: reviewed_sha,
+      failure_reason: reason,
+      resume_condition: resume_condition
+    }
+  end
+
+  defp infrastructure_outcome(settings, iteration, reviewed_sha, reason, resume_condition, attempts) do
+    %ReviewOutcome{
+      outcome: :infrastructure_unavailable,
+      iteration: iteration + 1,
+      max_iterations: settings.max_iterations,
+      reviewed_sha: reviewed_sha,
+      failure_reason: reason,
+      attempts: attempts,
+      resume_condition: resume_condition
+    }
+  end
+
+  defp budget_outcome(settings, iteration, reviewed_sha, %ReviewOutcome{} = latest) do
+    %ReviewOutcome{
+      outcome: :budget_exhausted_with_findings,
+      iteration: iteration,
+      max_iterations: settings.max_iterations,
+      reviewed_sha: latest.reviewed_sha || reviewed_sha,
+      summary: latest.summary,
+      failure_reason: :review_budget_exhausted,
+      review_effort: :thorough,
+      findings: latest.findings,
+      severity_counts: latest.severity_counts,
+      resume_condition:
+        "A human must resolve or explicitly accept the listed findings. After that decision and any required code/head change, start a fresh orchestration run for a new exact-head review."
+    }
+  end
+
+  defp budget_outcome(settings, iteration, reviewed_sha, _latest) do
+    %ReviewOutcome{
+      outcome: :budget_exhausted_with_findings,
+      iteration: iteration,
+      max_iterations: settings.max_iterations,
+      reviewed_sha: reviewed_sha,
+      failure_reason: :review_budget_exhausted,
+      review_effort: :thorough,
+      resume_condition:
+        "A human must inspect the run evidence and record a decision. After that decision and any required code/head change, start a fresh orchestration run for a new exact-head review."
+    }
+  end
+
+  defp conclude_inconclusive(issue, review_context, attempt, reason, resume_condition) do
+    outcome =
+      review_context.settings
+      |> inconclusive_outcome(
+        review_context.iteration,
+        review_context.reviewed_sha,
+        reason,
+        resume_condition
+      )
+      |> Map.put(:attempts, attempt)
+
+    Logger.warning("review.gate inconclusive #{issue_context(issue)} reason=#{inspect(reason)}; withholding handoff")
+    note_nonapproval(issue, outcome, review_context.opts)
+    put_terminal_outcome(issue.id, outcome)
+    emit_outcome_telemetry(issue, outcome)
+    {:automation_inconclusive, outcome}
+  end
+
+  defp conclude_infrastructure_failure(issue, review_context, attempt, reason, opts) do
+    classified = SymphonyElixir.AgentFailure.classify(reason, backend: "codex")
+
+    outcome =
+      infrastructure_outcome(
+        review_context.settings,
+        review_context.iteration,
+        review_context.reviewed_sha,
+        %{class: classified.class, reason: reason},
+        "Restore reviewer tool/auth/runtime availability, then start a fresh orchestration run and re-attempt review for the candidate SHA.",
+        attempt
+      )
+
+    Logger.warning("review.gate infrastructure unavailable #{issue_context(issue)} reason=#{inspect(reason)}; withholding handoff")
+    note_nonapproval(issue, outcome, opts)
+    put_terminal_outcome(issue.id, outcome)
+    emit_outcome_telemetry(issue, outcome)
+    {:infrastructure_unavailable, outcome}
+  end
+
+  defp note_budget_exhausted(%Issue{} = issue, %ReviewOutcome{} = outcome, opts) do
+    note_once(@budget_noted_key, issue, outcome.outcome, opts, fn ->
       """
       #{@budget_marker}
-      Automated review reached #{iteration} change-request passes without converging. Proceeding to In Review for human review; the latest reviewer comments are in the run transcript for `#{issue.identifier}`.
+      Automated review outcome: `budget_exhausted_with_findings` (not approved).
+
+      Candidate SHA: `#{sha_label(outcome.reviewed_sha)}`
+      Change-request passes: #{outcome.iteration} of #{outcome.max_iterations}
+      Severity counts: #{format_severity_counts(outcome.severity_counts)}
+
+      Latest reviewer summary:
+      #{blank_to_placeholder(outcome.summary, "(no summary provided)")}
+
+      Unresolved findings:
+      #{format_comments(outcome.findings)}
+
+      Resume/escalation condition: #{outcome.resume_condition}
       """
     end)
 
-    Logger.info("review.gate budget exhausted #{issue_context(issue)} iterations=#{iteration}; allowing handoff")
+    Logger.warning("review.gate budget exhausted #{issue_context(issue)} iterations=#{outcome.iteration}; withholding handoff for human decision")
     :ok
   end
 
-  defp note_review_skipped(%Issue{} = issue, reason, opts) do
-    note_once(@skip_noted_key, issue, opts, fn ->
+  defp note_nonapproval(%Issue{} = issue, %ReviewOutcome{} = outcome, opts) do
+    note_once(@skip_noted_key, issue, outcome.outcome, opts, fn ->
       """
       #{@skip_marker}
-      Automated review was skipped before this In Review handoff (reason: `#{inspect(reason)}`). The handoff was allowed without an automated review pass; review manually.
+      Automated review outcome: `#{outcome.outcome}` (not approved).
+
+      Candidate SHA: `#{sha_label(outcome.reviewed_sha)}`
+      Review iteration: #{outcome.iteration} of #{outcome.max_iterations}
+      Failure reason: `#{inspect(outcome.failure_reason)}`
+      Severity counts: #{format_severity_counts(outcome.severity_counts)}
+
+      Preserved findings:
+      #{format_comments(outcome.findings)}
+
+      Resume/escalation condition: #{outcome.resume_condition}
       """
     end)
   end
 
   # Post a Linear note at most once per run per issue (the gate can be hit on
   # repeated handoff attempts within a single run).
-  defp note_once(flag_key, %Issue{id: issue_id}, opts, body_fun) do
+  defp note_once(flag_key, %Issue{id: issue_id}, discriminator, opts, body_fun) do
     seen = Process.get(flag_key, MapSet.new())
+    note_key = {issue_id, discriminator}
 
-    if MapSet.member?(seen, issue_id) do
+    if MapSet.member?(seen, note_key) do
       :ok
     else
-      Process.put(flag_key, MapSet.put(seen, issue_id))
+      Process.put(flag_key, MapSet.put(seen, note_key))
       comment_fn = Keyword.get(opts, :comment_fn, &Tracker.create_comment/2)
 
       case comment_fn.(issue_id, String.trim(body_fun.()) <> "\n") do
@@ -742,6 +1054,37 @@ defmodule SymphonyElixir.ReviewGate do
     :ok
   end
 
+  defp latest_outcome(issue_id) do
+    @latest_outcome_key
+    |> Process.get(%{})
+    |> Map.get(issue_id)
+  end
+
+  defp put_latest_outcome(issue_id, %ReviewOutcome{} = outcome) do
+    outcomes = Process.get(@latest_outcome_key, %{})
+    Process.put(@latest_outcome_key, Map.put(outcomes, issue_id, outcome))
+    :ok
+  end
+
+  defp clear_latest_outcome(issue_id) do
+    outcomes = Process.get(@latest_outcome_key, %{})
+    Process.put(@latest_outcome_key, Map.delete(outcomes, issue_id))
+    :ok
+  end
+
+  defp terminal_outcome(issue_id, reviewed_sha) do
+    case Process.get(@terminal_outcome_key, %{}) |> Map.get(issue_id) do
+      %ReviewOutcome{reviewed_sha: ^reviewed_sha} = outcome -> outcome
+      _outcome -> nil
+    end
+  end
+
+  defp put_terminal_outcome(issue_id, %ReviewOutcome{} = outcome) do
+    outcomes = Process.get(@terminal_outcome_key, %{})
+    Process.put(@terminal_outcome_key, Map.put(outcomes, issue_id, outcome))
+    :ok
+  end
+
   # --- settings ------------------------------------------------------------
 
   defp review_settings(%{config: config}) when is_map(config) do
@@ -757,6 +1100,10 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp review_settings(_review_workflow) do
+    default_review_settings()
+  end
+
+  defp default_review_settings do
     %{
       max_iterations: @default_max_iterations,
       verdict_path: @default_verdict_path,
@@ -768,22 +1115,34 @@ defmodule SymphonyElixir.ReviewGate do
 
   # --- telemetry -----------------------------------------------------------
 
-  defp emit_telemetry(%Issue{} = issue, iteration, outcome, comment_count, review_effort) do
+  defp emit_outcome_telemetry(%Issue{} = issue, %ReviewOutcome{} = outcome) do
     :telemetry.execute(
       @telemetry_event,
-      %{count: 1, iteration: iteration, comments: comment_count},
+      %{
+        count: 1,
+        iteration: outcome.iteration,
+        comments: length(outcome.findings),
+        unresolved_findings: length(outcome.findings)
+      },
       %{
         event: "gate.review",
         issue_id: issue.id,
         issue_identifier: issue.identifier,
         from_state: issue.state,
-        iteration: iteration,
-        outcome: outcome,
-        review_effort: review_effort
+        iteration: outcome.iteration,
+        max_iterations: outcome.max_iterations,
+        outcome: outcome.outcome,
+        reviewed_sha: outcome.reviewed_sha,
+        authoritative: outcome.authoritative,
+        severity_counts: outcome.severity_counts,
+        failure_reason: outcome.failure_reason,
+        review_effort: outcome.review_effort
       }
     )
 
-    Logger.info("gate.review #{issue_context(issue)} iteration=#{iteration} outcome=#{outcome} comments=#{comment_count} review_effort=#{inspect(review_effort)}")
+    Logger.info(
+      "gate.review #{issue_context(issue)} iteration=#{outcome.iteration} outcome=#{outcome.outcome} reviewed_sha=#{sha_label(outcome.reviewed_sha)} findings=#{length(outcome.findings)} severity_counts=#{inspect(outcome.severity_counts)} review_effort=#{inspect(outcome.review_effort)}"
+    )
   end
 
   # --- small helpers -------------------------------------------------------
@@ -814,6 +1173,35 @@ defmodule SymphonyElixir.ReviewGate do
       trimmed -> trimmed
     end
   end
+
+  defp severity_counts(findings) when is_list(findings) do
+    Enum.reduce(findings, %{}, fn finding, counts ->
+      severity =
+        finding
+        |> Map.get(:severity, "comment")
+        |> to_string()
+        |> String.trim()
+        |> String.downcase()
+        |> case do
+          "" -> "comment"
+          value -> value
+        end
+
+      Map.update(counts, severity, 1, &(&1 + 1))
+    end)
+  end
+
+  defp format_severity_counts(counts) when map_size(counts) == 0, do: "none recorded"
+
+  defp format_severity_counts(counts) do
+    counts
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map_join(", ", fn {severity, count} -> "#{severity}=#{count}" end)
+  end
+
+  defp present_sha?(value), do: is_binary(value) and String.trim(value) != ""
+  defp sha_label(value) when is_binary(value) and value != "", do: value
+  defp sha_label(_value), do: "unavailable"
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{identifier || "n/a"}"

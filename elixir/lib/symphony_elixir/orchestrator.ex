@@ -452,6 +452,7 @@ defmodule SymphonyElixir.Orchestrator do
       ])
       |> Map.put(:lifecycle_state, :implementing)
       |> Map.put(:lifecycle_started_at, now)
+      |> Map.put(:review_state, Map.get(metadata, :review_state))
     else
       running_entry
     end
@@ -1998,6 +1999,7 @@ defmodule SymphonyElixir.Orchestrator do
           turn_count: Map.get(metadata, :turn_count, 0),
           lifecycle_state: Map.get(metadata, :lifecycle_state, :implementing),
           lifecycle_started_at: Map.get(metadata, :lifecycle_started_at),
+          review_state: Map.get(metadata, :review_state),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,

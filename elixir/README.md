@@ -46,6 +46,15 @@ with explicit instructions to end the turn without retrying the mutation. If the
 an attached GitHub PR URL, the review gate uses that PR directly for the human-review section;
 otherwise it falls back to the current workspace branch's PR.
 
+The reviewer is fail-safe. Its terminal outcomes are `approved`, `request_changes`,
+`automation_inconclusive`, `infrastructure_unavailable`, and
+`budget_exhausted_with_findings`. Only `approved` for the exact pinned candidate SHA may apply the
+captured Linear mutation. Missing or malformed verdicts, reviewer timeout/crash/tool/auth failures,
+and unresolved findings at the iteration limit remain visibly unapproved. Symphony posts a
+marker-delimited, note-once escalation containing the candidate SHA, passes attempted, failure
+reason, severity counts, findings, and resume condition; the runtime API and dashboard expose the
+same review state.
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -276,13 +285,21 @@ Notes:
   transition and the parsed gate remediation is included in the next agent turn.
 - If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
   implementor turn that requested the handoff has closed, and applies the captured Linear
-  transition only after the reviewer approves or the configured review budget is exhausted.
+  transition only after an authoritative approval for the exact candidate SHA. Request changes,
+  inconclusive automation, reviewer infrastructure failures, and review-budget exhaustion all
+  withhold the transition and preserve the latest evidence for human resolution.
   The issue remains claimed in a distinct `handoff_pending_review` lifecycle while that reviewer
   runs, so the completed implementor is not mistaken for a stalled turn. Reviewer events emit a
   minimal, job-scoped heartbeat that refreshes worker activity without replacing implementor
   session or token accounting; a silent reviewer is timed out with a review-specific log and retry.
   Symphony also pins the reviewed PR head and rechecks it before applying the transition, so a push
   during review requires a fresh handoff review.
+  Reviewer session/verdict failures receive one bounded retry and are then latched for that
+  candidate during the current orchestration run; budget exhaustion is likewise latched and never
+  spawns another reviewer in that run. To recover, repair reviewer tool/auth/runtime or verdict
+  production, then start a fresh orchestration run (or attach/update the candidate head). For
+  `budget_exhausted_with_findings`, a human must explicitly resolve or accept the recorded findings;
+  Symphony never converts the cost limit into automated approval.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

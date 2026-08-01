@@ -149,6 +149,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(entry)
     }
+    |> maybe_put_review(entry)
   end
 
   defp retry_entry_payload(entry) do
@@ -204,6 +205,14 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(running)
     }
+    |> maybe_put_review(running)
+  end
+
+  defp maybe_put_review(payload, entry) do
+    case Map.get(entry, :review_state) do
+      review when is_map(review) -> Map.put(payload, :review, review)
+      _review -> payload
+    end
   end
 
   # The actual backend + model/effort the run is using, captured from the running

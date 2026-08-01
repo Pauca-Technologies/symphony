@@ -412,7 +412,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "deferred review handoff on abnormal turn completion" do
-    test "runs the captured handoff instead of dropping it when the turn aborts" do
+    test "runs the captured gate but withholds mutation when review is inconclusive" do
       workspace =
         Path.join(System.tmp_dir!(), "symphony-fix2-#{System.unique_integer([:positive])}")
 
@@ -427,15 +427,15 @@ defmodule SymphonyElixir.AgentRunnerTest do
         labels: []
       }
 
-      # Records the Linear handoff mutation `apply_deferred_review_handoff/1`
-      # fires once the (no-PR) reviewer gate approves.
+      # Records any unexpected Linear handoff mutation. A missing required PR
+      # is now explicitly inconclusive and must never be treated as approval.
       linear_client = fn query, variables, _opts ->
         send(test_pid, {:handoff_mutation_applied, query, variables})
         {:ok, %{"data" => %{}}}
       end
 
-      # No PR present -> the gate skips the reviewer and allows the handoff
-      # (a deterministic `:ok`), so no reviewer session is spawned.
+      # No PR present -> the gate does not spawn a reviewer, but it withholds
+      # the deferred mutation and preserves a non-approval outcome.
       no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
 
       review_workflow = %{
@@ -481,10 +481,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                  nil
                )
 
-      # The handoff mutation was applied despite the abnormal turn — it was not
-      # silently dropped with the dying task's process dictionary.
-      assert_received {:handoff_mutation_applied, query, _variables}
-      assert query =~ "issueUpdate"
+      refute_received {:handoff_mutation_applied, _query, _variables}
     end
   end
 
@@ -778,6 +775,22 @@ defmodule SymphonyElixir.AgentRunnerTest do
       send(runner_pid, :release_review_preflight)
 
       assert :ok = Task.await(task, 2_000)
+
+      assert_receive {:lifecycle_call, {:agent_lifecycle, "issue-preflight", :handoff_pending_review, %{review_key: {:pull_request, "issue-preflight", "PR_preflight", "head-preflight"}}}},
+                     1_000
+
+      assert_receive {:lifecycle_call,
+                      {:agent_lifecycle, "issue-preflight", :implementing,
+                       %{
+                         review_outcome: :approved,
+                         review_state: %{
+                           outcome: "approved",
+                           reviewed_sha: "head-preflight",
+                           iteration: 1,
+                           severity_counts: %{}
+                         }
+                       }}},
+                     1_000
     end
 
     test "live orchestrator does not redispatch while the shared runner reviews" do

@@ -51,7 +51,12 @@ defmodule SymphonyElixir.ReviewGateTest do
   defp pr_runner(test_pid \\ nil) do
     fn
       ["pr", "view" | _], _cwd ->
-        {Jason.encode!(%{"id" => "PR_7", "number" => 7, "body" => "Existing PR body."}), 0}
+        {Jason.encode!(%{
+           "id" => "PR_7",
+           "number" => 7,
+           "body" => "Existing PR body.",
+           "headRefOid" => "head-7"
+         }), 0}
 
       ["api", "graphql" | _] = args, _cwd ->
         if test_pid, do: send(test_pid, {:pr_edit, graphql_body_arg(args)})
@@ -68,11 +73,57 @@ defmodule SymphonyElixir.ReviewGateTest do
   test "approve verdict allows the handoff", %{workspace: workspace} do
     runner = verdict_runner(%{"verdict" => "approve", "summary" => "looks good", "comments" => []})
 
-    assert :ok =
+    assert {:approved, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner()
              )
+
+    assert outcome.outcome == :approved
+    assert outcome.authoritative
+    assert outcome.reviewed_sha == "head-7"
+  end
+
+  test "resolved PR without head SHA does not borrow workspace HEAD authority", %{
+    workspace: workspace
+  } do
+    {_, 0} = System.cmd("git", ["-C", workspace, "init", "--quiet"])
+    File.write!(Path.join(workspace, "README.md"), "candidate\n")
+    {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md"])
+
+    {_, 0} =
+      System.cmd("git", [
+        "-C",
+        workspace,
+        "-c",
+        "user.name=Symphony Test",
+        "-c",
+        "user.email=symphony@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "candidate"
+      ])
+
+    {workspace_head, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+    assert String.trim(workspace_head) != ""
+
+    unpinned_pr_runner = fn
+      ["pr", "view" | _], _cwd ->
+        {Jason.encode!(%{"id" => "PR_unpinned", "number" => 8, "body" => "Body."}), 0}
+
+      ["api", "graphql" | _], _cwd ->
+        {"", 0}
+    end
+
+    assert {:approved, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: verdict_runner(%{"verdict" => "approve"}),
+               pr_runner: unpinned_pr_runner
+             )
+
+    assert outcome.reviewed_sha == nil
+    refute outcome.authoritative
   end
 
   test "request_changes blocks with the reviewer comments as remediation", %{workspace: workspace} do
@@ -85,67 +136,92 @@ defmodule SymphonyElixir.ReviewGateTest do
         ]
       })
 
-    assert {:blocked, remediation, [comment]} =
+    assert {:request_changes, remediation, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner()
              )
+
+    assert [comment] = outcome.findings
 
     assert remediation =~ "requested changes (review pass 1 of 3)"
     assert remediation =~ "needs work"
     assert remediation =~ "app/foo.ts:12"
     assert remediation =~ "guard the nil case"
     assert %{severity: "blocker", file: "app/foo.ts", line: 12, body: "guard the nil case"} = comment
+    assert outcome.severity_counts == %{"blocker" => 1}
   end
 
-  test "loops up to max_iterations then allows the handoff with a one-time note", %{workspace: workspace} do
+  test "budget exhaustion preserves findings, never approves, and does not spawn more reviewers", %{workspace: workspace} do
     test_pid = self()
+    Process.put(:budget_review_runs, 0)
 
-    runner =
-      verdict_runner(%{
+    runner = fn ctx ->
+      Process.put(:budget_review_runs, Process.get(:budget_review_runs, 0) + 1)
+
+      verdict = %{
         "verdict" => "request_changes",
         "summary" => "still not there",
         "comments" => [%{"severity" => "major", "body" => "fix it"}]
-      })
+      }
+
+      File.mkdir_p!(Path.dirname(ctx.verdict_path))
+      File.write!(ctx.verdict_path, Jason.encode!(verdict))
+      {:ok, %{}}
+    end
 
     opts = [session_runner: runner, comment_fn: capture_comments(test_pid), pr_runner: pr_runner()]
 
-    # Three change-request passes, numbered 1..3.
-    assert {:blocked, p1, _} = ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+    # The first two change-request passes return remediation.
+    assert {:request_changes, p1, _} = ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
     assert p1 =~ "pass 1 of 3"
-    assert {:blocked, p2, _} = ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+    assert {:request_changes, p2, _} = ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
     assert p2 =~ "pass 2 of 3"
-    assert {:blocked, p3, _} = ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
-    assert p3 =~ "pass 3 of 3"
 
     refute_received {:review_comment, _, _}
 
-    # Budget spent: the next attempt is allowed and posts exactly one note.
-    assert :ok = ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+    # The third verdict consumes the budget and escalates immediately.
+    assert {:budget_exhausted_with_findings, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+
+    refute outcome.authoritative
+    assert outcome.findings == [%{severity: "major", file: nil, line: nil, body: "fix it"}]
+    assert outcome.severity_counts == %{"major" => 1}
+    assert Process.get(:budget_review_runs) == 3
     assert_received {:review_comment, "issue-1", body}
     assert body =~ "symphony:review-budget-exhausted"
+    assert body =~ "budget_exhausted_with_findings"
+    assert body =~ "[major] fix it"
+    assert body =~ "start a fresh orchestration run"
 
-    # A further attempt still allows, without re-posting the note.
-    assert :ok = ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+    assert {:budget_exhausted_with_findings, repeated} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+
+    assert repeated.findings == outcome.findings
+    assert Process.get(:budget_review_runs) == 3
     refute_received {:review_comment, _, _}
   end
 
-  test "fails open and notes when the reviewer session errors", %{workspace: workspace} do
+  test "reviewer crash is infrastructure_unavailable, latched, and never approves", %{workspace: workspace} do
     test_pid = self()
 
     runner = fn ctx ->
       attempt = Process.get(:review_attempt, 0) + 1
       Process.put(:review_attempt, attempt)
       send(test_pid, {:review_attempt, attempt, ctx.prompt})
-      {:error, :boom}
+      raise "reviewer crashed"
     end
 
-    assert :ok =
+    assert {:infrastructure_unavailable, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                comment_fn: capture_comments(test_pid),
                pr_runner: pr_runner()
              )
+
+    assert outcome.outcome == :infrastructure_unavailable
+    assert outcome.failure_reason.class == :agent_protocol_failure
+    refute outcome.authoritative
 
     assert_received {:review_attempt, 1, first_prompt}
     assert first_prompt =~ "Review UDPE-1"
@@ -159,6 +235,74 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_comment, "issue-1", body}
     assert body =~ "symphony:review-skipped"
     assert body =~ "review_session_failed"
+
+    assert {:infrastructure_unavailable, repeated} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               comment_fn: capture_comments(test_pid),
+               pr_runner: pr_runner()
+             )
+
+    assert repeated == outcome
+    assert Process.get(:review_attempt) == 2
+    refute_received {:review_comment, _, _}
+  end
+
+  for {label, reason, expected_class} <- [
+        {"timeout", {:turn_timeout, 60_000}, :response_timeout_or_stall},
+        {"tool failure", {:tool_error, :unavailable}, :agent_protocol_failure},
+        {"authentication failure", :unauthorized, :authentication_configuration}
+      ] do
+    test "#{label} is an explicit infrastructure_unavailable outcome", %{workspace: workspace} do
+      issue = %{issue() | id: "issue-#{unquote(label)}"}
+      runner = fn _ctx -> {:error, unquote(Macro.escape(reason))} end
+
+      assert {:infrastructure_unavailable, outcome} =
+               ReviewGate.run(workspace, issue, nil, review_workflow(),
+                 session_runner: runner,
+                 pr_runner: pr_runner(),
+                 comment_fn: fn _issue_id, _body -> :ok end
+               )
+
+      assert outcome.failure_reason.class == unquote(expected_class)
+      refute outcome.authoritative
+    end
+  end
+
+  test "a later request_changes verdict replaces approval evidence", %{workspace: workspace} do
+    runner = fn ctx ->
+      verdict =
+        case Process.get(:stale_approval_pass, 0) do
+          0 ->
+            %{"verdict" => "approve", "summary" => "first pass approved"}
+
+          _ ->
+            %{
+              "verdict" => "request_changes",
+              "summary" => "new blocker",
+              "comments" => [%{"severity" => "blocker", "body" => "do not hand off"}]
+            }
+        end
+
+      Process.put(:stale_approval_pass, Process.get(:stale_approval_pass, 0) + 1)
+      File.mkdir_p!(Path.dirname(ctx.verdict_path))
+      File.write!(ctx.verdict_path, Jason.encode!(verdict))
+      {:ok, %{}}
+    end
+
+    opts = [session_runner: runner, pr_runner: pr_runner()]
+
+    assert {:approved, approved} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+
+    assert approved.authoritative
+
+    assert {:request_changes, _prompt, changes} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
+
+    refute changes.authoritative
+    assert changes.summary == "new blocker"
+    assert changes.severity_counts == %{"blocker" => 1}
   end
 
   test "retries once when the reviewer session fails before producing a verdict", %{workspace: workspace} do
@@ -188,12 +332,14 @@ defmodule SymphonyElixir.ReviewGateTest do
       end
     end
 
-    assert :ok =
+    assert {:approved, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                comment_fn: capture_comments(test_pid),
                pr_runner: pr_runner(test_pid)
              )
+
+    assert outcome.attempts == 2
 
     assert_received {:review_session_attempt, 1, _first_prompt}
     assert_received {:review_session_attempt, 2, retry_prompt}
@@ -204,7 +350,7 @@ defmodule SymphonyElixir.ReviewGateTest do
     refute_received {:review_comment, _, _}
   end
 
-  test "fails open when no verdict file is written (clears stale verdicts first)", %{workspace: workspace} do
+  test "missing verdict is automation_inconclusive and clears stale approval", %{workspace: workspace} do
     test_pid = self()
 
     # Stale verdict from a previous run must not be trusted.
@@ -214,12 +360,15 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     runner = fn _ctx -> {:ok, %{}} end
 
-    assert :ok =
+    assert {:automation_inconclusive, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                comment_fn: capture_comments(test_pid),
                pr_runner: pr_runner()
              )
+
+    assert outcome.failure_reason == {:verdict_unreadable, :enoent}
+    refute outcome.authoritative
 
     assert_received {:review_comment, "issue-1", body}
     assert body =~ "symphony:review-skipped"
@@ -251,12 +400,14 @@ defmodule SymphonyElixir.ReviewGateTest do
       {:ok, %{}}
     end
 
-    assert :ok =
+    assert {:approved, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                comment_fn: capture_comments(test_pid),
                pr_runner: pr_runner(test_pid)
              )
+
+    assert outcome.attempts == 2
 
     assert_received {:review_attempt, 1, first_prompt}
     assert first_prompt =~ "Review UDPE-1"
@@ -319,12 +470,14 @@ defmodule SymphonyElixir.ReviewGateTest do
       {:ok, %{}}
     end
 
-    assert :ok =
+    assert {:approved, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                comment_fn: capture_comments(test_pid),
                pr_runner: pr_runner(test_pid)
              )
+
+    assert outcome.attempts == 2
 
     assert_received {:review_interim_attempt, 1, _first_prompt}
     assert_received {:review_interim_attempt, 2, retry_prompt}
@@ -334,18 +487,21 @@ defmodule SymphonyElixir.ReviewGateTest do
     refute_received {:review_comment, _, _}
   end
 
-  test "fails open on an unparseable verdict", %{workspace: workspace} do
+  test "malformed verdict is automation_inconclusive", %{workspace: workspace} do
     runner = fn ctx ->
       File.mkdir_p!(Path.dirname(ctx.verdict_path))
       File.write!(ctx.verdict_path, "not json{")
       {:ok, %{}}
     end
 
-    assert :ok =
+    assert {:automation_inconclusive, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner()
              )
+
+    assert match?({:verdict_unreadable, %Jason.DecodeError{}}, outcome.failure_reason)
+    refute outcome.authoritative
   end
 
   test "passes reviewer events to the lifecycle heartbeat callback", %{workspace: workspace} do
@@ -358,7 +514,7 @@ defmodule SymphonyElixir.ReviewGateTest do
       {:ok, %{}}
     end
 
-    assert :ok =
+    assert {:approved, _outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner(),
@@ -368,16 +524,18 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_heartbeat, %{event: :notification}}
   end
 
-  test "honors a custom max_iterations", %{workspace: workspace} do
+  test "max_iterations one escalates on the first request_changes verdict", %{workspace: workspace} do
     runner =
       verdict_runner(%{"verdict" => "request_changes", "comments" => [%{"body" => "x"}]})
 
     wf = review_workflow(%{"max_iterations" => 1})
     opts = [session_runner: runner, pr_runner: pr_runner()]
 
-    assert {:blocked, prompt, _} = ReviewGate.run(workspace, issue(), nil, wf, opts)
-    assert prompt =~ "pass 1 of 1"
-    assert :ok = ReviewGate.run(workspace, issue(), nil, wf, opts)
+    assert {:budget_exhausted_with_findings, outcome} =
+             ReviewGate.run(workspace, issue(), nil, wf, opts)
+
+    assert outcome.findings == [%{severity: "comment", file: nil, line: nil, body: "x"}]
+    assert outcome.iteration == 1
   end
 
   test "the reviewer tool executor is read-only and gate-free", %{workspace: workspace} do
@@ -390,7 +548,7 @@ defmodule SymphonyElixir.ReviewGateTest do
       {:ok, %{}}
     end
 
-    assert :ok =
+    assert {:approved, _outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner(),
@@ -429,11 +587,13 @@ defmodule SymphonyElixir.ReviewGateTest do
         "comments" => []
       })
 
-    assert :ok =
+    assert {:approved, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner(test_pid)
              )
+
+    assert outcome.authoritative
 
     assert_received {:pr_edit, body}
     assert body =~ "<!-- symphony:review:start -->"
@@ -464,7 +624,12 @@ defmodule SymphonyElixir.ReviewGateTest do
         "id,number,body,headRefOid"
       ],
       _cwd ->
-        {Jason.encode!(%{"id" => "PR_1358", "number" => 1358, "body" => "Existing PR body."}), 0}
+        {Jason.encode!(%{
+           "id" => "PR_1358",
+           "number" => 1358,
+           "body" => "Existing PR body.",
+           "headRefOid" => "head-1358"
+         }), 0}
 
       ["pr", "view", "--json", "id,number,body,headRefOid"], _cwd ->
         flunk("must not rely on current branch PR detection when Linear has a PR attachment")
@@ -474,29 +639,34 @@ defmodule SymphonyElixir.ReviewGateTest do
         {"", 0}
     end
 
-    assert :ok =
+    assert {:approved, outcome} =
              ReviewGate.run(workspace, issue, nil, review_workflow(),
                session_runner: runner,
                pr_runner: pr_runner
              )
+
+    assert outcome.reviewed_sha == "head-1358"
 
     assert_received {:pr_edit, body}
     assert body =~ "<!-- symphony:review:start -->"
     assert body =~ "Check the handoff review path."
   end
 
-  test "skips the reviewer entirely when no PR is present (require_pr)", %{workspace: workspace} do
+  test "missing required PR is automation_inconclusive", %{workspace: workspace} do
     test_pid = self()
     runner = fn _ctx -> flunk("the reviewer session must not run without a PR") end
 
     no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
 
-    assert {:skipped, {:no_pr, :no_pr}} =
+    assert {:automation_inconclusive, outcome} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(),
                session_runner: runner,
                pr_runner: no_pr,
                comment_fn: capture_comments(test_pid)
              )
+
+    assert outcome.failure_reason == {:no_pr, :no_pr}
+    refute outcome.authoritative
 
     assert_received {:review_comment, "issue-1", body}
     assert body =~ "symphony:review-skipped"
@@ -513,8 +683,10 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     wf = review_workflow(%{"require_pr" => false})
 
-    assert :ok =
+    assert {:approved, outcome} =
              ReviewGate.run(workspace, issue(), nil, wf, session_runner: runner, pr_runner: pr_runner)
+
+    refute outcome.authoritative
   end
 
   test "budget exhaustion refreshes the section to elevated risk", %{workspace: workspace} do
@@ -528,25 +700,33 @@ defmodule SymphonyElixir.ReviewGateTest do
         "comments" => [%{"body" => "fix"}]
       })
 
-    wf = review_workflow(%{"max_iterations" => 1})
+    wf = review_workflow(%{"max_iterations" => 2})
     opts = [session_runner: runner, pr_runner: pr_runner(test_pid), comment_fn: capture_comments(test_pid)]
 
     # Pass 1: request_changes -> section reflects the reviewer's medium tier.
-    assert {:blocked, _, _} = ReviewGate.run(workspace, issue(), nil, wf, opts)
+    assert {:request_changes, _, _} = ReviewGate.run(workspace, issue(), nil, wf, opts)
     assert_received {:pr_edit, first_body}
     assert first_body =~ "🟠 **Focused**"
 
-    # Pass 2: budget spent -> section is overwritten to high / did-not-converge.
-    assert :ok = ReviewGate.run(workspace, issue(), nil, wf, opts)
+    # Pass 2 consumes the budget -> section is overwritten immediately to high / did-not-converge.
+    assert {:budget_exhausted_with_findings, outcome} =
+             ReviewGate.run(workspace, issue(), nil, wf, opts)
+
+    assert outcome.outcome == :budget_exhausted_with_findings
     assert_received {:pr_edit, second_body}
     assert second_body =~ "🔴 **Thorough**"
     assert second_body =~ "without converging"
+    assert second_body =~ "handoff was **withheld"
+    assert second_body =~ "remains unapproved by automation"
+    refute second_body =~ "allowed through"
   end
 
-  test "returns :ok for issues without an id (fail open)", %{workspace: workspace} do
+  test "invalid review context is automation_inconclusive", %{workspace: workspace} do
     runner = fn _ctx -> flunk("session should not run without an issue id") end
 
-    assert :ok =
+    assert {:automation_inconclusive, outcome} =
              ReviewGate.run(workspace, %Issue{identifier: "UDPE-9"}, nil, review_workflow(), session_runner: runner)
+
+    assert outcome.failure_reason == :invalid_review_context
   end
 end

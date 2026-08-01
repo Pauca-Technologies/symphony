@@ -7,9 +7,25 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   # human-review section edit) without shelling real gh.
   defp stub_pr_runner do
     fn
-      ["pr", "view" | _], _cwd -> {Jason.encode!(%{"id" => "PR_7", "number" => 7, "body" => "Body."}), 0}
-      ["api", "graphql" | _], _cwd -> {"", 0}
+      ["pr", "view" | _], _cwd ->
+        {Jason.encode!(%{
+           "id" => "PR_7",
+           "number" => 7,
+           "body" => "Body.",
+           "headRefOid" => "head-7"
+         }), 0}
+
+      ["api", "graphql" | _], _cwd ->
+        {"", 0}
     end
+  end
+
+  defp review_workflow(review_config) do
+    %{
+      config: %{"review" => review_config},
+      prompt: "Review {{ issue.identifier }}",
+      prompt_template: "Review {{ issue.identifier }}"
+    }
   end
 
   test "tool_specs advertises the server-authenticated Linear tool contracts" do
@@ -372,10 +388,13 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert_received {:review_issue_state, "In Progress"}
 
     output = Jason.decode!(response["output"])
-    assert get_in(output, ["error", "message"]) =~ "Automated reviewer requested changes"
+    assert get_in(output, ["error", "message"]) =~ "Automated review did not approve"
     assert get_in(output, ["error", "remediation"]) =~ "requested changes (review pass 1 of 3)"
     assert get_in(output, ["error", "remediation"]) =~ "app/x.ts"
     assert [%{"severity" => "major"}] = get_in(output, ["error", "findings"])
+    assert get_in(output, ["error", "review", "outcome"]) == "request_changes"
+    assert get_in(output, ["error", "review", "reviewed_sha"]) == "head-7"
+    assert get_in(output, ["error", "review", "severity_counts"]) == %{"major" => 1}
   end
 
   test "linear_graphql lets the transition through when the reviewer approves" do
@@ -440,6 +459,104 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == true
     assert_received :mutation_sent
+  end
+
+  test "budget exhaustion remains blocked across repeated handoff mutations without new reviewers" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-review-budget-tool-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    issue = %Issue{
+      id: "issue-budget",
+      identifier: "UDPE-BUDGET",
+      title: "Do not fail open",
+      state: "In Progress"
+    }
+
+    test_pid = self()
+
+    session_runner = fn ctx ->
+      send(test_pid, :budget_reviewer_started)
+      File.mkdir_p!(Path.dirname(ctx.verdict_path))
+
+      File.write!(
+        ctx.verdict_path,
+        Jason.encode!(%{
+          "verdict" => "request_changes",
+          "summary" => "blocking finding remains",
+          "comments" => [%{"severity" => "blocker", "body" => "fix tenant isolation"}]
+        })
+      )
+
+      {:ok, %{}}
+    end
+
+    linear_client = fn
+      query, %{"issueId" => "issue-budget"}, [] ->
+        if query =~ "SymphonyResolveIssueTransition" do
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{
+                 "state" => %{"name" => "In Progress"},
+                 "team" => %{
+                   "states" => %{
+                     "nodes" => [%{"id" => "state-review", "name" => "In Review"}]
+                   }
+                 }
+               }
+             }
+           }}
+        else
+          send(test_pid, :unexpected_budget_handoff_mutation)
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        end
+    end
+
+    arguments = %{
+      "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+      "variables" => %{"issueId" => "issue-budget", "stateId" => "state-review"}
+    }
+
+    opts = [
+      handoff_gate_context: %{
+        issue: issue,
+        workspace: workspace,
+        worker_host: nil,
+        review_workflow: review_workflow(%{"max_iterations" => 1}),
+        review_opts: [
+          session_runner: session_runner,
+          pr_runner: stub_pr_runner(),
+          comment_fn: fn _issue_id, _body -> :ok end
+        ]
+      },
+      linear_client: linear_client
+    ]
+
+    [first, second, third] =
+      Enum.map(1..3, fn _attempt ->
+        DynamicTool.execute("linear_graphql", arguments, opts)
+      end)
+
+    assert first["success"] == false
+
+    assert get_in(Jason.decode!(first["output"]), ["error", "review", "outcome"]) ==
+             "budget_exhausted_with_findings"
+
+    assert get_in(Jason.decode!(second["output"]), ["error", "review", "outcome"]) ==
+             "budget_exhausted_with_findings"
+
+    assert get_in(Jason.decode!(third["output"]), ["error", "review", "outcome"]) ==
+             "budget_exhausted_with_findings"
+
+    assert_received :budget_reviewer_started
+    refute_received :budget_reviewer_started
+    refute_received :unexpected_budget_handoff_mutation
   end
 
   test "linear_graphql defers the reviewer gate when a deferred callback is provided" do

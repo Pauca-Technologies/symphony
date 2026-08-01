@@ -45,6 +45,17 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     initial_state = :sys.get_state(pid)
     started_at = DateTime.utc_now()
 
+    review_state = %{
+      outcome: "budget_exhausted_with_findings",
+      iteration: 3,
+      max_iterations: 3,
+      reviewed_sha: "abc123exacthead",
+      authoritative: false,
+      severity_counts: %{"blocker" => 1, "major" => 2},
+      failure_reason: "review_budget_exhausted",
+      resume_condition: "Human decision required."
+    }
+
     running_entry = %{
       pid: self(),
       ref: make_ref(),
@@ -56,6 +67,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       recent_codex_events: [],
+      review_state: review_state,
       started_at: started_at
     }
 
@@ -94,6 +106,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now
+    assert snapshot_entry.review_state == review_state
 
     assert snapshot_entry.last_codex_message == %{
              event: :notification,
@@ -113,6 +126,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                timestamp: now
              }
            ]
+
+    state_payload =
+      SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 5_000)
+
+    assert [%{review: ^review_state}] = state_payload.running
+
+    assert {:ok, %{running: %{review: ^review_state}}} =
+             SymphonyElixirWeb.Presenter.issue_payload(issue.identifier, orchestrator_name, 5_000)
   end
 
   test "orchestrator snapshot captures the actual backend and model" do

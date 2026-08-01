@@ -149,7 +149,8 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
       assert_received {:review_issue_state, "In Progress"}
 
       output = tool_call_output(resp)
-      assert get_in(output, ["error", "message"]) =~ "Automated reviewer requested changes"
+      assert get_in(output, ["error", "message"]) =~ "Automated review did not approve"
+      assert get_in(output, ["error", "review", "outcome"]) == "request_changes"
       assert get_in(output, ["error", "remediation"]) =~ "app/x.ts"
     end
 

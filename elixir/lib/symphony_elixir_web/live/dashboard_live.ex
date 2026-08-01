@@ -183,6 +183,41 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </article>
           </section>
 
+          <%= if review = issue_review(@issue_payload) do %>
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Automated Review</h2>
+                  <p class="section-copy">
+                    Latest exact-head review evidence. Only <code>approved</code> may authorize the deferred handoff.
+                  </p>
+                </div>
+                <span class={state_badge_class(review_value(review, :outcome) || "unknown")}>
+                  <%= review_value(review, :outcome) || "unknown" %>
+                </span>
+              </div>
+
+              <div class="field-list">
+                <div>
+                  <span class="field-label">Reviewed SHA</span>
+                  <pre class="code-panel"><%= review_value(review, :reviewed_sha) || "unavailable" %></pre>
+                </div>
+                <div>
+                  <span class="field-label">Iteration / severity</span>
+                  <pre class="code-panel"><%= review_iteration_label(review) %> · <%= review_severity_label(review) %></pre>
+                </div>
+                <div :if={review_value(review, :failure_reason)}>
+                  <span class="field-label">Failure reason</span>
+                  <pre class="code-panel"><%= review_value(review, :failure_reason) %></pre>
+                </div>
+                <div>
+                  <span class="field-label">Resume / escalation condition</span>
+                  <pre class="code-panel"><%= review_value(review, :resume_condition) || "n/a" %></pre>
+                </div>
+              </div>
+            </section>
+          <% end %>
+
           <section class="section-card">
             <div class="section-header">
               <div>
@@ -438,6 +473,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <td>
                         <span class={state_badge_class(entry.state)}>
                           <%= entry.state %>
+                        </span>
+                        <span :if={entry[:review]} class="muted">
+                          review: <%= review_value(entry[:review], :outcome) || "unknown" %>
+                          · <%= review_iteration_label(entry[:review]) %>
                         </span>
                       </td>
                       <td>
@@ -1082,6 +1121,31 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp escape_attr(value) when is_binary(value), do: escape_html(value)
 
   defp issue_path(issue_identifier) when is_binary(issue_identifier), do: "/issues/#{issue_identifier}"
+
+  defp issue_review(%{running: %{review: review}}) when is_map(review), do: review
+  defp issue_review(_payload), do: nil
+
+  defp review_iteration_label(review) do
+    "pass #{review_value(review, :iteration) || 0}/#{review_value(review, :max_iterations) || 0}"
+  end
+
+  defp review_severity_label(review) do
+    case review_value(review, :severity_counts) do
+      counts when is_map(counts) and map_size(counts) > 0 ->
+        counts
+        |> Enum.sort_by(fn {severity, _count} -> to_string(severity) end)
+        |> Enum.map_join(", ", fn {severity, count} -> "#{severity}=#{count}" end)
+
+      _counts ->
+        "no unresolved findings"
+    end
+  end
+
+  defp review_value(review, key) when is_map(review) and is_atom(key) do
+    Map.get(review, key) || Map.get(review, Atom.to_string(key))
+  end
+
+  defp review_value(_review, _key), do: nil
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

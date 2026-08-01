@@ -855,8 +855,10 @@ Part A: Stall detection
   pending coalesce into the existing review. Before applying the captured tracker transition,
   re-resolve the PR head; if it changed, clear pending state and require a fresh review.
 - Reviewer request-changes or timeout clears pending state. Request-changes returns control to the
-  implementor, approval applies the captured tracker transition, and existing fail-open handling
-  remains in force for reviewer infrastructure/session failures.
+  implementor. Only an authoritative `approved` verdict for the exact pinned candidate head may
+  apply the captured tracker transition. Missing/malformed verdicts, reviewer infrastructure or
+  session failures, and an exhausted review budget are explicit non-approval outcomes; they retain
+  findings and escalation evidence and withhold the captured transition for human resolution.
 
 Part B: Tracker state refresh
 

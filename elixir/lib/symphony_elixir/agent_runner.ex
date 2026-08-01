@@ -18,6 +18,7 @@ defmodule SymphonyElixir.AgentRunner do
     PromptBuilder,
     RepoConfig,
     ReviewGate,
+    ReviewOutcome,
     Router,
     SessionStartHook,
     TaskContextPrompt,
@@ -764,60 +765,87 @@ defmodule SymphonyElixir.AgentRunner do
         review_key: review_key
       })
 
-    result =
+    {outcome, handoff_gate_prompt, review_outcome} =
       case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
-        :ok ->
-          apply_reviewed_handoff(request, review_key, review_opts)
+        {:approved, review_outcome} ->
+          apply_reviewed_handoff(request, review_key, review_opts, review_outcome)
 
-        {:blocked, prompt, findings} ->
-          Logger.info("review.gate deferred blocked #{issue_context(issue)} findings=#{length(findings)}")
-          {:changes_requested, prompt}
+        {:request_changes, prompt, review_outcome} ->
+          Logger.info("review.gate deferred blocked #{issue_context(issue)} findings=#{length(review_outcome.findings)}")
+          {:request_changes, prompt, review_outcome}
 
-        {:skipped, reason} ->
-          Logger.info("review.gate deferred skipped #{issue_context(issue)} reason=#{inspect(reason)}")
-          apply_skipped_review_handoff(request)
+        {terminal_outcome, %ReviewOutcome{} = review_outcome}
+        when terminal_outcome in [
+               :automation_inconclusive,
+               :infrastructure_unavailable,
+               :budget_exhausted_with_findings
+             ] ->
+          Logger.warning("review.gate deferred withheld #{issue_context(issue)} outcome=#{terminal_outcome} reason=#{inspect(review_outcome.failure_reason)}")
+
+          {terminal_outcome, review_nonapproval_prompt(issue, review_outcome), review_outcome}
       end
-
-    {outcome, handoff_gate_prompt} = result
 
     :ok =
       transition_agent_lifecycle(recipient, issue, :implementing, %{
         review_job_id: review_job_id,
-        review_outcome: outcome
+        review_outcome: outcome,
+        review_state: ReviewOutcome.to_map(review_outcome)
       })
 
     handoff_gate_prompt
   end
 
-  defp apply_reviewed_handoff(request, review_key, review_opts) do
+  defp apply_reviewed_handoff(request, review_key, review_opts, %ReviewOutcome{} = review_outcome) do
     workspace = Map.fetch!(request, :workspace)
     issue = Map.fetch!(request, :issue)
-    current_review_key = ReviewGate.current_review_key(workspace, issue, review_opts)
 
-    if review_key_pinned?(review_key) and current_review_key == review_key do
+    if ReviewGate.authoritative_for_current_head?(
+         workspace,
+         issue,
+         review_key,
+         review_opts,
+         review_outcome
+       ) do
       case apply_deferred_review_handoff(request) do
-        nil -> {:approved, nil}
-        failure_prompt -> {:handoff_failed, failure_prompt}
+        nil ->
+          {:approved, nil, review_outcome}
+
+        failure_prompt ->
+          unavailable = unavailable_review_outcome(review_outcome, :deferred_linear_mutation_failed)
+          {:infrastructure_unavailable, failure_prompt, unavailable}
       end
     else
-      Logger.warning("review.gate deferred head changed #{issue_context(issue)} reviewed_key=#{inspect(review_key)} current_key=#{inspect(current_review_key)}; withholding Linear handoff")
+      Logger.warning("review.gate deferred head changed or unpinned #{issue_context(issue)} reviewed_key=#{inspect(review_key)}; withholding Linear handoff")
 
-      {:head_changed, deferred_review_head_changed_prompt(issue)}
+      inconclusive =
+        inconclusive_review_outcome(
+          review_outcome,
+          {:review_head_unpinned_or_changed, review_key}
+        )
+
+      {:automation_inconclusive, deferred_review_head_changed_prompt(issue), inconclusive}
     end
   end
 
-  defp apply_skipped_review_handoff(request) do
-    case apply_deferred_review_handoff(request) do
-      nil -> {:review_skipped, nil}
-      failure_prompt -> {:handoff_failed, failure_prompt}
-    end
+  defp inconclusive_review_outcome(%ReviewOutcome{} = review_outcome, reason) do
+    %{
+      review_outcome
+      | outcome: :automation_inconclusive,
+        authoritative: false,
+        failure_reason: reason,
+        resume_condition: "Re-run automated review for the exact current candidate head before applying the handoff."
+    }
   end
 
-  defp review_key_pinned?({:pull_request, _issue_id, _pr_identity, head_oid}),
-    do: is_binary(head_oid) and head_oid != ""
-
-  defp review_key_pinned?({:workspace, _issue_id, head_oid}),
-    do: is_binary(head_oid) and head_oid != ""
+  defp unavailable_review_outcome(%ReviewOutcome{} = review_outcome, reason) do
+    %{
+      review_outcome
+      | outcome: :infrastructure_unavailable,
+        authoritative: false,
+        failure_reason: reason,
+        resume_condition: "Restore Linear mutation availability, then re-attempt the gated handoff; approval is not carried forward."
+    }
+  end
 
   # UDPE-6952: resolve the deferred-review timeout from the RUNNING backend's
   # own config namespace (stall timeout when positive, else turn timeout),
@@ -951,6 +979,47 @@ defmodule SymphonyElixir.AgentRunner do
     """
     |> String.trim()
   end
+
+  defp review_nonapproval_prompt(%Issue{} = issue, %ReviewOutcome{} = outcome) do
+    findings = format_review_findings(outcome.findings)
+
+    """
+    System message:
+
+    Automated review did not approve the In Progress -> In Review handoff for #{issue.identifier}.
+
+    Outcome: `#{outcome.outcome}`
+    Reviewed candidate SHA: `#{outcome.reviewed_sha || "unavailable"}`
+    Review iteration: #{outcome.iteration} of #{outcome.max_iterations}
+    Severity counts: `#{inspect(outcome.severity_counts)}`
+    Failure reason: `#{inspect(outcome.failure_reason)}`
+
+    Preserved findings:
+    #{findings}
+
+    The original Linear mutation was not applied. #{outcome.resume_condition}
+    Do not represent this outcome as automated approval in the workpad or pull request.
+    """
+    |> String.trim()
+  end
+
+  defp format_review_findings([]),
+    do: "- (no structured findings were recovered; inspect the review failure evidence)"
+
+  defp format_review_findings(findings) when is_list(findings),
+    do: Enum.map_join(findings, "\n", &format_review_finding/1)
+
+  defp format_review_finding(finding) do
+    severity = Map.get(finding, :severity, "comment")
+    location = review_finding_location(Map.get(finding, :file), Map.get(finding, :line))
+    "- #{location}[#{severity}] #{Map.get(finding, :body, "(no detail)")}"
+  end
+
+  defp review_finding_location(file, line) when is_binary(file) and is_integer(line),
+    do: "#{file}:#{line} "
+
+  defp review_finding_location(file, _line) when is_binary(file), do: "#{file} "
+  defp review_finding_location(_file, _line), do: ""
 
   defp maybe_store_handoff_gate_prompt(%{"success" => false, "output" => output}) when is_binary(output) do
     case Jason.decode(output) do

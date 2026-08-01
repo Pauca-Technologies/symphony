@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{HandoffGate, Linear.Client, ReviewGate}
+  alias SymphonyElixir.{HandoffGate, Linear.Client, ReviewGate, ReviewOutcome}
 
   @linear_graphql_tool "linear_graphql"
   @issue_transition_query """
@@ -86,12 +86,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           }
         })
 
-      {:review_blocked, prompt, findings} ->
+      {:review_blocked, prompt, findings, review_outcome} ->
         failure_response(%{
           "error" => %{
-            "message" => "Automated reviewer requested changes before the In Review handoff.",
+            "message" => "Automated review did not approve the In Review handoff.",
             "remediation" => prompt,
-            "findings" => findings
+            "findings" => findings,
+            "review" => ReviewOutcome.to_map(review_outcome)
           }
         })
 
@@ -227,12 +228,90 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         {:review_deferred, deferred_review_result(issue)}
 
       nil ->
-        case ReviewGate.run(workspace, issue, worker_host, review_workflow, review_opts) do
-          :ok -> :ok
-          {:blocked, prompt, findings} -> {:review_blocked, prompt, findings}
-          {:skipped, _reason} -> :ok
-        end
+        run_inline_review(request)
     end
+  end
+
+  defp run_inline_review(request) do
+    {review_key, pinned_opts} =
+      ReviewGate.prepare_review(request.workspace, request.issue, request.review_opts)
+
+    result =
+      ReviewGate.run(
+        request.workspace,
+        request.issue,
+        request.worker_host,
+        request.review_workflow,
+        pinned_opts
+      )
+
+    handle_inline_review_result(result, request, review_key, pinned_opts)
+  end
+
+  defp handle_inline_review_result(
+         {:approved, review_outcome},
+         request,
+         review_key,
+         pinned_opts
+       ) do
+    if ReviewGate.authoritative_for_current_head?(
+         request.workspace,
+         request.issue,
+         review_key,
+         pinned_opts,
+         review_outcome
+       ) do
+      :ok
+    else
+      block_stale_approval(review_outcome)
+    end
+  end
+
+  defp handle_inline_review_result(
+         {:request_changes, prompt, review_outcome},
+         _request,
+         _review_key,
+         _pinned_opts
+       ) do
+    {:review_blocked, prompt, review_outcome.findings, review_outcome}
+  end
+
+  defp handle_inline_review_result(
+         {terminal_outcome, %ReviewOutcome{} = review_outcome},
+         _request,
+         _review_key,
+         _pinned_opts
+       )
+       when terminal_outcome in [
+              :automation_inconclusive,
+              :infrastructure_unavailable,
+              :budget_exhausted_with_findings
+            ] do
+    {:review_blocked, review_outcome_remediation(review_outcome), review_outcome.findings, review_outcome}
+  end
+
+  defp block_stale_approval(review_outcome) do
+    stale = %{
+      review_outcome
+      | outcome: :automation_inconclusive,
+        authoritative: false,
+        failure_reason: :review_head_unpinned_or_changed,
+        resume_condition: "Pin and re-review the exact current candidate SHA before applying the handoff."
+    }
+
+    {:review_blocked, review_outcome_remediation(stale), stale.findings, stale}
+  end
+
+  defp review_outcome_remediation(%ReviewOutcome{} = outcome) do
+    """
+    Automated review outcome: `#{outcome.outcome}` (not approved).
+    Reviewed candidate SHA: `#{outcome.reviewed_sha || "unavailable"}`.
+    Review iteration: #{outcome.iteration} of #{outcome.max_iterations}.
+    Failure reason: `#{inspect(outcome.failure_reason)}`.
+
+    The Linear handoff mutation was not applied. #{outcome.resume_condition}
+    """
+    |> String.trim()
   end
 
   defp deferred_review_callback(context) do
