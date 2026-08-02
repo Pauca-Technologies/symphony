@@ -5,7 +5,7 @@ defmodule SymphonyElixir.HandoffGate do
 
   require Logger
 
-  alias SymphonyElixir.{Config, Linear.Issue, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, Telemetry, Workspace}
 
   @telemetry_event [:symphony_elixir, :gate, :before_handoff]
   @handoff_target_states MapSet.new(["in review", "human review"])
@@ -264,19 +264,35 @@ defmodule SymphonyElixir.HandoffGate do
   end
 
   defp emit_telemetry(%Issue{} = issue, target_state, outcome, breakdown) do
+    metadata = %{
+      subtype: "before_handoff",
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      parent_issue_id: issue.parent_id,
+      from_state: issue.state,
+      target_state: target_state,
+      outcome: outcome,
+      gates: breakdown,
+      checks: Enum.map(breakdown, &Map.take(&1, [:name, :status, :passed]))
+    }
+
     :telemetry.execute(
       @telemetry_event,
       %{count: 1},
-      %{
-        event: "gate.before_handoff",
+      Map.put(metadata, :event, "gate.before_handoff")
+    )
+
+    Telemetry.emit(:gate, metadata)
+
+    if outcome == :passed do
+      Telemetry.emit(:quality_outcome, %{
+        outcome: "handoff",
         issue_id: issue.id,
         issue_identifier: issue.identifier,
-        from_state: issue.state,
-        target_state: target_state,
-        outcome: outcome,
-        gates: breakdown
-      }
-    )
+        parent_issue_id: issue.parent_id,
+        target_state: target_state
+      })
+    end
 
     Logger.info("gate.before_handoff issue_id=#{issue.id || "n/a"} issue_identifier=#{issue.identifier || "n/a"} from_state=#{issue.state || "n/a"} target_state=#{target_state} outcome=#{outcome}")
   end

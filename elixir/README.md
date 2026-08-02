@@ -169,6 +169,8 @@ Notes:
   later turns on the same live thread receive
   only compact continuation guidance plus any actionable handoff or reviewer findings. Symphony
   records prompt character/byte counts and included section names without storing raw prompt text.
+  It also records SHA-256 hashes for the complete prompt and each injected section, allowing prompt
+  reuse/duplication analysis without retaining task or workflow prose.
   A newly started backend thread still receives the full first-turn prompt, including on retries,
   because it cannot safely rely on context retained by a previous process.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
@@ -368,9 +370,36 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
-- Codex session transcripts are written as NDJSON files under `./log/codex_sessions` by default,
-  or under `<logs-root>/log/codex_sessions` when `--logs-root` is set. The issue JSON endpoint
-  includes the current known transcript paths for that issue.
+- Session transcripts are written as compact, renderer-compatible NDJSON under
+  `./log/codex_sessions` by default, or under `<logs-root>/log/codex_sessions` when `--logs-root`
+  is set. Streaming text and tool-output chunks are bounded and coalesced by stream/tool identity;
+  cumulative token notifications are omitted, cumulative ACP tool updates keep their latest merged
+  state, and terminal Codex items replace their partial records. Terminal items, lifecycle, tools,
+  errors, and other semantic records remain. The issue JSON endpoint includes the current
+  known transcript paths for that issue. Existing NDJSON files and readers remain supported.
+- A redacted gzip raw sidecar (`*.raw.ndjson.gz`) is staged while a session runs. By default it is
+  retained for failed sessions and a deterministic 1% success sample, then pruned after seven days.
+  Set `observability.raw_trace_debug: true` (or `raw_trace_policy: all`) temporarily for an incident;
+  restore the default after diagnosis. `raw_trace_policy: none` disables successful-session
+  retention, while `sampled` retains successful sessions at `raw_trace_sample_rate`. Failure traces
+  are always retained for the configured window. Valid original protocol documents remain complete
+  after recursive redaction (including provider-only fields); invalid originals retain only byte
+  count/hash metadata. Raw traces never bypass `observability.redact_fields`, whose defaults cover
+  authorization/token/cookie keys plus password, secret, client-secret, private-key, and API-key
+  variants. Configured `redact_fields` extend these mandatory defaults and separator-insensitive
+  matching covers snake_case, kebab-case, and camelCase spellings. The policy is snapshotted once
+  per dispatched run, so a workflow reload applies to
+  subsequent runs without reparsing configuration for every notification.
+- Compact fleet events live in `~/.symphony/telemetry/<YYYY-MM-DD>.jsonl` for at least 30 days.
+  `mix telemetry.report --from YYYY-MM-DD --to YYYY-MM-DD --json` reports fleet, repository,
+  issue, parent/delegated-thread, phase, failure, gate, review, tool-output, percentile, and quality
+  views without parsing transcripts. Percentiles use the conventional nearest-rank definition.
+  Token totals use each actual thread's greatest cumulative
+  snapshot; cached input and reasoning remain distinct and repeated absolute snapshots are not
+  summed. Unversioned telemetry JSONL remains readable as schema version 0.
+- Benign protocol notifications and stdout chunks do not produce one debug-log line each by
+  default. `observability.benign_notification_debug: true` is the short-lived log-level escape
+  hatch; selective gzip raw traces are normally the more complete incident artifact.
 - To render a transcript in a human-readable terminal format, run
   `bin/codex-session-log log/codex_sessions/<session-file>.ndjson`.
 

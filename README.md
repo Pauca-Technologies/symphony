@@ -22,6 +22,12 @@ classification-only turn chooses the execution profile from bounded issue contex
 repositories retain a quality fallback for ambiguous, risky, or failed classifications. The
 selected execution model and reasoning effort are visible in Symphony's dashboard.
 
+The reference implementation also maintains a compact, versioned fleet analytics layer. It
+reconciles cumulative usage by actual parent and delegated threads, retains rolling lifecycle and
+failure history, and keeps complete recursively redacted compressed protocol traces selectively for
+failed/sampled sessions while compacting high-frequency semantic streams by tool/message identity.
+This makes weekly token/time/quality reports bounded without discarding incident evidence.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

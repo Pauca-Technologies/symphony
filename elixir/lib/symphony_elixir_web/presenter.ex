@@ -321,7 +321,13 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(log_entry, :worker_host),
       workspace_path: Map.get(log_entry, :workspace_path)
     }
+    |> maybe_put_log_field(:storage_schema_version, Map.get(log_entry, :storage_schema_version))
+    |> maybe_put_log_field(:raw_trace_path, Map.get(log_entry, :raw_trace_path))
+    |> maybe_put_log_field(:raw_trace_pending_path, Map.get(log_entry, :raw_trace_pending_path))
   end
+
+  defp maybe_put_log_field(payload, _key, nil), do: payload
+  defp maybe_put_log_field(payload, key, value), do: Map.put(payload, key, value)
 
   defp transcript_payload(entry, transcript_cache) when is_map(entry) do
     case latest_session_log_entry(entry) do

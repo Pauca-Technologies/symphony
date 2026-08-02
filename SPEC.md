@@ -1505,7 +1505,15 @@ Token accounting rules:
 - Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
 - Extract input/output/total token counts leniently from common field names within the selected
   payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
+- For absolute totals, track a high-water mark per actual backend thread, not merely per issue,
+  run, or parent session. Accept only the positive difference from that thread's prior high water.
+  Repeated or out-of-order snapshots MUST NOT be summed, and an interrupted/incomplete thread MUST
+  retain its latest valid cumulative totals.
+- Parent and delegated thread totals MUST reconcile to issue/session/fleet totals without counting
+  a delegated snapshot as part of the parent's cumulative counter.
+- Preserve input, cached input, output, reasoning, total, current-context, and context-window
+  meanings as distinct fields. Cached input and reasoning are dimensions of provider usage and
+  MUST NOT be added to a provider `total_tokens` value a second time.
 - Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
   way.
 - Accumulate aggregate totals in orchestrator state.
@@ -1525,7 +1533,38 @@ Rate-limit tracking:
 - Track the latest rate-limit payload seen in any agent update.
 - Any human-readable presentation of rate-limit data is implementation-defined.
 
-### 13.6 Humanized Agent Event Summaries (OPTIONAL)
+### 13.6 Compact Fleet Events and Session Retention
+
+Implementations SHOULD maintain a compact, versioned analytics stream independent of humanized
+transcripts. The stable event vocabulary SHOULD cover run/session/thread/turn lifecycle, prompt
+size and injected-section hashes, token high waters and accepted deltas, phase transitions, tool
+boundaries/outcomes/output size/artifact references, typed failure/retry/circuit decisions,
+gate/attestation/review identity and reuse, lease lifecycle, base-drift/overlap decisions, and
+available handoff/CI/reopen/blocking-finding/merge/revert quality outcomes.
+
+Compact reporting SHOULD provide fleet, repository, issue, parent/delegated-thread, phase,
+failure-class, tool, review, and percentile views. At minimum it SHOULD include p50/p90 token and
+duration, delegation share, gate reuse, retries by failure class, tool output bytes, and quality
+guardrails. Reports MUST reconstruct token totals from each actual thread's cumulative high water,
+never by summing repeated absolute snapshots. Percentiles SHOULD use conventional nearest-rank
+semantics so small samples do not understate their upper tail.
+
+Session persistence SHOULD coalesce high-frequency streaming/token notifications or maintain an
+equivalent bounded analytics index. Existing NDJSON readers SHOULD remain compatible or receive a
+migration path. Selectively retained raw traces MAY be compressed, but protocol/security/
+correctness failures MUST retain enough redacted evidence for diagnosis. Operators MUST have a
+documented temporary raw-trace/debug escape hatch. When raw originals are valid structured
+documents, retention SHOULD preserve their complete recursively redacted shape rather than apply
+the compact fleet-event string bound; unparseable originals SHOULD retain safe size/hash metadata
+instead of opaque content. Operator-configured redaction names SHOULD extend a mandatory credential
+baseline rather than permit an empty/custom list to disable baseline privacy protection.
+
+Compact lifecycle/error analytics SHOULD support rolling 7- and 30-day analysis. Retention policy
+MUST define durations, sampling, privacy, recursive secret-field redaction, and cleanup. Benign
+per-notification debug logs SHOULD be disabled by default so lifecycle/error history is not rotated
+away by streaming chatter.
+
+### 13.7 Humanized Agent Event Summaries (OPTIONAL)
 
 Humanized summaries of raw agent protocol events are OPTIONAL.
 

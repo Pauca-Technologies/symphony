@@ -5,7 +5,7 @@ defmodule SymphonyElixir.SessionStartHook do
 
   require Logger
 
-  alias SymphonyElixir.{Config, Linear.Issue, SSH, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, SSH, Telemetry, Workspace}
 
   @telemetry_event [:symphony_elixir, :gate, :session_start]
 
@@ -86,20 +86,28 @@ defmodule SymphonyElixir.SessionStartHook do
   end
 
   defp emit_telemetry(%Issue{} = issue, workspace, worker_host, outcome, duration_ms, script_timings, workpad_files) do
+    metadata = %{
+      subtype: "session_start",
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      parent_issue_id: issue.parent_id,
+      workspace: workspace,
+      worker_host: worker_host,
+      outcome: outcome,
+      duration_ms: duration_ms,
+      checks: script_timings,
+      artifact_refs: workpad_files,
+      script_timings: script_timings,
+      workpad_files: workpad_files
+    }
+
     :telemetry.execute(
       @telemetry_event,
       %{count: 1, duration_ms: duration_ms},
-      %{
-        event: "gate.session_start",
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        workspace: workspace,
-        worker_host: worker_host,
-        outcome: outcome,
-        script_timings: script_timings,
-        workpad_files: workpad_files
-      }
+      Map.put(metadata, :event, "gate.session_start")
     )
+
+    Telemetry.emit(:gate, metadata)
 
     Logger.info(
       "gate.session_start issue_id=#{issue.id || "n/a"} issue_identifier=#{issue.identifier || "n/a"} workspace=#{workspace} worker_host=#{worker_host_for_log(worker_host)} outcome=#{outcome} duration_ms=#{duration_ms}"

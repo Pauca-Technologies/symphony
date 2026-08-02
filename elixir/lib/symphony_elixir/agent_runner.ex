@@ -62,14 +62,25 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason} ->
           failure = classify_run_failure(reason, issue)
 
-          %{
-            duration_ms: duration_ms,
-            outcome: "error",
+          failure_attrs = %{
             failure_class: Atom.to_string(failure.class),
             failure_scope: Atom.to_string(failure.scope),
             trusted_failure: failure.trusted,
+            backend: failure.backend,
             reset_at: failure.reset_at && DateTime.to_iso8601(failure.reset_at),
             retry_after_ms: failure.retry_after_ms
+          }
+
+          Telemetry.emit(:failure, Map.merge(telemetry_issue_attrs(issue, worker_host), failure_attrs))
+
+          %{
+            duration_ms: duration_ms,
+            outcome: "error",
+            failure_class: failure_attrs.failure_class,
+            failure_scope: failure_attrs.failure_scope,
+            trusted_failure: failure_attrs.trusted_failure,
+            reset_at: failure_attrs.reset_at,
+            retry_after_ms: failure_attrs.retry_after_ms
           }
       end
 
@@ -106,6 +117,9 @@ defmodule SymphonyElixir.AgentRunner do
     %{
       issue_id: issue.id,
       identifier: issue.identifier,
+      issue_identifier: issue.identifier,
+      parent_issue_id: issue.parent_id,
+      repository: repository_from_labels(issue.labels),
       worker_host: worker_host || "local",
       labels: issue.labels || []
     }
@@ -114,6 +128,15 @@ defmodule SymphonyElixir.AgentRunner do
   defp telemetry_issue_attrs(_issue, worker_host) do
     %{worker_host: worker_host || "local"}
   end
+
+  defp repository_from_labels(labels) when is_list(labels) do
+    Enum.find_value(labels, fn
+      "repo:" <> name -> name
+      _label -> nil
+    end) || "default"
+  end
+
+  defp repository_from_labels(_labels), do: "default"
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
@@ -498,11 +521,11 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(backend, app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    {prompt, included_sections} = build_turn_prompt(issue, opts, turn_number, max_turns)
+    {prompt, included_sections, section_hashes} = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     emit_prompt_built(
       prompt,
-      included_sections,
+      %{included_sections: included_sections, section_hashes: section_hashes},
       issue,
       workspace,
       app_session.worker_host,
@@ -617,15 +640,14 @@ defmodule SymphonyElixir.AgentRunner do
       #{handoff_guidance}
       """
 
-    included_sections =
-      [
+    {included_sections, section_hashes} =
+      prompt_section_metadata([
         {"handoff_gate_remediation", handoff_gate_prompt},
         {"continuation_guidance", "included"},
         {"handoff_tool_guidance", handoff_guidance}
-      ]
-      |> included_prompt_section_names()
+      ])
 
-    {prompt, included_sections}
+    {prompt, included_sections, section_hashes}
   end
 
   defp compose_prompt_sections(sections) do
@@ -635,16 +657,32 @@ defmodule SymphonyElixir.AgentRunner do
       end)
 
     prompt = Enum.map_join(included_sections, "\n\n", fn {_name, content} -> content end)
-    {prompt, Enum.map(included_sections, fn {name, _content} -> name end)}
+    {names, hashes} = prompt_section_metadata(included_sections)
+    {prompt, names, hashes}
   end
 
-  defp included_prompt_section_names(sections) do
-    sections
-    |> Enum.reject(fn {_name, content} -> is_nil(content) or String.trim(content) == "" end)
-    |> Enum.map(fn {name, _content} -> name end)
+  defp prompt_section_metadata(sections) do
+    sections = Enum.reject(sections, fn {_name, content} -> is_nil(content) or String.trim(content) == "" end)
+
+    {
+      Enum.map(sections, fn {name, _content} -> name end),
+      Map.new(sections, fn {name, content} ->
+        {name, :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)}
+      end)
+    }
   end
 
-  defp emit_prompt_built(prompt, included_sections, issue, workspace, worker_host, opts, turn_number, max_turns) do
+  defp emit_prompt_built(
+         prompt,
+         prompt_metadata,
+         issue,
+         workspace,
+         worker_host,
+         opts,
+         turn_number,
+         max_turns
+       ) do
+    included_sections = prompt_metadata.included_sections
     prompt_kind = if turn_number == 1, do: "initial", else: "continuation"
     prompt_chars = String.length(prompt)
     prompt_bytes = byte_size(prompt)
@@ -665,7 +703,9 @@ defmodule SymphonyElixir.AgentRunner do
       turn_number: turn_number,
       max_turns: max_turns,
       prompt_kind: prompt_kind,
-      included_sections: included_sections
+      included_sections: included_sections,
+      injected_section_hashes: prompt_metadata.section_hashes,
+      prompt_sha256: :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
     }
 
     :telemetry.execute(@prompt_built_telemetry_event, measurements, metadata)

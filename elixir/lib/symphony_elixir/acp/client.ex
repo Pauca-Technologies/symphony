@@ -29,7 +29,7 @@ defmodule SymphonyElixir.Acp.Client do
   require Logger
 
   alias SymphonyElixir.Acp.LinearGate
-  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, Telemetry}
 
   @initialize_id 1
   @session_new_id 2
@@ -751,10 +751,16 @@ defmodule SymphonyElixir.Acp.Client do
       if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
         Logger.warning("ACP stream output: #{text}")
       else
-        Logger.debug("ACP stream output: #{text}")
+        maybe_log_benign_stream(text)
       end
     end
   end
+
+  defp maybe_log_benign_stream(text) do
+    if benign_notification_debug?(), do: Logger.debug("ACP stream output: #{text}")
+  end
+
+  defp benign_notification_debug?, do: Telemetry.benign_notification_debug?()
 
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"

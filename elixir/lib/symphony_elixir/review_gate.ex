@@ -79,6 +79,7 @@ defmodule SymphonyElixir.ReviewGate do
     ReviewOutcome,
     ReviewPacket,
     ReviewTelemetry,
+    Telemetry,
     Tracker
   }
 
@@ -1367,6 +1368,24 @@ defmodule SymphonyElixir.ReviewGate do
   # --- telemetry -----------------------------------------------------------
 
   defp emit_outcome_telemetry(%Issue{} = issue, %ReviewOutcome{} = outcome) do
+    metadata = %{
+      subtype: "review",
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      parent_issue_id: issue.parent_id,
+      from_state: issue.state,
+      iteration: outcome.iteration,
+      max_iterations: outcome.max_iterations,
+      outcome: outcome.outcome,
+      packet_id: outcome.packet_id,
+      reviewed_sha: outcome.reviewed_sha,
+      authoritative: outcome.authoritative,
+      severity_counts: outcome.severity_counts,
+      failure_reason: outcome.failure_reason,
+      review_effort: outcome.review_effort,
+      attestation_report: outcome.attestation_report
+    }
+
     :telemetry.execute(
       @telemetry_event,
       %{
@@ -1375,21 +1394,22 @@ defmodule SymphonyElixir.ReviewGate do
         comments: length(outcome.findings),
         unresolved_findings: length(outcome.findings)
       },
-      %{
-        event: "gate.review",
+      Map.put(metadata, :event, "gate.review")
+    )
+
+    Telemetry.emit(:review, metadata)
+
+    if map_size(outcome.severity_counts) > 0 do
+      Telemetry.emit(:quality_outcome, %{
+        outcome: "human_blocking_findings",
         issue_id: issue.id,
         issue_identifier: issue.identifier,
-        from_state: issue.state,
-        iteration: outcome.iteration,
-        max_iterations: outcome.max_iterations,
-        outcome: outcome.outcome,
+        parent_issue_id: issue.parent_id,
         reviewed_sha: outcome.reviewed_sha,
-        authoritative: outcome.authoritative,
-        severity_counts: outcome.severity_counts,
-        failure_reason: outcome.failure_reason,
-        review_effort: outcome.review_effort
-      }
-    )
+        packet_id: outcome.packet_id,
+        severity_counts: outcome.severity_counts
+      })
+    end
 
     Logger.info(
       "gate.review #{issue_context(issue)} iteration=#{outcome.iteration} outcome=#{outcome.outcome} reviewed_sha=#{sha_label(outcome.reviewed_sha)} findings=#{length(outcome.findings)} severity_counts=#{inspect(outcome.severity_counts)} review_effort=#{inspect(outcome.review_effort)}"

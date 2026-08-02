@@ -21,6 +21,8 @@ defmodule SymphonyElixir.ReviewTelemetry do
     Process.put(key(handle), %{
       issue: issue,
       packet_id: packet.packet_id,
+      packet_bytes: packet |> Jason.encode!() |> byte_size(),
+      requested_lenses: get_in(packet, [:requested_lenses]) || [],
       reviewed_sha: packet.candidate.head_sha,
       started_ms: System.monotonic_time(:millisecond),
       order: [],
@@ -133,30 +135,36 @@ defmodule SymphonyElixir.ReviewTelemetry do
       packet_id: state.packet_id,
       reviewed_sha: state.reviewed_sha,
       thread_id: thread_id,
+      parent_thread_id: parent_id,
       role: role,
       outcome: Atom.to_string(outcome),
       tokens: thread.tokens,
       duration_ms: duration_ms,
       model: thread.model,
       reasoning_effort: thread.reasoning_effort,
-      findings: findings
+      findings: findings,
+      packet_bytes: state.packet_bytes,
+      requested_lenses: state.requested_lenses
     }
 
-    Telemetry.emit(:gate, attrs)
+    Telemetry.emit(:review, attrs)
     :telemetry.execute(@event, %{count: 1, tokens: thread.tokens, duration_ms: duration_ms, findings: findings}, attrs)
   end
 
   defp thread_id(message) do
-    string_value(message, :thread_id) ||
-      flexible_path(message, [:payload, :params, :threadId]) ||
-      flexible_path(message, [:payload, :params, :thread_id]) ||
-      flexible_path(message, [:payload, :params, :thread, :id]) ||
-      flexible_path(message, [:payload, :params, :turn, :threadId]) ||
-      flexible_path(message, [:payload, :params, :turn, :thread_id]) ||
-      flexible_path(message, [:payload, :params, :msg, :threadId]) ||
-      flexible_path(message, [:payload, :params, :msg, :thread_id]) ||
-      flexible_path(message, [:payload, :params, :msg, :payload, :threadId]) ||
+    [
+      string_value(message, :thread_id),
+      flexible_path(message, [:payload, :params, :threadId]),
+      flexible_path(message, [:payload, :params, :thread_id]),
+      flexible_path(message, [:payload, :params, :thread, :id]),
+      flexible_path(message, [:payload, :params, :turn, :threadId]),
+      flexible_path(message, [:payload, :params, :turn, :thread_id]),
+      flexible_path(message, [:payload, :params, :msg, :threadId]),
+      flexible_path(message, [:payload, :params, :msg, :thread_id]),
+      flexible_path(message, [:payload, :params, :msg, :payload, :threadId]),
       flexible_path(message, [:payload, :params, :msg, :payload, :thread_id])
+    ]
+    |> Enum.find(&is_binary/1)
   end
 
   defp fallback_thread_id(%{order: [only_thread]}), do: only_thread
@@ -174,8 +182,6 @@ defmodule SymphonyElixir.ReviewTelemetry do
     |> usage_candidates()
     |> Enum.find_value(0, &absolute_total/1)
   end
-
-  defp usage_tokens(_message), do: 0
 
   defp usage_candidates(message) do
     [

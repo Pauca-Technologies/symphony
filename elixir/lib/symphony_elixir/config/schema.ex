@@ -429,14 +429,61 @@ defmodule SymphonyElixir.Config.Schema do
       field(:dashboard_enabled, :boolean, default: true)
       field(:refresh_ms, :integer, default: 1_000)
       field(:render_interval_ms, :integer, default: 16)
+      # Compact fleet events are the durable 30-day analytics source. Raw
+      # protocol traces are intentionally shorter-lived and retained only for
+      # failures, sampled successes, or an explicit incident-debug override.
+      field(:telemetry_retention_days, :integer, default: 30)
+      field(:raw_trace_retention_days, :integer, default: 7)
+      field(:raw_trace_policy, :string, default: "failures")
+      field(:raw_trace_sample_rate, :float, default: 0.01)
+      field(:raw_trace_debug, :boolean, default: false)
+      field(:session_compaction_enabled, :boolean, default: true)
+      field(:benign_notification_debug, :boolean, default: false)
+
+      field(:redact_fields, {:array, :string},
+        default: [
+          "authorization",
+          "api_key",
+          "token",
+          "access_token",
+          "refresh_token",
+          "cookie",
+          "set-cookie",
+          "password",
+          "secret",
+          "client_secret",
+          "private_key",
+          "x-api-key"
+        ]
+      )
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:dashboard_enabled, :refresh_ms, :render_interval_ms], empty_values: [])
+      |> cast(
+        attrs,
+        [
+          :dashboard_enabled,
+          :refresh_ms,
+          :render_interval_ms,
+          :telemetry_retention_days,
+          :raw_trace_retention_days,
+          :raw_trace_policy,
+          :raw_trace_sample_rate,
+          :raw_trace_debug,
+          :session_compaction_enabled,
+          :benign_notification_debug,
+          :redact_fields
+        ],
+        empty_values: []
+      )
       |> validate_number(:refresh_ms, greater_than: 0)
       |> validate_number(:render_interval_ms, greater_than: 0)
+      |> validate_number(:telemetry_retention_days, greater_than_or_equal_to: 30)
+      |> validate_number(:raw_trace_retention_days, greater_than_or_equal_to: 7)
+      |> validate_number(:raw_trace_sample_rate, greater_than_or_equal_to: 0.0, less_than_or_equal_to: 1.0)
+      |> validate_inclusion(:raw_trace_policy, ["none", "failures", "sampled", "all"])
     end
   end
 

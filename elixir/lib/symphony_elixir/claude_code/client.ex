@@ -39,7 +39,7 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   require Logger
 
   alias SymphonyElixir.Acp.LinearGate
-  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, Telemetry}
 
   # Same vars the ACP path scrubs; the agent reaches Linear only through the
   # gated MCP tools, which hold the token server-side.
@@ -383,9 +383,13 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   end
 
   defp synthetic_payload(%{"type" => "tool_use"} = block, session_id) do
+    call_id = Map.get(block, "id")
+
     %{
       "method" => "item/tool/call",
       "params" => %{
+        "callId" => call_id,
+        "itemId" => call_id,
         "name" => to_string(Map.get(block, "name") || "tool"),
         "arguments" => Map.get(block, "input") || %{},
         "threadId" => session_id
@@ -395,12 +399,21 @@ defmodule SymphonyElixir.ClaudeCode.Client do
 
   defp synthetic_payload(%{"type" => "tool_result"} = block, session_id) do
     text = tool_result_text(Map.get(block, "content")) || ""
+    call_id = Map.get(block, "tool_use_id")
+    error? = Map.get(block, "is_error") == true
 
-    case tool_result_output(text, Map.get(block, "is_error") == true) do
+    case tool_result_output(text, error?) do
       output when is_binary(output) ->
         %{
           "method" => "item/commandExecution/outputDelta",
-          "params" => %{"output" => output, "threadId" => session_id}
+          "params" => %{
+            "callId" => call_id,
+            "itemId" => call_id,
+            "output" => output,
+            "status" => if(error?, do: "failed", else: "completed"),
+            "terminal" => true,
+            "threadId" => session_id
+          }
         }
 
       _ ->
@@ -548,10 +561,16 @@ defmodule SymphonyElixir.ClaudeCode.Client do
       if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
         Logger.warning("Claude Code stream output: #{text}")
       else
-        Logger.debug("Claude Code stream output: #{text}")
+        maybe_log_benign_stream(text)
       end
     end
   end
+
+  defp maybe_log_benign_stream(text) do
+    if benign_notification_debug?(), do: Logger.debug("Claude Code stream output: #{text}")
+  end
+
+  defp benign_notification_debug?, do: Telemetry.benign_notification_debug?()
 
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"

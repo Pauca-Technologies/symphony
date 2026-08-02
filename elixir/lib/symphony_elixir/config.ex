@@ -66,6 +66,20 @@ defmodule SymphonyElixir.Config do
           section_heading: String.t()
         }
 
+  @type observability_settings :: %{
+          dashboard_enabled: boolean(),
+          refresh_ms: pos_integer(),
+          render_interval_ms: pos_integer(),
+          telemetry_retention_days: pos_integer(),
+          raw_trace_retention_days: pos_integer(),
+          raw_trace_policy: String.t(),
+          raw_trace_sample_rate: float(),
+          raw_trace_debug: boolean(),
+          session_compaction_enabled: boolean(),
+          benign_notification_debug: boolean(),
+          redact_fields: [String.t()]
+        }
+
   @default_review_settings %{
     max_iterations: 3,
     verdict_path: ".artifacts/symphony-review/verdict.json",
@@ -234,6 +248,14 @@ defmodule SymphonyElixir.Config do
       port when is_integer(port) and port >= 0 -> port
       _ -> settings!().server.port
     end
+  end
+
+  @doc "Resolve durable telemetry, transcript retention, and redaction policy."
+  @spec observability_settings() :: observability_settings()
+  def observability_settings do
+    settings!().observability
+    |> Map.from_struct()
+    |> Map.drop([:__meta__])
   end
 
   @spec validate!() :: :ok | {:error, term()}

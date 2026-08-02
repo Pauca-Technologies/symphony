@@ -17,6 +17,31 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+observability:
+  # Compact, versioned fleet events are retained for rolling 30-day reports.
+  telemetry_retention_days: 30
+  # Raw protocol traces are gzip-compressed and retained for failures for 7 days.
+  raw_trace_retention_days: 7
+  raw_trace_policy: failures # none | failures | sampled | all
+  raw_trace_sample_rate: 0.01
+  raw_trace_debug: false
+  session_compaction_enabled: true
+  benign_notification_debug: false
+  # Additional credential names; mandatory defaults below always apply
+  # and also match snake_case, kebab-case, and camelCase spellings.
+  redact_fields:
+    - authorization
+    - api_key
+    - token
+    - access_token
+    - refresh_token
+    - cookie
+    - set-cookie
+    - password
+    - secret
+    - client_secret
+    - private_key
+    - x-api-key
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .

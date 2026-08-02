@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @behaviour SymphonyElixir.AgentBackend
 
   require Logger
-  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, PathSafety, SSH, Telemetry}
   alias SymphonyElixir.Codex.InterruptionClassifier
 
   @initialize_id 1
@@ -990,7 +990,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        Logger.debug("Codex notification: #{inspect(method)}")
+        if benign_notification_debug?(), do: Logger.debug("Codex notification: #{inspect(method)}")
         receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
     end
   end
@@ -1567,10 +1567,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
         Logger.warning("Codex #{stream_label} output: #{text}")
       else
-        Logger.debug("Codex #{stream_label} output: #{text}")
+        maybe_log_benign_stream("Codex", stream_label, text)
       end
     end
   end
+
+  defp maybe_log_benign_stream(backend, stream_label, text) do
+    if benign_notification_debug?(), do: Logger.debug("#{backend} #{stream_label} output: #{text}")
+  end
+
+  defp benign_notification_debug?, do: Telemetry.benign_notification_debug?()
 
   defp protocol_message_candidate?(data) do
     data
