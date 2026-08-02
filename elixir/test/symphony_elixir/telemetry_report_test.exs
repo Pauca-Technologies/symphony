@@ -58,6 +58,48 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
     assert report.failures.circuits == %{"opened" => 1}
   end
 
+  test "reports shadow decisions, applied transitions, outliers, and quality comparison" do
+    events = [
+      %{"event" => "routing_decision", "task_type" => "simple_direct", "budget_profile" => "simple", "budget_mode" => "shadow"},
+      %{"event" => "routing_decision", "task_type" => "security_tenant", "budget_profile" => "high_risk", "budget_mode" => "enforce", "override" => %{"source" => "issue_label"}},
+      %{
+        "event" => "budget_transition",
+        "transition" => %{
+          "dimension" => "total_tokens",
+          "action" => "compact_parent_resume_capsule",
+          "level" => "soft",
+          "proposed" => true,
+          "applied" => true
+        }
+      },
+      %{
+        "event" => "budget_transition",
+        "transition" => %{
+          "dimension" => "total_tokens",
+          "action" => "escalate_with_complete_resume_packet",
+          "level" => "extreme",
+          "proposed" => true,
+          "applied" => false
+        }
+      },
+      %{"event" => "review", "subtype" => "review", "packet_id" => "p", "outcome" => "request_changes", "iteration" => 1, "severity_counts" => %{"major" => 1}},
+      %{"event" => "quality_outcome", "outcome" => "ci_regression"},
+      %{"event" => "quality_outcome", "outcome" => "human_blocking_findings"}
+    ]
+
+    report = Report.build(events)
+
+    assert report.routing.task_types == %{"security_tenant" => 1, "simple_direct" => 1}
+    assert report.routing.overrides == 1
+    assert report.efficiency.proposed_transitions == 2
+    assert report.efficiency.applied_transitions == 1
+    assert report.efficiency.outliers == 1
+    assert report.efficiency.by_action["compact_parent_resume_capsule"] == 1
+    assert report.efficiency.comparison.review_findings_by_severity == %{"major" => 1}
+    assert report.efficiency.comparison.ci_outcomes == %{"ci_regression" => 1}
+    assert report.efficiency.comparison.human_outcomes == %{"human_blocking_findings" => 1}
+  end
+
   test "preserves the legacy top-level summary contract" do
     report =
       Report.build(

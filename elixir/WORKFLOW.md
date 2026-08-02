@@ -67,6 +67,15 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  # Soft budgets are policy/strategy signals, never completion or approval gates.
+  # Shadow mode records proposed routing and transitions without changing prompts.
+  efficiency:
+    mode: shadow # off | shadow | enforce
+    capsule_max_bytes: 4000
+    extreme_multiplier: 2.0
+    # Defaults are seeded from recent fleet p50/p90 bands and differ for
+    # simple, standard, and high-risk work. Repositories may override any
+    # positive threshold under profiles.<name> and task_profiles.<task_type>.
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never

@@ -102,6 +102,92 @@ defmodule SymphonyElixir.AgentRunnerTest.HandoffPromptBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.EfficiencyBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, prompt, _issue, opts) do
+    recipient = Application.fetch_env!(:symphony_elixir, :efficiency_recipient_for_test)
+    turn = Process.get(:efficiency_turn, 0) + 1
+    Process.put(:efficiency_turn, turn)
+    send(recipient, {:efficiency_prompt, turn, prompt})
+
+    on_message = Keyword.fetch!(opts, :on_message)
+    on_message.(%{event: :session_started, thread_id: "parent-thread", timestamp: DateTime.utc_now()})
+
+    on_message.(%{
+      event: :token_usage,
+      thread_id: "parent-thread",
+      timestamp: DateTime.utc_now(),
+      usage: %{input_tokens: 80 + turn * 20, output_tokens: 20, total_tokens: 100 + turn * 20}
+    })
+
+    {:ok, %{session_id: "efficiency-session-#{turn}"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
+defmodule SymphonyElixir.AgentRunnerTest.BudgetStressBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, _prompt, _issue, opts) do
+    owner = Application.fetch_env!(:symphony_elixir, :budget_stress_owner_for_test)
+    volume = Application.fetch_env!(:symphony_elixir, :budget_stress_volume_for_test)
+    on_message = Keyword.fetch!(opts, :on_message)
+
+    on_message.(%{event: :session_started, thread_id: "parent-thread", timestamp: DateTime.utc_now()})
+
+    Enum.each(1..volume, fn sequence ->
+      {thread_id, cumulative} =
+        if rem(sequence, 2) == 1,
+          do: {"parent-thread", div(sequence + 1, 2)},
+          else: {"delegated-thread", div(sequence, 2)}
+
+      on_message.(%{
+        event: :token_usage,
+        thread_id: thread_id,
+        usage: %{input_tokens: cumulative, output_tokens: 0, total_tokens: cumulative}
+      })
+    end)
+
+    {:message_queue_len, queue_len} = Process.info(self(), :message_queue_len)
+    send(owner, {:budget_stress_runner_queue_len, queue_len})
+    {:ok, %{session_id: "budget-stress-session"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
+defmodule SymphonyElixir.AgentRunnerTest.BudgetRuntimeRecipient do
+  @moduledoc false
+  use GenServer
+
+  def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
+
+  @impl true
+  def init(owner), do: {:ok, owner}
+
+  @impl true
+  def handle_info({:worker_runtime_info, issue_id, %{budget_metrics: _metrics} = info}, owner) do
+    send(owner, {:budget_runtime_info, issue_id, info})
+    {:noreply, owner}
+  end
+
+  def handle_info(_message, owner), do: {:noreply, owner}
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.LifecycleRecipient do
   @moduledoc false
   use GenServer
@@ -146,7 +232,10 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
   alias SymphonyElixir.AgentRunner
   alias SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend
+  alias SymphonyElixir.AgentRunnerTest.BudgetRuntimeRecipient
+  alias SymphonyElixir.AgentRunnerTest.BudgetStressBackend
   alias SymphonyElixir.AgentRunnerTest.DeferredBackend
+  alias SymphonyElixir.AgentRunnerTest.EfficiencyBackend
   alias SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend
   alias SymphonyElixir.AgentRunnerTest.HandoffPromptBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
@@ -169,6 +258,136 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end)
 
     :ok
+  end
+
+  describe "soft-budget continuations" do
+    test "injects one bounded enforced transition on the next continuation" do
+      Application.put_env(:symphony_elixir, :efficiency_recipient_for_test, self())
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :efficiency_recipient_for_test) end)
+
+      issue = %Issue{
+        id: "issue-efficiency-runner",
+        identifier: "UDPE-EFF",
+        title: "Small direct edit",
+        description: "Change one bounded helper.",
+        state: "In Progress",
+        labels: ["budget:simple"],
+        blocked_by: [],
+        children: []
+      }
+
+      fetcher = fn [_issue_id] ->
+        count = Process.get(:efficiency_fetch_count, 0) + 1
+        Process.put(:efficiency_fetch_count, count)
+        state = if count == 1, do: "In Progress", else: "Done"
+        {:ok, [%{issue | state: state}]}
+      end
+
+      workflow = %{
+        config: %{
+          "agent" => %{
+            "efficiency" => %{
+              "mode" => "enforce",
+              "capsule_max_bytes" => 1_000,
+              "profiles" => %{"simple" => %{"total_tokens" => 100}}
+            }
+          }
+        }
+      }
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 "/tmp",
+                 issue,
+                 self(),
+                 [
+                   agent_backend: {EfficiencyBackend, %{}},
+                   issue_state_fetcher: fetcher,
+                   per_repo_workflow: workflow,
+                   max_turns: 2
+                 ],
+                 nil
+               )
+
+      assert_received {:efficiency_prompt, 1, first_prompt}
+      assert_received {:efficiency_prompt, 2, second_prompt}
+      refute first_prompt =~ "soft-budget resume capsule"
+      assert second_prompt =~ "soft-budget resume capsule"
+      assert second_prompt =~ "compact_parent_resume_capsule"
+      assert length(String.split(second_prompt, "compact_parent_resume_capsule")) == 2
+
+      assert_received {:worker_runtime_info, "issue-efficiency-runner", %{budget_profile: "simple", budget_mode: "enforce"}}
+      assert_received {:worker_runtime_info, "issue-efficiency-runner", %{budget_transitions: transitions}}
+      assert "soft:total_tokens" in transitions
+    end
+
+    test "coalesces high-volume usage without accumulating full events in the runner mailbox" do
+      volume = 10_000
+      Application.put_env(:symphony_elixir, :budget_stress_owner_for_test, self())
+      Application.put_env(:symphony_elixir, :budget_stress_volume_for_test, volume)
+      {:ok, recipient} = BudgetRuntimeRecipient.start_link(self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :budget_stress_owner_for_test)
+        Application.delete_env(:symphony_elixir, :budget_stress_volume_for_test)
+        if Process.alive?(recipient), do: GenServer.stop(recipient)
+      end)
+
+      issue = %Issue{
+        id: "issue-efficiency-stress",
+        identifier: "UDPE-EFF-STRESS",
+        title: "Stress budget accounting",
+        description: "Exercise a bounded collector with many cumulative updates.",
+        state: "In Progress",
+        labels: ["budget:simple"],
+        blocked_by: [],
+        children: []
+      }
+
+      workflow = %{
+        config: %{
+          "agent" => %{
+            "efficiency" => %{
+              "mode" => "enforce",
+              "profiles" => %{
+                "simple" => %{
+                  "total_tokens" => 200,
+                  "delegated_tokens" => 100,
+                  "per_thread_tokens" => 100
+                }
+              }
+            }
+          }
+        }
+      }
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 "/tmp",
+                 issue,
+                 recipient,
+                 [
+                   agent_backend: {BudgetStressBackend, %{}},
+                   issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                   per_repo_workflow: workflow,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received {:budget_stress_runner_queue_len, queue_len}
+      assert queue_len < 10
+
+      assert_received {:budget_runtime_info, "issue-efficiency-stress", %{budget_metrics: metrics, budget_transitions: transitions}}
+
+      assert metrics.total_tokens == volume
+      assert metrics.parent_tokens == div(volume, 2)
+      assert metrics.delegated_tokens == div(volume, 2)
+      assert metrics.thread_count == 2
+      assert "soft:total_tokens" in transitions
+      assert "soft:delegated_tokens" in transitions
+      assert "soft:per_thread_tokens" in transitions
+    end
   end
 
   describe "handoff prompt guidance" do

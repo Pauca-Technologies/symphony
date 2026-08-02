@@ -8,7 +8,7 @@ defmodule SymphonyElixir.AgentClassifier do
   """
 
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.Config.AgentRouting
+  alias SymphonyElixir.Config.{AgentEfficiency, AgentRouting}
   alias SymphonyElixir.Linear.{Comment, Issue}
 
   @max_description_chars 12_000
@@ -22,6 +22,8 @@ defmodule SymphonyElixir.AgentClassifier do
 
   @type result :: %{
           profile: String.t(),
+          task_type: String.t(),
+          confidence: float(),
           risk: String.t(),
           complexity: String.t(),
           ambiguity: String.t(),
@@ -100,6 +102,7 @@ defmodule SymphonyElixir.AgentClassifier do
     Select the best execution profile for this software issue.
 
     Quality policy:
+    - Classify task_type as one of: #{Enum.join(AgentEfficiency.task_types(), ", ")}.
     - Prefer the stronger profile for security, authorization, tenant isolation, data migrations,
       concurrency, distributed state, broad architecture, destructive operations, cross-cutting
       changes, unclear requirements, or difficult root-cause analysis.
@@ -119,9 +122,11 @@ defmodule SymphonyElixir.AgentClassifier do
     %{
       "type" => "object",
       "additionalProperties" => false,
-      "required" => ["profile", "risk", "complexity", "ambiguity", "reasons"],
+      "required" => ["profile", "task_type", "confidence", "risk", "complexity", "ambiguity", "reasons"],
       "properties" => %{
         "profile" => %{"type" => "string", "enum" => Enum.sort(profile_names)},
+        "task_type" => %{"type" => "string", "enum" => AgentEfficiency.task_types()},
+        "confidence" => %{"type" => "number", "minimum" => 0, "maximum" => 1},
         "risk" => level_schema(),
         "complexity" => level_schema(),
         "ambiguity" => level_schema(),
@@ -164,17 +169,30 @@ defmodule SymphonyElixir.AgentClassifier do
 
   defp normalize_result(payload, profiles) when is_map(payload) do
     profile = Map.get(payload, "profile")
+    task_type = Map.get(payload, "task_type")
+    confidence = Map.get(payload, "confidence")
     risk = Map.get(payload, "risk")
     complexity = Map.get(payload, "complexity")
     ambiguity = Map.get(payload, "ambiguity")
     reasons = Map.get(payload, "reasons")
 
-    if Map.has_key?(profiles, profile) and valid_level?(risk) and valid_level?(complexity) and
-         valid_level?(ambiguity) and is_list(reasons) and reasons != [] and
-         Enum.all?(reasons, &is_binary/1) do
+    valid? =
+      Enum.all?([
+        Map.has_key?(profiles, profile),
+        task_type in AgentEfficiency.task_types(),
+        valid_confidence?(confidence),
+        valid_level?(risk),
+        valid_level?(complexity),
+        valid_level?(ambiguity),
+        valid_reasons?(reasons)
+      ])
+
+    if valid? do
       {:ok,
        %{
          profile: profile,
+         task_type: task_type,
+         confidence: confidence / 1,
          risk: risk,
          complexity: complexity,
          ambiguity: ambiguity,
@@ -189,6 +207,8 @@ defmodule SymphonyElixir.AgentClassifier do
     do: {:error, {:invalid_classifier_output, payload}}
 
   defp valid_level?(level), do: level in ["low", "medium", "high"]
+  defp valid_confidence?(confidence), do: is_number(confidence) and confidence >= 0 and confidence <= 1
+  defp valid_reasons?(reasons), do: is_list(reasons) and reasons != [] and Enum.all?(reasons, &is_binary/1)
 
   defp bounded(value, max_chars) when is_binary(value), do: String.slice(value, 0, max_chars)
   defp bounded(_value, _max_chars), do: nil

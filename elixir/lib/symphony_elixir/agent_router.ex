@@ -68,10 +68,10 @@ defmodule SymphonyElixir.AgentRouter do
         profile_name = quality_profile(result, routing)
 
         Logger.info(
-          "Selected agent profile for #{issue_context(issue)} profile=#{profile_name} classifier_profile=#{result.profile} risk=#{result.risk} complexity=#{result.complexity} ambiguity=#{result.ambiguity}"
+          "Selected agent profile for #{issue_context(issue)} profile=#{profile_name} classifier_profile=#{result.profile} task_type=#{Map.get(result, :task_type, "unreported")} confidence=#{Map.get(result, :confidence, "unreported")} risk=#{result.risk} complexity=#{result.complexity} ambiguity=#{result.ambiguity}"
         )
 
-        {:ok, selection(routing, profile_name, :classifier)}
+        {:ok, selection(routing, profile_name, :classifier, result)}
 
       {:error, reason} ->
         Logger.warning("Agent profile classifier failed; using quality fallback for #{issue_context(issue)} profile=#{routing.fallback_profile} reason=#{inspect(reason)}")
@@ -81,7 +81,10 @@ defmodule SymphonyElixir.AgentRouter do
   end
 
   defp quality_profile(result, routing) do
-    if "high" in [result.risk, result.complexity, result.ambiguity] do
+    high_risk_task? = Map.get(result, :task_type) in ~w(security_tenant data_schema concurrency_liveness broad_architecture)
+    low_confidence? = is_number(Map.get(result, :confidence)) and Map.get(result, :confidence) < 0.55
+
+    if high_risk_task? or low_confidence? or "high" in [result.risk, result.complexity, result.ambiguity] do
       routing.fallback_profile
     else
       result.profile
@@ -95,7 +98,7 @@ defmodule SymphonyElixir.AgentRouter do
     |> Enum.sort()
   end
 
-  defp selection(routing, profile_name, source) do
+  defp selection(routing, profile_name, source, classification \\ nil) do
     profile = Map.fetch!(routing.profiles, profile_name)
 
     %{
@@ -105,13 +108,14 @@ defmodule SymphonyElixir.AgentRouter do
         reasoning_effort: profile.reasoning_effort
       },
       profile: profile_name,
-      source: source
+      source: source,
+      classification: classification
     }
   end
 
   defp legacy_selection(issue) do
     {backend, overrides} = AgentBackend.resolve_for_issue(issue)
-    %{backend: backend, overrides: overrides, profile: nil, source: :legacy}
+    %{backend: backend, overrides: overrides, profile: nil, source: :legacy, classification: nil}
   end
 
   defp issue_context(%Issue{} = issue) do

@@ -325,6 +325,12 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:model, runtime_info[:model])
           |> maybe_put_runtime_value(:reasoning_effort, runtime_info[:reasoning_effort])
           |> maybe_put_runtime_value(:profile, runtime_info[:profile])
+          |> maybe_put_runtime_value(:task_type, runtime_info[:task_type])
+          |> maybe_put_runtime_value(:routing_confidence, runtime_info[:routing_confidence])
+          |> maybe_put_runtime_value(:budget_profile, runtime_info[:budget_profile])
+          |> maybe_put_runtime_value(:budget_mode, runtime_info[:budget_mode])
+          |> maybe_put_runtime_value(:budget_metrics, runtime_info[:budget_metrics])
+          |> maybe_put_runtime_value(:budget_transitions, runtime_info[:budget_transitions])
 
         issue = Map.get(updated_running_entry, :issue, %{})
 
@@ -1358,6 +1364,12 @@ defmodule SymphonyElixir.Orchestrator do
             model: nil,
             reasoning_effort: nil,
             profile: nil,
+            task_type: nil,
+            routing_confidence: nil,
+            budget_profile: nil,
+            budget_mode: nil,
+            budget_metrics: nil,
+            budget_transitions: [],
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -2052,6 +2064,12 @@ defmodule SymphonyElixir.Orchestrator do
           model: Map.get(metadata, :model),
           reasoning_effort: Map.get(metadata, :reasoning_effort),
           profile: Map.get(metadata, :profile),
+          task_type: Map.get(metadata, :task_type),
+          routing_confidence: Map.get(metadata, :routing_confidence),
+          budget_profile: Map.get(metadata, :budget_profile),
+          budget_mode: Map.get(metadata, :budget_mode),
+          budget_metrics: Map.get(metadata, :budget_metrics),
+          budget_transitions: Map.get(metadata, :budget_transitions, []),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,

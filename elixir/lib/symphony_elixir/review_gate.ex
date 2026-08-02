@@ -68,6 +68,7 @@ defmodule SymphonyElixir.ReviewGate do
   require Logger
 
   alias SymphonyElixir.{
+    AgentEfficiency,
     Cardinality,
     Codex.AppServer,
     Codex.DynamicTool,
@@ -179,7 +180,11 @@ defmodule SymphonyElixir.ReviewGate do
   @spec run(Path.t(), Issue.t(), term(), map(), keyword()) :: result()
   def run(workspace, %Issue{id: issue_id} = issue, worker_host, review_workflow, opts)
       when is_binary(workspace) and is_binary(issue_id) and is_map(review_workflow) do
-    settings = Config.review_settings(review_workflow)
+    settings =
+      review_workflow
+      |> Config.review_settings()
+      |> AgentEfficiency.review_settings(Keyword.get(opts, :efficiency_decision))
+
     iteration = current_iteration(issue_id)
     pr_opts = review_pr_opts(issue, opts)
 

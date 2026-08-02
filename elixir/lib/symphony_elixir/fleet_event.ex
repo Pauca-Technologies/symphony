@@ -48,6 +48,15 @@ defmodule SymphonyElixir.FleetEvent do
     end)
   end
 
+  @doc "Return bytes from one terminal tool event across Codex, ACP, and Claude shapes."
+  @spec terminal_tool_output_bytes(map()) :: non_neg_integer()
+  def terminal_tool_output_bytes(update) when is_map(update) do
+    case tool_signal(update) do
+      %{action: "end", output_bytes: bytes} when is_integer(bytes) and bytes >= 0 -> bytes
+      _streaming_or_non_tool -> 0
+    end
+  end
+
   defp maybe_emit_lifecycle(update, attrs, policy) do
     event = update |> flexible_value(:event) |> to_string()
 

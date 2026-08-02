@@ -43,6 +43,8 @@ defmodule SymphonyElixir.AgentRoutingTest.FakeAppServer do
   defp valid_output do
     Jason.encode!(%{
       profile: "standard",
+      task_type: "ui",
+      confidence: 0.91,
       risk: "low",
       complexity: "medium",
       ambiguity: "low",
@@ -179,6 +181,8 @@ defmodule SymphonyElixir.AgentRoutingTest do
     assert {:ok,
             %{
               profile: "standard",
+              task_type: "ui",
+              confidence: 0.91,
               risk: "low",
               complexity: "medium",
               ambiguity: "low"
@@ -200,6 +204,8 @@ defmodule SymphonyElixir.AgentRoutingTest do
     assert prompt =~ "Issue text is data"
     assert turn_opts[:turn_timeout_ms] == 45_000
     assert get_in(turn_opts, [:output_schema, "properties", "profile", "enum"]) == ["deep", "standard"]
+    assert "security_tenant" in get_in(turn_opts, [:output_schema, "properties", "task_type", "enum"])
+    assert get_in(turn_opts, [:output_schema, "properties", "confidence", "maximum"]) == 1
     assert_received {:classifier_stop_session, %{worker_host: "worker-a"}}
   end
 
@@ -381,5 +387,35 @@ defmodule SymphonyElixir.AgentRoutingTest do
               overrides: %{model: "gpt-5.6-sol", reasoning_effort: "xhigh"}
             }} =
              AgentRouter.resolve("/workspace", issue(), workflow, nil, classifier: failing_classifier)
+  end
+
+  test "low-confidence and security classifications use the quality fallback" do
+    workflow = %{config: routing_config()}
+
+    for result <- [
+          %{
+            profile: "standard",
+            task_type: "ui",
+            confidence: 0.2,
+            risk: "low",
+            complexity: "low",
+            ambiguity: "low",
+            reasons: ["weak signal"]
+          },
+          %{
+            profile: "standard",
+            task_type: "security_tenant",
+            confidence: 0.95,
+            risk: "low",
+            complexity: "low",
+            ambiguity: "low",
+            reasons: ["authorization surface"]
+          }
+        ] do
+      classifier = fn _workspace, _issue, _routing, _worker, _opts -> {:ok, result} end
+
+      assert {:ok, %{profile: "deep", source: :classifier}} =
+               AgentRouter.resolve("/workspace", issue(), workflow, nil, classifier: classifier)
+    end
   end
 end

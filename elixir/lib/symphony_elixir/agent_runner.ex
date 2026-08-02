@@ -8,6 +8,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   alias SymphonyElixir.{
     AgentBackend,
+    AgentBudgetCollector,
+    AgentEfficiency,
     AgentFailure,
     AgentRouter,
     Config,
@@ -354,8 +356,9 @@ defmodule SymphonyElixir.AgentRunner do
     }
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp codex_message_handler(recipient, issue, budget_ref) do
     fn message ->
+      AgentBudgetCollector.observe(budget_ref, message)
       send_codex_update(recipient, issue, message)
     end
   end
@@ -389,7 +392,7 @@ defmodule SymphonyElixir.AgentRunner do
   # it from the issue's labels. The session holds Codex's resolved model or the
   # config/override value handed to ACP/Claude Code; backends that report their
   # real model later on the wire refine it via the `:session_started` event.
-  defp send_agent_backend_info(recipient, %Issue{id: issue_id}, route, session)
+  defp send_agent_backend_info(recipient, %Issue{id: issue_id}, route, session, efficiency)
        when is_binary(issue_id) and is_pid(recipient) do
     send(
       recipient,
@@ -400,14 +403,35 @@ defmodule SymphonyElixir.AgentRunner do
          reasoning_effort:
            agent_session_reasoning_effort(session) ||
              Map.get(route.overrides, :reasoning_effort),
-         profile: route.profile
+         profile: route.profile,
+         task_type: efficiency.task_type,
+         routing_confidence: efficiency.confidence,
+         budget_profile: efficiency.budget_profile,
+         budget_mode: efficiency.mode,
+         budget_transitions: []
        }}
     )
 
     :ok
   end
 
-  defp send_agent_backend_info(_recipient, _issue, _route, _session), do: :ok
+  defp send_agent_backend_info(_recipient, _issue, _route, _session, _efficiency), do: :ok
+
+  defp send_budget_runtime_info(recipient, %Issue{id: issue_id}, budget_runtime)
+       when is_binary(issue_id) and is_pid(recipient) do
+    send(
+      recipient,
+      {:worker_runtime_info, issue_id,
+       %{
+         budget_metrics: budget_runtime.metrics,
+         budget_transitions: budget_runtime.transitions
+       }}
+    )
+
+    :ok
+  end
+
+  defp send_budget_runtime_info(_recipient, _issue, _budget_runtime), do: :ok
 
   defp agent_session_model(session) when is_map(session) do
     model =
@@ -453,31 +477,43 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host) do
-      result =
-        with {:ok, session} <-
-               route.backend.start_session(workspace,
-                 worker_host: worker_host,
-                 overrides: route.overrides,
-                 issue_context_file: Keyword.get(opts, :issue_context_file)
-               ) do
-          send_agent_backend_info(codex_update_recipient, issue, route, session)
+    with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
+         {:ok, efficiency} <-
+           AgentEfficiency.decide(issue, route, Keyword.get(opts, :per_repo_workflow)),
+         {:ok, budget_collector} <- AgentBudgetCollector.start_link(efficiency, issue) do
+      opts =
+        opts
+        |> Keyword.put(:efficiency_decision, efficiency)
+        |> Keyword.put(:budget_collector, budget_collector)
 
-          try do
-            do_run_codex_turns(
-              route.backend,
-              session,
-              workspace,
-              issue,
-              codex_update_recipient,
-              opts,
-              issue_state_fetcher,
-              1,
-              max_turns
-            )
-          after
-            route.backend.stop_session(session)
+      result =
+        try do
+          with {:ok, session} <-
+                 route.backend.start_session(workspace,
+                   worker_host: worker_host,
+                   overrides: route.overrides,
+                   issue_context_file: Keyword.get(opts, :issue_context_file)
+                 ) do
+            send_agent_backend_info(codex_update_recipient, issue, route, session, efficiency)
+
+            try do
+              do_run_codex_turns(
+                route.backend,
+                session,
+                workspace,
+                issue,
+                codex_update_recipient,
+                opts,
+                issue_state_fetcher,
+                1,
+                max_turns
+              )
+            after
+              route.backend.stop_session(session)
+            end
           end
+        after
+          AgentBudgetCollector.stop(budget_collector)
         end
 
       case {result, Keyword.has_key?(opts, :agent_backend)} do
@@ -520,7 +556,20 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp do_run_codex_turns(backend, app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(
+         backend,
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
+    budget_collector = Keyword.fetch!(opts, :budget_collector)
+    strategy_prompt = AgentBudgetCollector.take_strategy_prompt(budget_collector)
+    opts = maybe_put(opts, :efficiency_strategy_prompt, strategy_prompt)
     {prompt, included_sections, section_hashes} = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     emit_prompt_built(
@@ -535,14 +584,28 @@ defmodule SymphonyElixir.AgentRunner do
     )
 
     tool_executor = dynamic_tool_executor(issue, workspace, app_session.worker_host, opts)
+    budget_ref = AgentBudgetCollector.ref(budget_collector)
+    started_ms = System.monotonic_time(:millisecond)
+    :ok = AgentBudgetCollector.start_turn(budget_collector, prompt, started_ms)
 
-    case backend.run_turn(
-           app_session,
-           prompt,
-           issue,
-           on_message: codex_message_handler(codex_update_recipient, issue),
-           tool_executor: tool_executor
-         ) do
+    turn_result =
+      backend.run_turn(
+        app_session,
+        prompt,
+        issue,
+        on_message: codex_message_handler(codex_update_recipient, issue, budget_ref),
+        tool_executor: tool_executor
+      )
+
+    budget_runtime =
+      AgentBudgetCollector.finish_turn(
+        budget_collector,
+        System.monotonic_time(:millisecond)
+      )
+
+    send_budget_runtime_info(codex_update_recipient, issue, budget_runtime)
+
+    case turn_result do
       {:ok, turn_session} ->
         Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
         handoff_gate_prompt = pop_handoff_gate_prompt()
@@ -625,10 +688,12 @@ defmodule SymphonyElixir.AgentRunner do
   defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
     handoff_gate_prompt = Keyword.get(opts, :handoff_gate_prompt)
     handoff_guidance = handoff_tool_guidance(opts)
+    efficiency_strategy = Keyword.get(opts, :efficiency_strategy_prompt)
 
     prompt =
       """
       #{handoff_gate_prompt_section(handoff_gate_prompt)}
+      #{efficiency_strategy_section(efficiency_strategy)}
       Continuation guidance:
 
       - The previous Codex turn completed normally, but the Linear issue is still in an active state.
@@ -643,6 +708,7 @@ defmodule SymphonyElixir.AgentRunner do
     {included_sections, section_hashes} =
       prompt_section_metadata([
         {"handoff_gate_remediation", handoff_gate_prompt},
+        {"efficiency_strategy", efficiency_strategy},
         {"continuation_guidance", "included"},
         {"handoff_tool_guidance", handoff_guidance}
       ])
@@ -722,12 +788,19 @@ defmodule SymphonyElixir.AgentRunner do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
     per_repo_before_handoff = Keyword.get(opts, :per_repo_before_handoff)
     per_repo_review_workflow = Keyword.get(opts, :per_repo_review_workflow)
+    efficiency_decision = Keyword.get(opts, :efficiency_decision)
+
+    review_opts =
+      []
+      |> maybe_put(:efficiency_decision, efficiency_decision)
+      |> maybe_put(:requested_lenses, AgentEfficiency.review_lenses(efficiency_decision))
 
     handoff_context =
       %{issue: issue, workspace: workspace, worker_host: worker_host}
       |> maybe_put_map(:before_handoff_command, per_repo_before_handoff)
       |> maybe_put_map(:review_workflow, per_repo_review_workflow)
       |> maybe_put_map(:deferred_review_callback, deferred_review_callback(per_repo_review_workflow))
+      |> maybe_put_map(:review_opts, review_opts)
 
     fn tool, arguments ->
       result =
@@ -1085,6 +1158,15 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp handoff_gate_prompt_section(_prompt), do: ""
+
+  defp efficiency_strategy_section(prompt) when is_binary(prompt) do
+    case String.trim(prompt) do
+      "" -> ""
+      trimmed -> trimmed <> "\n\n"
+    end
+  end
+
+  defp efficiency_strategy_section(_prompt), do: ""
 
   defp handoff_tool_guidance(opts) do
     if Keyword.has_key?(opts, :per_repo_before_handoff) or Keyword.has_key?(opts, :per_repo_review_workflow) do

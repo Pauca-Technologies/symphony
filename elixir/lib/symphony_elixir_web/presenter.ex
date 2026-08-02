@@ -226,7 +226,22 @@ defmodule SymphonyElixirWeb.Presenter do
       reasoning_effort: blank_to_nil(Map.get(entry, :reasoning_effort)),
       profile: blank_to_nil(Map.get(entry, :profile))
     }
+    |> maybe_put_efficiency(entry)
   end
+
+  defp maybe_put_efficiency(agent, %{budget_profile: profile} = entry)
+       when is_binary(profile) do
+    Map.put(agent, :efficiency, %{
+      task_type: Map.get(entry, :task_type),
+      classifier_confidence: Map.get(entry, :routing_confidence),
+      budget_profile: profile,
+      mode: Map.get(entry, :budget_mode),
+      metrics: Map.get(entry, :budget_metrics),
+      transitions: Map.get(entry, :budget_transitions, [])
+    })
+  end
+
+  defp maybe_put_efficiency(agent, _entry), do: agent
 
   defp blank_to_nil(value) when is_binary(value) do
     case String.trim(value) do

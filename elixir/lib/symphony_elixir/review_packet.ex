@@ -63,7 +63,7 @@ defmodule SymphonyElixir.ReviewPacket do
       },
       repository_rules: rules,
       risk: risk,
-      requested_lenses: requested_lenses(risk, changed_files),
+      requested_lenses: requested_lenses(risk, changed_files, opts),
       validation_attestations: attestations.entries,
       unresolved_findings: prior.findings,
       follow_up: prior.delta,
@@ -517,21 +517,47 @@ defmodule SymphonyElixir.ReviewPacket do
     end
   end
 
-  defp requested_lenses(risk, changed_files) do
+  defp requested_lenses(risk, changed_files, opts) do
     base = [
       %{name: "correctness", rationale: "Exercise boundary, failure, concurrency, and ordering cases in changed behavior."},
       %{name: "regression", rationale: "Trace callers and shared contracts outside the changed files."},
       %{name: "test_evidence", rationale: "Verify tests prove the changed behavior rather than merely pass."}
     ]
 
-    security =
-      if risk.level == "high" or security_paths?(changed_files) do
-        [%{name: "security_tenant_auth", rationale: "Trust-boundary-sensitive paths require explicit authz, tenant isolation, input, and secret review."}]
-      else
-        []
-      end
+    security_lens =
+      %{
+        name: "security_tenant_auth",
+        rationale: "Trust-boundary-sensitive paths require explicit authz, tenant isolation, input, and secret review."
+      }
 
-    base ++ security ++ [%{name: "structure", rationale: "Check whether the change fits repository architecture without avoidable complexity."}]
+    security = if risk.level == "high" or security_paths?(changed_files), do: [security_lens], else: []
+
+    structure =
+      %{name: "structure", rationale: "Check whether the change fits repository architecture without avoidable complexity."}
+
+    required =
+      base ++ security ++ [structure]
+
+    configured = Keyword.get(opts, :requested_lenses)
+
+    if risk.level == "high" or security_paths?(changed_files) or not is_list(configured) do
+      required
+    else
+      configured_names = MapSet.new(configured)
+
+      (base ++ [security_lens, structure])
+      |> Enum.filter(&MapSet.member?(configured_names, &1.name))
+      |> ensure_lens(required, "correctness")
+      |> ensure_lens(required, "test_evidence")
+    end
+  end
+
+  defp ensure_lens(selected, required, name) do
+    if Enum.any?(selected, &(&1.name == name)) do
+      selected
+    else
+      selected ++ Enum.filter(required, &(&1.name == name))
+    end
   end
 
   defp issue_contract(%Issue{} = issue) do

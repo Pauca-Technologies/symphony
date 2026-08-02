@@ -48,6 +48,7 @@ defmodule Mix.Tasks.Telemetry.Report do
     Mix.shell().info("Gate reuse: #{fleet.gate_reuse.reused} reused / #{fleet.gate_reuse.rerun} rerun (#{format_rate(fleet.gate_reuse.reuse_rate)})")
 
     print_map("Retries by failure class", fleet.retries_by_class)
+    print_map("Budget transitions by action", summary.efficiency.by_action)
     print_group("Repositories", summary.repositories)
     print_group("Issues", summary.issues)
     print_group("Parent/subagent reconciliation", summary.parent_subagents)

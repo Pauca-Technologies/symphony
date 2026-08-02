@@ -28,6 +28,13 @@ failure history, and keeps complete recursively redacted compressed protocol tra
 failed/sampled sessions while compacting high-frequency semantic streams by tool/message identity.
 This makes weekly token/time/quality reports bounded without discarding incident evidence.
 
+Repositories can turn that telemetry into task-specific soft budgets. Shadow mode records proposed
+task/model/review routes and one-shot strategy transitions before enforcement; enforce mode applies
+bounded resume capsules at continuation boundaries. Parent and delegated usage is reconciled across
+turns through a bounded high-water collector instead of queuing full protocol events in the runner,
+while security validation, unresolved findings, and exact-head review approval remain unchanged
+quality requirements even when a high-risk task explicitly exceeds its budget.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

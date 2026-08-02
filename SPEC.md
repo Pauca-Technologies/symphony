@@ -453,7 +453,8 @@ Fields:
     `reasoning_effort`, and an optional positive `timeout_ms`. The classifier SHOULD be ephemeral,
     schema-constrained, limited to a bounded issue snapshot, and run without repository project
     instructions or implementation-agent dynamic tools. Issue content MUST be treated as untrusted
-    data.
+    data. Its structured result SHOULD include the execution profile, task class, confidence,
+    risk, complexity, ambiguity, and bounded reasons.
   - `profiles` is a REQUIRED non-empty map from profile name to `backend`, `model`,
     `reasoning_effort`, and classifier-facing `description`. This extension currently supports the
     `codex` backend.
@@ -468,6 +469,16 @@ Fields:
   - Host/operator label presets MAY take precedence over repository-owned routing profiles.
   - The selected model MUST be applied to Codex `thread/start`, and the selected reasoning effort
     MUST be applied to each Codex `turn/start`; routing MUST NOT be observational-only when enabled.
+- `efficiency` (object, OPTIONAL extension)
+  - Defines telemetry-driven soft-budget and review-routing policy as specified in Section 13.7.
+  - `mode` is `off`, `shadow` (default), or `enforce`; `capsule_max_bytes` MUST be bounded to a
+    safe positive range, and `extreme_multiplier` MUST be at least `1.0`.
+  - `task_profiles` maps supported task classifier values to names in the non-empty `profiles` map.
+    Profiles define positive token/time/byte/lens/iteration thresholds, optional reviewer model and
+    reasoning effort, an explicit `allow_overage` policy, and requested risk-relevant lens names.
+  - One exact valid `budget:<profile>` issue label MAY override the derived budget. A present invalid
+    budget label or more than one distinct valid budget profile MUST select the high-risk profile
+    and retain override provenance for operator inspection.
 
 #### 5.3.6 `codex` (object)
 
@@ -1564,7 +1575,45 @@ MUST define durations, sampling, privacy, recursive secret-field redaction, and 
 per-notification debug logs SHOULD be disabled by default so lifecycle/error history is not rotated
 away by streaming chatter.
 
-### 13.7 Humanized Agent Event Summaries (OPTIONAL)
+### 13.7 Telemetry-Driven Soft Budgets and Routing
+
+Repository workflows MAY configure `agent.efficiency` with `mode` (`off`, `shadow`, or `enforce`),
+a bounded resume-capsule size, an extreme-outlier multiplier, task-type-to-budget-profile mappings,
+and per-profile thresholds. Implementations SHOULD provide distinct simple, standard, and high-risk
+defaults derived from recent fleet percentiles rather than one global ceiling. Required dimensions
+include issue/run total, parent/delegated and per-thread high waters, per-turn growth, uncached/cached
+input, prompt/review-packet/tool-output bytes, elapsed phase time, requested reviewer lenses, and
+review iterations.
+
+The execution classifier SHOULD report one of `simple_direct`, `ui`, `security_tenant`,
+`data_schema`, `concurrency_liveness`, or `broad_architecture`, together with confidence, bounded
+input metadata, result/reasons, and override provenance. Missing/low-confidence telemetry and
+security, tenant, schema, concurrency, or broad-architecture signals MUST fail toward a quality
+fallback. Operators MAY override execution routing with an exact `agent:<profile>` label and budget
+routing with one exact valid `budget:<profile>` label. A present invalid budget label or more than
+one distinct valid budget profile MUST fail toward the high-risk budget with inspectable
+provenance.
+
+Soft-budget accounting MUST use actual parent/delegated thread cumulative high waters and survive
+continuation turns. A threshold identity is latched for the run: duplicate or out-of-order absolute
+usage notifications MUST NOT produce repeated warning prompts or transitions. Callback accounting
+SHOULD normalize and coalesce cumulative signals without retaining full protocol events in the
+runner mailbox, and a continuation-boundary snapshot MUST include callbacks begun before the turn
+returned. Tool-output bytes MUST come from terminal tool events rather than streaming deltas.
+`shadow` records the same proposed decisions/transitions without changing agent prompts. `enforce`
+applies a one-shot, bounded strategy capsule at a safe continuation boundary. Strategies MAY compact
+parent state, require fresh thin-context delegation/review, reuse exact-head gate evidence,
+constrain future tool output, select risk-relevant reviewer lenses/model/reasoning, synthesize open
+findings, or escalate an extreme outlier with a complete resume packet.
+
+Budgets are never completion or approval criteria. Reaching one MUST NOT mark work complete, approve
+a review, skip required security/tenant validation, reduce mandatory high-risk lenses/evidence, or
+suppress unresolved findings. A high-risk policy MAY explicitly allow overage while preserving or
+strengthening reviewer effort, packet capacity, lens coverage, and iteration count. Compact reports
+SHOULD compare rolling tokens, time, review findings, CI/human outcomes, and extreme outliers, and
+expose classifier/budget decisions and applied versus shadow transitions.
+
+### 13.8 Humanized Agent Event Summaries (OPTIONAL)
 
 Humanized summaries of raw agent protocol events are OPTIONAL.
 
@@ -1573,7 +1622,7 @@ If implemented:
 - Treat them as observability-only output.
 - Do not make orchestrator logic depend on humanized strings.
 
-### 13.7 OPTIONAL HTTP Server Extension
+### 13.9 OPTIONAL HTTP Server Extension
 
 This section defines an OPTIONAL HTTP interface for observability and operational control.
 

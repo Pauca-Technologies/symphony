@@ -197,6 +197,48 @@ defmodule SymphonyElixir.ReviewPacketTest do
     assert result.packet.evidence_status.raw_evidence_artifact in result.packet.implementation.evidence_links
   end
 
+  test "simple routing narrows optional lenses but preserves mandatory correctness evidence", context do
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("simple route"),
+               pr(context),
+               context.head_sha,
+               nil,
+               settings(),
+               attestations: [attestation(context.head_sha)],
+               requested_lenses: ["correctness"]
+             )
+
+    names = Enum.map(result.packet.requested_lenses, & &1.name)
+    assert names == ["correctness", "test_evidence"]
+  end
+
+  test "an explicitly requested security lens survives normal diff-risk classification", context do
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("security-classified route with a low-risk filename"),
+               pr(context),
+               context.head_sha,
+               nil,
+               settings(),
+               attestations: [attestation(context.head_sha)],
+               requested_lenses: [
+                 "correctness",
+                 "regression",
+                 "test_evidence",
+                 "security_tenant_auth",
+                 "structure"
+               ]
+             )
+
+    names = Enum.map(result.packet.requested_lenses, & &1.name)
+    assert "security_tenant_auth" in names
+    assert "regression" in names
+    assert "structure" in names
+  end
+
   defp settings(overrides \\ %{}) do
     Config.review_settings(%{config: %{"review" => overrides}, prompt: "", prompt_template: ""})
   end

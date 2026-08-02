@@ -261,7 +261,59 @@ Notes:
   `fallback_profile`; a classifier failure also fails closed to that profile. A single
   `agent:<profile>` issue label bypasses classification, while multiple matching profile labels use
   the fallback. Existing host `agent.label_presets` remain the highest-precedence override. Routing
-  is active directly; there is no shadow decision.
+  is active directly. The classifier also records a task class (`simple_direct`, `ui`,
+  `security_tenant`, `data_schema`, `concurrency_liveness`, or `broad_architecture`), confidence,
+  bounded input metadata, reasons, and override provenance for efficiency routing.
+
+  Soft fleet budgets live separately under repository-owned `agent.efficiency`. They default to
+  `shadow`, so proposed transitions are observable before prompts change. `enforce` applies each
+  threshold transition once at the next continuation boundary; `off` retains the decision record
+  without transition enforcement. Defaults use distinct simple/standard/high-risk profiles seeded
+  from recent fleet percentile bands, and every positive threshold is overrideable:
+
+  ```yaml
+  agent:
+    efficiency:
+      mode: shadow                 # off | shadow | enforce
+      capsule_max_bytes: 4000
+      extreme_multiplier: 2.0
+      task_profiles:
+        simple_direct: simple
+        ui: standard
+        security_tenant: high_risk
+        data_schema: high_risk
+        concurrency_liveness: high_risk
+        broad_architecture: high_risk
+      profiles:
+        simple:
+          total_tokens: 250000
+          delegated_tokens: 75000
+          per_thread_tokens: 150000
+          per_turn_growth_tokens: 100000
+          uncached_input_tokens: 125000
+          cached_input_tokens: 500000
+          tool_output_bytes: 250000
+          elapsed_phase_ms: 900000
+          review_packet_bytes: 32000
+          reviewer_lenses: 2
+          review_iterations: 2
+          reviewer_reasoning_effort: medium
+          review_lenses: [correctness, test_evidence]
+  ```
+
+  `budget:<profile>` is the explicit per-issue budget override. A typo/unknown profile or multiple
+  valid budget profiles fails toward `high_risk` with inspectable provenance. Token state is
+  reconstructed from actual parent/delegated thread high waters and remains live across continuation
+  turns. Backend callbacks coalesce their small cumulative signals directly into a bounded collector;
+  full protocol events never accumulate in the runner's budget mailbox, and a turn-boundary barrier
+  includes callbacks that began before the backend returned. Tool bytes count terminal Codex, ACP,
+  and Claude tool results, not streaming deltas. A crossing emits one compact `budget_transition`;
+  enforce mode adds one bounded resume capsule directing future work toward thin-context delegation,
+  exact-head artifact reuse, bounded tool output, and open-finding synthesis. Extreme outliers get a
+  complete-resume-packet escalation. None of these transitions can approve a review, mark work
+  complete, skip required security validation, or suppress findings. High-risk profiles may exceed
+  their budgets explicitly while preserving or strengthening reviewer effort, lens coverage, packet
+  capacity, and iteration count.
 
   The observability dashboard surfaces the **actual** backend, model, reasoning effort, and selected
   profile each run is using. Its "Agent" column in the running-issues list and "Agent" card on the
@@ -396,7 +448,11 @@ codex:
   views without parsing transcripts. Percentiles use the conventional nearest-rank definition.
   Token totals use each actual thread's greatest cumulative
   snapshot; cached input and reasoning remain distinct and repeated absolute snapshots are not
-  summed. Unversioned telemetry JSONL remains readable as schema version 0.
+  summed. Routing views include classifier inputs/result/confidence, budget profile/mode and
+  overrides; efficiency views distinguish proposed/applied transitions and compare tokens, time,
+  review findings, CI/human outcomes, and extreme outliers over the requested rolling window (use
+  the prior 30 days for the rollout comparison). Unversioned telemetry JSONL remains readable as
+  schema version 0.
 - Benign protocol notifications and stdout chunks do not produce one debug-log line each by
   default. `observability.benign_notification_debug: true` is the short-lived log-level escape
   hatch; selective gzip raw traces are normally the more complete incident artifact.

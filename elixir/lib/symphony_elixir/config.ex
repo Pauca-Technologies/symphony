@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.Config.{AgentRouting, Schema}
+  alias SymphonyElixir.Config.{AgentEfficiency, AgentRouting, Schema}
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -203,6 +203,17 @@ defmodule SymphonyElixir.Config do
 
   def agent_routing_settings(_workflow),
     do: {:error, {:invalid_agent_routing, "repository workflow must contain a config map"}}
+
+  @doc "Parse repository-owned soft-budget and efficiency-routing policy."
+  @spec agent_efficiency_settings(Workflow.loaded_workflow() | nil) ::
+          {:ok, AgentEfficiency.t()} | {:error, term()}
+  def agent_efficiency_settings(%{config: config}) when is_map(config),
+    do: AgentEfficiency.parse(config)
+
+  def agent_efficiency_settings(nil), do: AgentEfficiency.parse(%{})
+
+  def agent_efficiency_settings(_workflow),
+    do: {:error, {:invalid_agent_efficiency, "repository workflow must contain a config map"}}
 
   @doc """
   Resolve repository-owned automated-review settings from `WORKFLOW_REVIEW.md`.

@@ -36,6 +36,8 @@ defmodule SymphonyElixir.Telemetry do
           | :lease
           | :base_drift
           | :quality_outcome
+          | :routing_decision
+          | :budget_transition
           | :routing_skip
           | :cardinality_skip
           | :gc_removed

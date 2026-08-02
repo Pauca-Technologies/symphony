@@ -26,6 +26,8 @@ defmodule SymphonyElixir.Telemetry.Report do
     tools = Map.get(grouped, "tool", [])
     gates = Map.get(grouped, "gate", []) ++ Map.get(grouped, "review", [])
     retries = Map.get(grouped, "retry_policy", [])
+    routing_decisions = Map.get(grouped, "routing_decision", [])
+    budget_transitions = Map.get(grouped, "budget_transition", [])
 
     durations = values(ends, "duration_ms")
     thread_tokens = token_threads |> Map.values() |> Enum.map(& &1.tokens.total_tokens)
@@ -63,8 +65,14 @@ defmodule SymphonyElixir.Telemetry.Report do
       reviews: review_view(review_events),
       routing: %{
         routing_skips: length(Map.get(grouped, "routing_skip", [])),
-        cardinality_skips: length(Map.get(grouped, "cardinality_skip", []))
+        cardinality_skips: length(Map.get(grouped, "cardinality_skip", [])),
+        decisions: length(routing_decisions),
+        task_types: tally(routing_decisions, "task_type"),
+        budget_profiles: tally(routing_decisions, "budget_profile"),
+        modes: tally(routing_decisions, "budget_mode"),
+        overrides: Enum.count(routing_decisions, &is_map(&1["override"]))
       },
+      efficiency: efficiency_view(budget_transitions, grouped, totals, durations, review_events),
       gc: %{
         passes: length(Map.get(grouped, "gc_pass_summary", [])),
         removed: length(Map.get(grouped, "gc_removed", [])),
@@ -386,6 +394,29 @@ defmodule SymphonyElixir.Telemetry.Report do
       merges: Enum.count(quality, &(&1["outcome"] == "merge")),
       reverts: Enum.count(quality, &(&1["outcome"] == "revert")),
       ci_regressions: Enum.count(quality, &(&1["outcome"] == "ci_regression"))
+    }
+  end
+
+  defp efficiency_view(transitions, grouped, totals, durations, reviews) do
+    quality = Map.get(grouped, "quality_outcome", [])
+    review_verdicts = authoritative_review_verdicts(reviews)
+    nested = Enum.map(transitions, &Map.merge(&1, &1["transition"] || %{}))
+
+    %{
+      proposed_transitions: length(nested),
+      applied_transitions: Enum.count(nested, &(&1["applied"] == true)),
+      by_dimension: tally(nested, "dimension"),
+      by_action: tally(nested, "action"),
+      outliers: Enum.count(nested, &(&1["level"] == "extreme")),
+      comparison: %{
+        tokens: totals,
+        duration_ms_p50: percentile(durations, 0.5),
+        duration_ms_p90: percentile(durations, 0.9),
+        review_findings_by_severity: severity_tally(review_verdicts),
+        ci_outcomes: quality |> Enum.filter(&String.starts_with?(to_string(&1["outcome"] || ""), "ci_")) |> tally("outcome"),
+        human_outcomes: quality |> Enum.filter(&String.starts_with?(to_string(&1["outcome"] || ""), "human_")) |> tally("outcome"),
+        extreme_outliers: Enum.count(nested, &(&1["level"] == "extreme"))
+      }
     }
   end
 
