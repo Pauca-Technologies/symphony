@@ -18,6 +18,7 @@ defmodule SymphonyElixir.Orchestrator do
     OrchestratorVersion,
     QuotaCircuitStore,
     RepoConfig,
+    RepositoryScheduler,
     Router,
     SessionTranscript,
     StatusDashboard,
@@ -139,7 +140,8 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil,
       # "backend::account-scope" => provider/account quota circuit. Parked
       # retries remain claimed but have no per-issue timer while unavailable.
-      quota_circuits: %{}
+      quota_circuits: %{},
+      queued: %{}
     ]
   end
 
@@ -331,6 +333,13 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:budget_mode, runtime_info[:budget_mode])
           |> maybe_put_runtime_value(:budget_metrics, runtime_info[:budget_metrics])
           |> maybe_put_runtime_value(:budget_transitions, runtime_info[:budget_transitions])
+          |> maybe_put_runtime_value(:repository_id, runtime_info[:repository_id])
+          |> maybe_put_runtime_value(:scheduling_paths, runtime_info[:scheduling_paths])
+          |> maybe_put_runtime_value(:scheduling_path_source, runtime_info[:scheduling_path_source])
+          |> maybe_put_runtime_value(:base_sha, runtime_info[:base_sha])
+          |> maybe_put_runtime_value(:base_age_seconds, runtime_info[:base_age_seconds])
+          |> maybe_put_runtime_value(:candidate_base_sha, runtime_info[:candidate_base_sha])
+          |> maybe_put_runtime_value(:workspace_dirty, runtime_info[:workspace_dirty])
 
         issue = Map.get(updated_running_entry, :issue, %{})
 
@@ -375,6 +384,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        updated_running_entry = RepositoryScheduler.observe_plan(updated_running_entry, update)
         updated_running_entry = persist_codex_update(updated_running_entry, update)
 
         state =
@@ -630,6 +640,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
+  end
+
+  @doc false
+  @spec repository_schedule_for_test(Issue.t(), map(), map()) :: RepositoryScheduler.decision()
+  def repository_schedule_for_test(%Issue{} = issue, repo_config, running) do
+    RepositoryScheduler.decide(issue, repo_config, running)
   end
 
   @doc false
@@ -941,6 +957,18 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
     repo_config = load_repo_config_or_default()
 
+    state = %{
+      state
+      | queued:
+          retain_queue_timestamps(
+            state.queued,
+            issues,
+            state,
+            active_states,
+            terminal_states
+          )
+    }
+
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
@@ -952,17 +980,129 @@ defmodule SymphonyElixir.Orchestrator do
     if should_dispatch_issue?(issue, state, active_states, terminal_states) do
       issue
       |> gate_routing_and_cardinality(repo_config, active_states)
-      |> apply_gate_decision(state, issue)
+      |> apply_gate_decision(state, issue, repo_config)
     else
       state
     end
   end
 
-  defp apply_gate_decision(:pass, state, issue), do: dispatch_issue(state, issue)
-  defp apply_gate_decision(:skip_silent, state, _issue), do: state
+  defp apply_gate_decision(:pass, state, issue, repo_config) do
+    case RepositoryScheduler.decide(issue, repo_config, state.running) do
+      {:allow, decision} ->
+        state
+        |> allow_scheduling_dispatch(issue, decision)
+        |> dispatch_issue(issue)
 
-  defp apply_gate_decision({:skip_warn, body, telemetry}, state, issue) do
+      {:queue, decision} ->
+        queue_scheduling_decision(state, issue, decision)
+    end
+  end
+
+  defp apply_gate_decision(:skip_silent, state, _issue, _repo_config), do: state
+
+  defp apply_gate_decision({:skip_warn, body, telemetry}, state, issue, _repo_config) do
     emit_issue_warning(state, issue, body, telemetry)
+  end
+
+  defp queue_scheduling_decision(%State{} = state, %Issue{} = issue, decision) do
+    now_ms = System.monotonic_time(:millisecond)
+    previous = Map.get(state.queued, issue.id)
+    queued_at_ms = (previous && previous.queued_at_ms) || now_ms
+
+    entry =
+      decision
+      |> Map.merge(%{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        state: issue.state,
+        priority: issue.priority,
+        priority_rank: priority_rank(issue.priority),
+        created_at_key: issue_created_at_sort_key(issue),
+        queued_at_ms: queued_at_ms
+      })
+
+    if is_nil(previous) or queue_fingerprint(previous) != queue_fingerprint(entry) do
+      emit_scheduling_decision(issue, entry, "queue")
+    end
+
+    %{state | queued: Map.put(state.queued, issue.id, entry)}
+  end
+
+  defp emit_scheduling_decision(%Issue{} = issue, decision, action) do
+    Telemetry.emit(:scheduling, %{
+      action: action,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      repository: decision.repository_id || "default",
+      reason: decision.reason,
+      policy: decision.policy,
+      predicted_paths: decision.predicted_paths,
+      overlap_paths: decision.overlap_paths,
+      overlap_score: decision.overlap_score,
+      suggested_order: decision.suggested_order,
+      suggested_order_omitted: decision.suggested_order_omitted,
+      override: decision.override,
+      max_concurrent: decision.max_concurrent,
+      queue_time_ms: Map.get(decision, :queue_time_ms, 0)
+    })
+  end
+
+  defp queue_fingerprint(entry) do
+    {entry.reason, entry.overlap_paths, entry.suggested_order, entry.suggested_order_omitted, entry.override}
+  end
+
+  defp drop_queued(%State{} = state, issue_id), do: %{state | queued: Map.delete(state.queued, issue_id)}
+
+  defp maybe_add_queue_time(decision, %{queued_at_ms: queued_at_ms}) when is_integer(queued_at_ms) do
+    Map.put(decision, :queue_time_ms, max(0, System.monotonic_time(:millisecond) - queued_at_ms))
+  end
+
+  defp maybe_add_queue_time(decision, _entry), do: decision
+
+  defp allow_scheduling_dispatch(%State{} = state, %Issue{} = issue, decision) do
+    decision = maybe_add_queue_time(decision, state.queued[issue.id])
+    emit_scheduling_decision(issue, decision, "dispatch")
+    drop_queued(state, issue.id)
+  end
+
+  defp retain_queue_timestamps(queued, issues, state, active_states, terminal_states) do
+    eligible_ids =
+      issues
+      |> Enum.filter(fn
+        %Issue{} = issue ->
+          candidate_issue?(issue, active_states, terminal_states) and
+            !issue_blocked_by_non_terminal?(issue, terminal_states) and
+            (!MapSet.member?(state.claimed, issue.id) or Map.has_key?(state.retry_attempts, issue.id)) and
+            !Map.has_key?(state.running, issue.id)
+
+        _other ->
+          false
+      end)
+      |> Enum.map(& &1.id)
+      |> MapSet.new()
+
+    Map.filter(queued, fn {issue_id, _entry} -> MapSet.member?(eligible_ids, issue_id) end)
+  end
+
+  defp repository_id(%Issue{} = issue) do
+    case RepoConfig.load() do
+      {:ok, config} ->
+        case RepoConfig.match_repo(config, issue.labels) do
+          nil -> nil
+          repo -> repo.id
+        end
+
+      _error ->
+        nil
+    end
+  end
+
+  defp scheduling_paths(%Issue{} = issue) do
+    case RepoConfig.load() do
+      {:ok, config} -> RepositoryScheduler.predicted_paths(issue, RepoConfig.match_repo(config, issue.labels))
+      _error -> RepositoryScheduler.predicted_paths(issue, nil)
+    end
   end
 
   defp load_repo_config_or_default do
@@ -1151,13 +1291,43 @@ defmodule SymphonyElixir.Orchestrator do
   defp poll_delay_ms(%State{poll_interval_ms: interval}), do: interval
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
-    Enum.sort_by(issues, fn
+    issues
+    |> Enum.sort_by(fn
       %Issue{} = issue ->
         {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
 
       _ ->
         {priority_rank(nil), issue_created_at_sort_key(nil), ""}
     end)
+    |> dependency_stable_sort()
+  end
+
+  defp dependency_stable_sort(issues) do
+    ids =
+      MapSet.new(
+        Enum.flat_map(issues, fn
+          %Issue{id: id} when is_binary(id) -> [id]
+          _ -> []
+        end)
+      )
+
+    {sorted, remaining} =
+      Enum.reduce_while(1..max(length(issues), 1), {[], issues}, fn _pass, {sorted, remaining} ->
+        sorted_ids = MapSet.new(Enum.map(sorted, & &1.id))
+
+        {ready, blocked} =
+          Enum.split_with(remaining, fn issue ->
+            issue
+            |> Map.get(:blocked_by, [])
+            |> Enum.map(&Map.get(&1, :id))
+            |> Enum.filter(&MapSet.member?(ids, &1))
+            |> Enum.all?(&MapSet.member?(sorted_ids, &1))
+          end)
+
+        if ready == [], do: {:halt, {sorted, remaining}}, else: {:cont, {sorted ++ ready, blocked}}
+      end)
+
+    sorted ++ remaining
   end
 
   defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
@@ -1177,7 +1347,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       backend_dispatch_available?(state, predicted_backend(issue)) and
@@ -1248,22 +1418,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp issue_routable_to_worker?(_issue), do: true
 
-  defp todo_issue_blocked_by_non_terminal?(
-         %Issue{state: issue_state, blocked_by: blockers},
-         terminal_states
-       )
-       when is_binary(issue_state) and is_list(blockers) do
-    normalize_issue_state(issue_state) == "todo" and
-      Enum.any?(blockers, fn
-        %{state: blocker_state} when is_binary(blocker_state) ->
-          !terminal_issue_state?(blocker_state, terminal_states)
+  defp issue_blocked_by_non_terminal?(%Issue{blocked_by: blockers}, terminal_states)
+       when is_list(blockers) do
+    Enum.any?(blockers, fn
+      %{state: blocker_state} when is_binary(blocker_state) ->
+        !terminal_issue_state?(blocker_state, terminal_states)
 
-        _ ->
-          true
-      end)
+      _ ->
+        true
+    end)
   end
 
-  defp todo_issue_blocked_by_non_terminal?(_issue, _terminal_states), do: false
+  defp issue_blocked_by_non_terminal?(_issue, _terminal_states), do: false
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -1370,6 +1536,13 @@ defmodule SymphonyElixir.Orchestrator do
             budget_mode: nil,
             budget_metrics: nil,
             budget_transitions: [],
+            repository_id: repository_id(issue),
+            scheduling_paths: scheduling_paths(issue),
+            scheduling_path_source: "metadata",
+            base_sha: nil,
+            base_age_seconds: nil,
+            candidate_base_sha: nil,
+            workspace_dirty: nil,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -1732,24 +1905,39 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
-         dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
-      dispatch_active_retry(state, issue, attempt, metadata)
-    else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+    scheduling = RepositoryScheduler.decide(issue, load_repo_config_or_default(), state.running)
 
-      {:noreply,
-       schedule_issue_retry(
-         state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+    cond do
+      !retry_candidate_issue?(issue, terminal_state_set()) ->
+        {:noreply, release_issue_claim(state, issue.id)}
+
+      match?({:queue, _decision}, scheduling) ->
+        {:queue, decision} = scheduling
+        queued_state = queue_scheduling_decision(state, issue, decision)
+        schedule_repository_retry(queued_state, issue, attempt, metadata, decision.reason)
+
+      match?({:allow, _decision}, scheduling) and dispatch_slots_available?(issue, state) and
+          worker_slots_available?(state, metadata[:worker_host]) ->
+        {:allow, decision} = scheduling
+
+        state
+        |> allow_scheduling_dispatch(issue, decision)
+        |> dispatch_active_retry(issue, attempt, metadata)
+
+      true ->
+        Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+        schedule_repository_retry(state, issue, attempt, metadata, "no available orchestrator slots")
     end
+  end
+
+  defp schedule_repository_retry(state, issue, attempt, metadata, reason) do
+    {:noreply,
+     schedule_issue_retry(
+       state,
+       issue.id,
+       attempt + 1,
+       Map.merge(metadata, %{identifier: issue.identifier, error: reason})
+     )}
   end
 
   # The issue's claim is held here and its retry entry has already been popped,
@@ -1790,6 +1978,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
+        queued: Map.delete(state.queued, issue_id),
         failure_counts: Map.delete(state.failure_counts, issue_id)
     }
   end
@@ -2070,6 +2259,13 @@ defmodule SymphonyElixir.Orchestrator do
           budget_mode: Map.get(metadata, :budget_mode),
           budget_metrics: Map.get(metadata, :budget_metrics),
           budget_transitions: Map.get(metadata, :budget_transitions, []),
+          repository_id: Map.get(metadata, :repository_id),
+          scheduling_paths: Map.get(metadata, :scheduling_paths, []),
+          scheduling_path_source: Map.get(metadata, :scheduling_path_source),
+          base_sha: Map.get(metadata, :base_sha),
+          base_age_seconds: Map.get(metadata, :base_age_seconds),
+          candidate_base_sha: Map.get(metadata, :candidate_base_sha),
+          workspace_dirty: Map.get(metadata, :workspace_dirty),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
@@ -2114,9 +2310,18 @@ defmodule SymphonyElixir.Orchestrator do
 
     parked = quota_parked_snapshot(state.quota_circuits, now)
 
+    queued =
+      state.queued
+      |> Map.values()
+      |> Enum.map(fn entry ->
+        Map.put(entry, :queue_time_ms, max(0, now_ms - entry.queued_at_ms))
+      end)
+      |> Enum.sort_by(&{&1.priority_rank, &1.created_at_key, &1.identifier})
+
     {:reply,
      %{
        running: running,
+       queued: queued,
        retrying: retrying ++ parked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
@@ -3319,7 +3524,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+      !issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

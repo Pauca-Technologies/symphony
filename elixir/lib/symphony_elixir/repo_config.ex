@@ -33,6 +33,11 @@ defmodule SymphonyElixir.RepoConfig do
                                                      # agent prompt. Absent
                                                      # file -> reviewer off.
           max_concurrent: 3
+          overlap_policy: serialize                  # serialize | advisory | off
+          overlap_threshold: 0.5
+          scheduling_override_label: symphony:overlap-override
+          path_hints:                                # issue label -> predicted paths
+            area:auth: [app/auth/**, test/auth/**]
 
   This module never raises on a missing file: when `~/.symphony/repos.yaml`
   does not exist, the config is treated as empty (no repos configured) and
@@ -63,7 +68,11 @@ defmodule SymphonyElixir.RepoConfig do
           workflow_path: String.t(),
           review_workflow_path: String.t(),
           base_branch: String.t(),
-          max_concurrent: pos_integer()
+          max_concurrent: pos_integer(),
+          overlap_policy: String.t(),
+          overlap_threshold: float(),
+          scheduling_override_label: String.t(),
+          path_hints: %{optional(String.t()) => [String.t()]}
         }
 
   @type t :: %{
@@ -326,16 +335,19 @@ defmodule SymphonyElixir.RepoConfig do
     with id when is_binary(id) and id != "" <- Map.get(entry, "id") || {:missing, :id},
          label when is_binary(label) and label != "" <-
            Map.get(entry, "label") || {:missing, :label} do
-      repo_url =
-        case Map.get(entry, "repo_url") do
-          value when is_binary(value) and value != "" -> value
-          _ -> nil
-        end
-
+      repo_url = optional_string(entry, "repo_url")
       workflow_path = string_or_default(entry, "workflow_path", "WORKFLOW.md")
       review_workflow_path = string_or_default(entry, "review_workflow_path", "WORKFLOW_REVIEW.md")
       base_branch = string_or_default(entry, "base_branch", "main")
       max_concurrent = pos_integer(entry, "max_concurrent", 1)
+
+      overlap_policy = overlap_policy(entry)
+      overlap_threshold = bounded_float(entry, "overlap_threshold", 0.5)
+
+      scheduling_override_label =
+        string_or_default(entry, "scheduling_override_label", "symphony:overlap-override")
+
+      path_hints = path_hints(Map.get(entry, "path_hints", %{}))
 
       {:ok,
        %{
@@ -345,7 +357,11 @@ defmodule SymphonyElixir.RepoConfig do
          workflow_path: workflow_path,
          review_workflow_path: review_workflow_path,
          base_branch: base_branch,
-         max_concurrent: max_concurrent
+         max_concurrent: max_concurrent,
+         overlap_policy: overlap_policy,
+         overlap_threshold: overlap_threshold,
+         scheduling_override_label: scheduling_override_label,
+         path_hints: path_hints
        }}
     else
       {:missing, field} -> {:error, {:repo_entry_missing_field, index, field}}
@@ -382,6 +398,35 @@ defmodule SymphonyElixir.RepoConfig do
       _ -> default
     end
   end
+
+  defp optional_string(map, key) do
+    case Map.get(map, key) do
+      value when is_binary(value) and value != "" -> value
+      _missing -> nil
+    end
+  end
+
+  defp overlap_policy(entry) do
+    case Map.get(entry, "overlap_policy", "serialize") do
+      policy when policy in ["serialize", "advisory", "off"] -> policy
+      _invalid -> "serialize"
+    end
+  end
+
+  defp bounded_float(map, key, default) do
+    case Map.get(map, key) do
+      value when is_number(value) and value > 0 and value <= 1 -> value / 1
+      _invalid -> default
+    end
+  end
+
+  defp path_hints(value) when is_map(value) do
+    Map.new(value, fn {label, paths} ->
+      {label |> to_string() |> String.trim() |> String.downcase(), paths |> List.wrap() |> Enum.filter(&is_binary/1)}
+    end)
+  end
+
+  defp path_hints(_value), do: %{}
 
   defp default_workspace_root do
     Path.join(System.tmp_dir!(), @default_workspace_root_relative)

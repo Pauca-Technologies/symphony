@@ -69,6 +69,7 @@ defmodule SymphonyElixir.ReviewGate do
 
   alias SymphonyElixir.{
     AgentEfficiency,
+    BaseDrift,
     Cardinality,
     Codex.AppServer,
     Codex.DynamicTool,
@@ -230,10 +231,79 @@ defmodule SymphonyElixir.ReviewGate do
     reviewed_sha = candidate_sha(context.workspace, pr)
     context = Map.merge(context, %{pr: pr, reviewed_sha: reviewed_sha})
 
-    case terminal_outcome(context.issue.id, reviewed_sha) do
-      %ReviewOutcome{} = outcome -> {outcome.outcome, outcome}
-      nil -> run_unlatched_review(context)
+    base_drift_result =
+      case Keyword.get(context.opts, :base_drift_decision) do
+        %{action: action} = decision
+        when action in ["disabled", "allow_fresh_base", "allow_irrelevant_drift"] ->
+          {:ok, decision}
+
+        _missing_or_non_allowing_decision ->
+          BaseDrift.assess(
+            context.workspace,
+            context.issue,
+            Keyword.get(context.opts, :base_drift_ref),
+            base_drift_opts(context)
+          )
+      end
+
+    case base_drift_result do
+      {:ok, _decision} ->
+        case terminal_outcome(context.issue.id, reviewed_sha) do
+          %ReviewOutcome{} = outcome -> {outcome.outcome, outcome}
+          nil -> run_unlatched_review(context)
+        end
+
+      {:defer, prompt, decision} ->
+        outcome = base_drift_outcome(context, decision)
+        {:request_changes, prompt, outcome}
+
+      {:error, reason} ->
+        conclude_inconclusive(
+          context.issue,
+          context,
+          1,
+          {:base_drift_check_unavailable, reason},
+          "Restore remote-base visibility, refresh the candidate deliberately, and re-attempt the handoff; no automatic rebase was attempted."
+        )
     end
+  end
+
+  defp base_drift_opts(context) do
+    [worker_host: context.worker_host]
+    |> maybe_put_base_drift_runner(:git_runner, Keyword.get(context.opts, :base_drift_git_runner))
+    |> maybe_put_base_drift_runner(:ssh_runner, Keyword.get(context.opts, :base_drift_ssh_runner))
+  end
+
+  defp maybe_put_base_drift_runner(opts, key, runner) when is_function(runner),
+    do: Keyword.put(opts, key, runner)
+
+  defp maybe_put_base_drift_runner(opts, _key, _runner), do: opts
+
+  defp base_drift_outcome(context, decision) do
+    findings =
+      Enum.map(decision.overlap_paths, fn path ->
+        %{
+          severity: "blocking",
+          file: path,
+          line: nil,
+          body: "The configured base advanced on a path overlapping this candidate; refresh before final gates."
+        }
+      end)
+
+    %ReviewOutcome{
+      outcome: :request_changes,
+      iteration: context.iteration,
+      max_iterations: context.settings.max_iterations,
+      reviewed_sha: context.reviewed_sha,
+      summary: "Final gates deferred because the candidate overlaps newer base changes.",
+      failure_reason: :overlapping_base_drift,
+      resume_condition: "Refresh against the current base without discarding dirty work, then re-attempt the handoff.",
+      review_effort: :thorough,
+      authoritative: false,
+      findings: findings,
+      inspected: decision.overlap_paths,
+      severity_counts: %{"blocking" => length(findings)}
+    }
   end
 
   defp required_pr_outcome(%{issue: %Issue{} = issue} = context, reason) do

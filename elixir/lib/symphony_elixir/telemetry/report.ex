@@ -28,6 +28,12 @@ defmodule SymphonyElixir.Telemetry.Report do
     retries = Map.get(grouped, "retry_policy", [])
     routing_decisions = Map.get(grouped, "routing_decision", [])
     budget_transitions = Map.get(grouped, "budget_transition", [])
+    scheduling = Map.get(grouped, "scheduling", [])
+    base_drift = Map.get(grouped, "base_drift", [])
+    completed_rebases = Enum.filter(tools, &(&1["action"] == "end" and &1["vcs_operation"] == "rebase"))
+    failed_rebases = Enum.count(completed_rebases, &(not successful_tool_outcome?(&1["outcome"])))
+    scheduling_dispatches = Enum.filter(scheduling, &(&1["action"] == "dispatch"))
+    queue_times = values(scheduling_dispatches, "queue_time_ms")
 
     durations = values(ends, "duration_ms")
     thread_tokens = token_threads |> Map.values() |> Enum.map(& &1.tokens.total_tokens)
@@ -73,6 +79,24 @@ defmodule SymphonyElixir.Telemetry.Report do
         overrides: Enum.count(routing_decisions, &is_map(&1["override"]))
       },
       efficiency: efficiency_view(budget_transitions, grouped, totals, durations, review_events),
+      repository_scheduling: %{
+        decisions: length(scheduling),
+        dispatched: length(scheduling_dispatches),
+        queued: Enum.count(scheduling, &(&1["action"] == "queue")),
+        queued_by_reason: tally(Enum.filter(scheduling, &(&1["action"] == "queue")), "reason"),
+        queue_time_ms_p50: percentile(queue_times, 0.5),
+        queue_time_ms_p90: percentile(queue_times, 0.9),
+        queue_time_ms_max: Enum.max(queue_times, fn -> nil end),
+        overrides: Enum.count(scheduling, &(&1["override"] == true)),
+        overlap_decisions: Enum.count(scheduling, &((&1["overlap_score"] || 0) > 0)),
+        base_drift_checks: length(base_drift),
+        overlapping_base_drift: Enum.count(base_drift, &(&1["action"] == "defer_overlapping_drift")),
+        irrelevant_base_drift: Enum.count(base_drift, &(&1["action"] == "allow_irrelevant_drift")),
+        gates_avoided: Enum.reduce(base_drift, 0, &((&1["gates_avoided"] || 0) + &2)),
+        rebases: length(completed_rebases),
+        rebase_conflicts: failed_rebases,
+        rebase_conflict_rate: rate(failed_rebases, length(completed_rebases))
+      },
       gc: %{
         passes: length(Map.get(grouped, "gc_pass_summary", [])),
         removed: length(Map.get(grouped, "gc_removed", [])),
@@ -112,6 +136,15 @@ defmodule SymphonyElixir.Telemetry.Report do
       [] -> nil
       sorted -> Enum.at(sorted, max(ceil(q * length(sorted)), 1) - 1)
     end
+  end
+
+  defp successful_tool_outcome?(nil), do: true
+
+  defp successful_tool_outcome?(outcome) do
+    outcome
+    |> to_string()
+    |> String.downcase()
+    |> Kernel.in(["ok", "complete", "completed", "passed", "success", "succeeded"])
   end
 
   defp legacy_aliases(summary) do

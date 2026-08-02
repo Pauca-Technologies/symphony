@@ -50,6 +50,12 @@ defmodule SymphonyElixir.RepoConfigTest do
           repo_url: git@github.com:Pauca-Technologies/udp-dashboard-v2.git
           workflow_path: WORKFLOW.md
           max_concurrent: 3
+          overlap_policy: advisory
+          overlap_threshold: 0.75
+          scheduling_override_label: symphony:force-overlap
+          path_hints:
+            area:auth:
+              - lib/auth/**
       """)
 
       assert {:ok, config} = RepoConfig.load()
@@ -65,6 +71,10 @@ defmodule SymphonyElixir.RepoConfigTest do
                  id: "udp-dashboard-v2",
                  label: "repo:dashboard-v2",
                  max_concurrent: 3,
+                 overlap_policy: "advisory",
+                 overlap_threshold: 0.75,
+                 scheduling_override_label: "symphony:force-overlap",
+                 path_hints: %{"area:auth" => ["lib/auth/**"]},
                  workflow_path: "WORKFLOW.md"
                }
              ] = config.repos

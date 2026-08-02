@@ -206,6 +206,36 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
     assert report.fleet.retries_by_class == %{"infra" => 1}
   end
 
+  test "reports overlap queues, base-drift gates avoided, and rebase conflict rate" do
+    events = [
+      %{"event" => "scheduling", "action" => "queue", "reason" => "path_overlap", "overlap_score" => 1.0},
+      %{"event" => "scheduling", "action" => "dispatch", "reason" => "operator_override", "override" => true, "queue_time_ms" => 100},
+      %{"event" => "scheduling", "action" => "dispatch", "reason" => "disjoint_or_unknown", "queue_time_ms" => 200},
+      %{"event" => "scheduling", "action" => "dispatch", "reason" => "disjoint_or_unknown", "queue_time_ms" => 900},
+      %{"event" => "base_drift", "action" => "defer_overlapping_drift", "gates_avoided" => 1},
+      %{"event" => "base_drift", "action" => "allow_irrelevant_drift", "gates_avoided" => 0},
+      %{"event" => "tool", "action" => "end", "vcs_operation" => "rebase", "outcome" => "failed"},
+      %{"event" => "tool", "action" => "end", "vcs_operation" => "rebase", "outcome" => "ok"}
+    ]
+
+    scheduling = Report.build(events).repository_scheduling
+
+    assert scheduling.queued_by_reason == %{"path_overlap" => 1}
+    assert scheduling.dispatched == 3
+    assert scheduling.queue_time_ms_p50 == 200
+    assert scheduling.queue_time_ms_p90 == 900
+    assert scheduling.queue_time_ms_max == 900
+    assert scheduling.overrides == 1
+    assert scheduling.overlap_decisions == 1
+    assert scheduling.base_drift_checks == 2
+    assert scheduling.overlapping_base_drift == 1
+    assert scheduling.irrelevant_base_drift == 1
+    assert scheduling.gates_avoided == 1
+    assert scheduling.rebases == 2
+    assert scheduling.rebase_conflicts == 1
+    assert scheduling.rebase_conflict_rate == 0.5
+  end
+
   defp token(thread, parent, role, total, repository, issue) do
     %{
       "event" => "token_high_water",

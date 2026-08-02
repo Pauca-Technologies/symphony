@@ -39,6 +39,8 @@ defmodule SymphonyElixir.FleetEventTest do
       ),
       update("item/tool/call", %{"callId" => "claude-1", "itemId" => "claude-1", "name" => "Read", "arguments" => %{"file_path" => "README.md"}}, 40),
       update("item/commandExecution/outputDelta", %{"callId" => "claude-1", "itemId" => "claude-1", "output" => "contents", "terminal" => true, "status" => "completed"}, 50),
+      update("item/tool/call", %{"callId" => "claude-rebase", "itemId" => "claude-rebase", "name" => "Bash", "arguments" => %{"command" => "git rebase origin/main"}}, 51),
+      update("item/commandExecution/outputDelta", %{"callId" => "claude-rebase", "itemId" => "claude-rebase", "output" => "Successfully rebased", "terminal" => true, "status" => "completed"}, 52),
       update(
         "item/tool/call",
         %{"callId" => "dynamic-1", "tool" => "linear_graphql", "arguments" => %{"query" => "query Viewer { viewer { id } }"}},
@@ -57,10 +59,13 @@ defmodule SymphonyElixir.FleetEventTest do
       Telemetry.read_events(Date.utc_today(), Date.utc_today())
       |> Enum.filter(&(&1["event"] == "tool"))
 
-    assert Enum.frequencies_by(tools, & &1["action"]) == %{"end" => 4, "start" => 3}
+    assert Enum.frequencies_by(tools, & &1["action"]) == %{"end" => 5, "start" => 4}
     assert tools |> Enum.filter(&(&1["action"] == "end")) |> Enum.all?(&(&1["output_bytes"] > 0))
-    assert Enum.map(tools, & &1["tool_id"]) |> Enum.uniq() |> Enum.sort() == ["acp-1", "claude-1", "cmd-1", "dynamic-1"]
+    assert Enum.map(tools, & &1["tool_id"]) |> Enum.uniq() |> Enum.sort() == ["acp-1", "claude-1", "claude-rebase", "cmd-1", "dynamic-1"]
     refute Enum.any?(tools, &(&1["tool_id"] in ["msg-1", "reason-1"]))
+
+    assert %{"vcs_operation" => "rebase", "outcome" => "completed"} =
+             Enum.find(tools, &(&1["tool_id"] == "claude-rebase" and &1["action"] == "end"))
   end
 
   defp update(method, params, offset_ms, extra \\ []) do

@@ -259,6 +259,67 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert get_in(output, ["error", "remediation"]) =~ "review-required: review gate should run"
   end
 
+  test "remote handoff revalidates base drift on its worker instead of bypassing the check" do
+    workspace = "/srv/remote worktree"
+    issue = %Issue{id: "issue-remote-base", identifier: "UDPE-7163", title: "Remote base", state: "In Progress"}
+    test_pid = self()
+
+    ssh_runner = fn host, command, opts ->
+      send(test_pid, {:remote_handoff_git, host, command, opts})
+
+      output =
+        cond do
+          String.contains?(command, "'rev-parse' 'HEAD'") -> "head-remote\n"
+          String.contains?(command, "'rev-parse' 'refs/remotes/origin/main'") -> "base-remote\n"
+          String.contains?(command, "'merge-base'") -> "base-remote\n"
+          true -> ""
+        end
+
+      {:ok, {output, 0}}
+    end
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{
+          issue: issue,
+          workspace: workspace,
+          worker_host: "builder-a",
+          review_opts: [base_drift_ref: "main", base_drift_ssh_runner: ssh_runner]
+        },
+        linear_client: fn
+          query, %{"issueId" => "issue-remote-base"} = variables, []
+          when map_size(variables) == 1 ->
+            assert query =~ "SymphonyResolveIssueTransition"
+
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                   }
+                 }
+               }
+             }}
+
+          _mutation, %{"issueId" => "issue-remote-base", "stateId" => "state-review"}, [] ->
+            send(test_pid, :remote_handoff_mutation_sent)
+            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        end
+      )
+
+    assert response["success"] == true
+    assert_received :remote_handoff_mutation_sent
+    assert_received {:remote_handoff_git, "builder-a", command, [stderr_to_stdout: true]}
+    assert command =~ "cd '/srv/remote worktree' && git"
+  end
+
   test "linear_graphql runs handoff gates when IssueUpdateInput carries stateId" do
     workspace =
       Path.join(

@@ -100,18 +100,29 @@ defmodule SymphonyElixir.FleetEvent do
     action = signal.action
     timestamp = flexible_value(update, :timestamp)
     starts = Map.get(running_entry, :fleet_tool_starts, %{})
+    start = starts[item_id]
+    operation = vcs_operation(signal.command) || started_vcs_operation(start)
 
     Telemetry.emit(
       :tool,
-      tool_attrs(attrs, signal, item_id, item_type, category, action, tool_duration(starts[item_id], timestamp)),
+      tool_attrs(
+        attrs,
+        signal,
+        item_id,
+        item_type,
+        category,
+        operation,
+        action,
+        tool_duration(started_at(start), timestamp)
+      ),
       policy
     )
 
-    updated_starts = update_tool_starts(starts, item_id, timestamp, action)
+    updated_starts = update_tool_starts(starts, item_id, timestamp, operation, action)
     {Map.put(running_entry, :fleet_tool_starts, updated_starts), phase_for_tool(category)}
   end
 
-  defp tool_attrs(attrs, signal, item_id, item_type, category, action, duration_ms) do
+  defp tool_attrs(attrs, signal, item_id, item_type, category, vcs_operation, action, duration_ms) do
     %{
       issue_id: attrs.issue_id,
       issue_identifier: attrs.issue_identifier,
@@ -121,6 +132,7 @@ defmodule SymphonyElixir.FleetEvent do
       turn_id: attrs.turn_id,
       tool_id: item_id,
       tool_name: item_type,
+      vcs_operation: vcs_operation,
       action: action,
       category: category,
       duration_ms: if(action == "end", do: duration_ms),
@@ -130,8 +142,32 @@ defmodule SymphonyElixir.FleetEvent do
     }
   end
 
-  defp update_tool_starts(starts, item_id, timestamp, "start"), do: Map.put(starts, item_id, timestamp)
-  defp update_tool_starts(starts, item_id, _timestamp, _action), do: Map.delete(starts, item_id)
+  defp vcs_operation(command) when is_binary(command) do
+    normalized = String.downcase(command)
+
+    cond do
+      String.contains?(normalized, "git rebase") -> "rebase"
+      String.contains?(normalized, "git merge") -> "merge"
+      String.contains?(normalized, "git fetch") -> "fetch"
+      true -> nil
+    end
+  end
+
+  defp vcs_operation(_command), do: nil
+
+  defp update_tool_starts(starts, item_id, timestamp, vcs_operation, "start") do
+    Map.put(starts, item_id, %{started_at: timestamp, vcs_operation: vcs_operation})
+  end
+
+  defp update_tool_starts(starts, item_id, _timestamp, _vcs_operation, _action),
+    do: Map.delete(starts, item_id)
+
+  defp started_at(%{started_at: started_at}), do: started_at
+  defp started_at(%DateTime{} = started_at), do: started_at
+  defp started_at(_missing), do: nil
+
+  defp started_vcs_operation(%{vcs_operation: operation}), do: operation
+  defp started_vcs_operation(_missing), do: nil
 
   defp tool_signal(update) do
     payload = flexible_value(update, :payload) || %{}

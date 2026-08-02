@@ -15,9 +15,11 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
+            queued: length(Map.get(snapshot, :queued, [])),
             retrying: length(snapshot.retrying)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
+          queued: Enum.map(Map.get(snapshot, :queued, []), &queued_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits,
@@ -149,6 +151,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(entry)
     }
+    |> maybe_put_scheduling(entry)
     |> maybe_put_review(entry)
   end
 
@@ -165,6 +168,39 @@ defmodule SymphonyElixirWeb.Presenter do
       failure_class: stringify_atom(Map.get(entry, :failure_class)),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
+    }
+  end
+
+  defp queued_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      title: entry.title,
+      state: entry.state,
+      repository: entry.repository_id,
+      reason: entry.reason,
+      queue_time_ms: entry.queue_time_ms,
+      base_age_seconds: entry.base_age_seconds,
+      overlap_score: entry.overlap_score,
+      overlap_paths: entry.overlap_paths,
+      predicted_paths: entry.predicted_paths,
+      suggested_order: entry.suggested_order,
+      suggested_order_omitted: entry.suggested_order_omitted,
+      override: entry.override,
+      policy: entry.policy,
+      max_concurrent: entry.max_concurrent
+    }
+  end
+
+  defp scheduling_payload(entry) do
+    %{
+      repository: Map.get(entry, :repository_id),
+      path_source: Map.get(entry, :scheduling_path_source),
+      paths: Map.get(entry, :scheduling_paths, []),
+      base_sha: Map.get(entry, :base_sha),
+      candidate_base_sha: Map.get(entry, :candidate_base_sha),
+      base_age_seconds: Map.get(entry, :base_age_seconds),
+      workspace_dirty: Map.get(entry, :workspace_dirty)
     }
   end
 
@@ -205,7 +241,19 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(running)
     }
+    |> maybe_put_scheduling(running)
     |> maybe_put_review(running)
+  end
+
+  defp maybe_put_scheduling(payload, entry) do
+    scheduling = scheduling_payload(entry)
+
+    if scheduling.repository || scheduling.base_sha || scheduling.candidate_base_sha ||
+         scheduling.paths != [] || is_boolean(scheduling.workspace_dirty) do
+      Map.put(payload, :scheduling, scheduling)
+    else
+      payload
+    end
   end
 
   defp maybe_put_review(payload, entry) do

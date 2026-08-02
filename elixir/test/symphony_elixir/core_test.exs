@@ -941,6 +941,76 @@ defmodule SymphonyElixir.CoreTest do
              state.retry_attempts[issue_id]
   end
 
+  test "queued continuation emits one dispatch decision with elapsed queue time" do
+    previous_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_states = Application.get_env(:symphony_elixir, :memory_tracker_states_by_ids_result)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"],
+      max_concurrent_agents: 2,
+      poll_interval_ms: 30_000,
+      codex_command: "/bin/false app-server"
+    )
+
+    issue_id = "issue-queued-continuation"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-7163",
+      title: "Resume after repository contention",
+      description: "Queue telemetry must close on retry dispatch",
+      state: "In Progress",
+      labels: []
+    }
+
+    # Keep the startup tick empty; expose the issue only to the explicit retry below.
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_states_by_ids_result, {:ok, [issue]})
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    orchestrator_name = Module.concat(__MODULE__, :QueuedContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_issues)
+      restore_app_env(:memory_tracker_states_by_ids_result, previous_states)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+    retry_token = make_ref()
+    queued_at_ms = System.monotonic_time(:millisecond) - 1_500
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:queued, %{issue_id => %{queued_at_ms: queued_at_ms}})
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond) + 1_000,
+          identifier: issue.identifier
+        }
+      })
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(100)
+
+    dispatches =
+      SymphonyElixir.Telemetry.read_events(Date.utc_today(), Date.utc_today())
+      |> Enum.filter(&(&1["event"] == "scheduling" and &1["action"] == "dispatch" and &1["issue_id"] == issue_id))
+
+    assert [%{"queue_time_ms" => queue_time_ms}] = dispatches
+    assert queue_time_ms >= 1_500
+    refute Map.has_key?(:sys.get_state(pid).queued, issue_id)
+  end
+
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
     now_ms = System.monotonic_time(:millisecond)
     stale_tick_token = make_ref()

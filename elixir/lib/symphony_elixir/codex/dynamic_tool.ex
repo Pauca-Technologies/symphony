@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{HandoffGate, Linear.Client, ReviewGate, ReviewOutcome}
+  alias SymphonyElixir.{BaseDrift, HandoffGate, Linear.Client, ReviewGate, ReviewOutcome}
 
   @linear_graphql_tool "linear_graphql"
   @issue_transition_query """
@@ -86,6 +86,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           }
         })
 
+      {:base_drift_blocked, prompt, decision} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "Base drift blocked stale-head final validation and review.",
+            "remediation" => prompt,
+            "baseDrift" => decision
+          }
+        })
+
       {:review_blocked, prompt, findings, review_outcome} ->
         failure_response(%{
           "error" => %{
@@ -141,13 +150,54 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          true <- HandoffGate.handoff_transition?(current_state, target_state) do
       gate_issue = issue_with_state(issue, current_state)
 
-      case HandoffGate.run_before_handoff(workspace, gate_issue, worker_host, target_state, handoff_opts) do
-        :ok -> run_review_gate(query, variables, workspace, gate_issue, worker_host, context, linear_client)
+      with {:ok, base_drift_decision} <-
+             revalidate_base_before_handoff(workspace, gate_issue, worker_host, context),
+           :ok <- HandoffGate.run_before_handoff(workspace, gate_issue, worker_host, target_state, handoff_opts) do
+        context = put_base_drift_decision(context, base_drift_decision)
+        run_review_gate(query, variables, workspace, gate_issue, worker_host, context, linear_client)
+      else
         {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
+        {:base_drift_blocked, _prompt, _decision} = blocked -> blocked
       end
     else
       _ -> :ok
     end
+  end
+
+  defp revalidate_base_before_handoff(workspace, issue, worker_host, context) do
+    review_opts = Map.get(context, :review_opts, [])
+    base_ref = Keyword.get(review_opts, :base_drift_ref)
+
+    case BaseDrift.assess(workspace, issue, base_ref, base_drift_opts(worker_host, review_opts)) do
+      {:ok, decision} ->
+        {:ok, decision}
+
+      {:defer, prompt, decision} ->
+        {:base_drift_blocked, prompt, decision}
+
+      {:error, reason} when is_binary(base_ref) ->
+        prompt =
+          "Symphony could not revalidate origin/#{base_ref} before final gates (#{inspect(reason)}). " <>
+            "Keep the issue in progress, restore base visibility, and re-attempt the handoff. No rebase was attempted."
+
+        {:base_drift_blocked, prompt, %{action: "defer_check_unavailable", base_ref: base_ref, reason: inspect(reason), gates_avoided: 1}}
+    end
+  end
+
+  defp base_drift_opts(worker_host, review_opts) do
+    [worker_host: worker_host]
+    |> maybe_put_base_drift_runner(:git_runner, Keyword.get(review_opts, :base_drift_git_runner))
+    |> maybe_put_base_drift_runner(:ssh_runner, Keyword.get(review_opts, :base_drift_ssh_runner))
+  end
+
+  defp maybe_put_base_drift_runner(opts, key, runner) when is_function(runner),
+    do: Keyword.put(opts, key, runner)
+
+  defp maybe_put_base_drift_runner(opts, _key, _runner), do: opts
+
+  defp put_base_drift_decision(context, decision) do
+    review_opts = context |> Map.get(:review_opts, []) |> Keyword.put(:base_drift_decision, decision)
+    Map.put(context, :review_opts, review_opts)
   end
 
   defp issue_with_state(%SymphonyElixir.Linear.Issue{} = issue, state) when is_binary(state) do

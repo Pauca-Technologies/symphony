@@ -3,6 +3,12 @@
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+The reference scheduler is repository-aware: global and state limits are supplemented by
+per-repository ceilings and changed-path overlap risk. Disjoint work can use available capacity,
+while high-overlap work is deterministically ordered to avoid repeated rebases and invalidated
+validation. Before handoff it checks the current base and withholds expensive final gates only when
+newer base changes overlap the candidate; it never rewrites dirty work automatically.
+
 Automated handoff reviews use fresh, thin-context reviewer threads rather than copying an
 implementor's full history. A bounded, versioned packet pins every review to the exact base/head
 candidate while keeping the complete diff and security rules independently accessible; follow-up

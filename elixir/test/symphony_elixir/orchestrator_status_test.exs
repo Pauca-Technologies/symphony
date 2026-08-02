@@ -21,6 +21,59 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     send(pid, :stop)
   end
 
+  test "snapshot and API surface repository scheduling waits", _context do
+    orchestrator_name = Module.concat(__MODULE__, :SchedulingSnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    queued_at_ms = System.monotonic_time(:millisecond) - 2_000
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | queued: %{
+            "queued-1" => %{
+              issue_id: "queued-1",
+              identifier: "UDPE-QUEUE",
+              title: "Wait for overlapping work",
+              state: "Todo",
+              repository_id: "symphony",
+              reason: "path_overlap",
+              predicted_paths: ["lib/a.ex"],
+              overlap_paths: ["lib/a.ex"],
+              overlap_score: 1.0,
+              suggested_order: ["UDPE-FIRST", "UDPE-QUEUE"],
+              suggested_order_omitted: 3,
+              override: false,
+              policy: "serialize",
+              max_concurrent: 2,
+              base_age_seconds: 90,
+              priority_rank: 2,
+              created_at_key: 1,
+              queued_at_ms: queued_at_ms
+            }
+          }
+      }
+    end)
+
+    assert %{queued: [queued]} = Orchestrator.snapshot(orchestrator_name, 5_000)
+    assert queued.reason == "path_overlap"
+    assert queued.overlap_paths == ["lib/a.ex"]
+    assert queued.base_age_seconds == 90
+    assert queued.queue_time_ms >= 2_000
+
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 5_000)
+    assert payload.counts.queued == 1
+
+    assert [
+             %{
+               issue_identifier: "UDPE-QUEUE",
+               suggested_order: ["UDPE-FIRST", "UDPE-QUEUE"],
+               suggested_order_omitted: 3
+             }
+           ] = payload.queued
+  end
+
   test "orchestrator snapshot reflects last codex update and session id" do
     issue_id = "issue-snapshot"
 
@@ -2145,7 +2198,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Backoff queue/
+    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Repository queue/
+    assert plain =~ ~r/No repository-contention waits\r?\n│\s*\r?\n├─ Backoff queue/
   end
 
   test "status dashboard adds a spacer line before backoff queue when agents are active" do

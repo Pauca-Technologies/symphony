@@ -14,6 +14,10 @@
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │  No active agents
 │
+├─ Repository queue
+│
+│  No repository-contention waits
+│
 ├─ Backoff queue
 │
 │  No queued retries

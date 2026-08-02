@@ -434,7 +434,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{"running" => 1, "queued" => 0, "retrying" => 1},
+             "queued" => [],
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -1477,7 +1478,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -1542,7 +1543,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     port = HttpServer.bound_port()
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1}
   end
 
   test "http server also listens on loopback when bound to a non-loopback host" do
@@ -1580,7 +1581,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     # ...and always via loopback, thanks to the extra listener.
     loopback = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert loopback.status == 200
-    assert loopback.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert loopback.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1}
   end
 
   defp start_test_endpoint(overrides) do

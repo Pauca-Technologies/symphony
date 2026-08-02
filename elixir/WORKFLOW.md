@@ -56,6 +56,9 @@ hooks:
       scripts/hooks/session-start.sh
     fi
   # before_handoff runs before a Linear issue moves from In Progress to In Review.
+  # In multi-repo mode Symphony first fetches the configured base branch and
+  # skips this expensive hook when newer base changes overlap the candidate.
+  # It never rebases, resets, or stashes a dirty worktree automatically.
   # Repositories can use it to block handoff until repo-local gates pass, for example:
   # before_handoff: |
   #   scripts/hooks/before-handoff.sh

@@ -12,6 +12,7 @@ defmodule SymphonyElixir.AgentRunner do
     AgentEfficiency,
     AgentFailure,
     AgentRouter,
+    BaseDrift,
     Config,
     Linear.Client,
     Linear.Comment,
@@ -162,6 +163,11 @@ defmodule SymphonyElixir.AgentRunner do
         # In Review handoff. Absent file == feature off (legacy behavior).
         review_workflow = load_repo_review_workflow(workspace, routed_repo)
 
+        opts =
+          opts
+          |> maybe_put(:repository_id, routed_repo && routed_repo.id)
+          |> maybe_put(:base_drift_ref, routed_repo && routed_repo.base_branch)
+
         # When Symphony did the worktree clone (routed_repo present),
         # we now run the per-repo after_create here. The legacy single-
         # repo path already ran the host-level after_create inside
@@ -216,6 +222,14 @@ defmodule SymphonyElixir.AgentRunner do
          repo_hook_opts: repo_hook_opts
        }) do
     send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+
+    send_scheduling_runtime_info(
+      codex_update_recipient,
+      issue,
+      worker_host,
+      workspace,
+      opts
+    )
 
     session_start =
       SessionStartHook.run(
@@ -386,6 +400,39 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+
+  defp send_scheduling_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, opts)
+       when is_pid(recipient) and is_binary(issue_id) and is_binary(workspace) do
+    manifest =
+      BaseDrift.manifest(workspace, Keyword.get(opts, :base_drift_ref), worker_host: worker_host)
+
+    scheduling_info =
+      %{
+        repository_id: Keyword.get(opts, :repository_id),
+        base_sha: manifest.base_sha,
+        base_age_seconds: manifest.base_age_seconds,
+        candidate_base_sha: manifest.candidate_base_sha,
+        workspace_dirty: manifest.dirty
+      }
+      |> maybe_put_actual_manifest(manifest.actual_paths)
+
+    send(
+      recipient,
+      {:worker_runtime_info, issue_id, scheduling_info}
+    )
+
+    :ok
+  end
+
+  defp send_scheduling_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
+
+  defp maybe_put_actual_manifest(info, []), do: info
+
+  defp maybe_put_actual_manifest(info, paths) when is_list(paths) do
+    info
+    |> Map.put(:scheduling_paths, paths)
+    |> Map.put(:scheduling_path_source, "actual")
+  end
 
   # Report the *actual* backend (the resolved module the session runs on) and
   # model/effort, so the dashboard shows what is really running rather than re-deriving
@@ -605,6 +652,14 @@ defmodule SymphonyElixir.AgentRunner do
 
     send_budget_runtime_info(codex_update_recipient, issue, budget_runtime)
 
+    send_scheduling_runtime_info(
+      codex_update_recipient,
+      issue,
+      app_session.worker_host,
+      workspace,
+      opts
+    )
+
     case turn_result do
       {:ok, turn_session} ->
         Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
@@ -794,6 +849,7 @@ defmodule SymphonyElixir.AgentRunner do
       []
       |> maybe_put(:efficiency_decision, efficiency_decision)
       |> maybe_put(:requested_lenses, AgentEfficiency.review_lenses(efficiency_decision))
+      |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
 
     handoff_context =
       %{issue: issue, workspace: workspace, worker_host: worker_host}

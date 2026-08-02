@@ -154,6 +154,41 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- In multi-repository mode, each `repos[]` entry in host-owned
+  `~/.symphony/config.yml` has a repository concurrency and overlap policy:
+
+  ```yaml
+  repos:
+    - id: udp-dashboard-v2
+      label: repo:dashboard-v2
+      repo_url: git@github.com:example/udp-dashboard-v2.git
+      base_branch: develop
+      max_concurrent: 3
+      overlap_policy: serialize       # serialize | advisory | off
+      overlap_threshold: 0.5          # (0, 1]
+      scheduling_override_label: symphony:overlap-override
+      path_hints:
+        area:auth: [app/auth/**, test/auth/**]
+        component:billing: [app/billing/**]
+  ```
+
+  Symphony starts with issue `path:<repo-relative-path>` labels and configured
+  label hints, upgrades predictions from backend plan updates, then replaces
+  them with the actual git changed-file manifest. `serialize` queues candidates
+  whose overlap meets the threshold while allowing disjoint work up to
+  `max_concurrent`; the override label bypasses overlap serialization but never
+  the repository ceiling. Dependency order is enforced for every active state,
+  then human priority, creation time, and identifier provide deterministic
+  fairness. Reservations exist only for live workers, so terminal, stalled, or
+  blocked work releases them and a restart cannot resurrect a stale lease.
+- For a routed worktree, Symphony fetches and compares the configured base on
+  the local or SSH worker that owns it immediately before `before_handoff`. An
+  irrelevant base advance proceeds. An
+  overlapping advance blocks before final validation or automated review and
+  returns compact remediation. The check never rebases, resets, or stashes; a
+  dirty worktree is preserved for deliberate agent judgment. The exact passing
+  decision is handed to the immediately following review gate so it is not
+  fetched twice, while every later handoff attempt performs a new fetch.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -321,6 +356,11 @@ Notes:
   reported by) the running agent, rather than re-deriving them from issue labels. The model is the
   live resolved one where the agent reports it (Codex's `thread/start` response and Claude Code's
   `system/init`) and the configured/override value otherwise.
+  Repository scheduling waits are exposed separately with queue reason, bounded overlap paths,
+  queue time, base age, bounded suggested order plus its omitted count, policy, and override state. Running entries expose their
+  repository, path source/manifest, candidate/current base SHAs, base age, and dirty flag. Fleet
+  telemetry reports overlap decisions, queue time, rebase/conflict rate, irrelevant versus
+  overlapping base drift, and expensive gates avoided.
 - **Label groups.** A Linear label nested in a label *group* (e.g. the leaf `opencode:kimi2.7` under
   group `agent`) is flattened to `<group>:<leaf>` (`agent:opencode:kimi2.7`) before matching — Symphony
   fetches the label's `parent` and joins them. So `label_presets` and repo-routing labels are written

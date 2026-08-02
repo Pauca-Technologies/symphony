@@ -773,7 +773,7 @@ Tick sequence:
 1. Reconcile running issues.
 2. Run dispatch preflight validation.
 3. Fetch candidate issues from tracker using active states.
-4. Sort issues by dispatch priority.
+4. Sort issues by dependencies and dispatch priority.
 5. Dispatch eligible issues while slots remain.
 6. Notify observability/status consumers of state changes.
 
@@ -790,14 +790,16 @@ An issue is dispatch-eligible only if all are true:
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
-- Blocker rule for `Todo` state passes:
-  - If the issue state is `Todo`, do not dispatch when any blocker is non-terminal.
+- No blocker is non-terminal. This dependency rule applies to every active
+  state, including continuations already in progress.
 
 Sorting order (stable intent):
 
-1. `priority` ascending (1..4 are preferred; null/unknown sorts last)
-2. `created_at` oldest first
-3. `identifier` lexicographic tie-breaker
+1. Dependencies before dependents (cycles retain the deterministic fallback
+   order and MUST NOT deadlock dispatch)
+2. `priority` ascending (1..4 are preferred; null/unknown sorts last)
+3. `created_at` oldest first
+4. `identifier` lexicographic tie-breaker
 
 ### 8.3 Concurrency Control
 
@@ -811,6 +813,24 @@ Per-state limit:
 - otherwise fallback to global limit
 
 The runtime counts issues by their current tracked state in the `running` map.
+
+Repository-aware extension:
+
+- A configured `repos[].max_concurrent` is an additional hard ceiling.
+- `overlap_policy` is `serialize` (default), `advisory`, or `off`;
+  `overlap_threshold` defaults to `0.5`.
+- Signals progress from repository identity and issue label/path hints, through
+  initial-plan paths, to the actual changed-file manifest. Stronger signals
+  replace weaker ones.
+- `serialize` queues overlap at or above the threshold and permits disjoint or
+  unknown-path work while repository capacity remains. A configured operator
+  override label bypasses overlap serialization, never the hard ceiling.
+- Queue order is deterministic and dependency/human priority remains
+  authoritative. Queue entries expose reason, bounded overlap paths, base age,
+  queue time, and suggested order.
+- Reservations are derived from live `running` workers, not durable leases.
+  Terminal, stalled, blocked, or missing workers release them; after restart no
+  stale reservation is restored.
 
 ### 8.4 Retry and Backoff
 
@@ -988,6 +1008,17 @@ Execution contract:
 - Log hook start, failures, and timeouts.
 - Emit `gate.before_handoff` telemetry when `before_handoff` fires, including the per-gate
   pass/fail breakdown parsed from hook JSON output when available.
+- For a routed repository with a configured base branch, fetch and revalidate
+  that base on the local or SSH worker host that owns the worktree immediately
+  before `hooks.before_handoff`. Compute the
+  candidate manifest and paths changed between the candidate's merge base and
+  the current remote base. Irrelevant advances MUST NOT block. Overlapping
+  advances MUST block before the shell hook and any automated review, report
+  compact remediation, and count the expensive gates avoided. Required git
+  evidence failures fail closed. Symphony MUST NOT automatically rebase,
+  reset, stash, or discard a dirty worktree. The exact passing decision MAY be
+  passed to the immediately following review attempt, but a later handoff
+  attempt MUST fetch again.
 
 Version 1 readers used this issue-only shape. Implementations adding comment activity SHOULD emit
 version 2 while accepting version 1 during rolling deployment. Nullable fields remain present.
@@ -1675,8 +1706,21 @@ Minimum endpoints:
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
         "running": 2,
+        "queued": 1,
         "retrying": 1
       },
+      "queued": [
+        {
+          "issue_identifier": "MT-651",
+          "repository": "dashboard-v2",
+          "reason": "path_overlap",
+          "queue_time_ms": 12000,
+          "base_age_seconds": 90,
+          "overlap_paths": ["app/auth/policy.ts"],
+          "suggested_order": ["MT-649", "MT-651"],
+          "suggested_order_omitted": 0
+        }
+      ],
       "running": [
         {
           "issue_id": "abc123",

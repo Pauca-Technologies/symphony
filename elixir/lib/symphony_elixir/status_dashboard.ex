@@ -314,6 +314,7 @@ defmodule SymphonyElixir.StatusDashboard do
           {:ok,
            %{
              running: running,
+             queued: Map.get(snapshot, :queued, []),
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
@@ -348,6 +349,7 @@ defmodule SymphonyElixir.StatusDashboard do
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
+        scheduling_rows = format_scheduling_rows(Map.get(snapshot, :queued, []))
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -375,6 +377,8 @@ defmodule SymphonyElixir.StatusDashboard do
          ] ++
            running_rows ++
            running_to_backoff_spacer ++
+           [colorize("├─ Repository queue", @ansi_bold), "│"] ++
+           scheduling_rows ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -562,6 +566,7 @@ defmodule SymphonyElixir.StatusDashboard do
           {:ok,
            %{
              running: running,
+             queued: Map.get(snapshot, :queued, []),
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
@@ -664,6 +669,20 @@ defmodule SymphonyElixir.StatusDashboard do
       |> Enum.map_join(", ", &format_retry_summary/1)
       |> String.split(", ")
     end
+  end
+
+  defp format_scheduling_rows([]), do: ["│  " <> colorize("No repository-contention waits", @ansi_gray), "│"]
+
+  defp format_scheduling_rows(entries) do
+    Enum.map(entries, fn entry ->
+      paths = entry |> Map.get(:overlap_paths, []) |> Enum.take(4) |> Enum.join(",")
+      base_age = if is_integer(Map.get(entry, :base_age_seconds)), do: " base_age=#{entry.base_age_seconds}s", else: ""
+      base = "│  ⏳ #{entry.identifier} reason=#{entry.reason} repo=#{entry.repository_id || "default"} wait=#{next_in_words(entry.queue_time_ms)}#{base_age}"
+      omitted = Map.get(entry, :suggested_order_omitted, 0)
+      omitted_suffix = if omitted > 0, do: "(+#{omitted})", else: ""
+      order = " order=#{Enum.join(entry.suggested_order || [], "→")}#{omitted_suffix}"
+      if paths == "", do: base <> order, else: base <> " overlap=#{paths}" <> order
+    end)
   end
 
   defp format_retry_summary(retry_entry) do

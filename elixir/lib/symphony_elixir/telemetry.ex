@@ -38,6 +38,7 @@ defmodule SymphonyElixir.Telemetry do
           | :quality_outcome
           | :routing_decision
           | :budget_transition
+          | :scheduling
           | :routing_skip
           | :cardinality_skip
           | :gc_removed

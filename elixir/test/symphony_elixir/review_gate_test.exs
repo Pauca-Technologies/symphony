@@ -100,6 +100,77 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert outcome.reviewed_sha == "head-7"
   end
 
+  test "review reuses the exact pre-hook base decision instead of fetching again", %{
+    workspace: workspace
+  } do
+    runner = verdict_runner(%{"verdict" => "approve", "summary" => "fresh", "comments" => []})
+
+    assert {:approved, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner(),
+               base_drift_ref: "missing-base-that-would-fail",
+               base_drift_decision: %{
+                 action: "allow_fresh_base",
+                 overlap_paths: [],
+                 overlap_paths_omitted: 0
+               }
+             )
+
+    assert outcome.authoritative
+  end
+
+  test "review does not trust a remote-worker bypass marker", %{workspace: workspace} do
+    session_runner = fn _context -> flunk("review must not run without required base evidence") end
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(workspace, issue(), "builder-a", review_workflow(),
+               session_runner: session_runner,
+               pr_runner: pr_runner(),
+               base_drift_ref: "main",
+               base_drift_decision: %{action: "remote_worker_unavailable"},
+               base_drift_ssh_runner: fn _host, _command, _opts ->
+                 {:error, :worker_unreachable}
+               end
+             )
+
+    assert outcome.failure_reason == {:base_drift_check_unavailable, {:git_failed, ["rev-parse", "HEAD"], 255, "remote git unavailable: :worker_unreachable"}}
+  end
+
+  test "direct review assessment reads base drift on the selected remote worker", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    ssh_runner = fn host, command, opts ->
+      send(test_pid, {:remote_base_git, host, command, opts})
+
+      output =
+        cond do
+          String.contains?(command, "'rev-parse' 'HEAD'") -> "head-7\n"
+          String.contains?(command, "'rev-parse' 'refs/remotes/origin/main'") -> "base-7\n"
+          String.contains?(command, "'merge-base'") -> "base-7\n"
+          true -> ""
+        end
+
+      {:ok, {output, 0}}
+    end
+
+    assert {:approved, outcome} =
+             ReviewGate.run(workspace, issue(), "builder-a", review_workflow(),
+               session_runner: verdict_runner(%{"verdict" => "approve", "summary" => "remote base is fresh", "comments" => []}),
+               pr_runner: pr_runner(),
+               base_drift_ref: "main",
+               base_drift_ssh_runner: ssh_runner
+             )
+
+    assert outcome.authoritative
+
+    assert_received {:remote_base_git, "builder-a", command, [stderr_to_stdout: true]}
+    assert command =~ "cd '#{workspace}' && git"
+    assert_received {:remote_base_git, "builder-a", _command, [stderr_to_stdout: true]}
+  end
+
   test "fresh reviewer receives a bounded exact-head packet without implementor transcript", %{
     workspace: workspace
   } do
