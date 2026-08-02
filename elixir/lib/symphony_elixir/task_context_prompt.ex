@@ -8,18 +8,64 @@ defmodule SymphonyElixir.TaskContextPrompt do
   """
 
   alias SymphonyElixir.Linear.{Comment, Issue}
-  alias SymphonyElixir.SessionStartHook
+  alias SymphonyElixir.{PromptSection, SessionStartHook}
+
+  @section_version "task-context/v1"
 
   @spec render(Issue.t(), SessionStartHook.result() | nil) :: String.t()
   def render(%Issue{} = issue, session_start \\ nil) do
+    issue
+    |> sections(session_start)
+    |> Enum.map_join("\n\n", & &1.content)
+  end
+
+  @doc "Return the canonical, independently versioned task-context sections."
+  @spec sections(Issue.t(), SessionStartHook.result() | nil) :: [PromptSection.t()]
+  def sections(%Issue{} = issue, session_start \\ nil) do
     [
-      issue_section(issue),
-      activity_section(issue),
-      startup_artifacts_section(session_start)
+      section("task.issue", :task_issue, issue_source(issue), issue_section(issue), true, :linear),
+      section(
+        "task.current_metadata",
+        :current_candidate_metadata,
+        issue_source(issue),
+        current_metadata_section(issue),
+        true,
+        :linear
+      ),
+      section("task.activity", :task_activity, activity_source(issue), activity_section(issue), true, :linear),
+      section(
+        "task.startup_artifacts",
+        :startup_artifacts,
+        "repository:session_start",
+        startup_artifacts_section(session_start),
+        true,
+        :repository
+      )
     ]
     |> Enum.reject(&is_nil/1)
-    |> Enum.join("\n\n")
   end
+
+  @doc "Return task fragments whose duplicate rendering outside the canonical task section may be suppressed."
+  @spec canonical_fragments(Issue.t()) :: [map()]
+  def canonical_fragments(%Issue{description: description}) when is_binary(description) do
+    case String.trim(description) do
+      "" ->
+        []
+
+      content ->
+        [
+          %{
+            id: "task.issue.description",
+            content: content,
+            authoritative_section_id: "task.issue",
+            source_section_ids: ["repository.workflow"],
+            allow_format_equivalent: true
+          }
+        ]
+    end
+  end
+
+  def canonical_fragments(%Issue{}), do: []
 
   defp issue_section(%Issue{} = issue) do
     """
@@ -27,12 +73,20 @@ defmodule SymphonyElixir.TaskContextPrompt do
 
     Issue: #{format_value(issue.identifier)}
     Title: #{format_value(issue.title)}
+    Description:
+    #{format_description(issue.description)}
+    """
+    |> String.trim()
+  end
+
+  defp current_metadata_section(%Issue{} = issue) do
+    """
+    ## Current candidate metadata
+
     State: #{format_value(issue.state)}
     Labels: #{format_labels(issue.labels)}
     URL: #{format_value(issue.url)}
-
-    Description:
-    #{format_description(issue.description)}
+    Issue updated at: #{format_datetime(issue.updated_at)}
     """
     |> String.trim()
   end
@@ -72,6 +126,25 @@ defmodule SymphonyElixir.TaskContextPrompt do
     """
     |> String.trim()
   end
+
+  defp section(_id, _type, _source, nil, _reusable, _ownership), do: nil
+
+  defp section(id, type, source, content, reusable, ownership) do
+    PromptSection.new(
+      id: id,
+      type: type,
+      source: source,
+      version: @section_version,
+      content: content,
+      reusable: reusable,
+      ownership: ownership
+    )
+  end
+
+  defp issue_source(%Issue{id: id}) when is_binary(id), do: "linear:issue/#{id}"
+  defp issue_source(%Issue{identifier: identifier}), do: "linear:issue/#{identifier || "unknown"}"
+
+  defp activity_source(%Issue{} = issue), do: issue_source(issue) <> "/activity"
 
   defp startup_outcome_guidance(:passed) do
     "The repository generated these files before this turn from the workspace and issue snapshot. Read them before source; each annotation explains what it contributes."

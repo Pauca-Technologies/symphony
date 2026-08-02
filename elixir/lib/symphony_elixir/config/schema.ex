@@ -439,6 +439,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:raw_trace_debug, :boolean, default: false)
       field(:session_compaction_enabled, :boolean, default: true)
       field(:benign_notification_debug, :boolean, default: false)
+      field(:prompt_debug, :boolean, default: false)
+      field(:prompt_debug_max_bytes, :integer, default: 32_000)
 
       field(:redact_fields, {:array, :string},
         default: [
@@ -474,6 +476,8 @@ defmodule SymphonyElixir.Config.Schema do
           :raw_trace_debug,
           :session_compaction_enabled,
           :benign_notification_debug,
+          :prompt_debug,
+          :prompt_debug_max_bytes,
           :redact_fields
         ],
         empty_values: []
@@ -483,6 +487,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:telemetry_retention_days, greater_than_or_equal_to: 30)
       |> validate_number(:raw_trace_retention_days, greater_than_or_equal_to: 7)
       |> validate_number(:raw_trace_sample_rate, greater_than_or_equal_to: 0.0, less_than_or_equal_to: 1.0)
+      |> validate_number(:prompt_debug_max_bytes, greater_than: 0, less_than_or_equal_to: 256_000)
       |> validate_inclusion(:raw_trace_policy, ["none", "failures", "sampled", "all"])
     end
   end

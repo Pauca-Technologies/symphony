@@ -77,6 +77,8 @@ defmodule SymphonyElixir.Config do
           raw_trace_debug: boolean(),
           session_compaction_enabled: boolean(),
           benign_notification_debug: boolean(),
+          prompt_debug: boolean(),
+          prompt_debug_max_bytes: pos_integer(),
           redact_fields: [String.t()]
         }
 

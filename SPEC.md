@@ -688,12 +688,21 @@ Important nuance:
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
-- The first turn SHOULD use the canonical task context followed by the full rendered repository
-  workflow prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original first-turn prompt that is already present in thread history.
-- Each turn SHOULD emit prompt observability with the prompt kind, character and byte counts, and
-  symbolic included-section names. This observability MUST NOT contain raw prompt content.
+- The first turn SHOULD use typed prompt sections with stable semantic IDs, source identity,
+  renderer version, content hash, and byte/token estimates. The canonical task sections own issue
+  details and current tracker activity, followed by the rendered repository workflow rules.
+- Exact issue prose repeated by the repository workflow MAY be suppressed when the canonical task
+  section is present. Formatting-only equivalent rules MAY be suppressed only when ownership and
+  precedence are explicit. Similar or ambiguous safety, tenant/auth, validation, acceptance, and
+  handoff text MUST be preserved and diagnosed; generic fuzzy instruction deletion is forbidden.
+- Continuation turns SHOULD send a bounded resume capsule to the existing thread, reference
+  unchanged static section versions/hashes, and include only changed current candidate metadata and
+  current unresolved findings rather than completed remediation history.
+- Each turn SHOULD emit prompt observability with the prompt kind, character and byte counts,
+  symbolic included-section names, and per-section provenance, size, hash, reuse, and suppression
+  decisions. Durable observability MUST NOT contain raw prompt content. An optional, disabled-by-
+  default incident debug rendering MAY expose the final composed prompt in logs only when bounded,
+  provenance-delimited, and protected by configured secret-field redaction.
 - Compact continuation guidance applies only while reusing the same live backend thread. The first
   turn of a newly started backend session SHOULD retain the full task context and repository
   workflow unless that backend has restored verified prior-thread context; a retry attempt alone is

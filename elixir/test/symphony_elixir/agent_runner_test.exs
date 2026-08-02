@@ -261,6 +261,127 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "soft-budget continuations" do
+    test "includes changed Linear activity while reusing unchanged continuation sections" do
+      recipient = self()
+      Application.put_env(:symphony_elixir, :handoff_prompt_recipient_for_test, recipient)
+
+      telemetry_handler_id =
+        "agent-runner-activity-prompt-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_handler_id,
+        AgentRunner.prompt_built_telemetry_event(),
+        fn _event, _measurements, metadata, _config ->
+          send(recipient, {:activity_prompt_telemetry, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :handoff_prompt_recipient_for_test)
+        :telemetry.detach(telemetry_handler_id)
+      end)
+
+      old_comment = %Comment{
+        id: "old-comment",
+        body: "Original activity.",
+        author_name: "Owner",
+        created_at: ~U[2026-08-02 09:00:00Z]
+      }
+
+      new_comment = %Comment{
+        id: "new-comment",
+        body: "New activity decision: preserve tenant isolation.",
+        author_name: "Owner",
+        created_at: ~U[2026-08-02 10:00:00Z]
+      }
+
+      issue = %Issue{
+        id: "issue-activity-continuation",
+        identifier: "UDPE-ACTIVITY",
+        title: "Refresh current activity",
+        description: "Use only the latest activity snapshot.",
+        state: "In Progress",
+        labels: [],
+        comments: [old_comment],
+        updated_at: ~U[2026-08-02 08:00:00Z]
+      }
+
+      fetcher = fn [_issue_id] ->
+        count = Process.get(:activity_continuation_fetch_count, 0) + 1
+        Process.put(:activity_continuation_fetch_count, count)
+
+        refreshed =
+          if count == 1 do
+            %{issue | comments: [new_comment]}
+          else
+            %{issue | state: "Done", comments: [new_comment]}
+          end
+
+        {:ok, [refreshed]}
+      end
+
+      comments_fetcher = fn _issue_id ->
+        {:ok, %{comments: [new_comment], truncated: false}}
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 System.tmp_dir!(),
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {HandoffPromptBackend, %{}},
+                   issue_state_fetcher: fetcher,
+                   issue_comments_fetcher: comments_fetcher,
+                   max_turns: 3
+                 ],
+                 nil
+               )
+
+      assert_receive {:handoff_prompt, initial_prompt, ^issue}
+      assert initial_prompt =~ "Original activity."
+
+      assert_receive {:handoff_prompt, continuation_prompt, refreshed_issue}
+      assert refreshed_issue.comments == [new_comment]
+      assert continuation_prompt =~ "New activity decision: preserve tenant isolation."
+      assert continuation_prompt =~ "Current candidate metadata is unchanged"
+      assert continuation_prompt =~ "Current Linear activity changed"
+      refute continuation_prompt =~ "Original activity."
+
+      assert_receive {:activity_prompt_telemetry, %{prompt_kind: "initial", prompt_sections: initial_sections}}
+
+      assert Enum.map(initial_sections, & &1.id) == [
+               "task.issue",
+               "task.current_metadata",
+               "task.activity",
+               "repository.workflow"
+             ]
+
+      assert_receive {:activity_prompt_telemetry,
+                      %{
+                        prompt_kind: "continuation",
+                        prompt_sections: continuation_sections,
+                        prompt_section_decisions: continuation_decisions
+                      }}
+
+      assert Enum.map(continuation_sections, & &1.id) == [
+               "continuation.resume_capsule",
+               "task.activity"
+             ]
+
+      reused_ids =
+        continuation_decisions
+        |> Enum.filter(&(&1.decision == "reused"))
+        |> Enum.map(& &1.section_id)
+
+      assert Enum.sort(reused_ids) == [
+               "repository.workflow",
+               "task.current_metadata",
+               "task.issue"
+             ]
+    end
+
     test "injects one bounded enforced transition on the next continuation" do
       Application.put_env(:symphony_elixir, :efficiency_recipient_for_test, self())
       on_exit(fn -> Application.delete_env(:symphony_elixir, :efficiency_recipient_for_test) end)

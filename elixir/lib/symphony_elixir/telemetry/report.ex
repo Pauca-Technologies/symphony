@@ -28,6 +28,7 @@ defmodule SymphonyElixir.Telemetry.Report do
     retries = Map.get(grouped, "retry_policy", [])
     routing_decisions = Map.get(grouped, "routing_decision", [])
     budget_transitions = Map.get(grouped, "budget_transition", [])
+    prompt_events = Map.get(grouped, "prompt_built", [])
     scheduling = Map.get(grouped, "scheduling", [])
     base_drift = Map.get(grouped, "base_drift", [])
     completed_rebases = Enum.filter(tools, &(&1["action"] == "end" and &1["vcs_operation"] == "rebase"))
@@ -79,6 +80,7 @@ defmodule SymphonyElixir.Telemetry.Report do
         overrides: Enum.count(routing_decisions, &is_map(&1["override"]))
       },
       efficiency: efficiency_view(budget_transitions, grouped, totals, durations, review_events),
+      prompts: prompt_view(prompt_events),
       repository_scheduling: %{
         decisions: length(scheduling),
         dispatched: length(scheduling_dispatches),
@@ -135,6 +137,54 @@ defmodule SymphonyElixir.Telemetry.Report do
     case Enum.sort(values) do
       [] -> nil
       sorted -> Enum.at(sorted, max(ceil(q * length(sorted)), 1) - 1)
+    end
+  end
+
+  defp prompt_view(events) do
+    sections = Enum.flat_map(events, &list_field(&1, "prompt_sections"))
+    decisions = Enum.flat_map(events, &list_field(&1, "prompt_section_decisions"))
+    diagnostics = Enum.flat_map(events, &list_field(&1, "prompt_section_diagnostics"))
+
+    by_section =
+      sections
+      |> Enum.group_by(&(&1["id"] || "unknown"))
+      |> Map.new(fn {id, occurrences} ->
+        section_decisions = Enum.filter(decisions, &(&1["section_id"] == id))
+
+        {id,
+         %{
+           renders: length(occurrences),
+           bytes: Enum.sum(Enum.map(occurrences, &number_field(&1, "bytes"))),
+           estimated_tokens: Enum.sum(Enum.map(occurrences, &number_field(&1, "estimated_tokens"))),
+           reused: Enum.count(section_decisions, &(&1["decision"] == "reused")),
+           suppressed: Enum.count(section_decisions, &(&1["decision"] == "suppressed")),
+           suppressed_bytes: Enum.sum(Enum.map(section_decisions, &number_field(&1, "suppressed_bytes")))
+         }}
+      end)
+
+    %{
+      builds: length(events),
+      bytes: Enum.sum(Enum.map(events, &number_field(&1, "prompt_bytes"))),
+      estimated_tokens: Enum.sum(Enum.map(events, &number_field(&1, "prompt_tokens_estimate"))),
+      suppressed_bytes: Enum.sum(Enum.map(events, &number_field(&1, "suppressed_prompt_bytes"))),
+      reuse_decisions: Enum.count(decisions, &(&1["decision"] == "reused")),
+      suppression_decisions: Enum.count(decisions, &(&1["decision"] == "suppressed")),
+      ambiguous_overlaps: Enum.count(diagnostics, &(&1["reason"] == "ambiguous_overlap")),
+      by_section: by_section
+    }
+  end
+
+  defp list_field(map, key) do
+    case map[key] do
+      values when is_list(values) -> Enum.filter(values, &is_map/1)
+      _missing -> []
+    end
+  end
+
+  defp number_field(map, key) do
+    case map[key] do
+      value when is_number(value) -> value
+      _missing -> 0
     end
   end
 

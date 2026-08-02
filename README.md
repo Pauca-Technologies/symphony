@@ -41,6 +41,13 @@ turns through a bounded high-water collector instead of queuing full protocol ev
 while security validation, unresolved findings, and exact-head review approval remain unchanged
 quality requirements even when a high-risk task explicitly exceeds its budget.
 
+Prompt construction uses typed, provenance-aware sections. The canonical Task context owns issue
+details and live activity, so exact copies of issue prose in repository workflow templates are not
+injected twice. Only explicit ownership matches and formatting-only equivalents are suppressed;
+ambiguous safety, tenant/auth, validation, acceptance, and handoff rules fail open and remain in the
+prompt. Continuations reference unchanged section versions/hashes in bounded resume capsules, while
+fleet telemetry records section sizes and decisions without persisting raw prompt content.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

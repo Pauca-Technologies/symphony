@@ -146,6 +146,8 @@ defmodule SymphonyElixir.Telemetry do
         raw_trace_debug: false,
         session_compaction_enabled: true,
         benign_notification_debug: false,
+        prompt_debug: false,
+        prompt_debug_max_bytes: 32_000,
         redact_fields: default_redact_fields()
       }
   end

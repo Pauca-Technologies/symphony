@@ -3,6 +3,74 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
 
   alias SymphonyElixir.Telemetry.Report
 
+  test "aggregates provenance-aware prompt section reuse and suppression" do
+    events = [
+      %{
+        "event" => "prompt_built",
+        "prompt_bytes" => 900,
+        "prompt_tokens_estimate" => 300,
+        "suppressed_prompt_bytes" => 420,
+        "prompt_sections" => [
+          %{
+            "id" => "task.issue",
+            "bytes" => 500,
+            "estimated_tokens" => 167
+          },
+          %{
+            "id" => "repository.workflow",
+            "bytes" => 400,
+            "estimated_tokens" => 133
+          }
+        ],
+        "prompt_section_decisions" => [
+          %{
+            "section_id" => "repository.workflow",
+            "decision" => "suppressed",
+            "suppressed_bytes" => 220
+          },
+          %{
+            "section_id" => "task.issue",
+            "decision" => "reused",
+            "suppressed_bytes" => 200
+          }
+        ],
+        "prompt_section_diagnostics" => [
+          %{"section_id" => "repository.workflow", "reason" => "ambiguous_overlap"}
+        ]
+      }
+    ]
+
+    prompts = Report.build(events).prompts
+
+    assert prompts == %{
+             builds: 1,
+             bytes: 900,
+             estimated_tokens: 300,
+             suppressed_bytes: 420,
+             reuse_decisions: 1,
+             suppression_decisions: 1,
+             ambiguous_overlaps: 1,
+             by_section: %{
+               "repository.workflow" => %{
+                 renders: 1,
+                 bytes: 400,
+                 estimated_tokens: 133,
+                 reused: 0,
+                 suppressed: 1,
+                 suppressed_bytes: 220
+               },
+               "task.issue" => %{
+                 renders: 1,
+                 bytes: 500,
+                 estimated_tokens: 167,
+                 reused: 1,
+                 suppressed: 0,
+                 suppressed_bytes: 200
+               }
+             }
+           }
+  end
+
   test "reconciles parent and delegated high waters without double counting" do
     events = [
       token("parent", "parent", "parent", 100, "repo-a", "UDPE-1"),

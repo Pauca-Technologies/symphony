@@ -27,6 +27,10 @@ observability:
   raw_trace_debug: false
   session_compaction_enabled: true
   benign_notification_debug: false
+  # Incident-only final prompt rendering with typed provenance boundaries.
+  # Content is redacted and bounded; keep disabled during normal operation.
+  prompt_debug: false
+  prompt_debug_max_bytes: 32000
   # Additional credential names; mandatory defaults below always apply
   # and also match snake_case, kebab-case, and camelCase spellings.
   redact_fields:

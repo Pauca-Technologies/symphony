@@ -19,6 +19,8 @@ defmodule SymphonyElixir.AgentRunner do
     Linear.Issue,
     Orchestrator,
     PromptBuilder,
+    PromptComposer,
+    PromptSection,
     RepoConfig,
     ReviewGate,
     ReviewOutcome,
@@ -165,6 +167,7 @@ defmodule SymphonyElixir.AgentRunner do
 
         opts =
           opts
+          |> Keyword.put_new(:issue_comments_fetcher, &Tracker.fetch_issue_comments/1)
           |> maybe_put(:repository_id, routed_repo && routed_repo.id)
           |> maybe_put(:base_drift_ref, routed_repo && routed_repo.base_branch)
 
@@ -617,11 +620,12 @@ defmodule SymphonyElixir.AgentRunner do
     budget_collector = Keyword.fetch!(opts, :budget_collector)
     strategy_prompt = AgentBudgetCollector.take_strategy_prompt(budget_collector)
     opts = maybe_put(opts, :efficiency_strategy_prompt, strategy_prompt)
-    {prompt, included_sections, section_hashes} = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt_composition = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = prompt_composition.prompt
 
     emit_prompt_built(
       prompt,
-      %{included_sections: included_sections, section_hashes: section_hashes},
+      prompt_composition,
       issue,
       workspace,
       app_session.worker_host,
@@ -673,7 +677,7 @@ defmodule SymphonyElixir.AgentRunner do
             backend
           )
 
-        case continue_with_issue?(issue, issue_state_fetcher) do
+        case continue_with_issue?(issue, issue_state_fetcher, opts) do
           {:continue, refreshed_issue} when turn_number < max_turns ->
             Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
@@ -683,7 +687,9 @@ defmodule SymphonyElixir.AgentRunner do
               workspace,
               refreshed_issue,
               codex_update_recipient,
-              Keyword.put(opts, :handoff_gate_prompt, handoff_gate_prompt),
+              opts
+              |> Keyword.put(:handoff_gate_prompt, handoff_gate_prompt)
+              |> Keyword.put(:prompt_composition_state, prompt_composition.state),
               issue_state_fetcher,
               turn_number + 1,
               max_turns
@@ -732,64 +738,88 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
-    [
-      {"task_context", TaskContextPrompt.render(issue, Keyword.get(opts, :session_start_result))},
-      {"repository_workflow", PromptBuilder.build_prompt(issue, opts)},
-      {"handoff_tool_guidance", handoff_tool_guidance(opts)}
-    ]
-    |> compose_prompt_sections()
-  end
-
-  defp build_turn_prompt(_issue, opts, turn_number, max_turns) do
-    handoff_gate_prompt = Keyword.get(opts, :handoff_gate_prompt)
     handoff_guidance = handoff_tool_guidance(opts)
+
+    sections =
+      TaskContextPrompt.sections(issue, Keyword.get(opts, :session_start_result)) ++
+        [
+          PromptBuilder.build_section(issue, opts),
+          prompt_section(
+            "symphony.handoff_constraints",
+            :handoff_constraints,
+            "symphony:agent_runner",
+            "handoff/v1",
+            handoff_guidance,
+            true
+          )
+        ]
+
+    canonical_fragments =
+      TaskContextPrompt.canonical_fragments(issue) ++
+        canonical_handoff_fragments(handoff_guidance)
+
+    PromptComposer.compose(sections, canonical_fragments: canonical_fragments)
+  end
+
+  defp build_turn_prompt(issue, opts, turn_number, max_turns) do
+    handoff_gate_prompt = Keyword.get(opts, :handoff_gate_prompt)
     efficiency_strategy = Keyword.get(opts, :efficiency_strategy_prompt)
+    prior_state = Keyword.get(opts, :prompt_composition_state, %{})
 
-    prompt =
-      """
-      #{handoff_gate_prompt_section(handoff_gate_prompt)}
-      #{efficiency_strategy_section(efficiency_strategy)}
-      Continuation guidance:
+    current_sections =
+      issue
+      |> TaskContextPrompt.sections(nil)
+      |> Enum.filter(&(&1.id in ["task.current_metadata", "task.activity"]))
 
-      - The previous Codex turn completed normally, but the Linear issue is still in an active state.
-      - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-      - Resume from the current workspace and workpad state instead of restarting from scratch.
-      - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-      - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    {reused, changed_current} = PromptComposer.reused_sections(prior_state, current_sections)
+    static_reused = reusable_static_sections(prior_state)
 
-      #{handoff_guidance}
-      """
+    sections = [
+      prompt_section(
+        "review.open_findings",
+        :open_findings,
+        "symphony:latest_handoff_gate",
+        "review-findings/v1",
+        handoff_gate_prompt,
+        false
+      ),
+      prompt_section(
+        "efficiency.current_strategy",
+        :efficiency_strategy,
+        "symphony:agent_budget",
+        "efficiency-strategy/v1",
+        efficiency_strategy,
+        false
+      ),
+      prompt_section(
+        "continuation.resume_capsule",
+        :continuation_capsule,
+        "symphony:agent_runner",
+        "resume-capsule/v1",
+        continuation_capsule(static_reused, reused, changed_current, turn_number, max_turns),
+        false
+      )
+      | changed_current
+    ]
 
-    {included_sections, section_hashes} =
-      prompt_section_metadata([
-        {"handoff_gate_remediation", handoff_gate_prompt},
-        {"efficiency_strategy", efficiency_strategy},
-        {"continuation_guidance", "included"},
-        {"handoff_tool_guidance", handoff_guidance}
-      ])
+    composition = PromptComposer.compose(sections)
 
-    {prompt, included_sections, section_hashes}
-  end
-
-  defp compose_prompt_sections(sections) do
-    included_sections =
-      Enum.reject(sections, fn {_name, content} ->
-        is_nil(content) or String.trim(content) == ""
+    reuse_decisions =
+      Enum.map(static_reused ++ reused, fn identity ->
+        %{
+          section_id: identity.id,
+          decision: "reused",
+          reason: "unchanged_section_already_in_live_thread",
+          hash: identity.hash,
+          suppressed_bytes: identity.bytes
+        }
       end)
 
-    prompt = Enum.map_join(included_sections, "\n\n", fn {_name, content} -> content end)
-    {names, hashes} = prompt_section_metadata(included_sections)
-    {prompt, names, hashes}
-  end
-
-  defp prompt_section_metadata(sections) do
-    sections = Enum.reject(sections, fn {_name, content} -> is_nil(content) or String.trim(content) == "" end)
-
-    {
-      Enum.map(sections, fn {name, _content} -> name end),
-      Map.new(sections, fn {name, content} ->
-        {name, :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)}
-      end)
+    %{
+      composition
+      | decisions: composition.decisions ++ reuse_decisions,
+        suppressed_bytes: composition.suppressed_bytes + Enum.sum(Enum.map(static_reused ++ reused, & &1.bytes)),
+        state: Map.merge(prior_state, composition.state)
     }
   end
 
@@ -803,15 +833,17 @@ defmodule SymphonyElixir.AgentRunner do
          turn_number,
          max_turns
        ) do
-    included_sections = prompt_metadata.included_sections
     prompt_kind = if turn_number == 1, do: "initial", else: "continuation"
+    included_sections = legacy_included_sections(prompt_metadata.included_sections, prompt_kind)
     prompt_chars = String.length(prompt)
     prompt_bytes = byte_size(prompt)
 
     measurements = %{
       count: 1,
       prompt_bytes: prompt_bytes,
-      prompt_chars: prompt_chars
+      prompt_chars: prompt_chars,
+      prompt_tokens_estimate: PromptSection.estimated_tokens(prompt_bytes),
+      suppressed_prompt_bytes: prompt_metadata.suppressed_bytes
     }
 
     metadata = %{
@@ -826,11 +858,16 @@ defmodule SymphonyElixir.AgentRunner do
       prompt_kind: prompt_kind,
       included_sections: included_sections,
       injected_section_hashes: prompt_metadata.section_hashes,
+      prompt_sections: prompt_metadata.sections,
+      prompt_section_decisions: prompt_metadata.decisions,
+      prompt_section_diagnostics: prompt_metadata.diagnostics,
       prompt_sha256: :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
     }
 
     :telemetry.execute(@prompt_built_telemetry_event, measurements, metadata)
     Telemetry.emit(:prompt_built, Map.merge(metadata, measurements))
+
+    maybe_log_prompt_debug(prompt_metadata, opts)
 
     Logger.info(
       "agent.prompt_built #{issue_context(issue)} workspace=#{workspace} worker_host=#{worker_host_for_log(worker_host)} " <>
@@ -1206,23 +1243,131 @@ defmodule SymphonyElixir.AgentRunner do
     Process.delete(@handoff_gate_prompt_key)
   end
 
-  defp handoff_gate_prompt_section(prompt) when is_binary(prompt) do
-    case String.trim(prompt) do
-      "" -> ""
-      trimmed -> trimmed <> "\n\n"
+  defp prompt_section(id, type, source, version, content, reusable) do
+    PromptSection.new(
+      id: id,
+      type: type,
+      source: source,
+      version: version,
+      content: if(is_binary(content), do: content, else: ""),
+      reusable: reusable,
+      ownership: :symphony
+    )
+  end
+
+  defp canonical_handoff_fragments(handoff_guidance) when is_binary(handoff_guidance) do
+    case String.trim(handoff_guidance) do
+      "" ->
+        []
+
+      content ->
+        [
+          %{
+            id: "symphony.handoff_constraints",
+            content: content,
+            authoritative_section_id: "symphony.handoff_constraints",
+            source_section_ids: ["repository.workflow"],
+            allow_format_equivalent: true
+          }
+        ]
     end
   end
 
-  defp handoff_gate_prompt_section(_prompt), do: ""
+  defp continuation_capsule(static_reused, current_reused, changed_current, turn_number, max_turns) do
+    static_references =
+      static_reused
+      |> Enum.map_join("\n", fn identity ->
+        "- `#{identity.id}` `#{identity.version}` `#{identity.hash}`"
+      end)
 
-  defp efficiency_strategy_section(prompt) when is_binary(prompt) do
-    case String.trim(prompt) do
-      "" -> ""
-      trimmed -> trimmed <> "\n\n"
+    current_status = [
+      current_section_status(
+        "Current candidate metadata",
+        "task.current_metadata",
+        current_reused,
+        changed_current
+      ),
+      current_section_status("Current Linear activity", "task.activity", current_reused, changed_current)
+    ]
+
+    """
+    Continuation guidance:
+
+    This bounded resume capsule is for continuation turn ##{turn_number} of #{max_turns}. Resume from the current workspace and workpad instead of restarting. Focus on remaining ticket work and current unresolved findings.
+
+    #{Enum.join(current_status, "\n")}
+
+    Unchanged static context already present in this live thread (section, version, hash):
+    #{if(static_references == "", do: "- No reusable section manifest was available; preserve the existing thread context.", else: static_references)}
+    """
+    |> String.trim()
+  end
+
+  defp current_section_status(label, id, reused, changed) do
+    cond do
+      Enum.any?(changed, &(&1.id == id)) ->
+        "- #{label} changed and is included as section `#{id}` below."
+
+      Enum.any?(reused, &(&1.id == id)) ->
+        "- #{label} is unchanged and is reused by version/hash."
+
+      true ->
+        "- #{label} was unavailable; preserve the existing live-thread context."
     end
   end
 
-  defp efficiency_strategy_section(_prompt), do: ""
+  defp reusable_static_sections(prior_state) do
+    prior_state
+    |> Map.values()
+    |> Enum.filter(
+      &(&1.reusable and
+          &1.id in [
+            "task.issue",
+            "task.startup_artifacts",
+            "repository.workflow",
+            "symphony.handoff_constraints"
+          ])
+    )
+    |> Enum.sort_by(& &1.id)
+  end
+
+  defp legacy_included_sections(section_ids, prompt_kind) do
+    section_ids
+    |> Enum.map(fn
+      "task.current_metadata" when prompt_kind == "continuation" -> nil
+      "task." <> _rest -> "task_context"
+      "repository.workflow" -> "repository_workflow"
+      "symphony.handoff_constraints" -> "handoff_tool_guidance"
+      "review.open_findings" -> "handoff_gate_remediation"
+      "efficiency.current_strategy" -> "efficiency_strategy"
+      "continuation.resume_capsule" -> "continuation_guidance"
+      id -> id
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp maybe_log_prompt_debug(composition, opts) do
+    observability = Telemetry.observability()
+    enabled? = Keyword.get(opts, :prompt_debug, Map.get(observability, :prompt_debug, false))
+
+    if enabled? do
+      Logger.debug(fn ->
+        "agent.prompt_debug\n" <>
+          PromptComposer.debug_render(composition,
+            redact_fields: observability.redact_fields,
+            max_bytes:
+              Keyword.get(
+                opts,
+                :prompt_debug_max_bytes,
+                Map.get(observability, :prompt_debug_max_bytes, 32_000)
+              )
+          )
+      end)
+    end
+
+    :ok
+  end
 
   defp handoff_tool_guidance(opts) do
     if Keyword.has_key?(opts, :per_repo_before_handoff) or Keyword.has_key?(opts, :per_repo_review_workflow) do
@@ -1239,44 +1384,16 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, opts)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        refreshed_issue = preserve_issue_comments(issue, refreshed_issue)
+        case refresh_issue_activity(issue, refreshed_issue, opts) do
+          {:ok, refreshed_issue} ->
+            classify_refreshed_issue(issue, refreshed_issue)
 
-        cond do
-          repo_label_drifted?(issue, refreshed_issue) ->
-            Logger.info("Label drift detected mid-flight for #{issue_context(refreshed_issue)}; finishing current turn cleanly and halting (no reroute)")
-
-            {:done, refreshed_issue}
-
-          Orchestrator.review_state?(refreshed_issue.state) ->
-            # The issue moved into a review/merge state mid-run (Human
-            # Review, In Review, Merging, Ready to Merge). The repo prompt
-            # forbids the agent from touching the PR there — humans merge —
-            # so continuing would only burn no-op turns until agent.max_turns
-            # trips mark_blocked_on_giveup(:max_turns_exhausted) and demotes a
-            # merge-ready issue to a false Blocked. Finish the current turn
-            # cleanly and halt. Mirrors the dispatch-side guard in
-            # Orchestrator.candidate_issue?/3 and is authoritative even if a
-            # host misconfigures such a state as active (UDPE-6950).
-            Logger.info("Issue #{issue_context(refreshed_issue)} entered review/merge state (now #{inspect(refreshed_issue.state)}); ending run without further continuation")
-
-            {:done, refreshed_issue}
-
-          active_issue_state?(refreshed_issue.state) ->
-            {:continue, refreshed_issue}
-
-          true ->
-            # The issue left the active states mid-run. This is the sanctioned
-            # "blocked" channel: an agent that knows it is stuck transitions the
-            # issue to Blocked (via the gated linear_graphql tool), and that
-            # transition ends the run here — the current turn finishes and we do
-            # NOT dispatch another. Any non-active terminal (Done/Cancelled/…)
-            # ends it the same way.
-            Logger.info("Issue #{issue_context(refreshed_issue)} left active states (now #{inspect(refreshed_issue.state)}); ending run without further continuation")
-
-            {:done, refreshed_issue}
+          {:error, reason} ->
+            {:error, reason}
         end
 
       {:ok, []} ->
@@ -1287,13 +1404,70 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+  defp continue_with_issue?(issue, _issue_state_fetcher, _opts), do: {:done, issue}
+
+  defp refresh_issue_activity(previous_issue, refreshed_issue, opts) do
+    cond do
+      not active_issue_state?(refreshed_issue.state) ->
+        {:ok, preserve_issue_comments(previous_issue, refreshed_issue)}
+
+      Keyword.has_key?(opts, :issue_comments_fetcher) ->
+        attach_issue_comments(refreshed_issue, opts)
+
+      true ->
+        {:ok, preserve_issue_comments(previous_issue, refreshed_issue)}
+    end
+  end
+
+  defp classify_refreshed_issue(issue, refreshed_issue) do
+    cond do
+      repo_label_drifted?(issue, refreshed_issue) ->
+        Logger.info("Label drift detected mid-flight for #{issue_context(refreshed_issue)}; finishing current turn cleanly and halting (no reroute)")
+
+        {:done, refreshed_issue}
+
+      Orchestrator.review_state?(refreshed_issue.state) ->
+        # The issue moved into a review/merge state mid-run (Human
+        # Review, In Review, Merging, Ready to Merge). The repo prompt
+        # forbids the agent from touching the PR there — humans merge —
+        # so continuing would only burn no-op turns until agent.max_turns
+        # trips mark_blocked_on_giveup(:max_turns_exhausted) and demotes a
+        # merge-ready issue to a false Blocked. Finish the current turn
+        # cleanly and halt. Mirrors the dispatch-side guard in
+        # Orchestrator.candidate_issue?/3 and is authoritative even if a
+        # host misconfigures such a state as active (UDPE-6950).
+        Logger.info("Issue #{issue_context(refreshed_issue)} entered review/merge state (now #{inspect(refreshed_issue.state)}); ending run without further continuation")
+
+        {:done, refreshed_issue}
+
+      active_issue_state?(refreshed_issue.state) ->
+        {:continue, refreshed_issue}
+
+      true ->
+        # The issue left the active states mid-run. This is the sanctioned
+        # "blocked" channel: an agent that knows it is stuck transitions the
+        # issue to Blocked (via the gated linear_graphql tool), and that
+        # transition ends the run here — the current turn finishes and we do
+        # NOT dispatch another. Any non-active terminal (Done/Cancelled/…)
+        # ends it the same way.
+        Logger.info("Issue #{issue_context(refreshed_issue)} left active states (now #{inspect(refreshed_issue.state)}); ending run without further continuation")
+
+        {:done, refreshed_issue}
+    end
+  end
 
   defp preserve_issue_comments(%Issue{} = previous_issue, %Issue{} = refreshed_issue) do
+    {comments, truncated?} =
+      if refreshed_issue.comments != [] or refreshed_issue.comments_truncated do
+        {refreshed_issue.comments, refreshed_issue.comments_truncated}
+      else
+        {previous_issue.comments, previous_issue.comments_truncated}
+      end
+
     %{
       refreshed_issue
-      | comments: previous_issue.comments,
-        comments_truncated: previous_issue.comments_truncated
+      | comments: comments,
+        comments_truncated: truncated?
     }
   end
 

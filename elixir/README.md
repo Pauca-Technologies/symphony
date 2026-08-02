@@ -154,6 +154,12 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- Symphony composes the first turn from typed, hashed sections. The host-owned Task context is
+  authoritative for issue details and current activity; an exact or formatting-equivalent copy of
+  the issue description rendered by the repository template is replaced with a reference to that
+  canonical section. Similar or distinct repository rules are preserved and reported as ambiguous
+  overlap rather than being deleted heuristically. Continuations reuse version/hash identities in
+  a bounded capsule and include changed current candidate metadata plus only current open findings.
 - In multi-repository mode, each `repos[]` entry in host-owned
   `~/.symphony/config.yml` has a repository concurrency and overlap policy:
 
@@ -496,6 +502,11 @@ codex:
 - Benign protocol notifications and stdout chunks do not produce one debug-log line each by
   default. `observability.benign_notification_debug: true` is the short-lived log-level escape
   hatch; selective gzip raw traces are normally the more complete incident artifact.
+- Prompt events contain per-section IDs, source/version, hashes, byte/token estimates, and
+  reuse/suppression diagnostics, never raw prompt content. For an incident,
+  `observability.prompt_debug: true` emits a bounded debug-log rendering with provenance boundaries;
+  configured secret assignments are redacted and `prompt_debug_max_bytes` caps the rendering.
+  Keep this mode disabled during normal operation.
 - To render a transcript in a human-readable terminal format, run
   `bin/codex-session-log log/codex_sessions/<session-file>.ndjson`.
 
