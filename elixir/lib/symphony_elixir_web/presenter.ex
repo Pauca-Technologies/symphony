@@ -152,6 +152,7 @@ defmodule SymphonyElixirWeb.Presenter do
       context: context_payload(entry)
     }
     |> maybe_put_scheduling(entry)
+    |> maybe_put_handoff_gate(entry)
     |> maybe_put_review(entry)
   end
 
@@ -242,6 +243,7 @@ defmodule SymphonyElixirWeb.Presenter do
       context: context_payload(running)
     }
     |> maybe_put_scheduling(running)
+    |> maybe_put_handoff_gate(running)
     |> maybe_put_review(running)
   end
 
@@ -260,6 +262,13 @@ defmodule SymphonyElixirWeb.Presenter do
     case Map.get(entry, :review_state) do
       review when is_map(review) -> Map.put(payload, :review, review)
       _review -> payload
+    end
+  end
+
+  defp maybe_put_handoff_gate(payload, entry) do
+    case Map.get(entry, :handoff_gate) do
+      gate when is_map(gate) -> Map.put(payload, :handoff_gate, gate)
+      _gate -> payload
     end
   end
 

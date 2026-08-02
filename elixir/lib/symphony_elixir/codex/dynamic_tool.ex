@@ -86,6 +86,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           }
         })
 
+      {:handoff_infrastructure_error, prompt, gate} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "The asynchronous before_handoff gate could not be verified.",
+            "remediation" => prompt,
+            "gate" => protocol_gate_payload(gate)
+          }
+        })
+
       {:base_drift_blocked, prompt, decision} ->
         failure_response(%{
           "error" => %{
@@ -106,6 +115,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         })
 
       {:review_deferred, result} ->
+        success_response(result)
+
+      {:handoff_deferred, result} ->
         success_response(result)
 
       {:error, reason} ->
@@ -139,7 +151,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       Map.get(context, :before_handoff_command) || Map.get(context, "before_handoff_command")
 
     handoff_opts =
-      if is_binary(before_handoff_cmd), do: [hook_command: before_handoff_cmd], else: []
+      [async: true]
+      |> maybe_put_keyword(:hook_command, before_handoff_cmd)
+      |> maybe_put_keyword(
+        :timeout_ms,
+        Map.get(context, :before_handoff_timeout_ms) || Map.get(context, "before_handoff_timeout_ms")
+      )
+      |> maybe_put_keyword(
+        :stale_ms,
+        Map.get(context, :before_handoff_stale_ms) || Map.get(context, "before_handoff_stale_ms")
+      )
 
     with %{id: context_issue_id} when is_binary(context_issue_id) <- issue,
          workspace when is_binary(workspace) <- workspace,
@@ -150,19 +171,153 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          true <- HandoffGate.handoff_transition?(current_state, target_state) do
       gate_issue = issue_with_state(issue, current_state)
 
-      with {:ok, base_drift_decision} <-
-             revalidate_base_before_handoff(workspace, gate_issue, worker_host, context),
-           :ok <- HandoffGate.run_before_handoff(workspace, gate_issue, worker_host, target_state, handoff_opts) do
-        context = put_base_drift_decision(context, base_drift_decision)
-        run_review_gate(query, variables, workspace, gate_issue, worker_host, context, linear_client)
-      else
-        {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
-        {:base_drift_blocked, _prompt, _decision} = blocked -> blocked
+      case revalidate_base_before_handoff(workspace, gate_issue, worker_host, context) do
+        {:ok, base_drift_decision} ->
+          context = put_base_drift_decision(context, base_drift_decision)
+
+          run_resolved_handoff_gate(
+            %{
+              query: query,
+              variables: variables,
+              workspace: workspace,
+              issue: gate_issue,
+              worker_host: worker_host,
+              target_state: target_state,
+              context: context,
+              linear_client: linear_client
+            },
+            handoff_opts
+          )
+
+        {:base_drift_blocked, _prompt, _decision} = blocked ->
+          blocked
       end
     else
       _ -> :ok
     end
   end
+
+  defp run_resolved_handoff_gate(request, handoff_opts) do
+    result =
+      HandoffGate.run_before_handoff(
+        request.workspace,
+        request.issue,
+        request.worker_host,
+        request.target_state,
+        handoff_opts
+      )
+
+    case result do
+      :ok -> run_review_gate_for_request(request)
+      {:passed, _gate} -> run_review_gate_for_request(request)
+      {:pending, gate} -> defer_handoff_gate(request, gate)
+      {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
+      {:failed, prompt, gate} -> {:handoff_blocked, prompt, protocol_gate_list(gate)}
+      {:invalidated, prompt, gate} -> {:handoff_blocked, prompt, protocol_gate_list(gate)}
+      {:infrastructure_error, prompt, gate} -> {:handoff_infrastructure_error, prompt, gate}
+    end
+  end
+
+  defp run_review_gate_for_request(request) do
+    run_review_gate(
+      request.query,
+      request.variables,
+      request.workspace,
+      request.issue,
+      request.worker_host,
+      request.context,
+      request.linear_client
+    )
+  end
+
+  defp defer_handoff_gate(request_context, gate) do
+    context = request_context.context
+
+    request = %{
+      query: request_context.query,
+      variables: request_context.variables,
+      workspace: request_context.workspace,
+      issue: request_context.issue,
+      worker_host: request_context.worker_host,
+      target_state: request_context.target_state,
+      gate: gate,
+      before_handoff_command: Map.get(context, :before_handoff_command) || Map.get(context, "before_handoff_command"),
+      before_handoff_timeout_ms: Map.get(context, :before_handoff_timeout_ms) || Map.get(context, "before_handoff_timeout_ms"),
+      before_handoff_stale_ms: Map.get(context, :before_handoff_stale_ms) || Map.get(context, "before_handoff_stale_ms"),
+      review_workflow: Map.get(context, :review_workflow) || Map.get(context, "review_workflow"),
+      review_opts: Map.get(context, :review_opts, []),
+      linear_client: request_context.linear_client
+    }
+
+    case deferred_handoff_gate_callback(context) do
+      callback when is_function(callback, 1) ->
+        case callback.(request) do
+          result when result in [:ok, :already_pending] ->
+            {:handoff_deferred, deferred_handoff_gate_result(request_context.issue, gate)}
+
+          {:error, reason} ->
+            prompt = "Symphony could not persist pending handoff gate #{gate.job_id}: #{inspect(reason)}"
+            {:handoff_infrastructure_error, prompt, gate}
+        end
+
+      _ ->
+        prompt = "Symphony has no durable asynchronous handoff callback for pending gate #{gate.job_id}."
+        {:handoff_infrastructure_error, prompt, gate}
+    end
+  end
+
+  defp deferred_handoff_gate_callback(context) do
+    Map.get(context, :deferred_handoff_gate_callback) ||
+      Map.get(context, "deferred_handoff_gate_callback")
+  end
+
+  defp deferred_handoff_gate_result(issue, gate) do
+    %{
+      "success" => true,
+      "status" => "handoff_gate_pending",
+      "issueIdentifier" =>
+        Map.get(issue, :identifier) || Map.get(issue, "identifier") || Map.get(issue, :id) ||
+          Map.get(issue, "id"),
+      "gate" => %{
+        "jobId" => gate.job_id,
+        "status" => to_string(gate.status),
+        "candidateHash" => gate.candidate_hash,
+        "nextPollMs" => gate.next_poll_ms,
+        "progress" => gate.progress
+      },
+      "instructions" => "Symphony is polling the exact-candidate handoff gate outside the model turn. Do not retry the Linear mutation; end this turn now."
+    }
+  end
+
+  defp protocol_gate_list(gate) do
+    [
+      %{
+        name: "before_handoff",
+        status: to_string(gate.status),
+        passed: false,
+        detail: gate.remediation || gate.summary
+      }
+    ]
+  end
+
+  defp protocol_gate_payload(%{job_id: job_id, status: status} = gate) do
+    %{
+      "jobId" => job_id,
+      "status" => to_string(status),
+      "candidateHash" => Map.get(gate, :candidate_hash),
+      "exactHash" => Map.get(gate, :exact_hash),
+      "identity" => Map.get(gate, :identity),
+      "heartbeatAt" => Map.get(gate, :heartbeat_at),
+      "heartbeatAgeMs" => Map.get(gate, :heartbeat_age_ms),
+      "nextPollMs" => Map.get(gate, :next_poll_ms),
+      "progress" => Map.get(gate, :progress)
+    }
+  end
+
+  defp protocol_gate_payload(gate) when is_map(gate), do: gate
+
+  defp maybe_put_keyword(opts, _key, nil), do: opts
+  defp maybe_put_keyword(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp revalidate_base_before_handoff(workspace, issue, worker_host, context) do
     review_opts = Map.get(context, :review_opts, [])

@@ -399,6 +399,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:after_run, :string)
       field(:before_remove, :string)
       field(:timeout_ms, :integer, default: 60_000)
+      field(:before_handoff_timeout_ms, :integer)
+      field(:before_handoff_stale_ms, :integer, default: 120_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -410,12 +412,16 @@ defmodule SymphonyElixir.Config.Schema do
         :before_handoff,
         :after_run,
         :before_remove,
-        :timeout_ms
+        :timeout_ms,
+        :before_handoff_timeout_ms,
+        :before_handoff_stale_ms
       ]
 
       schema
       |> cast(attrs, hook_fields, empty_values: [])
       |> validate_number(:timeout_ms, greater_than: 0)
+      |> validate_number(:before_handoff_timeout_ms, greater_than: 0)
+      |> validate_number(:before_handoff_stale_ms, greater_than: 0)
     end
   end
 

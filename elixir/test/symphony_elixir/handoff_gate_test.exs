@@ -121,6 +121,70 @@ defmodule SymphonyElixir.HandoffGateTest do
              HandoffGate.gate_breakdown("[]", true)
   end
 
+  test "protocol v1 distinguishes pending, passed, failed, invalidated, and infrastructure outcomes" do
+    pending = protocol_report("running")
+    passed = protocol_report("passed", %{"completedAt" => "2026-08-02T12:01:00Z"})
+    failed = protocol_report("failed", %{"remediation" => "fix tests"})
+    invalidated = protocol_report("invalidated", %{"summary" => "candidate changed"})
+    infrastructure = protocol_report("infrastructure_error", %{"summary" => "runner lost"})
+
+    assert {:ok, %{status: :running, job_id: "gate-1", next_poll_ms: 250}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(pending), 3, nil, 1_000)
+
+    assert {:ok, %{status: :passed, candidate_hash: "candidate-1"}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(passed), 0, "candidate-1", 1_000)
+
+    assert {:ok, %{status: :failed, remediation: "fix tests"}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(failed), 2, nil, 1_000)
+
+    assert {:ok, %{status: :invalidated}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(invalidated), 2, nil, 1_000)
+
+    assert {:ok, %{status: :infrastructure_error}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(infrastructure), 1, nil, 1_000)
+  end
+
+  test "protocol v1 rejects stale heartbeats, status/exit mismatches, and stale candidate passes" do
+    pending = protocol_report("pending", %{"heartbeatAgeMs" => 2_001})
+    passed = protocol_report("passed")
+
+    assert {:error, reason, _report} =
+             HandoffGate.parse_protocol_result(Jason.encode!(pending), 3, nil, 2_000)
+
+    assert reason =~ "heartbeat is stale"
+
+    assert {:error, reason, _report} =
+             HandoffGate.parse_protocol_result(Jason.encode!(passed), 3, nil, 2_000)
+
+    assert reason =~ "requires exit 0"
+
+    assert {:candidate_changed, %{status: :invalidated, candidate_hash: "candidate-1"}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(passed), 0, "candidate-2", 2_000)
+  end
+
+  test "poll exports the protocol and durable job identity to the hook" do
+    workspace = temp_workspace!("handoff-poll-env")
+    report = protocol_report("passed", %{"jobId" => "gate-poll-1"})
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.dirname(workspace),
+      hook_before_handoff: """
+      test "$SYMPHONY_HANDOFF_GATE_JOB_ID" = "gate-poll-1"
+      printf '%s' '#{Jason.encode!(report)}'
+      """
+    )
+
+    assert {:passed, %{job_id: "gate-poll-1", candidate_hash: "candidate-1"}} =
+             HandoffGate.poll_before_handoff(
+               workspace,
+               issue("MT-HANDOFF-POLL"),
+               nil,
+               "In Review",
+               "gate-poll-1",
+               expected_candidate_hash: "candidate-1"
+             )
+  end
+
   defp temp_workspace!(name) do
     root = Path.join(System.tmp_dir!(), "symphony-elixir-#{name}-#{System.unique_integer([:positive])}")
     workspace = Path.join(root, "workspace")
@@ -136,5 +200,34 @@ defmodule SymphonyElixir.HandoffGateTest do
       title: "Handoff gate",
       state: "In Progress"
     }
+  end
+
+  defp protocol_report(status, overrides \\ %{}) do
+    base = %{
+      "protocolVersion" => 1,
+      "jobId" => "gate-1",
+      "status" => status,
+      "identity" => %{
+        "repositoryIdentity" => "repo-1",
+        "worktreeIdentity" => "worktree-1",
+        "prNumber" => 1854,
+        "baseRef" => "develop",
+        "baseSha" => "base-1",
+        "headSha" => "head-1",
+        "candidateFingerprint" => "fingerprint-1",
+        "gateConfigHash" => "config-1",
+        "mutablePrStateHash" => "mutable-1",
+        "candidateHash" => "candidate-1",
+        "exactHash" => "exact-1"
+      },
+      "heartbeatAt" => "2026-08-02T12:00:00Z",
+      "heartbeatAgeMs" => 10,
+      "nextPollMs" => 250,
+      "progress" => %{"stage" => "tests", "completed" => 1, "total" => 3},
+      "startedAt" => "2026-08-02T11:59:00Z",
+      "checks" => []
+    }
+
+    Map.merge(base, overrides)
   end
 end

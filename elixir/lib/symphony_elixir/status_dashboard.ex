@@ -601,6 +601,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
     state =
       case Map.get(running_entry, :lifecycle_state) do
+        :handoff_pending_gate -> "gate pending"
         :handoff_pending_review -> "review pending"
         _ -> running_entry.state || "unknown"
       end

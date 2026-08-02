@@ -415,6 +415,10 @@ Fields:
   - Runs before an agent-driven Linear status transition from `In Progress` to a review handoff
     state such as `In Review`.
   - Failure cancels the status transition and feeds hook remediation into the next agent turn.
+- `before_handoff_timeout_ms` (integer, OPTIONAL)
+  - Overrides `hooks.timeout_ms` for each initial or polling invocation of `before_handoff`.
+- `before_handoff_stale_ms` (integer, OPTIONAL, default `120000`)
+  - Maximum accepted heartbeat age for an asynchronous pending handoff gate.
 - `after_run` (multiline shell script string, OPTIONAL)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
@@ -639,6 +643,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.session_start`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.before_handoff`: shell script or null
+- `hooks.before_handoff_timeout_ms`: positive integer or null; falls back to `hooks.timeout_ms`
+- `hooks.before_handoff_stale_ms`: positive integer, default `120000`
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
@@ -877,8 +883,9 @@ Reconciliation runs every tick and has two parts.
 
 Part A: Stall detection
 
-- Each running issue has a lifecycle state. Normal agent work uses `implementing`; an accepted
-  deferred handoff review uses `handoff_pending_review` and remains in the running/claimed sets.
+- Each running issue has a lifecycle state. Normal agent work uses `implementing`; an asynchronous
+  shell gate uses `handoff_pending_gate`, and an accepted deferred handoff review uses
+  `handoff_pending_review`. Both pending states remain in the running/claimed sets.
 - For `implementing`, compute `elapsed_ms` since the newest of:
   - `last_codex_timestamp` if any event has been seen,
   - the current lifecycle state's start time, or
@@ -891,6 +898,14 @@ Part A: Stall detection
   worker and review job, that refreshes `last_codex_timestamp` without altering session/token
   accounting. Terminate the worker with a visible review-timeout retry if reviewer inactivity
   exceeds the review timeout.
+- For `handoff_pending_gate`, do not apply the implementor activity clock, failure retry, or
+  max-turn accounting and do not dispatch a replacement implementor. Poll the durable gate by job
+  ID without starting a coding-agent turn. Status surfaces MUST expose the job and candidate
+  identity, pending age, heartbeat age/time, progress stage, and next-poll delay.
+- Persist the captured tracker mutation and pending gate identity outside the agent-writable
+  workspace. After process restart, reattach to that job before starting a coding-agent session.
+  Repeated requests for the same candidate MUST coalesce. A changed candidate cancels or
+  supersedes the old request; a stale pass MUST NOT authorize the mutation.
 - A pending review is keyed to the issue and reviewed PR head. Repeated requests while that job is
   pending coalesce into the existing review. Before applying the captured tracker transition,
   re-resolve the PR head; if it changed, clear pending state and require a fresh review.
@@ -1013,10 +1028,21 @@ Execution contract:
   written outside the agent-writable workspace, MUST NOT contain tracker credentials, and SHOULD
   be refreshed from the same normalized issue and comment activity used to assemble the first turn
   before session startup and before `hooks.before_handoff`.
-- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
+- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. `before_handoff` may override each
+  invocation with `hooks.before_handoff_timeout_ms`.
 - Log hook start, failures, and timeouts.
 - Emit `gate.before_handoff` telemetry when `before_handoff` fires, including the per-gate
   pass/fail breakdown parsed from hook JSON output when available.
+- Invoke `before_handoff` with `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. A protocol version 1 report
+  includes `jobId`, `status`, `identity.candidateHash`, and `identity.exactHash`. Pending/running
+  reports additionally include `heartbeatAt`, `heartbeatAgeMs`, `nextPollMs`, and
+  `progress.stage`; they exit `3`. Passed reports exit `0`; failed/invalidated reports exit `2`;
+  infrastructure errors exit `1`. Polls set `SYMPHONY_HANDOFF_GATE_JOB_ID` and MUST attach to the
+  named job rather than starting another underlying gate.
+- On pending/running, durably record the original tracker mutation, end the active model turn, and
+  poll without a model turn. Apply the mutation only after a passed report is revalidated for the
+  exact current candidate. Failed, invalidated, or infrastructure terminal results clear pending
+  state and resume the implementor once with bounded remediation.
 - For a routed repository with a configured base branch, fetch and revalidate
   that base on the local or SSH worker host that owns the worktree immediately
   before `hooks.before_handoff`. Compute the
@@ -1090,7 +1116,8 @@ Failure semantics:
   context; it is not fatal to the current run attempt.
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `before_handoff` failure or timeout cancels the attempted tracker state transition and provides
-  remediation to the next agent turn.
+  remediation to the next agent turn. A valid protocol pending/running result is neither a failure
+  nor a timeout and does not consume a retry or coding-agent turn.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 

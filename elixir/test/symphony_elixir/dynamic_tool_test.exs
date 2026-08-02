@@ -197,6 +197,95 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert [%{name: "landable-check", passed: false}] = gates
   end
 
+  test "linear_graphql defers a protocol-v1 pending handoff without applying the mutation" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-pending-handoff-tool-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    issue = %Issue{
+      id: "issue-pending-gate",
+      identifier: "UDPE-7157",
+      title: "Defer handoff",
+      state: "In Progress"
+    }
+
+    report = %{
+      "protocolVersion" => 1,
+      "jobId" => "job-7157",
+      "status" => "pending",
+      "identity" => %{
+        "repositoryIdentity" => "repo-7157",
+        "worktreeIdentity" => "worktree-7157",
+        "prNumber" => 1854,
+        "baseRef" => "develop",
+        "baseSha" => "base-7157",
+        "headSha" => "head-7157",
+        "candidateFingerprint" => "fingerprint-7157",
+        "gateConfigHash" => "config-7157",
+        "mutablePrStateHash" => "mutable-7157",
+        "candidateHash" => "candidate-7157",
+        "exactHash" => "exact-7157"
+      },
+      "heartbeatAt" => "2026-08-02T12:00:00Z",
+      "heartbeatAgeMs" => 5,
+      "nextPollMs" => 1_000,
+      "progress" => %{"stage" => "ci", "completed" => 2, "total" => 5}
+    }
+
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{
+          issue: issue,
+          workspace: workspace,
+          worker_host: nil,
+          before_handoff_command: "printf '%s' '#{Jason.encode!(report)}'; exit 3",
+          deferred_handoff_gate_callback: fn request ->
+            send(test_pid, {:pending_handoff, request})
+            :ok
+          end
+        },
+        linear_client: fn
+          query, %{"issueId" => "issue-pending-gate"}, [] ->
+            assert query =~ "SymphonyResolveIssueTransition"
+
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                   }
+                 }
+               }
+             }}
+
+          _query, _variables, [] ->
+            flunk("pending handoff mutation must not be applied")
+        end
+      )
+
+    assert response["success"] == true
+    output = Jason.decode!(response["output"])
+    assert output["status"] == "handoff_gate_pending"
+    assert get_in(output, ["gate", "jobId"]) == "job-7157"
+
+    assert_receive {:pending_handoff, %{gate: %{job_id: "job-7157"}, target_state: "In Review"}}
+  end
+
   test "linear_graphql runs handoff gates when issueUpdate uses the issue identifier" do
     workspace =
       Path.join(
