@@ -38,6 +38,15 @@ materially needed. Handoff state changes must use that gated tool; Symphony does
 native Linear MCP `save_issue` calls because they cannot run `hooks.before_handoff` or the automated
 review gate.
 
+`hooks.before_handoff` may implement the version 1 asynchronous gate protocol. Symphony sets
+`SYMPHONY_HANDOFF_GATE_PROTOCOL=1`; a `pending` or `running` report exits `3` and supplies a durable
+job ID, exact candidate identity, heartbeat, progress, and next-poll delay. Symphony persists the
+captured Linear mutation outside the agent-writable worktree, closes the active model turn, and
+polls with `SYMPHONY_HANDOFF_GATE_JOB_ID` without consuming model turns or tokens. Only a `passed`
+report for the original candidate can release the mutation. Failed, invalidated, stale-heartbeat,
+and infrastructure outcomes resume the implementor once with compact remediation. A restart
+reattaches to the persisted job rather than starting a duplicate gate.
+
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
 mutation, the active implementor turn closes, and Symphony runs the reviewer before applying that
@@ -139,6 +148,8 @@ hooks:
     scripts/hooks/session-start.sh
   before_handoff: |
     scripts/hooks/before-handoff.sh
+  before_handoff_timeout_ms: 60000
+  before_handoff_stale_ms: 120000
 agent:
   max_concurrent_agents: 10
   max_turns: 20
@@ -391,6 +402,12 @@ Notes:
 - Use `hooks.before_handoff` to run a repo-local gate before an agent moves a Linear issue from
   `In Progress` to a review handoff state such as `In Review`. A non-zero exit blocks the status
   transition and the parsed gate remediation is included in the next agent turn.
+  Protocol-aware hooks receive `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. Exit `3` with a version 1
+  `pending`/`running` JSON report to defer the mutation; subsequent lightweight polls receive
+  `SYMPHONY_HANDOFF_GATE_JOB_ID`. Configure the hook invocation deadline independently with
+  `before_handoff_timeout_ms` and the maximum accepted heartbeat age with
+  `before_handoff_stale_ms`. The runtime APIs expose job/candidate identity, pending age,
+  heartbeat age, progress stage, and next-poll delay while the issue is `handoff_pending_gate`.
 - If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
   implementor turn that requested the handoff has closed, and applies the captured Linear
   transition only after an authoritative approval for the exact candidate SHA. Request changes,

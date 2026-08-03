@@ -271,7 +271,6 @@ defmodule SymphonyElixir.CodexSessionLogRenderer do
   end
 
   defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
-  defp acp_chunk_text(_update), do: nil
 
   defp acp_content_text(%{"content" => nested}), do: acp_content_text(nested)
   defp acp_content_text(%{"text" => text}) when is_binary(text), do: text

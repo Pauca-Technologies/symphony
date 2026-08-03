@@ -83,6 +83,32 @@ defmodule SymphonyElixir.AgentRunnerTest.TurnCountingBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.PendingGateBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, prompt, _issue, _opts) do
+    recipient = Application.fetch_env!(:symphony_elixir, :pending_gate_recipient_for_test)
+    turn = Process.get(:pending_gate_turn, 0) + 1
+    Process.put(:pending_gate_turn, turn)
+    send(recipient, {:pending_gate_turn, turn, prompt})
+
+    if turn == 1 do
+      request = Application.fetch_env!(:symphony_elixir, :pending_gate_request_for_test)
+      :ok = SymphonyElixir.AgentRunner.store_deferred_handoff_gate_for_test(request)
+    end
+
+    {:ok, %{session_id: "pending-gate-session-#{turn}"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.HandoffPromptBackend do
   @moduledoc false
   @behaviour SymphonyElixir.AgentBackend
@@ -239,6 +265,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend
   alias SymphonyElixir.AgentRunnerTest.HandoffPromptBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
+  alias SymphonyElixir.AgentRunnerTest.PendingGateBackend
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
   alias SymphonyElixir.Linear.Comment
   alias SymphonyElixir.Linear.Issue
@@ -1231,10 +1258,13 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       Application.put_env(:symphony_elixir, :blocking_deferred_request_for_test, request)
       Application.put_env(:symphony_elixir, :blocking_deferred_recipient_for_test, test_pid)
-      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      # Keep the orchestrator's immediate startup poll from racing this test's
+      # deliberately injected running entry.
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
 
       orchestrator_name = Module.concat(__MODULE__, :LiveReviewOrchestrator)
       {:ok, orchestrator} = Orchestrator.start_link(name: orchestrator_name)
+      Process.sleep(50)
 
       on_exit(fn ->
         if Process.alive?(orchestrator), do: Process.exit(orchestrator, :normal)
@@ -1282,6 +1312,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
         |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue.id))
       end)
 
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
       send(worker_pid, :finish_implementor_turn)
       assert_receive {:review_runner_waiting, ^worker_pid, review_event_at}, 1_000
 
@@ -1297,6 +1329,196 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       send(worker_pid, :finish_review)
       assert :ok = Task.await(task, 2_000)
+    end
+  end
+
+  describe "asynchronous handoff gate recovery" do
+    test "reattaches to a durable job and applies an exact-candidate pass without a model turn" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-recovery-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7157")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-recovery",
+        identifier: "UDPE-7157",
+        title: "Recover pending gate",
+        state: "In Progress",
+        labels: []
+      }
+
+      pending_gate = async_gate(:pending)
+
+      assert :ok =
+               Workspace.persist_handoff_gate_state(workspace, %{
+                 "query" => "mutation Move { issueUpdate(id: \"issue-gate-recovery\", input: {stateId: \"review\"}) { success } }",
+                 "variables" => %{},
+                 "targetState" => "In Review",
+                 "gate" => %{
+                   "jobId" => pending_gate.job_id,
+                   "status" => "pending",
+                   "candidateHash" => pending_gate.candidate_hash,
+                   "exactHash" => pending_gate.exact_hash,
+                   "identity" => pending_gate.identity,
+                   "heartbeatAt" => pending_gate.heartbeat_at,
+                   "heartbeatAgeMs" => pending_gate.heartbeat_age_ms,
+                   "nextPollMs" => pending_gate.next_poll_ms,
+                   "progress" => pending_gate.progress,
+                   "startedAt" => pending_gate.started_at
+                 }
+               })
+
+      Application.put_env(:symphony_elixir, :turn_count_recipient_for_test, self())
+      test_pid = self()
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
+        File.rm_rf(workspace_root)
+      end)
+
+      poller = fn ^workspace, ^issue, nil, "In Review", "job-7157", poll_opts ->
+        assert poll_opts[:expected_candidate_hash] == "candidate-7157"
+        send(test_pid, :durable_gate_polled)
+        {:passed, async_gate(:passed)}
+      end
+
+      linear_client = fn query, %{}, [] ->
+        send(test_pid, {:recovered_handoff_applied, query})
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+
+      state_fetcher = fn ["issue-gate-recovery"] -> {:ok, [issue]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {TurnCountingBackend, %{}},
+                   issue_context_file: Workspace.issue_context_path(workspace),
+                   issue_state_fetcher: state_fetcher,
+                   handoff_gate_poller: poller,
+                   linear_client: linear_client,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received :durable_gate_polled
+      assert_received {:recovered_handoff_applied, query}
+      assert query =~ "issueUpdate"
+      refute_received :turn_ran
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
+    test "coalesces repeated requests for the same candidate into one durable job" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-coalesce-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7157")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-coalesce",
+        identifier: "UDPE-7157",
+        title: "Coalesce pending gate",
+        state: "In Progress",
+        labels: []
+      }
+
+      request = %{
+        query: "mutation Move { issueUpdate(id: \"issue-gate-coalesce\", input: {stateId: \"review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        target_state: "In Review",
+        gate: async_gate(:pending),
+        linear_client: fn _query, _variables, _opts -> {:ok, %{}} end
+      }
+
+      on_exit(fn -> File.rm_rf(workspace_root) end)
+
+      assert :ok = AgentRunner.store_deferred_handoff_gate_for_test(request)
+      assert :already_pending = AgentRunner.store_deferred_handoff_gate_for_test(request)
+
+      assert {:ok, %{"gate" => %{"jobId" => "job-7157"}}} =
+               Workspace.load_handoff_gate_state(workspace)
+    end
+
+    test "a terminal gate failure gets one remediation turn even at max_turns" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-remediation-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7157")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-remediation",
+        identifier: "UDPE-7157",
+        title: "Resume after failed gate",
+        state: "In Progress",
+        labels: []
+      }
+
+      request = %{
+        query: "mutation Move { issueUpdate(id: \"issue-gate-remediation\", input: {stateId: \"review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        target_state: "In Review",
+        gate: async_gate(:pending),
+        linear_client: fn _query, _variables, _opts -> {:ok, %{}} end
+      }
+
+      Application.put_env(:symphony_elixir, :pending_gate_recipient_for_test, self())
+      Application.put_env(:symphony_elixir, :pending_gate_request_for_test, request)
+      {:ok, state_reads} = Agent.start_link(fn -> 0 end)
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :pending_gate_recipient_for_test)
+        Application.delete_env(:symphony_elixir, :pending_gate_request_for_test)
+        if Process.alive?(state_reads), do: Agent.stop(state_reads)
+        File.rm_rf(workspace_root)
+      end)
+
+      state_fetcher = fn ["issue-gate-remediation"] ->
+        read = Agent.get_and_update(state_reads, fn count -> {count, count + 1} end)
+        state = if read < 2, do: "In Progress", else: "Done"
+        {:ok, [%{issue | state: state}]}
+      end
+
+      failed_gate = %{async_gate(:failed) | remediation: "Fix the failing exact-head tests."}
+
+      poller = fn _workspace, _issue, nil, "In Review", "job-7157", _opts ->
+        {:failed, "Fix the failing exact-head tests.", failed_gate}
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {PendingGateBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   handoff_gate_poller: poller,
+                   handoff_gate_sleep: fn _milliseconds -> :ok end,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received {:pending_gate_turn, 1, _initial_prompt}
+      assert_received {:pending_gate_turn, 2, remediation_prompt}
+      assert remediation_prompt =~ "Fix the failing exact-head tests."
+      refute_received {:pending_gate_turn, 3, _prompt}
     end
   end
 
@@ -1346,5 +1568,27 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert_received :turn_ran
       refute_received :turn_ran
     end
+  end
+
+  defp async_gate(status) do
+    %{
+      protocol_version: 1,
+      job_id: "job-7157",
+      status: status,
+      identity: %{"candidateHash" => "candidate-7157", "exactHash" => "exact-7157"},
+      candidate_hash: "candidate-7157",
+      exact_hash: "exact-7157",
+      heartbeat_at: "2026-08-02T12:00:00Z",
+      heartbeat_age_ms: 10,
+      next_poll_ms: 1,
+      progress: %{"stage" => "ci", "completed" => 1, "total" => 2},
+      started_at: "2026-08-02T11:59:00Z",
+      completed_at: if(status == :passed, do: "2026-08-02T12:01:00Z", else: nil),
+      result_artifact: nil,
+      checks: [],
+      remediation: nil,
+      summary: nil,
+      single_flight: true
+    }
   end
 end

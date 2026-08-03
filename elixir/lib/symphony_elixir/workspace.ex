@@ -67,6 +67,44 @@ defmodule SymphonyElixir.Workspace do
     Path.join([Path.dirname(workspace), ".symphony-context", Path.basename(workspace) <> ".json"])
   end
 
+  @doc "Return the trusted durable pending-handoff file associated with a workspace."
+  @spec handoff_gate_state_path(Path.t()) :: Path.t()
+  def handoff_gate_state_path(workspace) when is_binary(workspace) do
+    issue_context_path(workspace) <> ".handoff-gate.json"
+  end
+
+  @doc "Atomically persist pending asynchronous handoff state outside the agent workspace."
+  @spec persist_handoff_gate_state(Path.t(), map(), worker_host()) :: :ok | {:error, term()}
+  def persist_handoff_gate_state(workspace, state, worker_host \\ nil)
+      when is_binary(workspace) and is_map(state) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, payload} <-
+           Jason.encode(%{
+             "protocolVersion" => 1,
+             "capturedAt" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+             "request" => state
+           }) do
+      write_handoff_gate_state(workspace, payload, worker_host)
+    end
+  end
+
+  @doc "Load a durable pending asynchronous handoff request, if one exists."
+  @spec load_handoff_gate_state(Path.t(), worker_host()) :: {:ok, map() | nil} | {:error, term()}
+  def load_handoff_gate_state(workspace, worker_host \\ nil) when is_binary(workspace) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, payload} <- read_handoff_gate_state(workspace, worker_host) do
+      decode_handoff_gate_state(payload)
+    end
+  end
+
+  @doc "Remove the durable pending asynchronous handoff request for a workspace."
+  @spec clear_handoff_gate_state(Path.t(), worker_host()) :: :ok | {:error, term()}
+  def clear_handoff_gate_state(workspace, worker_host \\ nil) when is_binary(workspace) do
+    with :ok <- validate_workspace_path(workspace, worker_host) do
+      remove_handoff_gate_state(workspace, worker_host)
+    end
+  end
+
   @doc """
   Run `after_create` against a workspace that's already populated.
   Public because `AgentRunner` calls this with the per-repo workflow's
@@ -202,6 +240,7 @@ defmodule SymphonyElixir.Workspace do
           :ok ->
             maybe_run_before_remove_hook(workspace, nil)
             result = File.rm_rf(workspace)
+            remove_handoff_gate_state(workspace, nil)
             remove_issue_context(workspace)
             result
 
@@ -211,6 +250,7 @@ defmodule SymphonyElixir.Workspace do
 
       false ->
         result = File.rm_rf(workspace)
+        remove_handoff_gate_state(workspace, nil)
         remove_issue_context(workspace)
         result
     end
@@ -223,8 +263,10 @@ defmodule SymphonyElixir.Workspace do
       [
         remote_shell_assign("workspace", workspace),
         remote_shell_assign("context_file", issue_context_path(workspace)),
+        remote_shell_assign("handoff_file", handoff_gate_state_path(workspace)),
         "rm -rf \"$workspace\"",
         "rm -f \"$context_file\"",
+        "rm -f \"$handoff_file\"",
         "rmdir \"$(dirname \"$context_file\")\" 2>/dev/null || true"
       ]
       |> Enum.join("\n")
@@ -323,7 +365,11 @@ defmodule SymphonyElixir.Workspace do
           {:ok, ""}
 
         command ->
-          run_hook(command, workspace, issue_context, "before_handoff", worker_host, capture_output: true)
+          run_hook(command, workspace, issue_context, "before_handoff", worker_host,
+            capture_output: true,
+            timeout_ms: Keyword.get(opts, :timeout_ms),
+            env: handoff_hook_env(opts)
+          )
       end
     end
   end
@@ -489,7 +535,7 @@ defmodule SymphonyElixir.Workspace do
   defp run_hook(command, workspace, issue_context, hook_name, worker_host, opts \\ [])
 
   defp run_hook(command, workspace, issue_context, hook_name, nil, opts) do
-    timeout_ms = Config.settings!().hooks.timeout_ms
+    timeout_ms = Keyword.get(opts, :timeout_ms) || Config.settings!().hooks.timeout_ms
     capture_output? = Keyword.get(opts, :capture_output, false)
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
@@ -504,7 +550,7 @@ defmodule SymphonyElixir.Workspace do
         System.cmd("sh", ["-lc", command],
           cd: workspace,
           stderr_to_stdout: true,
-          env: hook_env(workspace)
+          env: hook_env(workspace, Keyword.get(opts, :env, []))
         )
       end)
 
@@ -522,15 +568,15 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp run_hook(command, workspace, issue_context, hook_name, worker_host, opts) when is_binary(worker_host) do
-    timeout_ms = Config.settings!().hooks.timeout_ms
+    timeout_ms = Keyword.get(opts, :timeout_ms) || Config.settings!().hooks.timeout_ms
     capture_output? = Keyword.get(opts, :capture_output, false)
+    exports = remote_hook_exports(workspace, Keyword.get(opts, :env, []))
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
     case run_remote_command(
            worker_host,
-           "cd #{shell_escape(workspace)} && export SYMPHONY_RUN=1 && " <>
-             "export SYMPHONY_ISSUE_CONTEXT_FILE=#{shell_escape(issue_context_path(workspace))} && #{command}",
+           "cd #{shell_escape(workspace)} && #{exports} #{command}",
            timeout_ms
          ) do
       {:ok, cmd_result} ->
@@ -670,11 +716,28 @@ defmodule SymphonyElixir.Workspace do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
-  defp hook_env(workspace) do
+  defp hook_env(workspace, extra_env) do
     [
       {"SYMPHONY_RUN", "1"},
       {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)}
-    ]
+    ] ++ extra_env
+  end
+
+  defp handoff_hook_env(opts) do
+    []
+    |> maybe_put_hook_env("SYMPHONY_HANDOFF_GATE_PROTOCOL", Keyword.get(opts, :gate_protocol))
+    |> maybe_put_hook_env("SYMPHONY_HANDOFF_GATE_JOB_ID", Keyword.get(opts, :gate_job_id))
+  end
+
+  defp maybe_put_hook_env(env, _name, nil), do: env
+  defp maybe_put_hook_env(env, name, value), do: env ++ [{name, to_string(value)}]
+
+  defp remote_hook_exports(workspace, extra_env) do
+    ([
+       {"SYMPHONY_RUN", "1"},
+       {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)}
+     ] ++ extra_env)
+    |> Enum.map_join(" ", fn {name, value} -> "export #{name}=#{shell_escape(value)} &&" end)
   end
 
   defp encode_issue_context(issue_or_identifier) do
@@ -779,6 +842,107 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp write_handoff_gate_state(workspace, payload, nil) do
+    state_file = handoff_gate_state_path(workspace)
+    state_dir = Path.dirname(state_file)
+    temporary_file = state_file <> ".tmp.#{System.unique_integer([:positive])}"
+
+    result =
+      with :ok <- File.mkdir_p(state_dir),
+           :ok <- File.write(temporary_file, payload, [:binary]),
+           :ok <- File.chmod(temporary_file, 0o600),
+           do: File.rename(temporary_file, state_file)
+
+    if result != :ok, do: File.rm(temporary_file)
+    result
+  end
+
+  defp write_handoff_gate_state(workspace, payload, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("state_file", handoff_gate_state_path(workspace)),
+        "state_dir=$(dirname \"$state_file\")",
+        "mkdir -p \"$state_dir\"",
+        "temporary_file=\"$state_file.tmp.$$\"",
+        "trap 'rm -f \"$temporary_file\"' EXIT",
+        "umask 077",
+        "printf '%s' #{shell_escape(payload)} > \"$temporary_file\"",
+        "chmod 600 \"$temporary_file\"",
+        "mv \"$temporary_file\" \"$state_file\"",
+        "trap - EXIT"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:handoff_gate_state_write_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_handoff_gate_state(workspace, nil) do
+    case File.read(handoff_gate_state_path(workspace)) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, :enoent} -> {:ok, nil}
+      {:error, reason} -> {:error, {:handoff_gate_state_read_failed, reason}}
+    end
+  end
+
+  defp read_handoff_gate_state(workspace, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("state_file", handoff_gate_state_path(workspace)),
+        "if [ -f \"$state_file\" ]; then cat \"$state_file\"; else exit 3; fi"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {payload, 0}} -> {:ok, payload}
+      {:ok, {_output, 3}} -> {:ok, nil}
+      {:ok, {output, status}} -> {:error, {:handoff_gate_state_read_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp decode_handoff_gate_state(nil), do: {:ok, nil}
+
+  defp decode_handoff_gate_state(payload) when is_binary(payload) do
+    case Jason.decode(payload) do
+      {:ok, %{"protocolVersion" => 1, "request" => request}} when is_map(request) ->
+        {:ok, request}
+
+      {:ok, decoded} ->
+        {:error, {:invalid_handoff_gate_state, decoded}}
+
+      {:error, reason} ->
+        {:error, {:invalid_handoff_gate_state, reason}}
+    end
+  end
+
+  defp remove_handoff_gate_state(workspace, nil) do
+    case File.rm(handoff_gate_state_path(workspace)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:handoff_gate_state_remove_failed, reason}}
+    end
+  end
+
+  defp remove_handoff_gate_state(workspace, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("state_file", handoff_gate_state_path(workspace)),
+        "rm -f \"$state_file\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:handoff_gate_state_remove_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
     end
   end
 

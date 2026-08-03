@@ -273,7 +273,10 @@ defmodule SymphonyElixir.Acp.Client do
       }
     }
 
-    if AgentTransport.send_message(port, payload), do: :ok, else: {:error, :initialize_send_failed}
+    true = AgentTransport.send_message(port, payload)
+    :ok
+  rescue
+    ArgumentError -> {:error, :initialize_send_failed}
   end
 
   defp send_session_new(port, workspace, gate, acp) do

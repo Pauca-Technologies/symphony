@@ -445,6 +445,41 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp transition_agent_lifecycle(
          running_entry,
+         :handoff_pending_gate,
+         %{gate_job_id: gate_job_id, gate: gate}
+       )
+       when is_map(running_entry) and is_binary(gate_job_id) and is_map(gate) do
+    now = DateTime.utc_now()
+    issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+    session_id = running_entry_session_id(running_entry)
+
+    lifecycle_started_at =
+      if previous_state == :handoff_pending_gate,
+        do: Map.get(running_entry, :lifecycle_started_at, now),
+        else: now
+
+    Logger.info(
+      "Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=handoff_pending_gate gate_job_id=#{gate_job_id} status=#{Map.get(gate, :status)}"
+    )
+
+    emit_agent_lifecycle(running_entry, previous_state, :handoff_pending_gate, %{
+      gate_job_id: gate_job_id,
+      gate_job_identity: Map.get(gate, :exact_hash),
+      gate_status: Map.get(gate, :status),
+      gate_stage: get_in(gate, [:progress, "stage"]) || get_in(gate, [:progress, :stage])
+    })
+
+    running_entry
+    |> Map.put(:lifecycle_state, :handoff_pending_gate)
+    |> Map.put(:lifecycle_started_at, lifecycle_started_at)
+    |> Map.put(:handoff_gate_job_id, gate_job_id)
+    |> Map.put(:handoff_gate_state, gate)
+  end
+
+  defp transition_agent_lifecycle(
+         running_entry,
          :handoff_pending_review,
          %{
            timeout_ms: timeout_ms,
@@ -478,9 +513,39 @@ defmodule SymphonyElixir.Orchestrator do
     |> Map.put(:handoff_review_timeout_ms, timeout_ms)
   end
 
-  defp transition_agent_lifecycle(running_entry, :implementing, metadata)
-       when is_map(running_entry) do
-    if Map.get(running_entry, :handoff_review_job_id) == Map.get(metadata, :review_job_id) do
+  defp transition_agent_lifecycle(
+         %{lifecycle_state: :handoff_pending_gate} = running_entry,
+         :implementing,
+         metadata
+       )
+       when is_map(metadata) do
+    if Map.get(running_entry, :handoff_gate_job_id) == Map.get(metadata, :gate_job_id) do
+      now = DateTime.utc_now()
+      issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+      outcome = Map.get(metadata, :gate_outcome, :unknown)
+      session_id = running_entry_session_id(running_entry)
+
+      Logger.info("Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=implementing gate_outcome=#{outcome}")
+
+      emit_agent_lifecycle(running_entry, previous_state, :implementing, %{
+        gate_job_id: Map.get(metadata, :gate_job_id),
+        gate_outcome: outcome
+      })
+
+      running_entry
+      |> Map.drop([:handoff_gate_job_id, :handoff_gate_state])
+      |> Map.put(:lifecycle_state, :implementing)
+      |> Map.put(:lifecycle_started_at, now)
+    else
+      running_entry
+    end
+  end
+
+  defp transition_agent_lifecycle(running_entry, :implementing, %{review_job_id: review_job_id} = metadata)
+       when is_map(running_entry) and is_integer(review_job_id) do
+    if Map.get(running_entry, :handoff_review_job_id) == review_job_id do
       now = DateTime.utc_now()
       issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
       identifier = Map.get(running_entry, :identifier, issue_id)
@@ -527,7 +592,13 @@ defmodule SymphonyElixir.Orchestrator do
       details: details
     })
 
-    phase = if to == :handoff_pending_review, do: "review", else: "implementation"
+    phase =
+      case to do
+        :handoff_pending_review -> "review"
+        :handoff_pending_gate -> "handoff_gate"
+        _ -> "implementation"
+      end
+
     Telemetry.emit(:phase, %{issue_identifier: Map.get(issue, :identifier), session_id: Map.get(running_entry, :session_id), phase: phase, action: "transition"})
   end
 
@@ -535,8 +606,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -580,9 +650,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -830,6 +897,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_running_issue_timeout(
          state,
+         _issue_id,
+         %{lifecycle_state: :handoff_pending_gate},
+         _now,
+         _implementor_timeout_ms
+       ) do
+    state
+  end
+
+  defp reconcile_running_issue_timeout(
+         state,
          issue_id,
          %{lifecycle_state: :handoff_pending_review} = running_entry,
          now,
@@ -924,8 +1001,6 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.filter(&match?(%DateTime{}, &1))
     |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
   end
-
-  defp last_activity_timestamp(_running_entry), do: nil
 
   defp handoff_review_elapsed_ms(running_entry, now) do
     running_entry
@@ -2276,6 +2351,7 @@ defmodule SymphonyElixir.Orchestrator do
           turn_count: Map.get(metadata, :turn_count, 0),
           lifecycle_state: Map.get(metadata, :lifecycle_state, :implementing),
           lifecycle_started_at: Map.get(metadata, :lifecycle_started_at),
+          handoff_gate: handoff_gate_snapshot(metadata, now),
           review_state: Map.get(metadata, :review_state),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -2685,7 +2761,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
-  defp acp_chunk_text(_update), do: nil
 
   # ACP content is a single `{type:"text", text:...}` block, a list of blocks, or
   # a `{type:"content", content:{...}}` wrapper (tool-call output); pull the text
@@ -3464,8 +3539,6 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | codex_totals: codex_totals}
   end
 
-  defp record_session_completion_totals(state, _running_entry), do: state
-
   # Shared body for a valid-config tick: flip the loop into "checking now…",
   # clear the fired tick timer, and hand off to the poll cycle.
   defp begin_poll_check(%State{} = state) do
@@ -3898,10 +3971,10 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp put_quota_circuit(%State{} = state, circuit_key, circuit, persist? \\ true) do
+  defp put_quota_circuit(%State{} = state, circuit_key, circuit) do
     state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
     state = arm_quota_circuit(state, circuit_key)
-    if persist?, do: QuotaCircuitStore.save(state.quota_circuits)
+    QuotaCircuitStore.save(state.quota_circuits)
     state
   end
 
@@ -4416,15 +4489,10 @@ defmodule SymphonyElixir.Orchestrator do
     Enum.find_value(fields, fn field -> map_integer_value(payload, field) end)
   end
 
-  defp payload_get(payload, field), do: map_integer_value(payload, field)
-
   defp map_integer_value(payload, field) do
-    if is_map(payload) do
-      value = Map.get(payload, field)
-      integer_like(value)
-    else
-      nil
-    end
+    payload
+    |> Map.get(field)
+    |> integer_like()
   end
 
   defp running_seconds(%DateTime{} = started_at, %DateTime{} = now) do
@@ -4432,6 +4500,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp running_seconds(_started_at, _now), do: 0
+
+  defp handoff_gate_snapshot(metadata, now) do
+    case Map.get(metadata, :handoff_gate_state) do
+      gate when is_map(gate) ->
+        Map.put(
+          gate,
+          :pending_age_seconds,
+          running_seconds(Map.get(metadata, :lifecycle_started_at), now)
+        )
+
+      _gate ->
+        nil
+    end
+  end
 
   defp integer_like(value) when is_integer(value) and value >= 0, do: value
 

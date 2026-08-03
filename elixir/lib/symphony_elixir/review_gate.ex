@@ -172,6 +172,9 @@ defmodule SymphonyElixir.ReviewGate do
     * `:session_runner` — `fn ctx -> {:ok, term()} | {:error, term()} end`
       that runs the reviewer Codex session. Defaults to the real
       `AppServer`-backed runner. Injected in tests.
+    * `:review_packet_builder` — seven-argument function matching
+      `ReviewPacket.build/7`. Defaults to the production packet builder and
+      permits deterministic packet-boundary tests.
     * `:on_message` — callback for reviewer Codex events. The orchestrator uses
       these events as a reviewer-specific heartbeat while the implementor is
       paused.
@@ -363,8 +366,9 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp run_unlatched_review(context) do
     prior_outcome = latest_outcome(context.issue.id)
+    packet_builder = Keyword.get(context.opts, :review_packet_builder, &ReviewPacket.build/7)
 
-    case ReviewPacket.build(
+    case packet_builder.(
            context.workspace,
            context.issue,
            context.pr,

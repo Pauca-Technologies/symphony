@@ -66,6 +66,11 @@ hooks:
   # Repositories can use it to block handoff until repo-local gates pass, for example:
   # before_handoff: |
   #   scripts/hooks/before-handoff.sh
+  # Async protocol invocations receive SYMPHONY_HANDOFF_GATE_PROTOCOL=1; polls
+  # also receive SYMPHONY_HANDOFF_GATE_JOB_ID. These limits are independent of
+  # other lifecycle hooks.
+  before_handoff_timeout_ms: 60000
+  before_handoff_stale_ms: 120000
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 # Automated-review packet/context/turn budgets are repository-owned. Configure

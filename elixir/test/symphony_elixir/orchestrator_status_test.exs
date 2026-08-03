@@ -1955,6 +1955,104 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     send(worker_pid, :done)
   end
 
+  test "pending asynchronous handoff gate is observable and excluded from implementor stall retries" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue_id = "issue-pending-handoff-gate"
+    orchestrator_name = Module.concat(__MODULE__, :PendingHandoffGateOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    parent = self()
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          {:start_gate, orchestrator} ->
+            result =
+              GenServer.call(
+                orchestrator,
+                {:agent_lifecycle, issue_id, :handoff_pending_gate,
+                 %{
+                   gate_job_id: "job-7157",
+                   gate: %{
+                     job_id: "job-7157",
+                     status: :running,
+                     candidate_hash: "candidate-7157",
+                     exact_hash: "exact-7157",
+                     identity: %{"headSha" => "head-7157"},
+                     heartbeat_at: "2026-08-02T12:00:00Z",
+                     heartbeat_age_ms: 25,
+                     next_poll_ms: 1_000,
+                     progress: %{"stage" => "tests", "completed" => 2, "total" => 4},
+                     started_at: "2026-08-02T11:59:00Z"
+                   }
+                 }}
+              )
+
+            send(parent, {:gate_started, result})
+        end
+
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    issue = %Issue{id: issue_id, identifier: "UDPE-7157", state: "In Progress"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-pending-gate",
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: stale_activity_at,
+      last_codex_event: :turn_completed,
+      lifecycle_state: :implementing,
+      lifecycle_started_at: stale_activity_at,
+      started_at: stale_activity_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(worker_pid, {:start_gate, pid})
+    assert_receive {:gate_started, :ok}, 1_000
+    send(pid, :tick)
+    Process.sleep(100)
+
+    state = :sys.get_state(pid)
+    assert Process.alive?(worker_pid)
+    assert state.running[issue_id].lifecycle_state == :handoff_pending_gate
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+    [running] = Enum.filter(snapshot.running, &(&1.issue_id == issue_id))
+    assert running.handoff_gate.job_id == "job-7157"
+    assert running.handoff_gate.candidate_hash == "candidate-7157"
+    assert running.handoff_gate.heartbeat_age_ms == 25
+    assert get_in(running.handoff_gate, [:progress, "stage"]) == "tests"
+    assert is_integer(running.handoff_gate.pending_age_seconds)
+
+    send(worker_pid, :done)
+  end
+
   test "stalled handoff review clears pending state and retries visibly" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

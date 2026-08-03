@@ -152,6 +152,7 @@ defmodule SymphonyElixirWeb.Presenter do
       context: context_payload(entry)
     }
     |> maybe_put_scheduling(entry)
+    |> maybe_put_handoff_gate(entry)
     |> maybe_put_review(entry)
   end
 
@@ -242,6 +243,7 @@ defmodule SymphonyElixirWeb.Presenter do
       context: context_payload(running)
     }
     |> maybe_put_scheduling(running)
+    |> maybe_put_handoff_gate(running)
     |> maybe_put_review(running)
   end
 
@@ -260,6 +262,13 @@ defmodule SymphonyElixirWeb.Presenter do
     case Map.get(entry, :review_state) do
       review when is_map(review) -> Map.put(payload, :review, review)
       _review -> payload
+    end
+  end
+
+  defp maybe_put_handoff_gate(payload, entry) do
+    case Map.get(entry, :handoff_gate) do
+      gate when is_map(gate) -> Map.put(payload, :handoff_gate, gate)
+      _gate -> payload
     end
   end
 
@@ -440,23 +449,31 @@ defmodule SymphonyElixirWeb.Presenter do
        when is_map(entry) and is_binary(path) and is_map(transcript_cache) do
     case transcript_file_stamp(path) do
       {:ok, stamp} ->
-        case Map.get(transcript_cache, path) do
-          {^stamp, blocks} ->
-            {blocks, transcript_cache}
-
-          _ ->
-            case load_transcript_blocks(path) do
-              blocks when is_list(blocks) and blocks != [] ->
-                # Replace the cache wholesale (single entry) so it never holds
-                # blocks for a stale path — keeps per-connection memory bounded.
-                {blocks, %{path => {stamp, blocks}}}
-
-              _ ->
-                {ring_buffer_blocks(entry), transcript_cache}
-            end
-        end
+        transcript_blocks_for_stamp(entry, path, stamp, transcript_cache)
 
       :error ->
+        {ring_buffer_blocks(entry), transcript_cache}
+    end
+  end
+
+  defp transcript_blocks_for_stamp(entry, path, stamp, transcript_cache) do
+    case Map.get(transcript_cache, path) do
+      {^stamp, blocks} ->
+        {blocks, transcript_cache}
+
+      _stale_or_missing ->
+        refresh_transcript_blocks(entry, path, stamp, transcript_cache)
+    end
+  end
+
+  defp refresh_transcript_blocks(entry, path, stamp, transcript_cache) do
+    case load_transcript_blocks(path) do
+      blocks when is_list(blocks) and blocks != [] ->
+        # Replace the cache wholesale (single entry) so it never holds blocks
+        # for a stale path — keeps per-connection memory bounded.
+        {blocks, %{path => {stamp, blocks}}}
+
+      _unavailable ->
         {ring_buffer_blocks(entry), transcript_cache}
     end
   end
@@ -493,8 +510,6 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp load_transcript_blocks(_path), do: []
-
   defp transcript_record(line) when is_binary(line) do
     line
     |> String.trim()
@@ -515,6 +530,12 @@ defmodule SymphonyElixirWeb.Presenter do
     at = Map.get(record, "at")
     origin = transcript_origin(payload, parent_thread_from_session_id(Map.get(record, "session_id")))
 
+    stream_transcript_fragment(method, at, payload, origin)
+  end
+
+  defp transcript_fragment(_record), do: nil
+
+  defp stream_transcript_fragment(method, at, payload, origin) do
     cond do
       method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
         build_stream_fragment("agent", at, payload, agent_text_paths(), origin)
@@ -528,6 +549,13 @@ defmodule SymphonyElixirWeb.Presenter do
       method in reasoning_methods() ->
         build_stream_fragment("reasoning", at, payload, reasoning_text_paths(), origin)
 
+      true ->
+        control_transcript_fragment(method, at, payload, origin)
+    end
+  end
+
+  defp control_transcript_fragment(method, at, payload, origin) do
+    cond do
       method == "item/tool/call" ->
         build_tool_fragment(at, payload, origin)
 
@@ -546,8 +574,6 @@ defmodule SymphonyElixirWeb.Presenter do
         nil
     end
   end
-
-  defp transcript_fragment(_record), do: nil
 
   defp build_acp_fragment(at, payload, origin) do
     update = acp_update(payload)
@@ -581,7 +607,6 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
-  defp acp_chunk_text(_update), do: nil
 
   defp acp_content_text(%{"content" => nested}), do: acp_content_text(nested)
   defp acp_content_text(%{"text" => text}) when is_binary(text), do: text
