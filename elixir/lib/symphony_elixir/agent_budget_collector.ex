@@ -250,5 +250,4 @@ defmodule SymphonyElixir.AgentBudgetCollector do
 
   defp reported_thread("thread-unreported"), do: nil
   defp reported_thread(thread_id) when is_binary(thread_id), do: thread_id
-  defp reported_thread(_thread_id), do: nil
 end

@@ -149,15 +149,20 @@ defmodule SymphonyElixir.Linear.Adapter do
   defp ensure_label_id(issue_id, label_name) do
     with {:ok, response} <-
            client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}) do
-      case get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
-        label_id when is_binary(label_id) ->
+      label_id =
+        get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"])
+
+      team_id = get_in(response, ["data", "issue", "team", "id"])
+
+      case {label_id, team_id} do
+        {label_id, _team_id} when is_binary(label_id) ->
           {:ok, label_id}
 
-        _ ->
-          case get_in(response, ["data", "issue", "team", "id"]) do
-            team_id when is_binary(team_id) -> create_label(team_id, label_name)
-            _ -> {:error, :label_missing}
-          end
+        {_label_id, team_id} when is_binary(team_id) ->
+          create_label(team_id, label_name)
+
+        _missing_ids ->
+          {:error, :label_missing}
       end
     end
   end

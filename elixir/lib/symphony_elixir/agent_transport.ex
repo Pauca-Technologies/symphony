@@ -201,7 +201,7 @@ defmodule SymphonyElixir.AgentTransport do
   def stop_port(_port), do: :ok
 
   @doc "Send a JSON-RPC message as a single newline-terminated line."
-  @spec send_message(port(), map()) :: boolean()
+  @spec send_message(port(), map()) :: true
   def send_message(port, message) when is_port(port) and is_map(message) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)

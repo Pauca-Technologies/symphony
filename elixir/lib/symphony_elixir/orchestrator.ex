@@ -606,8 +606,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -651,9 +650,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -1005,8 +1001,6 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.filter(&match?(%DateTime{}, &1))
     |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
   end
-
-  defp last_activity_timestamp(_running_entry), do: nil
 
   defp handoff_review_elapsed_ms(running_entry, now) do
     running_entry
@@ -2767,7 +2761,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
-  defp acp_chunk_text(_update), do: nil
 
   # ACP content is a single `{type:"text", text:...}` block, a list of blocks, or
   # a `{type:"content", content:{...}}` wrapper (tool-call output); pull the text
@@ -3546,8 +3539,6 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | codex_totals: codex_totals}
   end
 
-  defp record_session_completion_totals(state, _running_entry), do: state
-
   # Shared body for a valid-config tick: flip the loop into "checking now…",
   # clear the fired tick timer, and hand off to the poll cycle.
   defp begin_poll_check(%State{} = state) do
@@ -3980,10 +3971,10 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp put_quota_circuit(%State{} = state, circuit_key, circuit, persist? \\ true) do
+  defp put_quota_circuit(%State{} = state, circuit_key, circuit) do
     state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
     state = arm_quota_circuit(state, circuit_key)
-    if persist?, do: QuotaCircuitStore.save(state.quota_circuits)
+    QuotaCircuitStore.save(state.quota_circuits)
     state
   end
 
@@ -4498,15 +4489,10 @@ defmodule SymphonyElixir.Orchestrator do
     Enum.find_value(fields, fn field -> map_integer_value(payload, field) end)
   end
 
-  defp payload_get(payload, field), do: map_integer_value(payload, field)
-
   defp map_integer_value(payload, field) do
-    if is_map(payload) do
-      value = Map.get(payload, field)
-      integer_like(value)
-    else
-      nil
-    end
+    payload
+    |> Map.get(field)
+    |> integer_like()
   end
 
   defp running_seconds(%DateTime{} = started_at, %DateTime{} = now) do

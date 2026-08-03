@@ -100,6 +100,35 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert outcome.reviewed_sha == "head-7"
   end
 
+  test "review packet builder can be injected without changing approval semantics", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    packet_builder = fn workspace, issue, pr, reviewed_sha, prior_outcome, settings, opts ->
+      send(test_pid, {:review_packet_builder, issue.identifier, reviewed_sha})
+
+      SymphonyElixir.ReviewPacket.build(
+        workspace,
+        issue,
+        pr,
+        reviewed_sha,
+        prior_outcome,
+        settings,
+        opts
+      )
+    end
+
+    assert {:approved, %{authoritative: true}} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               review_packet_builder: packet_builder,
+               session_runner: verdict_runner(%{"verdict" => "approve", "summary" => "packet seam"}),
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:review_packet_builder, "UDPE-1", "head-7"}
+  end
+
   test "review reuses the exact pre-hook base decision instead of fetching again", %{
     workspace: workspace
   } do

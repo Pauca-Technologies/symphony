@@ -632,8 +632,7 @@ defmodule SymphonyElixir.AgentRunner do
               codex_update_recipient,
               opts,
               context.issue_state_fetcher,
-              1,
-              context.max_turns
+              {1, context.max_turns}
             )
           after
             route.backend.stop_session(session)
@@ -680,8 +679,7 @@ defmodule SymphonyElixir.AgentRunner do
          codex_update_recipient,
          opts,
          issue_state_fetcher,
-         turn_number,
-         max_turns
+         {turn_number, max_turns}
        ) do
     budget_collector = Keyword.fetch!(opts, :budget_collector)
     strategy_prompt = AgentBudgetCollector.take_strategy_prompt(budget_collector)
@@ -767,8 +765,7 @@ defmodule SymphonyElixir.AgentRunner do
               |> Keyword.put(:handoff_gate_prompt, handoff_gate_prompt)
               |> Keyword.put(:prompt_composition_state, prompt_composition.state),
               issue_state_fetcher,
-              turn_number + 1,
-              max_turns
+              {turn_number + 1, max_turns}
             )
 
           {:continue, refreshed_issue} when is_binary(handoff_gate_prompt) ->
@@ -864,8 +861,7 @@ defmodule SymphonyElixir.AgentRunner do
         |> Keyword.put(:handoff_gate_grace_turn_used, true)
         |> Keyword.put(:prompt_composition_state, context.prompt_state),
         context.issue_state_fetcher,
-        context.turn_number + 1,
-        context.max_turns
+        {context.turn_number + 1, context.max_turns}
       )
     end
   end
