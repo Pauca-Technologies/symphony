@@ -31,6 +31,7 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.CodexSessionLogRenderer,
           SymphonyElixir.Config,
           SymphonyElixir.Config.AgentEfficiency,
+          SymphonyElixir.Config.Schema.LinearGithubMapping,
           SymphonyElixir.FleetEvent,
           SymphonyElixir.Github.PrReviewSection,
           SymphonyElixir.Linear.Client,
