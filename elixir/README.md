@@ -195,9 +195,10 @@ Notes:
   whose overlap meets the threshold while allowing disjoint work up to
   `max_concurrent`; the override label bypasses overlap serialization but never
   the repository ceiling. Dependency order is enforced for every active state,
-  then human priority, creation time, and identifier provide deterministic
-  fairness. Reservations exist only for live workers, so terminal, stalled, or
-  blocked work releases them and a restart cannot resurrect a stale lease.
+  then Linear priority (Urgent, High, Medium, Low, and finally unprioritized),
+  creation time, and identifier provide deterministic fairness. Reservations exist only for live
+  workers, so terminal, stalled, or blocked work releases them and a restart cannot resurrect a
+  stale lease.
 - For a routed worktree, Symphony fetches and compares the configured base on
   the local or SSH worker that owns it immediately before `before_handoff`. An
   irrelevant base advance proceeds. An

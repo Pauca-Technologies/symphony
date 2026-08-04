@@ -401,6 +401,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Issue.label_names(issue) == ["frontend", "infra"]
     assert issue.labels == ["frontend", "infra"]
     refute issue.assigned_to_worker
+
+    assert Enum.map([1, 2, 3, 4, 0, nil, 99], &Issue.dispatch_priority_rank/1) ==
+             [1, 2, 3, 4, 5, 5, 5]
   end
 
   test "linear client normalizes blockers from inverse relations" do
@@ -680,20 +683,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
-  test "orchestrator sorts dispatch by priority then oldest created_at" do
+  test "orchestrator sorts every Linear priority then oldest created_at and identifier" do
     issue_same_priority_older = %Issue{
-      id: "issue-old-high",
+      id: "issue-old-urgent",
       identifier: "MT-200",
-      title: "Old high priority",
+      title: "Old urgent priority",
       state: "Todo",
       priority: 1,
       created_at: ~U[2026-01-01 00:00:00Z]
     }
 
     issue_same_priority_newer = %Issue{
-      id: "issue-new-high",
+      id: "issue-new-urgent",
       identifier: "MT-201",
-      title: "New high priority",
+      title: "New urgent priority",
       state: "Todo",
       priority: 1,
       created_at: ~U[2026-01-02 00:00:00Z]
@@ -702,20 +705,59 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     issue_lower_priority_older = %Issue{
       id: "issue-old-low",
       identifier: "MT-199",
-      title: "Old lower priority",
+      title: "Old high priority",
       state: "Todo",
       priority: 2,
       created_at: ~U[2025-12-01 00:00:00Z]
     }
 
+    medium = %Issue{
+      id: "issue-medium",
+      identifier: "MT-300",
+      title: "Medium",
+      state: "Todo",
+      priority: 3,
+      created_at: ~U[2025-01-01 00:00:00Z]
+    }
+
+    low = %{medium | id: "issue-low", identifier: "MT-400", title: "Low", priority: 4}
+
+    no_priority = %{
+      medium
+      | id: "issue-none",
+        identifier: "MT-500",
+        title: "No priority",
+        priority: nil
+    }
+
+    zero_priority = %{
+      medium
+      | id: "issue-zero",
+        identifier: "MT-501",
+        title: "Zero priority",
+        priority: 0
+    }
+
     sorted =
       Orchestrator.sort_issues_for_dispatch_for_test([
+        zero_priority,
         issue_lower_priority_older,
+        low,
         issue_same_priority_newer,
+        no_priority,
+        medium,
         issue_same_priority_older
       ])
 
-    assert Enum.map(sorted, & &1.identifier) == ["MT-200", "MT-201", "MT-199"]
+    assert Enum.map(sorted, & &1.identifier) == [
+             "MT-200",
+             "MT-201",
+             "MT-199",
+             "MT-300",
+             "MT-400",
+             "MT-500",
+             "MT-501"
+           ]
   end
 
   test "todo issue with non-terminal blocker is not dispatch-eligible" do

@@ -1092,7 +1092,7 @@ defmodule SymphonyElixir.Orchestrator do
         title: issue.title,
         state: issue.state,
         priority: issue.priority,
-        priority_rank: priority_rank(issue.priority),
+        priority_rank: Issue.dispatch_priority_rank(issue.priority),
         created_at_key: issue_created_at_sort_key(issue),
         queued_at_ms: queued_at_ms
       })
@@ -1369,10 +1369,10 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> Enum.sort_by(fn
       %Issue{} = issue ->
-        {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+        {Issue.dispatch_priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
 
       _ ->
-        {priority_rank(nil), issue_created_at_sort_key(nil), ""}
+        {Issue.dispatch_priority_rank(nil), issue_created_at_sort_key(nil), ""}
     end)
     |> dependency_stable_sort()
   end
@@ -1404,9 +1404,6 @@ defmodule SymphonyElixir.Orchestrator do
 
     sorted ++ remaining
   end
-
-  defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
-  defp priority_rank(_priority), do: 5
 
   defp issue_created_at_sort_key(%Issue{created_at: %DateTime{} = created_at}) do
     DateTime.to_unix(created_at, :microsecond)

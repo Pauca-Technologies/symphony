@@ -812,7 +812,7 @@ Sorting order (stable intent):
 
 1. Dependencies before dependents (cycles retain the deterministic fallback
    order and MUST NOT deadlock dispatch)
-2. `priority` ascending (1..4 are preferred; null/unknown sorts last)
+2. `priority` ascending (1 Urgent, 2 High, 3 Medium, 4 Low; 0/null/unknown sorts last)
 3. `created_at` oldest first
 4. `identifier` lexicographic tie-breaker
 

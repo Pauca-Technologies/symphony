@@ -160,7 +160,7 @@ defmodule SymphonyElixir.RepositoryScheduler do
     end)
     |> Enum.sort_by(fn entry ->
       issue = Map.get(entry, :issue, %{})
-      {Map.get(issue, :priority) || 5, created_at_key(Map.get(issue, :created_at)), Map.get(entry, :identifier, "")}
+      {Issue.dispatch_priority_rank(Map.get(issue, :priority)), created_at_key(Map.get(issue, :created_at)), Map.get(entry, :identifier, "")}
     end)
   end
 

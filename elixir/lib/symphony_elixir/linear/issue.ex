@@ -65,6 +65,15 @@ defmodule SymphonyElixir.Linear.Issue do
           updated_at: DateTime.t() | nil
         }
 
+  @type dispatch_priority_rank :: 1 | 2 | 3 | 4 | 5
+
+  @doc "Normalize Linear priority for dispatch ordering; unprioritized and unknown values sort last."
+  @spec dispatch_priority_rank(term()) :: dispatch_priority_rank()
+  def dispatch_priority_rank(priority) when is_integer(priority) and priority in 1..4,
+    do: priority
+
+  def dispatch_priority_rank(_priority), do: 5
+
   @spec label_names(t()) :: [String.t()]
   def label_names(%__MODULE__{labels: labels}) do
     labels
