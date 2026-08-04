@@ -252,6 +252,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </div>
             </div>
 
+            <p :if={@issue_payload.transcript.truncated} class="empty-state">
+              Showing the latest bounded transcript window. The issue JSON endpoint retains the complete persisted history.
+            </p>
+
             <%= if transcript_blocks(@issue_payload.transcript) == [] do %>
               <p class="empty-state">
                 No transcript text is available yet.

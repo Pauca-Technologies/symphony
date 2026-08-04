@@ -1191,9 +1191,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert issue_html =~ "Compaction"
     assert issue_html =~ "Context compacted for turn turn-htt"
     assert issue_html =~ "transcript-block-compaction"
-    # The full persisted history is shown — even the very first entry, which sits
-    # well past the former 1 MB tail-read window, must still render.
-    assert issue_html =~ "OLD-BEGINNING"
+    assert issue_html =~ "Showing the latest bounded transcript window."
+    refute issue_html =~ "OLD-BEGINNING"
     refute issue_html =~ "agent message content streaming: structured update"
     refute issue_html =~ "<script>alert(1)</script>"
     assert issue_html =~ "Wire up the HTTP server"
@@ -1229,6 +1228,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, reconstructed} =
       SymphonyElixirWeb.Presenter.issue_payload("MT-HTTP", orchestrator_name, 5_000)
+
+    assert Enum.any?(
+             reconstructed.transcript.blocks,
+             &String.contains?(Map.get(&1, :text, ""), "OLD-BEGINNING")
+           )
+
+    refute Map.has_key?(reconstructed.transcript, :truncated)
 
     assert [interleaved_agent] =
              Enum.filter(
@@ -1273,6 +1279,22 @@ defmodule SymphonyElixir.ExtensionsTest do
     # Every output in this fixture belongs to a command/tool and is folded into
     # that activity; no stream fragment leaks into a standalone Output card.
     refute issue_html =~ "transcript-block-output"
+
+    appended_record = %{
+      "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      "event" => "notification",
+      "payload" => %{
+        "method" => "codex/event/agent_message_content_delta",
+        "params" => %{"msg" => %{"content" => " Incremental append is visible."}}
+      }
+    }
+
+    File.write!(transcript_file, Jason.encode!(appended_record) <> "\n", [:append])
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      render(issue_view) =~ "Incremental append is visible."
+    end)
 
     updated_issue_snapshot =
       put_in(updated_snapshot.running, [

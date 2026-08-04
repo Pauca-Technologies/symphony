@@ -1723,6 +1723,9 @@ Enablement (extension):
 - Host a human-readable dashboard at `/`.
 - The returned document SHOULD depict the current state of the system (for example active sessions,
   retry delays, token consumption, runtime totals, recent events, and health/error indicators).
+- Implementations MAY coalesce change notifications and show a bounded, incrementally updated
+  transcript window in the live dashboard, provided an explicit operational-debugging path remains
+  available for the complete persisted transcript.
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
   consumes the JSON API below.
 

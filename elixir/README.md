@@ -485,6 +485,10 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- Live dashboard change notifications are coalesced into short update windows. Issue pages seed a
+  bounded tail of the active transcript and parse only appended NDJSON bytes on later updates, so a
+  high-volume protocol stream cannot make every connected browser repeatedly load and render the
+  complete session. The issue JSON endpoint remains the explicit full-history view.
 - Session transcripts are written as compact, renderer-compatible NDJSON under
   `./log/codex_sessions` by default, or under `<logs-root>/log/codex_sessions` when `--logs-root`
   is set. Streaming text and tool-output chunks are bounded and coalesced by stream/tool identity;

@@ -5,6 +5,11 @@ defmodule SymphonyElixirWeb.Presenter do
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
 
+  @live_transcript_read_limit 1_000_000
+  @live_transcript_block_limit 200
+  @live_transcript_content_limit 512_000
+  @transcript_sentinel_bytes 64
+
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
     generated_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
@@ -39,22 +44,23 @@ defmodule SymphonyElixirWeb.Presenter do
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}
   def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms) when is_binary(issue_identifier) do
-    case issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms, %{}) do
+    case issue_payload_with_mode(issue_identifier, orchestrator, snapshot_timeout_ms, %{}, :full) do
       {:ok, payload, _transcript_cache} -> {:ok, payload}
       error -> error
     end
   end
 
-  # Cache-aware variant used by the live detail page. `transcript_cache` holds the
-  # parsed transcript blocks for the session log keyed on the file's
-  # `{mtime, size}` stamp, so the dashboard's per-event broadcasts don't re-read
-  # and re-parse the whole transcript when the file hasn't changed (e.g. a
-  # completed session, or a reload triggered by some *other* issue streaming).
-  # Returns the (possibly updated) cache for the caller to hold onto.
+  # Cache-aware variant used by the live detail page. It seeds a bounded tail of
+  # the persisted transcript and parses only newly appended bytes thereafter.
+  # The three-argument function remains the explicit full-history projection.
   @spec issue_payload(String.t(), GenServer.name(), timeout(), map()) ::
           {:ok, map(), map()} | {:error, :issue_not_found}
   def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms, transcript_cache)
       when is_binary(issue_identifier) and is_map(transcript_cache) do
+    issue_payload_with_mode(issue_identifier, orchestrator, snapshot_timeout_ms, transcript_cache, :live)
+  end
+
+  defp issue_payload_with_mode(issue_identifier, orchestrator, snapshot_timeout_ms, transcript_cache, mode) do
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
@@ -63,7 +69,7 @@ defmodule SymphonyElixirWeb.Presenter do
         if is_nil(running) and is_nil(retry) do
           {:error, :issue_not_found}
         else
-          {body, new_cache} = issue_payload_body(issue_identifier, running, retry, transcript_cache)
+          {body, new_cache} = issue_payload_body(issue_identifier, running, retry, transcript_cache, mode)
           {:ok, body, new_cache}
         end
 
@@ -83,8 +89,8 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, transcript_cache) do
-    {transcript, new_transcript_cache} = transcript_payload(running || retry, transcript_cache)
+  defp issue_payload_body(issue_identifier, running, retry, transcript_cache, mode) do
+    {transcript, new_transcript_cache} = transcript_payload(running || retry, transcript_cache, mode)
 
     body = %{
       issue_identifier: issue_identifier,
@@ -401,26 +407,36 @@ defmodule SymphonyElixirWeb.Presenter do
   defp maybe_put_log_field(payload, _key, nil), do: payload
   defp maybe_put_log_field(payload, key, value), do: Map.put(payload, key, value)
 
-  defp transcript_payload(entry, transcript_cache) when is_map(entry) do
+  defp transcript_payload(entry, transcript_cache, mode) when is_map(entry) do
     case latest_session_log_entry(entry) do
       %{path: path} = log_entry when is_binary(path) ->
-        {blocks, new_cache} = transcript_blocks_for_entry(entry, path, transcript_cache)
+        {blocks, truncated, new_cache} =
+          transcript_blocks_for_entry(entry, path, transcript_cache, mode)
 
-        {%{
-           session_id: Map.get(log_entry, :session_id),
-           path: path,
-           started_at: iso8601(Map.get(log_entry, :started_at)),
-           last_event_at: iso8601(Map.get(log_entry, :last_event_at)),
-           blocks: blocks
-         }, new_cache}
+        transcript = %{
+          session_id: Map.get(log_entry, :session_id),
+          path: path,
+          started_at: iso8601(Map.get(log_entry, :started_at)),
+          last_event_at: iso8601(Map.get(log_entry, :last_event_at)),
+          blocks: blocks
+        }
+
+        transcript = if mode == :live, do: Map.put(transcript, :truncated, truncated), else: transcript
+        {transcript, new_cache}
 
       _ ->
-        {%{session_id: nil, path: nil, started_at: nil, last_event_at: nil, blocks: []}, transcript_cache}
+        {empty_transcript(mode), transcript_cache}
     end
   end
 
-  defp transcript_payload(_entry, transcript_cache),
-    do: {%{session_id: nil, path: nil, started_at: nil, last_event_at: nil, blocks: []}, transcript_cache}
+  defp transcript_payload(_entry, transcript_cache, mode),
+    do: {empty_transcript(mode), transcript_cache}
+
+  defp empty_transcript(:live),
+    do: %{session_id: nil, path: nil, started_at: nil, last_event_at: nil, truncated: false, blocks: []}
+
+  defp empty_transcript(:full),
+    do: %{session_id: nil, path: nil, started_at: nil, last_event_at: nil, blocks: []}
 
   defp latest_session_log_entry(entry) do
     entry
@@ -433,60 +449,188 @@ defmodule SymphonyElixirWeb.Presenter do
     )
   end
 
-  # The details page shows the full session transcript from the persisted log —
-  # the *entire* history, for running entries too, not just completed ones. The
-  # orchestrator's in-memory `recent_codex_transcript_blocks` is a small ring
-  # buffer (kept lean so it's cheap to ship in every snapshot); it only holds the
-  # most recent blocks, so reading it here would drop older entries as new ones
-  # stream in. The on-disk log is the complete history, so prefer it and fall
-  # back to the in-memory buffer only before the log exists (e.g. pre-`session_id`
-  # events that aren't persisted yet).
-  #
-  # Re-parsing the whole log on every dashboard broadcast would be wasteful, so
-  # the parsed blocks are memoized on the file's `{mtime, size}` stamp: an
-  # unchanged file is served straight from `transcript_cache` without a re-read.
-  defp transcript_blocks_for_entry(entry, path, transcript_cache)
+  # Explicit API callers get the complete persisted history. The live page uses
+  # a bounded tail and carries an append offset so frequent updates only parse
+  # new NDJSON records.
+  defp transcript_blocks_for_entry(entry, path, transcript_cache, :full)
        when is_map(entry) and is_binary(path) and is_map(transcript_cache) do
-    case transcript_file_stamp(path) do
-      {:ok, stamp} ->
-        transcript_blocks_for_stamp(entry, path, stamp, transcript_cache)
+    case load_transcript_blocks(path) do
+      blocks when is_list(blocks) and blocks != [] -> {blocks, false, transcript_cache}
+      _unavailable -> {ring_buffer_blocks(entry), false, transcript_cache}
+    end
+  end
+
+  defp transcript_blocks_for_entry(entry, path, transcript_cache, :live)
+       when is_map(entry) and is_binary(path) and is_map(transcript_cache) do
+    case transcript_file_info(path) do
+      {:ok, file_info} ->
+        live_transcript_blocks(entry, path, file_info, transcript_cache)
 
       :error ->
-        {ring_buffer_blocks(entry), transcript_cache}
+        {ring_buffer_blocks(entry), false, transcript_cache}
     end
   end
 
-  defp transcript_blocks_for_stamp(entry, path, stamp, transcript_cache) do
+  defp live_transcript_blocks(entry, path, file_info, transcript_cache) do
     case Map.get(transcript_cache, path) do
-      {^stamp, blocks} ->
-        {blocks, transcript_cache}
+      %{identity: identity, offset: offset, mtime: mtime} = cached
+      when identity == file_info.identity and offset == file_info.size and mtime == file_info.mtime ->
+        {cached.blocks, cached.truncated, transcript_cache}
+
+      %{identity: identity, offset: offset}
+      when identity == file_info.identity and offset == file_info.size ->
+        seed_live_transcript(entry, path, file_info, transcript_cache)
+
+      %{identity: identity, offset: offset} = cached
+      when identity == file_info.identity and offset <= file_info.size and
+             file_info.size - offset <= @live_transcript_read_limit ->
+        append_live_transcript(entry, path, file_info, cached, transcript_cache)
 
       _stale_or_missing ->
-        refresh_transcript_blocks(entry, path, stamp, transcript_cache)
+        seed_live_transcript(entry, path, file_info, transcript_cache)
     end
   end
 
-  defp refresh_transcript_blocks(entry, path, stamp, transcript_cache) do
-    case load_transcript_blocks(path) do
-      blocks when is_list(blocks) and blocks != [] ->
-        # Replace the cache wholesale (single entry) so it never holds blocks
-        # for a stale path — keeps per-connection memory bounded.
-        {blocks, %{path => {stamp, blocks}}}
+  defp append_live_transcript(entry, path, file_info, cached, transcript_cache) do
+    if cached_sentinel_matches?(path, cached) do
+      case read_file_range(path, cached.offset, file_info.size - cached.offset) do
+        {:ok, appended} ->
+          {lines, carry, carry_truncated} =
+            split_complete_transcript_lines(cached.carry <> appended)
 
-      _unavailable ->
-        {ring_buffer_blocks(entry), transcript_cache}
+          fragments = transcript_fragments(lines)
+          {blocks, blocks_truncated} = bound_live_transcript(cached.blocks ++ fragments)
+          truncated = cached.truncated or carry_truncated or blocks_truncated
+          new_entry = live_cache_entry(path, file_info, blocks, carry, truncated)
+
+          {fallback_live_blocks(blocks, entry), truncated, %{path => new_entry}}
+
+        :error ->
+          {fallback_live_blocks(cached.blocks, entry), cached.truncated, transcript_cache}
+      end
+    else
+      seed_live_transcript(entry, path, file_info, transcript_cache)
+    end
+  end
+
+  defp seed_live_transcript(entry, path, file_info, transcript_cache) do
+    start_offset = max(file_info.size - @live_transcript_read_limit, 0)
+
+    case read_file_range(path, start_offset, file_info.size - start_offset) do
+      {:ok, content} ->
+        {content, leading_truncated} = drop_partial_leading_record(content, start_offset)
+        {lines, carry, carry_truncated} = split_complete_transcript_lines(content)
+        {blocks, blocks_truncated} = lines |> transcript_fragments() |> bound_live_transcript()
+        truncated = leading_truncated or carry_truncated or blocks_truncated
+        blocks = fallback_live_blocks(blocks, entry)
+        new_entry = live_cache_entry(path, file_info, blocks, carry, truncated)
+
+        {blocks, truncated, %{path => new_entry}}
+
+      :error ->
+        {ring_buffer_blocks(entry), false, transcript_cache}
+    end
+  end
+
+  defp fallback_live_blocks([], entry), do: ring_buffer_blocks(entry)
+  defp fallback_live_blocks(blocks, _entry), do: blocks
+
+  defp live_cache_entry(path, file_info, blocks, carry, truncated) do
+    %{
+      identity: file_info.identity,
+      mtime: file_info.mtime,
+      offset: file_info.size,
+      sentinel: transcript_sentinel(path, file_info.size),
+      blocks: blocks,
+      carry: carry,
+      truncated: truncated
+    }
+  end
+
+  defp cached_sentinel_matches?(_path, %{offset: 0}), do: true
+
+  defp cached_sentinel_matches?(path, cached) do
+    transcript_sentinel(path, cached.offset) == cached.sentinel
+  end
+
+  defp transcript_sentinel(path, offset) do
+    length = min(offset, @transcript_sentinel_bytes)
+
+    case read_file_range(path, offset - length, length) do
+      {:ok, sentinel} -> sentinel
+      :error -> nil
+    end
+  end
+
+  defp drop_partial_leading_record(content, 0), do: {content, false}
+
+  defp drop_partial_leading_record(content, _start_offset) do
+    case :binary.match(content, "\n") do
+      {index, 1} ->
+        remaining = byte_size(content) - index - 1
+        {binary_part(content, index + 1, remaining), true}
+
+      :nomatch ->
+        {<<>>, true}
+    end
+  end
+
+  defp split_complete_transcript_lines(content) do
+    parts = :binary.split(content, "\n", [:global])
+
+    {lines, carry} =
+      if binary_ends_with_newline?(content) do
+        {Enum.drop(parts, -1), <<>>}
+      else
+        {Enum.drop(parts, -1), List.last(parts) || <<>>}
+      end
+
+    if byte_size(carry) > @live_transcript_read_limit do
+      {lines, <<>>, true}
+    else
+      {lines, carry, false}
+    end
+  end
+
+  defp binary_ends_with_newline?(<<>>), do: false
+  defp binary_ends_with_newline?(content), do: :binary.last(content) == ?\n
+
+  defp transcript_file_info(path) when is_binary(path) do
+    case File.stat(path, time: :posix) do
+      {:ok, stat} ->
+        {:ok,
+         %{
+           identity: {stat.major_device, stat.minor_device, stat.inode},
+           mtime: stat.mtime,
+           size: stat.size
+         }}
+
+      {:error, _reason} ->
+        :error
+    end
+  end
+
+  defp read_file_range(_path, _offset, 0), do: {:ok, <<>>}
+
+  defp read_file_range(path, offset, length) do
+    case File.open(path, [:read, :binary]) do
+      {:ok, io_device} ->
+        result =
+          case :file.pread(io_device, offset, length) do
+            {:ok, content} -> {:ok, content}
+            _ -> :error
+          end
+
+        File.close(io_device)
+        result
+
+      {:error, _reason} ->
+        :error
     end
   end
 
   defp ring_buffer_blocks(entry),
     do: entry |> Map.get(:recent_codex_transcript_blocks) |> List.wrap()
-
-  defp transcript_file_stamp(path) when is_binary(path) do
-    case File.stat(path, time: :posix) do
-      {:ok, %File.Stat{mtime: mtime, size: size}} -> {:ok, {mtime, size}}
-      {:error, _reason} -> :error
-    end
-  end
 
   # Reads and parses the entire persisted session log. The on-disk log is the
   # complete history, so we deliberately read all of it — no byte/line/block
@@ -498,15 +642,94 @@ defmodule SymphonyElixirWeb.Presenter do
       {:ok, content} ->
         content
         |> String.split("\n", trim: true)
-        |> Enum.map(&transcript_record/1)
-        |> Enum.reject(&is_nil/1)
-        # `transcript_fragment/1` may yield a single fragment, nil, or a list
-        # (an ACP `tool_call_update` produces both a tool and an output fragment).
-        |> Enum.flat_map(fn record -> record |> transcript_fragment() |> List.wrap() end)
-        |> merge_transcript_fragments()
+        |> transcript_fragments()
 
       {:error, _reason} ->
         []
+    end
+  end
+
+  defp transcript_fragments(lines) when is_list(lines) do
+    lines
+    |> Enum.map(&transcript_record/1)
+    |> Enum.reject(&is_nil/1)
+    # `transcript_fragment/1` may yield a single fragment, nil, or a list
+    # (an ACP `tool_call_update` produces both a tool and an output fragment).
+    |> Enum.flat_map(fn record -> record |> transcript_fragment() |> List.wrap() end)
+    |> merge_transcript_fragments()
+  end
+
+  defp bound_live_transcript(blocks) when is_list(blocks) do
+    merged = merge_transcript_fragments(blocks)
+    count_bounded = Enum.take(merged, -@live_transcript_block_limit)
+    count_truncated = length(count_bounded) < length(merged)
+
+    {kept_reversed, _bytes, content_truncated} =
+      count_bounded
+      |> Enum.reverse()
+      |> Enum.reduce_while({[], 0, false}, fn block, {kept, bytes, truncated} ->
+        block_bytes = transcript_block_content_bytes(block)
+
+        cond do
+          bytes + block_bytes <= @live_transcript_content_limit ->
+            {:cont, {[block | kept], bytes + block_bytes, truncated}}
+
+          kept == [] ->
+            trimmed = trim_transcript_block(block, @live_transcript_content_limit)
+            {:halt, {[trimmed], @live_transcript_content_limit, true}}
+
+          true ->
+            {:halt, {kept, bytes, true}}
+        end
+      end)
+
+    {kept_reversed, count_truncated or content_truncated}
+  end
+
+  defp transcript_block_content_bytes(block) do
+    binary_field_bytes(block, :title) + binary_field_bytes(block, :text)
+  end
+
+  defp binary_field_bytes(block, field) do
+    case Map.get(block, field) do
+      value when is_binary(value) -> byte_size(value)
+      _ -> 0
+    end
+  end
+
+  defp trim_transcript_block(block, limit) do
+    title = Map.get(block, :title)
+    text = Map.get(block, :text)
+    title_bytes = if is_binary(title), do: min(byte_size(title), limit), else: 0
+    remaining = limit - title_bytes
+
+    block
+    |> maybe_replace_binary_field(:title, title, title_bytes)
+    |> maybe_replace_binary_field(:text, text, remaining)
+  end
+
+  defp maybe_replace_binary_field(block, field, value, limit) when is_binary(value),
+    do: Map.put(block, field, utf8_suffix(value, limit))
+
+  defp maybe_replace_binary_field(block, _field, _value, _limit), do: block
+
+  defp utf8_suffix(_value, 0), do: <<>>
+  defp utf8_suffix(value, limit) when byte_size(value) <= limit, do: value
+
+  defp utf8_suffix(value, limit) do
+    value
+    |> binary_part(byte_size(value) - limit, limit)
+    |> ensure_valid_utf8_suffix()
+  end
+
+  defp ensure_valid_utf8_suffix(<<>>), do: <<>>
+
+  defp ensure_valid_utf8_suffix(value) do
+    if String.valid?(value) do
+      value
+    else
+      <<_byte, rest::binary>> = value
+      ensure_valid_utf8_suffix(rest)
     end
   end
 
