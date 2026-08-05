@@ -29,6 +29,7 @@ defmodule SymphonyElixirWeb.Presenter do
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits,
           backend_usage: backend_usage_payload(snapshot),
+          mode: mode_payload(snapshot),
           quota_circuits:
             snapshot
             |> Map.get(:quota_circuits, [])
@@ -88,6 +89,25 @@ defmodule SymphonyElixirWeb.Presenter do
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
+  end
+
+  @spec drain_payload(GenServer.name(), boolean()) ::
+          {:ok, map()} | {:error, :unavailable | term()}
+  def drain_payload(orchestrator, enabled) when is_boolean(enabled) do
+    case Orchestrator.set_drain_mode(orchestrator, enabled) do
+      {:ok, mode} -> {:ok, mode_payload(%{mode: mode})}
+      {:error, reason} -> {:error, reason}
+      :unavailable -> {:error, :unavailable}
+    end
+  end
+
+  defp mode_payload(snapshot) do
+    mode = Map.get(snapshot, :mode, %{})
+
+    %{
+      draining: Map.get(mode, :draining, false),
+      started_at: iso8601(Map.get(mode, :started_at))
+    }
   end
 
   defp issue_payload_body(issue_identifier, running, retry, transcript_cache, mode) do
@@ -158,6 +178,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(entry)
     }
+    |> maybe_put_persistent_worker(entry)
     |> maybe_put_scheduling(entry)
     |> maybe_put_handoff_gate(entry)
     |> maybe_put_review(entry)
@@ -404,6 +425,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(running)
     }
+    |> maybe_put_persistent_worker(running)
     |> maybe_put_scheduling(running)
     |> maybe_put_handoff_gate(running)
     |> maybe_put_review(running)
@@ -417,6 +439,13 @@ defmodule SymphonyElixirWeb.Presenter do
       Map.put(payload, :scheduling, scheduling)
     else
       payload
+    end
+  end
+
+  defp maybe_put_persistent_worker(payload, entry) do
+    case Map.get(entry, :persistent_worker_id) do
+      worker_id when is_binary(worker_id) -> Map.put(payload, :persistent_worker_id, worker_id)
+      _other -> payload
     end
   end
 

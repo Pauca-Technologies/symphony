@@ -37,6 +37,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec drain(Conn.t(), map()) :: Conn.t()
+  def drain(conn, _params), do: set_drain_mode(conn, true)
+
+  @spec resume(Conn.t(), map()) :: Conn.t()
+  def resume(conn, _params), do: set_drain_mode(conn, false)
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")
@@ -51,6 +57,19 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     conn
     |> put_status(status)
     |> json(%{error: %{code: code, message: message}})
+  end
+
+  defp set_drain_mode(conn, enabled) do
+    case Presenter.drain_payload(orchestrator(), enabled) do
+      {:ok, mode} ->
+        json(conn, %{mode: mode})
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+
+      {:error, reason} ->
+        error_response(conn, 500, "drain_state_write_failed", inspect(reason))
+    end
   end
 
   defp orchestrator do

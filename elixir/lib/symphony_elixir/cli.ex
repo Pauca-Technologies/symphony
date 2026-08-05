@@ -3,7 +3,7 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.LogFile
+  alias SymphonyElixir.{LogFile, PersistentWorker}
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
   @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
@@ -18,6 +18,20 @@ defmodule SymphonyElixir.CLI do
         }
 
   @spec main([String.t()]) :: no_return()
+  def main(["__persistent_worker__", spec_path]) do
+    exit_status =
+      case PersistentWorker.Runtime.run(spec_path) do
+        :ok ->
+          0
+
+        {:error, reason} ->
+          IO.puts(:stderr, "Persistent worker failed: #{inspect(reason)}")
+          1
+      end
+
+    System.halt(exit_status)
+  end
+
   def main(args) do
     case evaluate(args) do
       :ok ->

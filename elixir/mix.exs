@@ -54,6 +54,16 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Utf8,
           SymphonyElixir.Orchestrator,
           SymphonyElixir.Orchestrator.State,
+          # These workers cross a detached OS-process boundary. Their focused
+          # reconnect/adoption tests run in-process, while the built-binary
+          # smoke test exercises the uninstrumented worker VM end to end.
+          SymphonyElixir.PersistentWorker,
+          SymphonyElixir.PersistentWorker.Client,
+          SymphonyElixir.PersistentWorker.Launcher,
+          SymphonyElixir.PersistentWorker.Protocol,
+          SymphonyElixir.PersistentWorker.Registry,
+          SymphonyElixir.PersistentWorker.Runtime,
+          SymphonyElixir.PersistentWorker.Server,
           SymphonyElixir.AgentRunner,
           SymphonyElixir.ReviewGate,
           SymphonyElixir.CLI,

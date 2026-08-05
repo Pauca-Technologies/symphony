@@ -44,10 +44,22 @@ defmodule SymphonyElixir.TestSupport do
         repo_config_path = Path.join(workflow_root, "repos.yaml")
         telemetry_dir = Path.join(workflow_root, "telemetry")
         quota_circuit_state_path = Path.join(workflow_root, "quota-circuits.json")
+        drain_state_path = Path.join(workflow_root, "drain-state.json")
+        persistent_worker_registry_root = Path.join(workflow_root, "workers")
+        persistent_worker_log_root = Path.join(workflow_root, "worker-logs")
         Application.put_env(:symphony_elixir, :repo_config_path, repo_config_path)
         Application.put_env(:symphony_elixir, :telemetry_dir, telemetry_dir)
         Application.put_env(:symphony_elixir, :telemetry_enabled, false)
         Application.put_env(:symphony_elixir, :quota_circuit_state_path, quota_circuit_state_path)
+        Application.put_env(:symphony_elixir, :drain_state_path, drain_state_path)
+
+        Application.put_env(
+          :symphony_elixir,
+          :persistent_worker_registry_root,
+          persistent_worker_registry_root
+        )
+
+        Application.put_env(:symphony_elixir, :persistent_worker_log_root, persistent_worker_log_root)
 
         on_exit(fn ->
           Application.delete_env(:symphony_elixir, :workflow_file_path)
@@ -59,6 +71,10 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :telemetry_dir)
           Application.delete_env(:symphony_elixir, :telemetry_enabled)
           Application.delete_env(:symphony_elixir, :quota_circuit_state_path)
+          Application.delete_env(:symphony_elixir, :drain_state_path)
+          Application.delete_env(:symphony_elixir, :persistent_worker_registry_root)
+          Application.delete_env(:symphony_elixir, :persistent_worker_log_root)
+          Application.put_env(:symphony_elixir, :persistent_workers_enabled, false)
           File.rm_rf(workflow_root)
         end)
 

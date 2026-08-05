@@ -252,8 +252,20 @@ Notes:
   never open the circuit and continue through the normal bounded per-issue retry path.
 - Active quota circuits are checkpointed to `~/.symphony/quota-circuits.json`. This deliberately
   small snapshot preserves outage deadlines and parked issue order across an orchestrator restart;
-  it does not persist running agent processes or the general retry queue. Circuit state, reset/probe
-  deadlines, account scope, and parked counts are exposed by the runtime API and status dashboard.
+  it does not persist the general retry queue. Circuit state, reset/probe deadlines, account scope,
+  and parked counts are exposed by the runtime API and status dashboard.
+- Each dispatched issue runs in a detached, authenticated worker BEAM registered under
+  `~/.symphony/workers`. That worker owns the backend process and its stdio port; the main
+  orchestrator owns only a reconnecting relay. Restarting or crashing the orchestrator therefore
+  preserves active Codex, ACP, and Claude Code sessions, including remote sessions reached through
+  SSH. A replacement orchestrator adopts the workers and replays their latest acknowledged runtime
+  checkpoint plus any events produced while disconnected. Completed records are removed
+  automatically; per-worker logs live under `~/.symphony/worker-logs`. Worker BEAMs use a small
+  scheduler pool because model and repository work runs in external processes.
+- Drain mode pauses new candidate dispatch, retries, and quota probes without stopping active
+  workers. Its state is saved in `~/.symphony/drain-state.json`, so it remains active through the
+  restart it is intended to protect. Enable it with `POST /api/v1/drain` or the dashboard button;
+  cancel it with `POST /api/v1/resume` or **Cancel drain**. Cancelling schedules an immediate poll.
 - `agent.backend` selects the coding-agent backend: `codex` (default, the Codex app-server described
   above), `acp` (the Agent Client Protocol, e.g. `opencode acp`), or `claude_code` (native Claude Code
   `claude -p` stream-json). All backends honor the same handoff gate and observability transcript.

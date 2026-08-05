@@ -53,7 +53,8 @@ Important boundary:
 - Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
 - Expose operator-visible observability (at minimum structured logs).
 - Support tracker/filesystem-driven restart recovery without requiring a persistent database; exact
-  in-memory scheduler state is not restored.
+  in-memory scheduler state is not restored. Implementations MAY additionally preserve live runs in
+  reconnectable worker processes.
 
 ### 2.2 Non-Goals
 
@@ -1899,6 +1900,12 @@ Minimum endpoints:
     }
     ```
 
+- `POST /api/v1/drain` (extension)
+  - Persists drain mode and pauses new dispatch, retry execution, and provider probes without
+    stopping live workers.
+- `POST /api/v1/resume` (extension)
+  - Cancels drain mode and schedules an immediate tracker poll.
+
 API design notes:
 
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
@@ -1967,24 +1974,33 @@ API design notes:
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
-Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
-process restart.
+The baseline design is intentionally in-memory for scheduler state. Restart recovery means a
+conforming service can resume useful operation by polling tracker state and reusing preserved
+workspaces; retry timers are not required to survive.
+
+The Elixir implementation additionally launches each live run in a detached worker BEAM. The
+worker owns the backend process and stdio port and exposes an authenticated loopback channel. The
+orchestrator owns a replaceable relay, acknowledges ordered events with a bounded runtime
+checkpoint, and reconnects after restart. This preserves an in-flight coding-agent process without
+requiring a database or attempting to reattach an Erlang port from a new VM.
 
 After restart:
 
 - No retry timers are restored from prior process memory.
-- No running sessions are assumed recoverable.
-- Service recovers by:
+- A baseline implementation MAY assume no running sessions are recoverable and recover by:
   - startup terminal workspace cleanup
   - fresh polling of active issues
   - re-dispatching eligible work
+- A reconnectable-worker implementation SHOULD adopt authenticated live workers before dispatch,
+  claim their issue ids, restore their last acknowledged runtime checkpoint, and replay later
+  events. An unreachable worker record must not authorize duplicate concurrent work.
 
 ### 14.4 Operator Intervention Points
 
 Operators can control behavior by:
 
+- Enabling persisted drain mode to pause new work while live workers continue, then cancelling it
+  to resume normal dispatch.
 - Editing `WORKFLOW.md` (prompt and most runtime settings).
 - `WORKFLOW.md` changes are detected and re-applied automatically without restart according to
   Section 6.2.
@@ -2500,7 +2516,8 @@ Use the same validation profiles as Section 17:
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
-- TODO: Persist retry queue and session metadata across process restarts.
+- TODO: Persist the general retry queue across process restarts. Live detached workers already
+  retain their current session metadata in the Elixir implementation.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead

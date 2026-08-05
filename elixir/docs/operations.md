@@ -20,23 +20,34 @@ Record the source commit, binary checksum, current service command (including `-
 
 ## 2. Drain without lowering agent concurrency
 
-Prevent new Linear work from becoming eligible (for example, temporarily remove the Symphony
-assignee from waiting issues), but do not change `agent.max_concurrent_agents`. Watch the existing
-runtime API until `running`, `queued`, and `retrying` are all zero:
+Enable Symphony's persisted drain mode; do not change `agent.max_concurrent_agents`. Existing agents
+continue, while new candidates, retries, and quota probes remain paused:
 
 ```bash
+curl -fsS -X POST http://127.0.0.1:PORT/api/v1/drain
 curl -fsS http://127.0.0.1:PORT/api/v1/state
 ```
 
-Only after the drain is complete, stop the old service with its configured service manager. Confirm
-the old PID exited normally and preserve its logs. If work does not drain, postpone the rollout;
-do not kill agent or test processes to force the window.
+The state response reports `mode.draining: true`. You may wait for all work to finish, or restart
+while sessions are still active: detached workers keep owning their backend processes and the next
+orchestrator reconnects to them. Do not remove `~/.symphony/workers` or stop worker PIDs.
+
+The first rollout that introduces persistent workers cannot adopt agents launched by an older
+Symphony version; drain those legacy runs fully once. Subsequent rollouts can reconnect.
 
 ## 3. Install and restart
 
 Atomically install the staged binary using the deployment's normal release mechanism, retain the
 previous binary, and start the service with the exact recorded workflow/log-root/port arguments.
 Verify the new PID, start time, source commit/checksum, and configured `agent.test_worker_limit`.
+Confirm the same `persistent_worker_id` values appear in `/api/v1/state`, then resume dispatch:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:PORT/api/v1/resume
+```
+
+If verification fails, leave drain mode enabled while investigating or rolling back. Cancelling
+drain mode is reversible and schedules an immediate tracker poll.
 
 ## 4. Verify before cleanup
 

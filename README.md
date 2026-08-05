@@ -32,6 +32,11 @@ classification-only turn chooses the execution profile from bounded issue contex
 repositories retain a quality fallback for ambiguous, risky, or failed classifications. The
 selected execution model and reasoning effort are visible in Symphony's dashboard.
 
+The Elixir implementation isolates each live run in a detached worker process. The orchestrator can
+restart for a deployment and reconnect to those workers without terminating their coding-agent
+sessions. A persisted, reversible drain mode pauses new dispatch while existing work continues, so
+operators can choose either a fully drained rollout or a reconnecting restart.
+
 The reference implementation also maintains a compact, versioned fleet analytics layer. It
 reconciles cumulative usage by actual parent and delegated threads, retains rolling lifecycle and
 failure history, and keeps complete recursively redacted compressed protocol traces selectively for

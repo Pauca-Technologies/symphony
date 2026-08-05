@@ -13,9 +13,11 @@ defmodule SymphonyElixir.Orchestrator do
     AgentRunner,
     Cardinality,
     Config,
+    DrainStore,
     FleetEvent,
     LogFile,
     OrchestratorVersion,
+    PersistentWorker,
     QuotaCircuitStore,
     RepoConfig,
     RepositoryScheduler,
@@ -86,6 +88,7 @@ defmodule SymphonyElixir.Orchestrator do
   @poll_transition_render_delay_ms 20
   @recent_codex_events_limit 200
   @recent_codex_transcript_blocks_limit 80
+  @persistent_checkpoint_interval_ms 1_000
   # Dead-man's-switch heartbeat (audit §9.10). The orchestrator writes
   # ~/.symphony/heartbeat every 60s with the current poll-loop state. A
   # cron-driven check-heartbeat script reads the file and surfaces a local
@@ -121,6 +124,8 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       :poll_backoff_until_ms,
+      :drain_started_at,
+      draining: false,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -162,6 +167,7 @@ defmodule SymphonyElixir.Orchestrator do
     config = Config.settings!()
 
     quota_circuits = QuotaCircuitStore.load()
+    drain_state = DrainStore.load()
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
@@ -170,6 +176,8 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      draining: drain_state.enabled,
+      drain_started_at: drain_state.started_at,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil,
       backend_rate_limits: %{},
@@ -184,7 +192,12 @@ defmodule SymphonyElixir.Orchestrator do
     schedule_heartbeat(0)
     schedule_workspace_gc(0)
 
-    {:ok, state}
+    {:ok, state, {:continue, :adopt_persistent_workers}}
+  end
+
+  @impl true
+  def handle_continue(:adopt_persistent_workers, %State{} = state) do
+    {:noreply, maybe_adopt_persistent_workers(state)}
   end
 
   @impl true
@@ -392,6 +405,7 @@ defmodule SymphonyElixir.Orchestrator do
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
         updated_running_entry = RepositoryScheduler.observe_plan(updated_running_entry, update)
         updated_running_entry = persist_codex_update(updated_running_entry, update)
+        updated_running_entry = remember_rate_limit_update(updated_running_entry, update)
 
         state =
           state
@@ -608,8 +622,12 @@ defmodule SymphonyElixir.Orchestrator do
     Telemetry.emit(:phase, %{issue_identifier: Map.get(issue, :identifier), session_id: Map.get(running_entry, :session_id), phase: phase, action: "transition"})
   end
 
+  defp maybe_dispatch(%State{draining: true} = state) do
+    state |> maybe_adopt_persistent_workers() |> reconcile_running_issues()
+  end
+
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+    state = state |> maybe_adopt_persistent_workers() |> reconcile_running_issues()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues() do
@@ -855,7 +873,7 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         release_issue_claim(state, issue_id)
 
-      %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+      %{ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
@@ -863,9 +881,7 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(identifier, worker_host)
         end
 
-        if is_pid(pid) do
-          terminate_task(pid)
-        end
+        stop_running_worker(running_entry)
 
         if is_reference(ref) do
           Process.demonitor(ref, [:flush])
@@ -1031,7 +1047,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_task(_pid), do: :ok
+  defp stop_running_worker(%{pid: pid, persistent_worker_id: worker_id})
+       when is_pid(pid) and is_binary(worker_id) do
+    PersistentWorker.stop(pid)
+  end
+
+  defp stop_running_worker(%{pid: pid}) when is_pid(pid), do: terminate_task(pid)
+  defp stop_running_worker(_running_entry), do: :ok
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -1424,7 +1446,8 @@ defmodule SymphonyElixir.Orchestrator do
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    state.draining != true and
+      candidate_issue?(issue, active_states, terminal_states) and
       !issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -1572,6 +1595,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp do_dispatch_issue(%State{draining: true} = state, _issue, _attempt, _preferred_worker_host),
+    do: state
+
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
     backend = predicted_backend(issue)
@@ -1587,70 +1613,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
-         end) do
-      {:ok, pid} ->
+    case start_issue_worker(issue, attempt, recipient, worker_host) do
+      {:ok, pid, persistent_worker_id} ->
         ref = Process.monitor(pid)
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+        Logger.info(
+          "Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} persistent_worker_id=#{persistent_worker_id || "none"} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+        )
 
         running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            backend: predicted_backend(issue),
-            model: nil,
-            reasoning_effort: nil,
-            profile: nil,
-            task_type: nil,
-            routing_confidence: nil,
-            budget_profile: nil,
-            budget_mode: nil,
-            budget_metrics: nil,
-            budget_transitions: [],
-            repository_id: repository_id(issue),
-            scheduling_paths: scheduling_paths(issue),
-            scheduling_path_source: "metadata",
-            base_sha: nil,
-            base_age_seconds: nil,
-            candidate_base_sha: nil,
-            workspace_dirty: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            recent_codex_events: [],
-            recent_codex_transcript_blocks: [],
-            codex_session_logs: [],
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            codex_thread_token_high_waters: %{},
-            observability_policy: Config.observability_settings(),
-            codex_context_tokens: 0,
-            codex_context_window: nil,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            quota_probe:
-              quota_probe_issue?(
-                state,
-                predicted_backend(issue),
-                worker_host,
-                issue.id
-              ),
-            lifecycle_state: :implementing,
-            lifecycle_started_at: DateTime.utc_now(),
-            started_at: DateTime.utc_now()
-          })
+          Map.put(
+            state.running,
+            issue.id,
+            new_running_entry(
+              state,
+              issue,
+              attempt,
+              worker_host,
+              pid,
+              ref,
+              persistent_worker_id,
+              DateTime.utc_now()
+            )
+          )
 
         %{
           state
@@ -1672,6 +1657,166 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host
         })
     end
+  end
+
+  defp start_issue_worker(issue, attempt, recipient, worker_host) do
+    if PersistentWorker.enabled?() do
+      start_persistent_issue_worker(issue, attempt, recipient, worker_host)
+    else
+      start_in_process_issue_worker(issue, attempt, recipient, worker_host)
+    end
+  end
+
+  defp start_persistent_issue_worker(issue, attempt, recipient, worker_host) do
+    case PersistentWorker.start(issue, attempt, worker_host, recipient) do
+      {:ok, %{pid: pid, manifest: manifest}} -> {:ok, pid, manifest.worker_id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp start_in_process_issue_worker(issue, attempt, recipient, worker_host) do
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+         end) do
+      {:ok, pid} -> {:ok, pid, nil}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_adopt_persistent_workers(%State{} = state) do
+    if PersistentWorker.enabled?() do
+      self()
+      |> PersistentWorker.attach_all(tracked_persistent_worker_ids(state))
+      |> Enum.reduce(state, &adopt_persistent_worker/2)
+    else
+      state
+    end
+  end
+
+  defp tracked_persistent_worker_ids(%State{} = state) do
+    state.running
+    |> Map.values()
+    |> Enum.flat_map(&persistent_worker_id_list/1)
+    |> MapSet.new()
+  end
+
+  defp persistent_worker_id_list(entry) do
+    case Map.get(entry, :persistent_worker_id) do
+      worker_id when is_binary(worker_id) -> [worker_id]
+      _other -> []
+    end
+  end
+
+  defp adopt_persistent_worker(
+         %{pid: pid, manifest: manifest, spec: %{issue: %Issue{} = issue}},
+         %State{} = state
+       ) do
+    if Map.has_key?(state.running, issue.id) do
+      Logger.warning("Ignoring duplicate persistent worker worker_id=#{manifest.worker_id} #{issue_context(issue)}")
+      PersistentWorker.stop(pid)
+      state
+    else
+      ref = Process.monitor(pid)
+      started_at = parse_worker_started_at(manifest.started_at)
+
+      running_entry =
+        new_running_entry(
+          state,
+          issue,
+          manifest.attempt,
+          manifest.worker_host,
+          pid,
+          ref,
+          manifest.worker_id,
+          started_at
+        )
+
+      Logger.info("Reconnected persistent worker worker_id=#{manifest.worker_id} #{issue_context(issue)} pid=#{inspect(pid)}")
+
+      %{
+        state
+        | running: Map.put(state.running, issue.id, running_entry),
+          claimed: MapSet.put(state.claimed, issue.id),
+          retry_attempts: Map.delete(state.retry_attempts, issue.id)
+      }
+    end
+  end
+
+  defp parse_worker_started_at(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _other -> DateTime.utc_now()
+    end
+  end
+
+  defp parse_worker_started_at(_value), do: DateTime.utc_now()
+
+  defp new_running_entry(
+         state,
+         issue,
+         attempt,
+         worker_host,
+         pid,
+         ref,
+         persistent_worker_id,
+         started_at
+       ) do
+    %{
+      pid: pid,
+      ref: ref,
+      persistent_worker_id: persistent_worker_id,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: worker_host,
+      workspace_path: nil,
+      backend: predicted_backend(issue),
+      model: nil,
+      reasoning_effort: nil,
+      profile: nil,
+      task_type: nil,
+      routing_confidence: nil,
+      budget_profile: nil,
+      budget_mode: nil,
+      budget_metrics: nil,
+      budget_transitions: [],
+      repository_id: repository_id(issue),
+      scheduling_paths: scheduling_paths(issue),
+      scheduling_path_source: "metadata",
+      base_sha: nil,
+      base_age_seconds: nil,
+      candidate_base_sha: nil,
+      workspace_dirty: nil,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      recent_codex_transcript_blocks: [],
+      codex_session_logs: [],
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_thread_token_high_waters: %{},
+      observability_policy: Config.observability_settings(),
+      codex_context_tokens: 0,
+      codex_context_window: nil,
+      turn_count: 0,
+      retry_attempt: normalize_retry_attempt(attempt),
+      quota_probe:
+        quota_probe_issue?(
+          state,
+          predicted_backend(issue),
+          worker_host,
+          issue.id
+        ),
+      lifecycle_state: :implementing,
+      lifecycle_started_at: started_at,
+      started_at: started_at
+    }
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
@@ -1899,6 +2044,21 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         :missing
     end
+  end
+
+  defp handle_retry_issue(%State{draining: true} = state, issue_id, attempt, metadata) do
+    Logger.debug("Deferring retry while orchestrator is draining issue_id=#{issue_id}")
+
+    state =
+      schedule_issue_retry(
+        state,
+        issue_id,
+        attempt,
+        Map.put(metadata, :delay_ms_override, max(state.poll_interval_ms, 1_000))
+      )
+
+    retry = state.retry_attempts |> Map.fetch!(issue_id) |> Map.put(:drain_deferred, true)
+    {:noreply, %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, retry)}}
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
@@ -2298,6 +2458,25 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Enable or cancel persistent drain mode without stopping active workers."
+  @spec set_drain_mode(boolean()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def set_drain_mode(enabled), do: set_drain_mode(__MODULE__, enabled)
+
+  @doc false
+  @spec set_drain_mode(GenServer.server(), boolean()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_drain_mode(server, enabled) when is_boolean(enabled) do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:set_drain_mode, enabled})
+      catch
+        :exit, _reason -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -2317,6 +2496,46 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def handle_call(
+        {:persistent_worker_checkpoint, worker_id, seq, checkpoint},
+        {client_pid, _tag},
+        %State{} = state
+      )
+      when is_binary(worker_id) and is_integer(seq) and seq >= 0 and is_pid(client_pid) do
+    case running_entry_for_persistent_client(state, worker_id, client_pid) do
+      {issue_id, running_entry} ->
+        state = apply_persistent_checkpoint(state, issue_id, running_entry, seq, checkpoint)
+        notify_dashboard()
+        {:reply, :ok, state}
+
+      nil ->
+        {:reply, :stale_worker, state}
+    end
+  end
+
+  def handle_call(
+        {:persistent_worker_event, worker_id, seq, event},
+        {client_pid, _tag} = from,
+        %State{} = state
+      )
+      when is_binary(worker_id) and is_integer(seq) and seq > 0 and is_pid(client_pid) do
+    case running_entry_for_persistent_client(state, worker_id, client_pid) do
+      {issue_id, running_entry} ->
+        handle_persistent_worker_event(
+          state,
+          from,
+          client_pid,
+          issue_id,
+          running_entry,
+          seq,
+          event
+        )
+
+      nil ->
+        {:reply, :stale_worker, state}
+    end
+  end
+
+  def handle_call(
         {:agent_lifecycle, issue_id, lifecycle_state, metadata},
         {worker_pid, _tag},
         %{running: running} = state
@@ -2333,6 +2552,31 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         {:reply, :stale_worker, state}
+    end
+  end
+
+  def handle_call({:set_drain_mode, enabled}, _from, %State{} = state)
+      when is_boolean(enabled) do
+    started_at = drain_started_at(state, enabled)
+
+    case DrainStore.persist(enabled, started_at) do
+      :ok ->
+        state = %{state | draining: enabled, drain_started_at: started_at}
+        state = if enabled, do: state, else: resume_from_drain(state)
+
+        Logger.info(
+          if(enabled,
+            do: "Orchestrator entered drain mode; active workers continue and new dispatch is paused",
+            else: "Orchestrator left drain mode; normal dispatch is resuming"
+          )
+        )
+
+        notify_dashboard()
+        {:reply, {:ok, drain_mode_payload(state)}, state}
+
+      {:error, reason} ->
+        Logger.warning("Unable to persist drain mode change: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -2357,6 +2601,7 @@ defmodule SymphonyElixir.Orchestrator do
           title: metadata.issue.title,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
+          persistent_worker_id: Map.get(metadata, :persistent_worker_id),
           workspace_path: Map.get(metadata, :workspace_path),
           backend: Map.get(metadata, :backend),
           model: Map.get(metadata, :model),
@@ -2437,6 +2682,7 @@ defmodule SymphonyElixir.Orchestrator do
        rate_limits: Map.get(state, :codex_rate_limits),
        backend_usage: active_backend_usage(state),
        quota_circuits: quota_circuit_snapshot(state.quota_circuits, now),
+       mode: drain_mode_payload(state),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -2458,6 +2704,213 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp drain_started_at(%State{draining: true, drain_started_at: %DateTime{} = started_at}, true),
+    do: started_at
+
+  defp drain_started_at(_state, true), do: DateTime.utc_now()
+  defp drain_started_at(_state, false), do: nil
+
+  defp drain_mode_payload(%State{} = state) do
+    %{
+      draining: state.draining == true,
+      started_at: state.drain_started_at
+    }
+  end
+
+  defp resume_from_drain(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    retry_attempts =
+      Map.new(state.retry_attempts, fn {issue_id, retry} ->
+        if Map.get(retry, :drain_deferred) do
+          if is_reference(retry.timer_ref), do: Process.cancel_timer(retry.timer_ref)
+          retry_token = make_ref()
+          timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, 0)
+
+          {issue_id,
+           retry
+           |> Map.delete(:drain_deferred)
+           |> Map.put(:retry_token, retry_token)
+           |> Map.put(:timer_ref, timer_ref)
+           |> Map.put(:due_at_ms, now_ms)}
+        else
+          {issue_id, retry}
+        end
+      end)
+
+    state = %{state | retry_attempts: retry_attempts}
+
+    state =
+      Enum.reduce(state.quota_circuits, state, fn
+        {circuit_key, %{drain_deferred: true} = circuit}, state_acc ->
+          updated =
+            circuit
+            |> Map.delete(:drain_deferred)
+            |> Map.put(:next_probe_at, DateTime.utc_now())
+
+          state_acc
+          |> Map.put(:quota_circuits, Map.put(state_acc.quota_circuits, circuit_key, updated))
+          |> arm_quota_circuit(circuit_key)
+
+        {_circuit_key, _circuit}, state_acc ->
+          state_acc
+      end)
+
+    schedule_tick(state, 0)
+  end
+
+  defp running_entry_for_persistent_client(%State{} = state, worker_id, client_pid) do
+    Enum.find_value(state.running, fn {issue_id, entry} ->
+      if Map.get(entry, :persistent_worker_id) == worker_id and Map.get(entry, :pid) == client_pid,
+        do: {issue_id, entry}
+    end)
+  end
+
+  defp handle_persistent_worker_event(
+         state,
+         from,
+         client_pid,
+         issue_id,
+         running_entry,
+         seq,
+         event
+       ) do
+    if seq <= Map.get(running_entry, :persistent_checkpoint_seq, 0) do
+      {:reply, {:ok, persistent_worker_checkpoint(running_entry)}, state}
+    else
+      event = normalize_persistent_worker_event(event, client_pid, running_entry)
+      state = dispatch_persistent_worker_event(event, from, state)
+      persistent_worker_event_reply(state, issue_id, seq)
+    end
+  end
+
+  defp persistent_worker_event_reply(state, issue_id, seq) do
+    case Map.get(state.running, issue_id) do
+      nil ->
+        {:reply, {:terminal, nil}, state}
+
+      running_entry ->
+        running_entry = Map.put(running_entry, :persistent_checkpoint_seq, seq)
+        {checkpoint, running_entry} = maybe_build_persistent_checkpoint(running_entry)
+        state = %{state | running: Map.put(state.running, issue_id, running_entry)}
+        {:reply, {:ok, checkpoint}, state}
+    end
+  end
+
+  defp apply_persistent_checkpoint(state, issue_id, running_entry, seq, checkpoint)
+       when is_map(checkpoint) do
+    if seq > Map.get(running_entry, :persistent_checkpoint_seq, 0) do
+      safe_checkpoint = Map.drop(checkpoint, [:pid, :ref, :persistent_worker_id])
+
+      updated_entry =
+        running_entry
+        |> Map.merge(safe_checkpoint)
+        |> Map.put(:persistent_checkpoint_seq, seq)
+        |> Map.put(:persistent_last_checkpoint_at_ms, System.monotonic_time(:millisecond))
+
+      token_delta = %{
+        input_tokens:
+          Map.get(updated_entry, :codex_input_tokens, 0) -
+            Map.get(running_entry, :codex_input_tokens, 0),
+        output_tokens:
+          Map.get(updated_entry, :codex_output_tokens, 0) -
+            Map.get(running_entry, :codex_output_tokens, 0),
+        total_tokens:
+          Map.get(updated_entry, :codex_total_tokens, 0) -
+            Map.get(running_entry, :codex_total_tokens, 0)
+      }
+
+      state =
+        state
+        |> apply_codex_token_delta(token_delta)
+        |> restore_checkpoint_rate_limits(updated_entry)
+
+      %{state | running: Map.put(state.running, issue_id, updated_entry)}
+    else
+      state
+    end
+  end
+
+  defp apply_persistent_checkpoint(state, _issue_id, _running_entry, _seq, _checkpoint),
+    do: state
+
+  defp remember_rate_limit_update(running_entry, update) do
+    if is_map(extract_rate_limits(update)) do
+      Map.put(running_entry, :last_rate_limit_update, update)
+    else
+      running_entry
+    end
+  end
+
+  defp restore_checkpoint_rate_limits(state, running_entry) do
+    case Map.get(running_entry, :last_rate_limit_update) do
+      %{} = update -> apply_backend_rate_limits(state, update, running_entry)
+      _other -> state
+    end
+  end
+
+  defp normalize_persistent_worker_event(
+         {:worker_run_failure, issue_id, _runner_pid, failure},
+         client_pid,
+         _running_entry
+       ),
+       do: {:worker_run_failure, issue_id, client_pid, failure}
+
+  defp normalize_persistent_worker_event(
+         {:handoff_review_heartbeat, issue_id, _runner_pid, review_job_id, timestamp},
+         client_pid,
+         _running_entry
+       ),
+       do: {:handoff_review_heartbeat, issue_id, client_pid, review_job_id, timestamp}
+
+  defp normalize_persistent_worker_event(
+         {:persistent_worker_completed, reason},
+         client_pid,
+         running_entry
+       ),
+       do: {:DOWN, running_entry.ref, :process, client_pid, reason}
+
+  defp normalize_persistent_worker_event(event, _client_pid, _running_entry), do: event
+
+  defp dispatch_persistent_worker_event(
+         {:agent_lifecycle, _issue_id, _lifecycle_state, _metadata} = event,
+         from,
+         state
+       ) do
+    case handle_call(event, from, state) do
+      {:reply, _reply, updated_state} -> updated_state
+    end
+  end
+
+  defp dispatch_persistent_worker_event(event, _from, state) do
+    case handle_info(event, state) do
+      {:noreply, updated_state} -> updated_state
+    end
+  end
+
+  defp persistent_worker_checkpoint(running_entry) do
+    Map.drop(running_entry, [
+      :pid,
+      :ref,
+      :persistent_worker_id,
+      :persistent_checkpoint_seq,
+      :persistent_last_checkpoint_at_ms
+    ])
+  end
+
+  defp maybe_build_persistent_checkpoint(running_entry) do
+    now_ms = System.monotonic_time(:millisecond)
+    last_checkpoint_ms = Map.get(running_entry, :persistent_last_checkpoint_at_ms)
+
+    if not is_integer(last_checkpoint_ms) or
+         now_ms - last_checkpoint_ms >= @persistent_checkpoint_interval_ms do
+      checkpoint = persistent_worker_checkpoint(running_entry)
+      {checkpoint, Map.put(running_entry, :persistent_last_checkpoint_at_ms, now_ms)}
+    else
+      {:unchanged, running_entry}
+    end
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
@@ -3830,10 +4283,18 @@ defmodule SymphonyElixir.Orchestrator do
         circuit = %{circuit | timer_ref: nil, timer_token: nil}
         state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
 
-        if available_slots(state) > 0 and quota_probe_slot_available?(state, circuit.worker_host) do
-          start_quota_probe(state, circuit_key)
-        else
-          defer_quota_probe(state, circuit_key)
+        cond do
+          state.draining ->
+            state
+            |> defer_quota_probe(circuit_key)
+            |> mark_quota_probe_drain_deferred(circuit_key)
+
+          available_slots(state) > 0 and
+              quota_probe_slot_available?(state, circuit.worker_host) ->
+            start_quota_probe(state, circuit_key)
+
+          true ->
+            defer_quota_probe(state, circuit_key)
         end
 
       _ ->
@@ -3959,6 +4420,17 @@ defmodule SymphonyElixir.Orchestrator do
         put_quota_circuit(state, circuit_key, updated)
 
       _ ->
+        state
+    end
+  end
+
+  defp mark_quota_probe_drain_deferred(%State{} = state, circuit_key) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        updated = Map.put(circuit, :drain_deferred, true)
+        %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, updated)}
+
+      _other ->
         state
     end
   end

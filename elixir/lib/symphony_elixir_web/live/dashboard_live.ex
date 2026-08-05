@@ -50,6 +50,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("enable-drain", _params, socket) do
+    {:noreply, set_drain_mode(socket, true)}
+  end
+
+  def handle_event("cancel-drain", _params, socket) do
+    {:noreply, set_drain_mode(socket, false)}
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -235,6 +244,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <span class="field-label">Worker host</span>
                 <pre class="code-panel"><%= @issue_payload.workspace.host || "local" %></pre>
               </div>
+              <div :if={@issue_payload.running && Map.get(@issue_payload.running, :persistent_worker_id)}>
+                <span class="field-label">Persistent worker</span>
+                <pre class="code-panel"><%= Map.get(@issue_payload.running, :persistent_worker_id) %></pre>
+              </div>
               <div :if={@issue_payload.last_error}>
                 <span class="field-label">Latest retry error</span>
                 <pre class="code-panel"><%= @issue_payload.last_error %></pre>
@@ -320,6 +333,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
 
             <div class="status-stack">
+              <span :if={draining?(@dashboard_payload)} class="status-badge status-badge-draining">
+                <span class="status-badge-dot"></span>
+                Draining
+              </span>
               <span class="status-badge status-badge-live">
                 <span class="status-badge-dot"></span>
                 Live
@@ -328,6 +345,22 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <span class="status-badge-dot"></span>
                 Offline
               </span>
+              <button
+                :if={draining?(@dashboard_payload)}
+                type="button"
+                class="subtle-button"
+                phx-click="cancel-drain"
+              >
+                Cancel drain
+              </button>
+              <button
+                :if={not draining?(@dashboard_payload)}
+                type="button"
+                class="subtle-button"
+                phx-click="enable-drain"
+              >
+                Enable drain mode
+              </button>
             </div>
           </div>
         </header>
@@ -346,7 +379,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <article class="metric-card">
               <p class="metric-label">Running</p>
               <p class="metric-value numeric"><%= @dashboard_payload.counts.running %></p>
-              <p class="metric-detail">Active issue sessions in the current runtime.</p>
+              <p class="metric-detail">
+                <%= if draining?(@dashboard_payload) do %>
+                  Active sessions continue; new dispatch is paused.
+                <% else %>
+                  Active issue sessions in the current runtime.
+                <% end %>
+              </p>
             </article>
 
             <article class="metric-card">
@@ -639,6 +678,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
     |> assign(:issue_identifier, nil)
     |> assign(:transcript_cache, %{})
   end
+
+  defp set_drain_mode(socket, enabled) do
+    case Presenter.drain_payload(orchestrator(), enabled) do
+      {:ok, _mode} ->
+        socket
+        |> clear_flash()
+        |> load_dashboard_page()
+
+      {:error, reason} ->
+        put_flash(socket, :error, "Unable to change drain mode: #{inspect(reason)}")
+    end
+  end
+
+  defp draining?(%{mode: %{draining: true}}), do: true
+  defp draining?(_payload), do: false
 
   defp load_issue_page(socket, issue_identifier) when is_binary(issue_identifier) do
     transcript_cache = socket.assigns[:transcript_cache] || %{}

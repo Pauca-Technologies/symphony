@@ -75,6 +75,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:set_drain_mode, enabled}, _from, state) do
+      if recipient = Keyword.get(state, :recipient), do: send(recipient, {:drain_mode, enabled})
+
+      {:reply,
+       {:ok,
+        %{
+          draining: enabled,
+          started_at: if(enabled, do: DateTime.utc_now(), else: nil)
+        }}, state}
+    end
   end
 
   setup do
@@ -499,6 +510,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       StaticOrchestrator.start_link(
         name: orchestrator_name,
         snapshot: snapshot,
+        recipient: self(),
         refresh: %{
           queued: true,
           coalesced: false,
@@ -587,6 +599,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "limits" => %{"five_hour" => nil, "weekly" => nil}
                }
              ],
+             "mode" => %{"draining" => false, "started_at" => nil},
              "quota_circuits" => []
            }
 
@@ -685,6 +698,14 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+
+    assert %{"mode" => %{"draining" => true, "started_at" => started_at}} =
+             build_conn() |> post("/api/v1/drain", %{}) |> json_response(200)
+
+    assert is_binary(started_at)
+
+    assert %{"mode" => %{"draining" => false, "started_at" => nil}} =
+             build_conn() |> post("/api/v1/resume", %{}) |> json_response(200)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -715,6 +736,14 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
 
     assert json_response(post(build_conn(), "/api/v1/refresh", %{}), 503) ==
+             %{
+               "error" => %{
+                 "code" => "orchestrator_unavailable",
+                 "message" => "Orchestrator is unavailable"
+               }
+             }
+
+    assert json_response(post(build_conn(), "/api/v1/drain", %{}), 503) ==
              %{
                "error" => %{
                  "code" => "orchestrator_unavailable",
@@ -1220,6 +1249,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       StaticOrchestrator.start_link(
         name: orchestrator_name,
         snapshot: snapshot,
+        recipient: self(),
         refresh: %{
           queued: true,
           coalesced: true,
@@ -1245,6 +1275,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Investigating the failure"
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
+    assert html =~ "Enable drain mode"
     assert html =~ "Wire up the HTTP server"
     assert html =~ "Retry the flaky migration"
     assert html =~ "claude-opus-4-8"
@@ -1255,6 +1286,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "has not reported account-limit usage"
     refute html =~ "11 left"
     refute html =~ ~s(%{&quot;primary&quot;)
+
+    _ = render_click(view, "enable-drain")
+    assert_receive {:drain_mode, true}
 
     updated_snapshot =
       put_in(snapshot.running, [

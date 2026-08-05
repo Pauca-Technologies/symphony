@@ -324,6 +324,16 @@ pre,
   animation: pulse-dot 2s ease-out infinite;
 }
 
+.status-badge-draining {
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.38);
+  color: #fbbf24;
+}
+
+.status-badge-draining .status-badge-dot {
+  box-shadow: 0 0 8px 1px rgba(245, 158, 11, 0.28);
+}
+
 @keyframes pulse-dot {
   0% {
     box-shadow: 0 0 6px 0 var(--accent-glow);
