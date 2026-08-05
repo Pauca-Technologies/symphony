@@ -1579,6 +1579,14 @@ SHOULD return:
   - `total_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
+- `backend_usage` (active backend/account rows, if available)
+  - Include the backend, account scope, running-session count, snapshot timestamp, and latest
+    provider rate-limit payload.
+  - Keep distinct account scopes separate because remote workers may use different credentials.
+  - Human-readable dashboards SHOULD identify 5-hour and weekly windows by their reported duration
+    rather than assuming provider bucket order.
+  - Backends that do not report account-limit usage SHOULD remain visible with usage marked
+    unavailable; the absence of provider data MUST NOT be presented as zero usage.
 
 RECOMMENDED snapshot error modes:
 

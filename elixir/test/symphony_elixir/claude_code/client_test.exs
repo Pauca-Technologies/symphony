@@ -35,6 +35,37 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
     end)
   end
 
+  test "forwards Claude subscription usage for backend-scoped collection" do
+    with_cc_env(fn workspace, _trace ->
+      write_fake_agent!(workspace.agent_path,
+        events: [
+          system_init(),
+          Jason.encode!(%{
+            "type" => "rate_limit_event",
+            "rate_limits" => %{
+              "five_hour" => %{"used_percentage" => 24, "resets_at" => 1_800_000_000},
+              "seven_day" => %{"used_percentage" => 62, "resets_at" => 1_800_100_000}
+            }
+          })
+        ]
+      )
+
+      assert {:ok, _} = run(workspace, on_message: collector())
+
+      assert_received {:cc_message,
+                       %{
+                         event: :notification,
+                         payload: %{
+                           "type" => "rate_limit_event",
+                           "rate_limits" => %{
+                             "five_hour" => %{"used_percentage" => 24},
+                             "seven_day" => %{"used_percentage" => 62}
+                           }
+                         }
+                       }}
+    end)
+  end
+
   test "builds the stream-json command and wires the gated MCP server with --strict-mcp-config" do
     with_cc_env(fn workspace, trace ->
       write_fake_agent!(workspace.agent_path, events: [system_init()])

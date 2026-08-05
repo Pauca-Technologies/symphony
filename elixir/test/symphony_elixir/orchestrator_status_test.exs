@@ -1330,6 +1330,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       ref: process_ref,
       identifier: issue.identifier,
       issue: issue,
+      backend: "codex",
+      worker_host: nil,
       session_id: nil,
       last_codex_message: nil,
       last_codex_timestamp: nil,
@@ -1379,6 +1381,75 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     snapshot = GenServer.call(pid, :snapshot)
     assert snapshot.rate_limits == rate_limits
+
+    assert [usage] = snapshot.backend_usage
+    assert usage.backend == "codex"
+    assert usage.account_scope == "local"
+    assert usage.running_agents == 1
+    assert usage.rate_limits == rate_limits
+    assert %DateTime{} = usage.updated_at
+
+    claude_issue_id = "issue-claude-rate-limit-snapshot"
+
+    :sys.replace_state(pid, fn state ->
+      claude_entry =
+        Map.merge(running_entry, %{
+          identifier: "MT-CLAUDE",
+          backend: "claude_code",
+          worker_host: nil
+        })
+
+      %{state | running: Map.put(state.running, claude_issue_id, claude_entry)}
+    end)
+
+    claude_rate_limits = %{
+      "five_hour" => %{"used_percentage" => 24, "resets_at" => 1_800_000_000},
+      "seven_day" => %{"used_percentage" => 62, "resets_at" => 1_800_100_000}
+    }
+
+    send(
+      pid,
+      {:codex_worker_update, claude_issue_id,
+       %{
+         event: :notification,
+         payload: %{"type" => "rate_limit_event", "rate_limits" => claude_rate_limits},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    remote_codex_issue_id = "issue-remote-codex-rate-limit-snapshot"
+    remote_rate_limits = put_in(rate_limits, ["primary", "remaining"], 40)
+
+    :sys.replace_state(pid, fn state ->
+      remote_entry =
+        Map.merge(running_entry, %{
+          identifier: "MT-REMOTE-CODEX",
+          backend: "codex",
+          worker_host: "worker-a"
+        })
+
+      %{state | running: Map.put(state.running, remote_codex_issue_id, remote_entry)}
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, remote_codex_issue_id,
+       %{
+         event: :notification,
+         payload: %{"rate_limits" => remote_rate_limits},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    usage_by_backend_scope =
+      pid
+      |> GenServer.call(:snapshot)
+      |> Map.fetch!(:backend_usage)
+      |> Map.new(&{{&1.backend, &1.account_scope}, &1})
+
+    assert usage_by_backend_scope[{"codex", "local"}].rate_limits == rate_limits
+    assert usage_by_backend_scope[{"codex", "worker:worker-a"}].rate_limits == remote_rate_limits
+    assert usage_by_backend_scope[{"claude_code", "local"}].rate_limits == claude_rate_limits
   end
 
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do

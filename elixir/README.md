@@ -558,6 +558,10 @@ The observability UI now runs on a minimal Phoenix stack:
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+- Active-backend usage cards grouped by provider account scope. Codex duration buckets and Claude
+  Code's named subscription windows are normalized into 5-hour/weekly percentage-used and reset
+  fields when their streams report them. Backends whose agent protocol does not expose subscription
+  limits remain visible as unavailable rather than being reported as zero.
 
 ## Project Layout
 

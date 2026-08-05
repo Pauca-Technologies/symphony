@@ -373,32 +373,41 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <section class="section-card">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Rate limits</h2>
-                <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+                <h2 class="section-title">Backend usage</h2>
+                <p class="section-copy">
+                  Account limits for every backend currently running. Availability depends on the backend protocol.
+                </p>
               </div>
             </div>
 
-            <%= if rate_limits_present?(@dashboard_payload.rate_limits) do %>
-              <div class="rate-limit-grid">
-                <div class="rate-limit-tile">
-                  <span class="rate-limit-label">Window</span>
-                  <span class="rate-limit-value"><%= rate_limit_window(@dashboard_payload.rate_limits) %></span>
-                </div>
-                <div class="rate-limit-tile">
-                  <span class="rate-limit-label">Primary</span>
-                  <span class="rate-limit-value"><%= rate_limit_bucket(@dashboard_payload.rate_limits, "primary") %></span>
-                </div>
-                <div class="rate-limit-tile">
-                  <span class="rate-limit-label">Secondary</span>
-                  <span class="rate-limit-value"><%= rate_limit_bucket(@dashboard_payload.rate_limits, "secondary") %></span>
-                </div>
-                <div class="rate-limit-tile">
-                  <span class="rate-limit-label">Credits</span>
-                  <span class="rate-limit-value"><%= rate_limit_credits(@dashboard_payload.rate_limits) %></span>
-                </div>
+            <%= if @dashboard_payload.backend_usage != [] do %>
+              <div class="backend-usage-grid">
+                <article :for={usage <- @dashboard_payload.backend_usage} class="backend-usage-card">
+                  <div class="backend-usage-head">
+                    <div>
+                      <span class="agent-backend"><%= agent_backend_label(usage.backend) %></span>
+                      <span class="muted mono"><%= usage.account_scope %></span>
+                    </div>
+                    <span class="muted numeric"><%= usage.running_agents %> running</span>
+                  </div>
+
+                  <%= if usage.available do %>
+                    <div class="backend-window-grid">
+                      <.usage_window label="5-hour" limit={usage.limits.five_hour} />
+                      <.usage_window label="Weekly" limit={usage.limits.weekly} />
+                    </div>
+                    <p :if={usage_metadata(usage) != ""} class="metric-detail">
+                      <%= usage_metadata(usage) %>
+                    </p>
+                  <% else %>
+                    <p class="backend-usage-unavailable">
+                      This backend has not reported account-limit usage through its agent protocol.
+                    </p>
+                  <% end %>
+                </article>
               </div>
             <% else %>
-              <p class="empty-state">No rate-limit snapshot available yet.</p>
+              <p class="empty-state">No active backends.</p>
             <% end %>
           </section>
 
@@ -604,6 +613,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
+  defp usage_window(assigns) do
+    ~H"""
+    <div class="backend-window">
+      <span class="rate-limit-label"><%= @label %></span>
+      <%= if @limit do %>
+        <span class="rate-limit-value"><%= usage_percent_label(@limit.used_percent) %> used</span>
+        <div class={"meter meter-sm #{usage_meter_level(@limit.used_percent)}"}>
+          <div class="meter-fill" style={"width: #{@limit.used_percent}%"}></div>
+        </div>
+        <span class="metric-detail"><%= usage_remaining_label(@limit.remaining_percent) %> remaining</span>
+        <span :if={@limit.resets_at} class="metric-detail">Resets <%= full_time(@limit.resets_at) %></span>
+      <% else %>
+        <span class="rate-limit-value">Not available</span>
+        <span class="metric-detail">Window not reported.</span>
+      <% end %>
+    </div>
+    """
+  end
+
   defp load_dashboard_page(socket) do
     socket
     |> assign(:dashboard_payload, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
@@ -747,6 +775,43 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_int(_value), do: "n/a"
+
+  defp usage_percent_label(value) when is_number(value) do
+    value
+    |> Kernel.*(1.0)
+    |> Float.round(1)
+    |> :erlang.float_to_binary(decimals: 1)
+    |> String.trim_trailing(".0")
+    |> Kernel.<>("%")
+  end
+
+  defp usage_percent_label(_value), do: "n/a"
+
+  defp usage_remaining_label(value), do: usage_percent_label(value)
+
+  defp usage_meter_level(percent) when is_number(percent) and percent >= 90, do: "meter-danger"
+  defp usage_meter_level(percent) when is_number(percent) and percent >= 75, do: "meter-warn"
+  defp usage_meter_level(_percent), do: ""
+
+  defp usage_metadata(usage) do
+    [
+      usage[:limit_id] && "Limit #{usage.limit_id}",
+      usage[:plan_type] && "Plan #{usage.plan_type}",
+      usage_credits_label(usage[:credits]),
+      usage[:updated_at] && "Updated #{full_time(usage.updated_at)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" · ")
+  end
+
+  defp usage_credits_label(%{unlimited: true}), do: "Credits unlimited"
+
+  defp usage_credits_label(%{available: true, balance: balance}) when is_number(balance),
+    do: "Credits #{balance}"
+
+  defp usage_credits_label(%{available: true}), do: "Credits available"
+  defp usage_credits_label(%{}), do: "No credits"
+  defp usage_credits_label(_credits), do: nil
 
   defp state_badge_class(state) do
     base = "state-badge"
@@ -1163,76 +1228,4 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp full_time(_iso), do: "n/a"
-
-  defp rate_limits_present?(rate_limits) when is_map(rate_limits), do: map_size(rate_limits) > 0
-  defp rate_limits_present?(_rate_limits), do: false
-
-  defp rate_limit_window(rate_limits) do
-    case rl_value(rate_limits, ["limit_id", "limit_name"]) do
-      value when is_binary(value) and value != "" -> value
-      _ -> "default"
-    end
-  end
-
-  defp rate_limit_bucket(rate_limits, key) do
-    case rl_value(rate_limits, [key]) do
-      bucket when is_map(bucket) -> format_rate_limit_bucket(bucket)
-      _ -> "n/a"
-    end
-  end
-
-  defp format_rate_limit_bucket(bucket) do
-    remaining = rl_value(bucket, ["remaining"])
-    limit = rl_value(bucket, ["limit"])
-
-    reset =
-      rl_value(bucket, ["reset_in_seconds", "resetInSeconds", "reset_at", "resetAt", "resets_at", "resetsAt"])
-
-    base =
-      cond do
-        is_number(remaining) and is_number(limit) -> "#{format_int(round(remaining))} / #{format_int(round(limit))} left"
-        is_number(remaining) -> "#{format_int(round(remaining))} left"
-        is_number(limit) -> "limit #{format_int(round(limit))}"
-        true -> "n/a"
-      end
-
-    if is_nil(reset), do: base, else: "#{base} · resets #{format_reset_value(reset)}"
-  end
-
-  defp format_reset_value(value) when is_integer(value), do: "#{value}s"
-  defp format_reset_value(value) when is_binary(value), do: value
-  defp format_reset_value(value), do: to_string(value)
-
-  defp rate_limit_credits(rate_limits) do
-    case rl_value(rate_limits, ["credits"]) do
-      credits when is_map(credits) ->
-        balance = rl_value(credits, ["balance"])
-
-        cond do
-          rl_value(credits, ["unlimited"]) == true -> "Unlimited"
-          is_number(balance) -> format_int(round(balance))
-          rl_value(credits, ["has_credits"]) == true -> "Available"
-          true -> "None"
-        end
-
-      _ ->
-        "n/a"
-    end
-  end
-
-  defp rl_value(map, keys) when is_map(map) and is_list(keys), do: Enum.find_value(keys, &rl_get(map, &1))
-  defp rl_value(_map, _keys), do: nil
-
-  defp rl_get(map, key) when is_binary(key) do
-    case Map.fetch(map, key) do
-      {:ok, value} -> value
-      :error -> atom_key_get(map, key)
-    end
-  end
-
-  defp atom_key_get(map, key) do
-    Map.get(map, String.to_existing_atom(key))
-  rescue
-    ArgumentError -> nil
-  end
 end

@@ -139,6 +139,10 @@ defmodule SymphonyElixir.Orchestrator do
       warned_at: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
+      # "backend::account-scope" => latest provider usage/rate-limit snapshot.
+      # Account scope matters because remote workers can use different provider
+      # credentials even when they run the same backend.
+      backend_rate_limits: %{},
       # "backend::account-scope" => provider/account quota circuit. Parked
       # retries remain claimed but have no per-issue timer while unavailable.
       quota_circuits: %{},
@@ -168,6 +172,7 @@ defmodule SymphonyElixir.Orchestrator do
       tick_token: nil,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil,
+      backend_rate_limits: %{},
       quota_circuits: quota_circuits,
       claimed: restored_quota_claims(quota_circuits)
     }
@@ -391,7 +396,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           state
           |> apply_codex_token_delta(token_delta)
-          |> apply_codex_rate_limits(update, running_entry)
+          |> apply_backend_rate_limits(update, running_entry)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -2430,6 +2435,7 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying ++ parked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       backend_usage: active_backend_usage(state),
        quota_circuits: quota_circuit_snapshot(state.quota_circuits, now),
        polling: %{
          checking?: state.poll_check_in_progress == true,
@@ -4133,6 +4139,47 @@ defmodule SymphonyElixir.Orchestrator do
   defp quota_account_scope(worker_host) when is_binary(worker_host), do: "worker:#{worker_host}"
   defp quota_account_scope(_worker_host), do: "local"
 
+  defp active_backend_usage(%State{} = state) do
+    state.running
+    |> Map.values()
+    |> Enum.group_by(fn entry ->
+      backend = Map.get(entry, :backend) || "unknown"
+      worker_host = Map.get(entry, :worker_host)
+      {backend, quota_account_scope(worker_host)}
+    end)
+    |> Enum.map(fn {{backend, account_scope}, entries} ->
+      worker_host = entries |> List.first() |> Map.get(:worker_host)
+      key = quota_circuit_key(backend, worker_host)
+
+      usage_snapshot =
+        Map.get(state.backend_rate_limits, key) ||
+          legacy_codex_usage_snapshot(state, backend, account_scope, worker_host)
+
+      %{
+        backend: backend,
+        account_scope: account_scope,
+        worker_host: worker_host,
+        running_agents: length(entries),
+        rate_limits: usage_snapshot && usage_snapshot.rate_limits,
+        updated_at: usage_snapshot && usage_snapshot.updated_at
+      }
+    end)
+    |> Enum.sort_by(&{&1.backend, &1.account_scope})
+  end
+
+  defp legacy_codex_usage_snapshot(%State{codex_rate_limits: rate_limits}, "codex", "local", worker_host)
+       when is_map(rate_limits) do
+    %{
+      backend: "codex",
+      account_scope: "local",
+      worker_host: worker_host,
+      rate_limits: rate_limits,
+      updated_at: nil
+    }
+  end
+
+  defp legacy_codex_usage_snapshot(_state, _backend, _account_scope, _worker_host), do: nil
+
   defp quota_provider_limit_id(rate_limits) when is_map(rate_limits) do
     Map.get(rate_limits, "limitId") || Map.get(rate_limits, :limitId) ||
       Map.get(rate_limits, "limit_id") || Map.get(rate_limits, :limit_id) || "default"
@@ -4255,13 +4302,27 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_token_delta(state, _token_delta), do: state
 
-  defp apply_codex_rate_limits(%State{} = state, update, running_entry)
+  defp apply_backend_rate_limits(%State{} = state, update, running_entry)
        when is_map(update) and is_map(running_entry) do
     case extract_rate_limits(update) do
       %{} = rate_limits ->
-        state = %{state | codex_rate_limits: rate_limits}
         backend = Map.get(running_entry, :backend) || "codex"
-        circuit_key = quota_circuit_key(backend, Map.get(running_entry, :worker_host))
+        worker_host = Map.get(running_entry, :worker_host)
+        circuit_key = quota_circuit_key(backend, worker_host)
+
+        usage_snapshot = %{
+          backend: backend,
+          account_scope: quota_account_scope(worker_host),
+          worker_host: worker_host,
+          rate_limits: rate_limits,
+          updated_at: Map.get(update, :timestamp) || DateTime.utc_now()
+        }
+
+        state = %{
+          state
+          | codex_rate_limits: if(backend == "codex", do: rate_limits, else: state.codex_rate_limits),
+            backend_rate_limits: Map.put(Map.get(state, :backend_rate_limits, %{}), circuit_key, usage_snapshot)
+        }
 
         if AgentFailure.recovered_rate_limits?(rate_limits) and
              recovered_update_after_open?(state, circuit_key, update) do
@@ -4275,7 +4336,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp apply_codex_rate_limits(state, _update, _running_entry), do: state
+  defp apply_backend_rate_limits(state, _update, _running_entry), do: state
 
   defp recovered_update_after_open?(%State{} = state, circuit_key, update) do
     case {Map.get(state.quota_circuits, circuit_key), Map.get(update, :timestamp)} do
@@ -4475,7 +4536,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp rate_limits_map?(payload) when is_map(payload) do
-    limit_id =
+    codex_rate_limits_map?(payload) or claude_rate_limits_map?(payload)
+  end
+
+  defp rate_limits_map?(_payload), do: false
+
+  defp codex_rate_limits_map?(payload) do
+    has_limit_id =
       Map.get(payload, "limit_id") ||
         Map.get(payload, :limit_id) ||
         Map.get(payload, "limitId") ||
@@ -4485,16 +4552,19 @@ defmodule SymphonyElixir.Orchestrator do
         Map.get(payload, "limitName") ||
         Map.get(payload, :limitName)
 
-    has_buckets =
+    has_limit_id != nil and
       Enum.any?(
         ["primary", :primary, "secondary", :secondary, "credits", :credits],
         &Map.has_key?(payload, &1)
       )
-
-    !is_nil(limit_id) and has_buckets
   end
 
-  defp rate_limits_map?(_payload), do: false
+  defp claude_rate_limits_map?(payload) do
+    Enum.any?(
+      ["five_hour", :five_hour, "seven_day", :seven_day],
+      &Map.has_key?(payload, &1)
+    )
+  end
 
   defp map_at_path(payload, path) when is_map(payload) and is_list(path) do
     Enum.reduce_while(path, payload, fn key, acc ->

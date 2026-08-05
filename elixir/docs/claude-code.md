@@ -71,6 +71,12 @@ claude -p \
 3. **Completion.** The terminal `result` message carries `stop_reason` /
    `is_error` / `subtype`: a successful result ⇒ completed (`max_tokens` /
    `max_turn_requests` complete with a note); any error result ⇒ abnormal.
+4. **Account usage.** When Claude Code emits a `rate_limit_event`, Symphony
+   records its optional `rate_limits.five_hour` and `rate_limits.seven_day`
+   percentages under the running backend/account scope. The web dashboard
+   displays both windows and their reset times. If the event or either window
+   is absent, the dashboard says it is unavailable rather than treating it as
+   zero usage.
 
 The same persistent process serves multiple Symphony turns: each subsequent
 user-message line starts a new turn that ends in its own `result`.

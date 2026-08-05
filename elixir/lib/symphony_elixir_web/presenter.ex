@@ -28,6 +28,7 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits,
+          backend_usage: backend_usage_payload(snapshot),
           quota_circuits:
             snapshot
             |> Map.get(:quota_circuits, [])
@@ -226,6 +227,161 @@ defmodule SymphonyElixirWeb.Presenter do
       probe_issue_id: Map.get(circuit, :probe_issue_id),
       parked_issue_count: Map.get(circuit, :parked_issue_count, 0)
     }
+  end
+
+  defp backend_usage_payload(snapshot) do
+    snapshot
+    |> backend_usage_entries()
+    |> Enum.map(fn entry ->
+      rate_limits = Map.get(entry, :rate_limits)
+
+      %{
+        backend: Map.get(entry, :backend) || "unknown",
+        account_scope: Map.get(entry, :account_scope) || "local",
+        running_agents: Map.get(entry, :running_agents, 0),
+        available: is_map(rate_limits),
+        limit_id: rate_limit_value(rate_limits, ["limit_id", "limitId", "limit_name", "limitName"]),
+        plan_type: rate_limit_value(rate_limits, ["plan_type", "planType"]),
+        credits: rate_limit_credits_payload(rate_limits),
+        updated_at: iso8601(Map.get(entry, :updated_at)),
+        limits: %{
+          five_hour: rate_limit_window_payload(rate_limits, 300, "primary"),
+          weekly: rate_limit_window_payload(rate_limits, 10_080, "secondary")
+        }
+      }
+    end)
+  end
+
+  defp backend_usage_entries(%{backend_usage: entries}) when is_list(entries), do: entries
+
+  # Compatibility for snapshot producers that predate backend-scoped usage.
+  # Only attach the legacy global snapshot to a local Codex run; never label a
+  # stale Codex value as ACP or Claude usage.
+  defp backend_usage_entries(snapshot) do
+    snapshot
+    |> Map.get(:running, [])
+    |> Enum.group_by(fn entry ->
+      backend = Map.get(entry, :backend) || "unknown"
+      worker_host = Map.get(entry, :worker_host)
+      {backend, account_scope(worker_host), worker_host}
+    end)
+    |> Enum.map(fn {{backend, account_scope, worker_host}, entries} ->
+      rate_limits =
+        if backend == "codex" and account_scope == "local",
+          do: Map.get(snapshot, :rate_limits),
+          else: nil
+
+      %{
+        backend: backend,
+        account_scope: account_scope,
+        worker_host: worker_host,
+        running_agents: length(entries),
+        rate_limits: rate_limits,
+        updated_at: nil
+      }
+    end)
+    |> Enum.sort_by(&{&1.backend, &1.account_scope})
+  end
+
+  defp account_scope(worker_host) when is_binary(worker_host), do: "worker:#{worker_host}"
+  defp account_scope(_worker_host), do: "local"
+
+  defp rate_limit_window_payload(rate_limits, window_minutes, fallback_key)
+       when is_map(rate_limits) do
+    named_key = if window_minutes == 300, do: "five_hour", else: "seven_day"
+
+    bucket =
+      Map.get(rate_limits, named_key) || rate_limit_atom_value(rate_limits, named_key) ||
+        [Map.get(rate_limits, "primary") || Map.get(rate_limits, :primary), Map.get(rate_limits, "secondary") || Map.get(rate_limits, :secondary)]
+        |> Enum.find(&rate_limit_window?(&1, window_minutes)) ||
+        Map.get(rate_limits, fallback_key) || rate_limit_atom_value(rate_limits, fallback_key)
+
+    normalize_rate_limit_bucket(bucket, window_minutes)
+  end
+
+  defp rate_limit_window_payload(_rate_limits, _window_minutes, _fallback_key), do: nil
+
+  defp rate_limit_window?(bucket, window_minutes) when is_map(bucket) do
+    rate_limit_value(bucket, [
+      "window_minutes",
+      "windowMinutes",
+      "window_duration_mins",
+      "windowDurationMins"
+    ]) == window_minutes
+  end
+
+  defp rate_limit_window?(_bucket, _window_minutes), do: false
+
+  defp normalize_rate_limit_bucket(bucket, default_window_minutes) when is_map(bucket) do
+    used_percent =
+      rate_limit_value(bucket, ["used_percent", "usedPercent", "used_percentage", "usedPercentage"]) ||
+        used_percent_from_remaining(bucket)
+
+    if is_number(used_percent) do
+      used_percent = used_percent |> Kernel.*(1.0) |> max(0.0) |> min(100.0) |> Float.round(1)
+
+      %{
+        used_percent: used_percent,
+        remaining_percent: Float.round(100 - used_percent, 1),
+        window_minutes:
+          rate_limit_value(bucket, [
+            "window_minutes",
+            "windowMinutes",
+            "window_duration_mins",
+            "windowDurationMins"
+          ]) || default_window_minutes,
+        resets_at: rate_limit_reset_at(bucket)
+      }
+    end
+  end
+
+  defp normalize_rate_limit_bucket(_bucket, _default_window_minutes), do: nil
+
+  defp used_percent_from_remaining(bucket) do
+    remaining = rate_limit_value(bucket, ["remaining"])
+    limit = rate_limit_value(bucket, ["limit"])
+
+    if is_number(remaining) and is_number(limit) and limit > 0,
+      do: (limit - remaining) / limit * 100
+  end
+
+  defp rate_limit_reset_at(bucket) do
+    case rate_limit_value(bucket, ["resets_at", "resetsAt", "reset_at", "resetAt"]) do
+      unix when is_integer(unix) -> unix |> DateTime.from_unix!() |> DateTime.to_iso8601()
+      %DateTime{} = datetime -> DateTime.to_iso8601(datetime)
+      value when is_binary(value) -> value
+      _value -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp rate_limit_value(map, keys) when is_map(map) do
+    Enum.find_value(keys, fn key -> Map.get(map, key) || rate_limit_atom_value(map, key) end)
+  end
+
+  defp rate_limit_value(_map, _keys), do: nil
+
+  defp rate_limit_credits_payload(rate_limits) when is_map(rate_limits) do
+    case rate_limit_value(rate_limits, ["credits"]) do
+      credits when is_map(credits) ->
+        %{
+          unlimited: rate_limit_value(credits, ["unlimited"]) == true,
+          available: rate_limit_value(credits, ["has_credits", "hasCredits"]) == true,
+          balance: rate_limit_value(credits, ["balance"])
+        }
+
+      _credits ->
+        nil
+    end
+  end
+
+  defp rate_limit_credits_payload(_rate_limits), do: nil
+
+  defp rate_limit_atom_value(map, key) when is_binary(key) do
+    Map.get(map, String.to_existing_atom(key))
+  rescue
+    ArgumentError -> nil
   end
 
   defp running_issue_payload(running) do

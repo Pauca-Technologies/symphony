@@ -415,6 +415,82 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, :label_create_failed} = Adapter.add_label("issue-1", "symphony:routing-warned")
   end
 
+  test "presenter maps active backend usage by reported window duration" do
+    orchestrator_name = Module.concat(__MODULE__, :BackendUsageOrchestrator)
+    reset_at = 1_800_000_000
+
+    snapshot = %{
+      static_snapshot()
+      | backend_usage: [
+          %{
+            backend: "codex",
+            account_scope: "local",
+            running_agents: 3,
+            updated_at: ~U[2026-08-05 12:00:00Z],
+            rate_limits: %{
+              "plan_type" => "pro",
+              "primary" => %{
+                "used_percent" => 61,
+                "window_minutes" => 10_080,
+                "resets_at" => reset_at
+              },
+              "secondary" => %{
+                "usedPercent" => 23,
+                "windowDurationMins" => 300,
+                "resetsAt" => reset_at
+              },
+              "credits" => %{"unlimited" => true}
+            }
+          },
+          %{
+            backend: "claude_code",
+            account_scope: "local",
+            running_agents: 2,
+            updated_at: ~U[2026-08-05 12:01:00Z],
+            rate_limits: %{
+              "five_hour" => %{"used_percentage" => 24, "resets_at" => reset_at},
+              "seven_day" => %{"used_percentage" => 62, "resets_at" => reset_at}
+            }
+          },
+          %{
+            backend: "acp",
+            account_scope: "worker:gpu-1",
+            running_agents: 1,
+            updated_at: nil,
+            rate_limits: nil
+          }
+        ]
+    }
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 50)
+
+    assert [codex, claude, acp] = payload.backend_usage
+    assert codex.backend == "codex"
+    assert codex.running_agents == 3
+    assert codex.plan_type == "pro"
+    assert codex.credits == %{unlimited: true, available: false, balance: nil}
+    assert codex.limits.five_hour.used_percent == 23.0
+    assert codex.limits.weekly.used_percent == 61.0
+    assert codex.limits.five_hour.resets_at == "2027-01-15T08:00:00Z"
+    assert claude.backend == "claude_code"
+    assert claude.limits.five_hour.used_percent == 24.0
+    assert claude.limits.weekly.used_percent == 62.0
+
+    assert acp == %{
+             backend: "acp",
+             account_scope: "worker:gpu-1",
+             running_agents: 1,
+             available: false,
+             limit_id: nil,
+             plan_type: nil,
+             credits: nil,
+             updated_at: nil,
+             limits: %{five_hour: nil, weekly: nil}
+           }
+  end
+
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
@@ -498,6 +574,19 @@ defmodule SymphonyElixir.ExtensionsTest do
                "seconds_running" => 42.5
              },
              "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "backend_usage" => [
+               %{
+                 "backend" => "claude_code",
+                 "account_scope" => "local",
+                 "running_agents" => 1,
+                 "available" => false,
+                 "limit_id" => nil,
+                 "plan_type" => nil,
+                 "credits" => nil,
+                 "updated_at" => nil,
+                 "limits" => %{"five_hour" => nil, "weekly" => nil}
+               }
+             ],
              "quota_circuits" => []
            }
 
@@ -689,6 +778,41 @@ defmodule SymphonyElixir.ExtensionsTest do
       response(get(build_conn(), "/vendor/phoenix_live_view/phoenix_live_view.js"), 200)
 
     assert live_view_js =~ "var LiveView = (() => {"
+  end
+
+  test "dashboard renders five-hour and weekly usage for an active backend" do
+    orchestrator_name = Module.concat(__MODULE__, :BackendUsageDashboardOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> put_in([:running, Access.at(0), :backend], "codex")
+      |> put_in([:running, Access.at(0), :model], "gpt-5.5")
+      |> Map.put(:backend_usage, [
+        %{
+          backend: "codex",
+          account_scope: "local",
+          running_agents: 1,
+          updated_at: ~U[2026-08-05 12:00:00Z],
+          rate_limits: %{
+            "plan_type" => "pro",
+            "primary" => %{"used_percent" => 23, "window_minutes" => 300},
+            "secondary" => %{"used_percent" => 61, "window_minutes" => 10_080},
+            "credits" => %{"unlimited" => true}
+          }
+        }
+      ])
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Backend usage"
+    assert html =~ "5-hour"
+    assert html =~ "Weekly"
+    assert html =~ "23% used"
+    assert html =~ "61% used"
+    assert html =~ "Plan pro"
+    assert html =~ "Credits unlimited"
   end
 
   test "dashboard liveview keeps the list compact and renders transcript text on the issue page" do
@@ -1126,7 +1250,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "claude-opus-4-8"
     assert html =~ "effort xhigh"
     assert html =~ "deep"
-    assert html =~ "11 left"
+    assert html =~ "Backend usage"
+    assert html =~ "Claude Code"
+    assert html =~ "has not reported account-limit usage"
+    refute html =~ "11 left"
     refute html =~ ~s(%{&quot;primary&quot;)
 
     updated_snapshot =
@@ -1676,7 +1803,17 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      backend_usage: [
+        %{
+          backend: "claude_code",
+          account_scope: "local",
+          worker_host: nil,
+          running_agents: 1,
+          rate_limits: nil,
+          updated_at: nil
+        }
+      ]
     }
   end
 
