@@ -144,6 +144,17 @@ defmodule SymphonyElixir.HandoffGateTest do
              HandoffGate.parse_protocol_result(Jason.encode!(infrastructure), 1, nil, 1_000)
   end
 
+  test "protocol v1 accepts producer string and legacy integer PR numbers" do
+    producer_report = protocol_report("passed")
+    legacy_report = put_in(producer_report, ["identity", "prNumber"], 1854)
+
+    assert {:ok, %{status: :passed, identity: %{"prNumber" => "1854"}}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(producer_report), 0, nil, 1_000)
+
+    assert {:ok, %{status: :passed, identity: %{"prNumber" => 1854}}} =
+             HandoffGate.parse_protocol_result(Jason.encode!(legacy_report), 0, nil, 1_000)
+  end
+
   test "protocol v1 rejects stale heartbeats, status/exit mismatches, and stale candidate passes" do
     pending = protocol_report("pending", %{"heartbeatAgeMs" => 2_001})
     passed = protocol_report("passed")
@@ -313,6 +324,9 @@ defmodule SymphonyElixir.HandoffGateTest do
       {Map.delete(protocol_report("pending"), "identity"), 3, "missing or invalid identity"},
       {put_in(protocol_report("pending"), ["identity", "headSha"], ""), 3, "missing or invalid identity.headSha"},
       {put_in(protocol_report("pending"), ["identity", "prNumber"], 0), 3, "missing or invalid identity.prNumber"},
+      {put_in(protocol_report("pending"), ["identity", "prNumber"], "0"), 3, "missing or invalid identity.prNumber"},
+      {put_in(protocol_report("pending"), ["identity", "prNumber"], "01854"), 3, "missing or invalid identity.prNumber"},
+      {put_in(protocol_report("pending"), ["identity", "prNumber"], "1854x"), 3, "missing or invalid identity.prNumber"},
       {put_in(protocol_report("pending"), ["progress", "stage"], ""), 3, "pending gate progress.stage is required"},
       {Map.delete(protocol_report("pending"), "progress"), 3, "pending gate progress is required"},
       {Map.delete(protocol_report("pending"), "heartbeatAt"), 3, "pending gate heartbeatAt"},
@@ -380,7 +394,7 @@ defmodule SymphonyElixir.HandoffGateTest do
       "identity" => %{
         "repositoryIdentity" => "repo-1",
         "worktreeIdentity" => "worktree-1",
-        "prNumber" => 1854,
+        "prNumber" => "1854",
         "baseRef" => "develop",
         "baseSha" => "base-1",
         "headSha" => "head-1",

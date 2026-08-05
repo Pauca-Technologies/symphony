@@ -37,6 +37,7 @@ defmodule SymphonyElixir.AgentRunner do
   @type worker_host :: String.t() | nil
   @prompt_built_telemetry_event [:symphony_elixir, :agent, :prompt_built]
   @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
+  @handoff_gate_infrastructure_failure_key {__MODULE__, :handoff_gate_infrastructure_failure}
   @deferred_handoff_gate_key {__MODULE__, :deferred_handoff_gate}
   @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
 
@@ -543,16 +544,20 @@ defmodule SymphonyElixir.AgentRunner do
     with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
          {:ok, efficiency} <-
            AgentEfficiency.decide(issue, route, Keyword.get(opts, :per_repo_workflow)) do
+      recovery =
+        recover_pending_handoff_gate(
+          workspace,
+          issue,
+          worker_host,
+          codex_update_recipient,
+          route.backend,
+          opts,
+          issue_state_fetcher
+        )
+        |> reject_recovered_handoff_infrastructure()
+
       result =
-        case recover_pending_handoff_gate(
-               workspace,
-               issue,
-               worker_host,
-               codex_update_recipient,
-               route.backend,
-               opts,
-               issue_state_fetcher
-             ) do
+        case recovery do
           :none ->
             run_agent_session(
               route,
@@ -602,6 +607,15 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp reject_recovered_handoff_infrastructure({:resume, _prompt, _issue} = recovery) do
+    case pop_handoff_infrastructure_failure() do
+      nil -> recovery
+      failure -> {:error, failure}
+    end
+  end
+
+  defp reject_recovered_handoff_infrastructure(recovery), do: recovery
 
   defp run_agent_session(route, efficiency, context) do
     workspace = context.workspace
@@ -752,8 +766,13 @@ defmodule SymphonyElixir.AgentRunner do
             backend
           )
 
-        case continue_with_issue?(issue, issue_state_fetcher, opts) do
-          {:continue, refreshed_issue} when turn_number < max_turns ->
+        handoff_infrastructure_failure = pop_handoff_infrastructure_failure()
+
+        case {continue_with_issue?(issue, issue_state_fetcher, opts), handoff_infrastructure_failure} do
+          {{:continue, _refreshed_issue}, {:handoff_gate_infrastructure, _details} = failure} ->
+            {:error, failure}
+
+          {{:continue, refreshed_issue}, nil} when turn_number < max_turns ->
             Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
             do_run_codex_turns(
@@ -769,7 +788,7 @@ defmodule SymphonyElixir.AgentRunner do
               {turn_number + 1, max_turns}
             )
 
-          {:continue, refreshed_issue} when is_binary(handoff_gate_prompt) ->
+          {{:continue, refreshed_issue}, nil} when is_binary(handoff_gate_prompt) ->
             continue_terminal_gate_remediation(%{
               backend: backend,
               app_session: app_session,
@@ -784,13 +803,13 @@ defmodule SymphonyElixir.AgentRunner do
               max_turns: max_turns
             })
 
-          {:continue, refreshed_issue} ->
-            finish_max_turns(refreshed_issue, workspace, turn_number, max_turns)
+          {{:continue, refreshed_issue}, nil} ->
+            finish_max_turns(refreshed_issue, turn_number, max_turns)
 
-          {:done, _refreshed_issue} ->
+          {{:done, _refreshed_issue}, _failure} ->
             :ok
 
-          {:error, reason} ->
+          {{:error, reason}, _failure} ->
             {:error, reason}
         end
 
@@ -827,27 +846,17 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp finish_max_turns(issue, workspace, turn_number, max_turns) do
-    Logger.info("Reached agent.max_turns for #{issue_context(issue)} with issue still active; marking Blocked and returning control to orchestrator")
-
-    mark_blocked_on_giveup(issue, %{
-      reason: :max_turns_exhausted,
-      turn_number: turn_number,
-      max_turns: max_turns,
-      workspace: workspace
-    })
+  defp finish_max_turns(issue, turn_number, max_turns) do
+    Logger.info(
+      "Reached agent.max_turns for #{issue_context(issue)} with issue still active; ending this worker session for orchestrator continuation without changing tracker state turn=#{turn_number}/#{max_turns}"
+    )
 
     :ok
   end
 
   defp continue_terminal_gate_remediation(context) do
     if Keyword.get(context.opts, :handoff_gate_grace_turn_used, false) do
-      finish_max_turns(
-        context.issue,
-        context.workspace,
-        context.turn_number,
-        context.max_turns
-      )
+      finish_max_turns(context.issue, context.turn_number, context.max_turns)
     else
       Logger.info("Continuing agent run for one terminal-gate remediation turn #{issue_context(context.issue)} after reaching agent.max_turns=#{context.max_turns}")
 
@@ -1036,6 +1045,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> maybe_put_map(:before_handoff_timeout_ms, per_repo_before_handoff_timeout_ms)
       |> maybe_put_map(:before_handoff_stale_ms, per_repo_before_handoff_stale_ms)
       |> Map.put(:deferred_handoff_gate_callback, &store_deferred_handoff_gate/1)
+      |> Map.put(:handoff_infrastructure_failure_callback, &store_handoff_infrastructure_failure/2)
       |> maybe_put_map(:review_workflow, per_repo_review_workflow)
       |> maybe_put_map(:deferred_review_callback, deferred_review_callback(per_repo_review_workflow))
       |> maybe_put_map(:review_opts, review_opts)
@@ -1077,6 +1087,19 @@ defmodule SymphonyElixir.AgentRunner do
        do: true
 
   defp same_pending_candidate?(_existing, _request), do: false
+
+  defp store_handoff_infrastructure_failure(prompt, gate) when is_binary(prompt) do
+    Process.put(
+      @handoff_gate_infrastructure_failure_key,
+      {:handoff_gate_infrastructure, %{message: prompt, gate: gate}}
+    )
+
+    :ok
+  end
+
+  defp pop_handoff_infrastructure_failure do
+    Process.delete(@handoff_gate_infrastructure_failure_key)
+  end
 
   defp persist_deferred_handoff_gate(request) do
     Workspace.persist_handoff_gate_state(
@@ -1301,9 +1324,16 @@ defmodule SymphonyElixir.AgentRunner do
          opts
        ) do
     case poll_pending_handoff_gate(request, recipient, backend, issue_state_fetcher, opts, true) do
-      {:completed, _issue} -> handoff_gate_prompt
-      {:resume, prompt, _issue} -> prompt
-      {:error, reason} -> pending_gate_error_prompt(Map.fetch!(request, :issue), reason)
+      {:completed, _issue} ->
+        handoff_gate_prompt
+
+      {:resume, prompt, _issue} ->
+        prompt
+
+      {:error, reason} ->
+        prompt = pending_gate_error_prompt(Map.fetch!(request, :issue), reason)
+        store_handoff_infrastructure_failure(prompt, %{reason: reason})
+        prompt
     end
   end
 
@@ -1379,8 +1409,11 @@ defmodule SymphonyElixir.AgentRunner do
         poll_pending_handoff_gate(request, recipient, backend, issue_state_fetcher, opts, true)
 
       {:error, reason} ->
+        prompt = pending_gate_error_prompt(request.issue, reason)
+        store_handoff_infrastructure_failure(prompt, %{reason: reason})
+
         case finish_pending_gate(request, recipient, :persistence_failed) do
-          :ok -> {:resume, pending_gate_error_prompt(request.issue, reason), request.issue}
+          :ok -> {:resume, prompt, request.issue}
           {:error, clear_reason} -> {:error, {reason, clear_reason}}
         end
     end
@@ -1419,6 +1452,7 @@ defmodule SymphonyElixir.AgentRunner do
          _opts
        ) do
     terminal_gate = if is_map(gate) and Map.has_key?(gate, :job_id), do: gate, else: request.gate
+    store_handoff_infrastructure_failure(prompt, gate)
     resume_after_terminal_gate(request, terminal_gate, prompt, recipient, :infrastructure_error)
   end
 
@@ -2122,8 +2156,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   @doc """
-  Mark an issue Blocked when the agent run terminally gives up (max_turns
-  exhausted or, in the future, all retries exhausted). Idempotent: skips work
+  Mark an issue Blocked when retry policy identifies a terminal failure that
+  requires human action. Idempotent: skips work
   if the issue already carries the routing-warned label. Best-effort on each
   Linear write — logs and continues rather than raising, since this runs in
   the failure path.

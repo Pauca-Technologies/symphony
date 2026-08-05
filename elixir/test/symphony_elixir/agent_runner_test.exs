@@ -1419,6 +1419,70 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
     end
 
+    test "ends the worker attempt on handoff infrastructure failure without a remediation turn" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-infrastructure-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7157")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-infrastructure",
+        identifier: "UDPE-7157",
+        title: "Back off after gate infrastructure failure",
+        state: "In Progress",
+        labels: []
+      }
+
+      request = %{
+        query: "mutation Move { issueUpdate(id: \"issue-gate-infrastructure\", input: {stateId: \"review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        target_state: "In Review",
+        gate: async_gate(:pending),
+        linear_client: fn _query, _variables, _opts -> {:ok, %{}} end
+      }
+
+      Application.put_env(:symphony_elixir, :pending_gate_recipient_for_test, self())
+      Application.put_env(:symphony_elixir, :pending_gate_request_for_test, request)
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :pending_gate_recipient_for_test)
+        Application.delete_env(:symphony_elixir, :pending_gate_request_for_test)
+        File.rm_rf(workspace_root)
+      end)
+
+      poller = fn _workspace, _issue, nil, "In Review", "job-7157", _opts ->
+        gate = %{async_gate(:infrastructure_error) | summary: "gate runner unavailable"}
+        {:infrastructure_error, "gate runner unavailable", gate}
+      end
+
+      state_fetcher = fn ["issue-gate-infrastructure"] -> {:ok, [issue]} end
+
+      assert {:error, {:handoff_gate_infrastructure, %{message: "gate runner unavailable", gate: %{status: :infrastructure_error}}}} =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {PendingGateBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   handoff_gate_poller: poller,
+                   handoff_gate_sleep: fn _milliseconds -> :ok end,
+                   max_turns: 5
+                 ],
+                 nil
+               )
+
+      assert_received {:pending_gate_turn, 1, _initial_prompt}
+      refute_received {:pending_gate_turn, 2, _remediation_prompt}
+      refute_received {:memory_tracker_state_update, "issue-gate-infrastructure", "Blocked"}
+      refute_received {:memory_tracker_add_label, "issue-gate-infrastructure", "needs-human-input"}
+    end
+
     test "coalesces repeated requests for the same candidate into one durable job" do
       workspace_root =
         Path.join(System.tmp_dir!(), "symphony-gate-coalesce-#{System.unique_integer([:positive])}")
@@ -1524,6 +1588,50 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert_received {:pending_gate_turn, 2, remediation_prompt}
       assert remediation_prompt =~ "Fix the failing exact-head tests."
       refute_received {:pending_gate_turn, 3, _prompt}
+    end
+  end
+
+  describe "max-turn session boundary" do
+    test "ends the worker session without changing the issue to Blocked" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-max-turn-boundary-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      Application.put_env(:symphony_elixir, :turn_count_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      issue = %Issue{
+        id: "issue-max-turn-boundary",
+        identifier: "UDPE-7007",
+        title: "Leave an active issue active",
+        state: "In Progress",
+        labels: []
+      }
+
+      state_fetcher = fn ["issue-max-turn-boundary"] -> {:ok, [issue]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {TurnCountingBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received :turn_ran
+      refute_received :turn_ran
+      refute_received {:memory_tracker_comment, "issue-max-turn-boundary", _body}
+      refute_received {:memory_tracker_add_label, "issue-max-turn-boundary", _label}
+      refute_received {:memory_tracker_state_update, "issue-max-turn-boundary", _state}
     end
   end
 

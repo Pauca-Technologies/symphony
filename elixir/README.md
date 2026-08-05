@@ -43,9 +43,11 @@ review gate.
 job ID, exact candidate identity, heartbeat, progress, and next-poll delay. Symphony persists the
 captured Linear mutation outside the agent-writable worktree, closes the active model turn, and
 polls with `SYMPHONY_HANDOFF_GATE_JOB_ID` without consuming model turns or tokens. Only a `passed`
-report for the original candidate can release the mutation. Failed, invalidated, stale-heartbeat,
-and infrastructure outcomes resume the implementor once with compact remediation. A restart
-reattaches to the persisted job rather than starting a duplicate gate.
+report for the original candidate can release the mutation. Failed and invalidated outcomes resume
+the implementor once with compact remediation. Stale-heartbeat, malformed-protocol, and other
+infrastructure outcomes fail the worker attempt and enter orchestrator backoff without consuming
+more model turns or changing the issue to `Blocked`. A restart reattaches to the persisted job
+rather than starting a duplicate gate.
 
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
@@ -225,13 +227,17 @@ Notes:
   It also records SHA-256 hashes for the complete prompt and each injected section, allowing prompt
   reuse/duplication analysis without retaining task or workflow prose.
   A newly started backend thread still receives the full first-turn prompt, including on retries,
-  because it cannot safely rely on context retained by a previous process.
+  because it cannot safely rely on context retained by a previous process. Reaching `max_turns`
+  ends only that worker session; it does not change the Linear state or add `needs-human-input`.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
   provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local
   JSONL telemetry records the failure class and retry-policy action (`scheduled`, `suppressed`,
   `parked`, or `probed`) rather than requiring operators to parse exception text. A retry blocked
   by an open circuit emits `suppressed` immediately before it enters the persistent parked queue.
+  When failures cross `agent.max_retries`, operational failures remain active at capped backoff;
+  only classified authentication/configuration failures are automatically moved to `Blocked` for
+  human action.
 - An authoritative Codex `usageLimitExceeded` result opens a Codex account quota circuit. The
   account boundary is the execution credential boundary (`local` or the specific SSH worker host),
   so a circuit on one worker does not suppress the same backend on a worker using another account.
@@ -415,6 +421,8 @@ Notes:
   `before_handoff_timeout_ms` and the maximum accepted heartbeat age with
   `before_handoff_stale_ms`. The runtime APIs expose job/candidate identity, pending age,
   heartbeat age, progress stage, and next-poll delay while the issue is `handoff_pending_gate`.
+  A terminal infrastructure/protocol verification result ends the worker attempt and uses
+  orchestrator backoff rather than asking the implementor to repair platform infrastructure.
 - If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
   implementor turn that requested the handoff has closed, and applies the captured Linear
   transition only after an authoritative approval for the exact candidate SHA. Request changes,

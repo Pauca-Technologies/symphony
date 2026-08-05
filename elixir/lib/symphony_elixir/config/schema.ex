@@ -176,12 +176,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:test_worker_limit, :integer, default: 2)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
-      # Hard cap on consecutive failed/stalled agent runs for one issue before
-      # Symphony gives up and marks it Blocked (`:retries_exhausted`). The
-      # exponential backoff (`max_retry_backoff_ms`) only bounds the *delay*
-      # between retries — without this count cap a persistently failing issue
-      # would retry forever. Reset whenever the issue completes a turn normally,
-      # so only genuine stuck loops trip it.
+      # Threshold for consecutive failed/stalled agent runs. Human-actionable
+      # configuration failures are marked Blocked beyond it; operational
+      # failures remain active and retry at `max_retry_backoff_ms`. Reset when
+      # the issue completes a turn normally.
       field(:max_retries, :integer, default: 10)
       field(:max_concurrent_agents_by_state, :map, default: %{})
       # Selects the coding-agent backend. "codex" = Codex app-server (default,

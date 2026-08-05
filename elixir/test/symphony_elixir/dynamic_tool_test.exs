@@ -222,7 +222,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       "identity" => %{
         "repositoryIdentity" => "repo-7157",
         "worktreeIdentity" => "worktree-7157",
-        "prNumber" => 1854,
+        "prNumber" => "1854",
         "baseRef" => "develop",
         "baseSha" => "base-7157",
         "headSha" => "head-7157",
@@ -284,6 +284,91 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert get_in(output, ["gate", "jobId"]) == "job-7157"
 
     assert_receive {:pending_handoff, %{gate: %{job_id: "job-7157"}, target_state: "In Review"}}
+  end
+
+  test "linear_graphql reports protocol infrastructure failures to the runner" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-infrastructure-handoff-tool-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    issue = %Issue{
+      id: "issue-infrastructure-gate",
+      identifier: "UDPE-7007",
+      title: "Back off after protocol failure",
+      state: "In Progress"
+    }
+
+    report = %{
+      "protocolVersion" => 1,
+      "jobId" => "job-infrastructure",
+      "status" => "infrastructure_error",
+      "identity" => %{
+        "repositoryIdentity" => "repo-infrastructure",
+        "worktreeIdentity" => "worktree-infrastructure",
+        "prNumber" => "1854",
+        "baseRef" => "develop",
+        "baseSha" => "base-infrastructure",
+        "headSha" => "head-infrastructure",
+        "candidateFingerprint" => "fingerprint-infrastructure",
+        "gateConfigHash" => "config-infrastructure",
+        "mutablePrStateHash" => "mutable-infrastructure",
+        "candidateHash" => "candidate-infrastructure",
+        "exactHash" => "exact-infrastructure"
+      },
+      "summary" => "gate runner unavailable",
+      "checks" => []
+    }
+
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{
+          issue: issue,
+          workspace: workspace,
+          worker_host: nil,
+          before_handoff_command: "printf '%s' '#{Jason.encode!(report)}'; exit 1",
+          handoff_infrastructure_failure_callback: fn prompt, gate ->
+            send(test_pid, {:handoff_infrastructure_failure, prompt, gate})
+          end
+        },
+        linear_client: fn
+          query, %{"issueId" => "issue-infrastructure-gate"}, [] ->
+            assert query =~ "SymphonyResolveIssueTransition"
+
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
+                   }
+                 }
+               }
+             }}
+
+          _query, _variables, [] ->
+            flunk("infrastructure-blocked handoff mutation must not be applied")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert_receive {:handoff_infrastructure_failure, prompt, %{job_id: "job-infrastructure", status: :infrastructure_error}}
+
+    assert prompt =~ "gate runner unavailable"
   end
 
   test "linear_graphql runs handoff gates when issueUpdate uses the issue identifier" do

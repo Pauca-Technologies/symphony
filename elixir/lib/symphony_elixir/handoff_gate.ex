@@ -462,13 +462,26 @@ defmodule SymphonyElixir.HandoffGate do
     ]
 
     with :ok <- require_identity_strings(identity, required_strings),
-         pr_number when is_integer(pr_number) and pr_number > 0 <- Map.get(identity, "prNumber") do
+         :ok <- validate_protocol_pr_number(Map.get(identity, "prNumber")) do
       :ok
     else
       {:error, _reason} = error -> error
-      _ -> {:error, "missing or invalid identity.prNumber"}
     end
   end
+
+  defp validate_protocol_pr_number(pr_number) when is_integer(pr_number) and pr_number > 0,
+    do: :ok
+
+  defp validate_protocol_pr_number(pr_number) when is_binary(pr_number) do
+    if Regex.match?(~r/^[1-9][0-9]*$/, pr_number) do
+      :ok
+    else
+      {:error, "missing or invalid identity.prNumber"}
+    end
+  end
+
+  defp validate_protocol_pr_number(_pr_number),
+    do: {:error, "missing or invalid identity.prNumber"}
 
   defp require_identity_strings(identity, keys) do
     Enum.reduce_while(keys, :ok, fn key, :ok ->

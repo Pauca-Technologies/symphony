@@ -128,8 +128,9 @@ defmodule SymphonyElixir.Orchestrator do
       # issue_id => count of consecutive failed/stalled agent runs since the
       # issue last completed a turn normally. Only genuine run failures (crash,
       # stall, handoff-review timeout, spawn failure) bump it; capacity waits
-      # and transient tracker errors don't. When it exceeds agent.max_retries we
-      # give up and mark the issue Blocked (`:retries_exhausted`). Kept separate
+      # and transient tracker errors don't. When it exceeds agent.max_retries,
+      # human-actionable configuration failures are marked Blocked while
+      # operational failures remain active at capped backoff. Kept separate
       # from `retry_attempts` (which drives backoff timing) on purpose.
       failure_counts: %{},
       # issue_id => monotonic ms of the last warning attempt. Fallback
@@ -1467,10 +1468,9 @@ defmodule SymphonyElixir.Orchestrator do
     # agent from modifying/merging/transitioning the PR — humans merge.
     # Symphony has no merge logic of its own, so an agent dispatched here
     # can only no-op every turn: AgentRunner.do_run_codex_turns keeps
-    # continuing while the tracker state stays "active", exhausts
-    # agent.max_turns, and mark_blocked_on_giveup(:max_turns_exhausted)
-    # demotes a human-approved, merge-ready issue to Blocked after ~40
-    # wasted turns (UDPE-6950). This guard is authoritative regardless of
+    # continuing while the tracker state stays "active" and wastes every
+    # available turn before the next continuation session. This guard is
+    # authoritative regardless of
     # tracker.active_states: even if a host's config lists such a state as
     # active (the historical misconfiguration this fixes), we refuse to
     # pick it up as implementor work. These states are instead serviced by
@@ -1756,25 +1756,59 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Schedule a retry for a *genuine* agent-run failure (crash, stall,
   # handoff-review timeout, spawn failure), counting it against the
-  # `agent.max_retries` cap. Once an issue accumulates more consecutive
-  # failures than the cap, give up: mark it Blocked (`:retries_exhausted`),
-  # same terminal treatment as max-turns exhaustion. Capacity waits and
-  # transient tracker/refresh errors call `schedule_issue_retry` directly and
-  # never count here, so backpressure and infra blips can't block an issue.
+  # `agent.max_retries` threshold. Beyond that threshold, only a classified
+  # configuration/authentication failure is treated as requiring human input.
+  # Operational failures remain claimed and retry at capped backoff, so a
+  # Symphony or dependency outage cannot semantically block the product issue.
+  # Capacity waits and transient tracker/refresh errors call
+  # `schedule_issue_retry` directly and never count here.
   defp schedule_failure_retry(%State{} = state, issue_id, next_attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     {failures, state} = bump_failure_count(state, issue_id)
     max_retries = max_retries_setting()
 
-    if is_integer(max_retries) and max_retries > 0 and failures > max_retries do
-      give_up_retries_exhausted(state, issue_id, failures - 1, max_retries, metadata)
-    else
-      schedule_issue_retry(state, issue_id, next_attempt, metadata)
+    cond do
+      !is_integer(max_retries) or max_retries <= 0 or failures <= max_retries ->
+        schedule_issue_retry(state, issue_id, next_attempt, metadata)
+
+      retry_exhaustion_requires_human?(metadata) ->
+        give_up_retries_exhausted(state, issue_id, failures - 1, max_retries, metadata)
+
+      true ->
+        keep_operational_failure_in_backoff(state, issue_id, next_attempt, max_retries, metadata)
     end
   end
 
   defp retry_failure_class(%AgentFailure{class: class}), do: class
   defp retry_failure_class(_failure), do: nil
+
+  defp retry_exhaustion_requires_human?(%{
+         failure: %AgentFailure{class: :authentication_configuration}
+       }),
+       do: true
+
+  defp retry_exhaustion_requires_human?(_metadata), do: false
+
+  defp keep_operational_failure_in_backoff(state, issue_id, next_attempt, max_retries, metadata) do
+    identifier = metadata[:identifier] || issue_id
+    delay_ms = Config.settings!().agent.max_retry_backoff_ms
+
+    Logger.error(
+      "Operational retries reached agent.max_retries for issue_id=#{issue_id} issue_identifier=#{identifier}; keeping issue active at capped backoff=#{delay_ms}ms instead of marking Blocked"
+    )
+
+    state = %{
+      state
+      | failure_counts: Map.put(state.failure_counts, issue_id, max_retries)
+    }
+
+    schedule_issue_retry(
+      state,
+      issue_id,
+      next_attempt,
+      Map.put(metadata, :delay_ms_override, delay_ms)
+    )
+  end
 
   defp give_up_retries_exhausted(%State{} = state, issue_id, retries, max_retries, metadata) do
     identifier = metadata[:identifier] || issue_id
@@ -1790,10 +1824,8 @@ defmodule SymphonyElixir.Orchestrator do
     |> release_issue_claim(issue_id)
   end
 
-  # Mark the issue Blocked off the GenServer loop: the Linear writes are
-  # network I/O and best-effort, so they must not block dispatch. Reuses the
-  # same give-up path as max-turns exhaustion (Blocked + needs-human-input +
-  # one comment), keyed on the `:retries_exhausted` reason.
+  # Mark a human-actionable failure Blocked off the GenServer loop. The Linear
+  # writes are network I/O and best-effort, so they must not block dispatch.
   defp spawn_retries_exhausted_block(%Issue{} = issue, retries, max_retries, metadata) do
     context = %{
       reason: :retries_exhausted,
@@ -3708,9 +3740,17 @@ defmodule SymphonyElixir.Orchestrator do
     {failures, state} = bump_failure_count(state, issue_id)
     max_retries = max_retries_setting()
 
-    if is_integer(max_retries) and max_retries > 0 and failures > max_retries do
+    if is_integer(max_retries) and max_retries > 0 and failures > max_retries and
+         retry_exhaustion_requires_human?(metadata) do
       give_up_retries_exhausted(state, issue_id, failures - 1, max_retries, metadata)
     else
+      state =
+        if is_integer(max_retries) and max_retries > 0 and failures > max_retries do
+          %{state | failure_counts: Map.put(state.failure_counts, issue_id, max_retries)}
+        else
+          state
+        end
+
       park_issue_retry(state, issue_id, next_attempt, metadata)
     end
   end

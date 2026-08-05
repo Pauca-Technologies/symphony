@@ -62,6 +62,7 @@ defmodule SymphonyElixir.AgentFailure do
     :gate_failed
   ]
   @infrastructure_tags [
+    :handoff_gate_infrastructure,
     :port_exit,
     :failed_to_spawn,
     :spawn_failed,

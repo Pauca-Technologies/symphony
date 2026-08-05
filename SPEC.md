@@ -700,6 +700,9 @@ Important nuance:
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
+- Reaching `agent.max_turns` ends the current worker session without changing tracker state or
+  applying a human-input label. The normal-exit continuation check decides whether to start a new
+  worker session.
 - The first turn SHOULD use typed prompt sections with stable semantic IDs, source identity,
   renderer version, content hash, and byte/token estimates. The canonical task sections own issue
   details and current tracker activity, followed by the rendered repository workflow rules.
@@ -865,6 +868,11 @@ Backoff formula:
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+- `agent.max_retries` is the threshold for terminal treatment, not proof that a product issue needs
+  human input. Classified operational/infrastructure failures MUST keep the issue active and retry
+  at capped backoff after crossing the threshold. An implementation MAY move an issue to `Blocked`
+  only for a failure class that explicitly requires human action, such as invalid authentication or
+  workflow configuration.
 
 Retry handling behavior:
 
@@ -1040,15 +1048,20 @@ Execution contract:
 - Emit `gate.before_handoff` telemetry when `before_handoff` fires, including the per-gate
   pass/fail breakdown parsed from hook JSON output when available.
 - Invoke `before_handoff` with `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. A protocol version 1 report
-  includes `jobId`, `status`, `identity.candidateHash`, and `identity.exactHash`. Pending/running
+  includes `jobId`, `status`, `identity.candidateHash`, and `identity.exactHash`.
+  `identity.prNumber` MUST be either a positive JSON integer or its canonical decimal-string
+  representation (for example `1854`; no sign, whitespace, or leading zeroes). Readers MUST accept
+  both representations during rolling deployment. Pending/running
   reports additionally include `heartbeatAt`, `heartbeatAgeMs`, `nextPollMs`, and
   `progress.stage`; they exit `3`. Passed reports exit `0`; failed/invalidated reports exit `2`;
   infrastructure errors exit `1`. Polls set `SYMPHONY_HANDOFF_GATE_JOB_ID` and MUST attach to the
   named job rather than starting another underlying gate.
 - On pending/running, durably record the original tracker mutation, end the active model turn, and
   poll without a model turn. Apply the mutation only after a passed report is revalidated for the
-  exact current candidate. Failed, invalidated, or infrastructure terminal results clear pending
-  state and resume the implementor once with bounded remediation.
+  exact current candidate. Failed or invalidated terminal results clear pending state and resume
+  the implementor once with bounded remediation. Infrastructure terminal results clear pending
+  state, fail the worker attempt with a typed infrastructure failure, and use orchestrator backoff
+  without consuming an implementor remediation turn.
 - For a routed repository with a configured base branch, fetch and revalidate
   that base on the local or SSH worker host that owns the worktree immediately
   before `hooks.before_handoff`. Compute the
@@ -1121,9 +1134,11 @@ Failure semantics:
 - `session_start` failure or timeout is logged, emitted as telemetry, and surfaced as advisory
   context; it is not fatal to the current run attempt.
 - `before_run` failure or timeout is fatal to the current run attempt.
-- `before_handoff` failure or timeout cancels the attempted tracker state transition and provides
-  remediation to the next agent turn. A valid protocol pending/running result is neither a failure
-  nor a timeout and does not consume a retry or coding-agent turn.
+- A legacy or protocol-declared validation failure from `before_handoff` cancels the attempted
+  tracker state transition and provides remediation to the next agent turn. Protocol verification,
+  timeout, and infrastructure failures cancel the transition and fail the worker attempt for
+  orchestrator backoff instead. A valid protocol pending/running result is neither a failure nor a
+  timeout and does not consume a retry or coding-agent turn.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 

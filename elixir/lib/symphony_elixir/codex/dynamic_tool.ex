@@ -87,6 +87,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         })
 
       {:handoff_infrastructure_error, prompt, gate} ->
+        notify_handoff_infrastructure_failure(opts, prompt, gate)
+
         failure_response(%{
           "error" => %{
             "message" => "The asynchronous before_handoff gate could not be verified.",
@@ -269,6 +271,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp deferred_handoff_gate_callback(context) do
     Map.get(context, :deferred_handoff_gate_callback) ||
       Map.get(context, "deferred_handoff_gate_callback")
+  end
+
+  defp notify_handoff_infrastructure_failure(opts, prompt, gate) do
+    context = Keyword.get(opts, :handoff_gate_context, %{})
+
+    case Map.get(context, :handoff_infrastructure_failure_callback) ||
+           Map.get(context, "handoff_infrastructure_failure_callback") do
+      callback when is_function(callback, 2) -> callback.(prompt, gate)
+      _callback -> :ok
+    end
   end
 
   defp deferred_handoff_gate_result(issue, gate) do

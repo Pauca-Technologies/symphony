@@ -82,7 +82,12 @@ agent:
   max_concurrent_agents: 10
   # Per-agent test process fan-out; this does not change max_concurrent_agents.
   test_worker_limit: 2
+  # This is a worker-session boundary only; exhaustion does not move Linear to Blocked.
   max_turns: 20
+  # Operational failures stay active at capped backoff after this threshold.
+  # Only classified authentication/configuration failures become human blockers.
+  max_retries: 10
+  max_retry_backoff_ms: 300000
   # Soft budgets are policy/strategy signals, never completion or approval gates.
   # Shadow mode records proposed routing and transitions without changing prompts.
   efficiency:

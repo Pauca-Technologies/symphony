@@ -658,7 +658,7 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, start_ms, 10_000)
   end
 
-  test "a persistently failing issue is marked Blocked once retries are exhausted" do
+  test "a persistent authentication failure is marked Blocked once retries are exhausted" do
     previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
     previous_labels = Application.get_env(:symphony_elixir, :memory_tracker_available_labels)
 
@@ -682,6 +682,7 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     issue = %Issue{id: issue_id, identifier: "MT-6954", state: "In Progress", labels: []}
+    failure = SymphonyElixir.AgentFailure.classify(:invalid_configuration, backend: "codex")
 
     running_entry = %{
       pid: self(),
@@ -689,6 +690,7 @@ defmodule SymphonyElixir.CoreTest do
       identifier: "MT-6954",
       issue: issue,
       retry_attempt: 3,
+      run_failure: failure,
       started_at: DateTime.utc_now()
     }
 
@@ -718,6 +720,76 @@ defmodule SymphonyElixir.CoreTest do
     refute MapSet.member?(state.claimed, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
     refute Map.has_key?(state.failure_counts, issue_id)
+  end
+
+  test "an infrastructure failure stays active at capped backoff after retries are exhausted" do
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    previous_labels = Application.get_env(:symphony_elixir, :memory_tracker_available_labels)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_retries: 3,
+      max_retry_backoff_ms: 300_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    Application.put_env(:symphony_elixir, :memory_tracker_available_labels, :all)
+
+    issue_id = "issue-infrastructure-exhausted"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :InfrastructureRetriesExhaustedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+      restore_app_env(:memory_tracker_available_labels, previous_labels)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    issue = %Issue{id: issue_id, identifier: "MT-7007", state: "In Progress", labels: []}
+
+    failure =
+      SymphonyElixir.AgentFailure.classify(
+        {:handoff_gate_infrastructure, "invalid protocol report"},
+        backend: "codex"
+      )
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-7007",
+      issue: issue,
+      retry_attempt: 3,
+      run_failure: failure,
+      started_at: DateTime.utc_now()
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:failure_counts, %{issue_id => 3})
+    end)
+
+    start_ms = System.monotonic_time(:millisecond)
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    Process.sleep(50)
+
+    refute_received {:memory_tracker_comment, ^issue_id, _body}
+    refute_received {:memory_tracker_add_label, ^issue_id, "needs-human-input"}
+    refute_received {:memory_tracker_state_update, ^issue_id, "Blocked"}
+
+    state = :sys.get_state(pid)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert state.failure_counts[issue_id] == 3
+
+    assert %{attempt: 4, due_at_ms: due_at_ms, failure_class: :transient_infrastructure} =
+             state.retry_attempts[issue_id]
+
+    assert_due_in_range(due_at_ms, start_ms, 300_000)
   end
 
   test "a failing issue keeps retrying while under the max_retries cap" do

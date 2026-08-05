@@ -51,6 +51,9 @@ defmodule SymphonyElixir.AgentFailureTest do
     assert AgentFailure.classify({:review_timeout, 60_000}, backend: "codex").class ==
              :handoff_reviewer_gate
 
+    assert AgentFailure.classify({:handoff_gate_infrastructure, "invalid report"}, backend: "codex").class ==
+             :transient_infrastructure
+
     assert %AgentFailure{class: :rate_limited, retry_after_ms: 30_000, scope: :issue} =
              AgentFailure.classify({:rate_limited, 30_000}, backend: "codex")
 
