@@ -766,10 +766,10 @@ defmodule SymphonyElixir.AgentRunner do
             backend
           )
 
-        handoff_infrastructure_failure = pop_handoff_infrastructure_failure()
+        infrastructure_failure = pop_handoff_infrastructure_failure()
 
-        case {continue_with_issue?(issue, issue_state_fetcher, opts), handoff_infrastructure_failure} do
-          {{:continue, _refreshed_issue}, {:handoff_gate_infrastructure, _details} = failure} ->
+        case {continue_with_issue?(issue, issue_state_fetcher, opts), infrastructure_failure} do
+          {{:continue, _refreshed_issue}, failure} when not is_nil(failure) ->
             {:error, failure}
 
           {{:continue, refreshed_issue}, nil} when turn_number < max_turns ->
@@ -1092,6 +1092,15 @@ defmodule SymphonyElixir.AgentRunner do
     Process.put(
       @handoff_gate_infrastructure_failure_key,
       {:handoff_gate_infrastructure, %{message: prompt, gate: gate}}
+    )
+
+    :ok
+  end
+
+  defp store_review_infrastructure_failure(%ReviewOutcome{} = outcome) do
+    Process.put(
+      @handoff_gate_infrastructure_failure_key,
+      {:review_gate_infrastructure, %{review: ReviewOutcome.to_map(outcome)}}
     )
 
     :ok
@@ -1588,12 +1597,14 @@ defmodule SymphonyElixir.AgentRunner do
           Logger.info("review.gate deferred blocked #{issue_context(issue)} findings=#{length(review_outcome.findings)}")
           {:request_changes, prompt, review_outcome}
 
+        {:infrastructure_unavailable, %ReviewOutcome{} = review_outcome} ->
+          Logger.warning("review.gate deferred withheld #{issue_context(issue)} outcome=infrastructure_unavailable reason=#{inspect(review_outcome.failure_reason)}")
+          store_review_infrastructure_failure(review_outcome)
+
+          {:infrastructure_unavailable, review_nonapproval_prompt(issue, review_outcome), review_outcome}
+
         {terminal_outcome, %ReviewOutcome{} = review_outcome}
-        when terminal_outcome in [
-               :automation_inconclusive,
-               :infrastructure_unavailable,
-               :budget_exhausted_with_findings
-             ] ->
+        when terminal_outcome in [:automation_inconclusive, :budget_exhausted_with_findings] ->
           Logger.warning("review.gate deferred withheld #{issue_context(issue)} outcome=#{terminal_outcome} reason=#{inspect(review_outcome.failure_reason)}")
 
           {terminal_outcome, review_nonapproval_prompt(issue, review_outcome), review_outcome}

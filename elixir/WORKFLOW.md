@@ -251,6 +251,7 @@ Use this only when completion is blocked by missing required tools or missing au
   - what is missing,
   - why it blocks required acceptance/validation,
   - exact human action needed to unblock.
+- The `linear_graphql` call that moves an issue to `Blocked` must include a top-level `blocker` object with a concise `summary` and one of these `kind` values: `missing_required_tool`, `missing_authentication`, `missing_permission`, or `product_decision`. Symphony, reviewer, handoff, CI, and other operational failures are not valid blocker kinds; leave the issue active for orchestrator retry.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad. The human response belongs in a separate Linear comment; on redispatch, reconcile it into the workpad and remove `needs-human-input` before resuming.
 
 ## Step 2: Execution phase (Todo -> In Progress -> Human Review)

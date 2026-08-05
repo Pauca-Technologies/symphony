@@ -238,6 +238,9 @@ Notes:
   When failures cross `agent.max_retries`, operational failures remain active at capped backoff;
   only classified authentication/configuration failures are automatically moved to `Blocked` for
   human action.
+- Agent-requested transitions to `Blocked` require a structured blocker kind and summary. The
+  accepted kinds are missing required tool, authentication, permission, or product decision;
+  Symphony, reviewer, handoff, CI, and other operational failures remain active for retry.
 - An authoritative Codex `usageLimitExceeded` result opens a Codex account quota circuit. The
   account boundary is the execution credential boundary (`local` or the specific SSH worker host),
   so a circuit on one worker does not suppress the same backend on a worker using another account.
@@ -426,8 +429,9 @@ Notes:
 - If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
   implementor turn that requested the handoff has closed, and applies the captured Linear
   transition only after an authoritative approval for the exact candidate SHA. Request changes,
-  inconclusive automation, reviewer infrastructure failures, and review-budget exhaustion all
-  withhold the transition and preserve the latest evidence for human resolution.
+  inconclusive automation and review-budget exhaustion withhold the transition and preserve the
+  latest evidence for human resolution. Reviewer infrastructure and packet-generation failures
+  end the worker attempt and use orchestrator backoff without consuming remediation turns.
   The issue remains claimed in a distinct `handoff_pending_review` lifecycle while that reviewer
   runs, so the completed implementor is not mistaken for a stalled turn. Reviewer events emit a
   minimal, job-scoped heartbeat that refreshes worker activity without replacing implementor

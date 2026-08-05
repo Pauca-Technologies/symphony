@@ -6,6 +6,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   alias SymphonyElixir.{BaseDrift, HandoffGate, Linear.Client, ReviewGate, ReviewOutcome}
 
   @linear_graphql_tool "linear_graphql"
+  @human_blocker_kinds [
+    "missing_required_tool",
+    "missing_authentication",
+    "missing_permission",
+    "product_decision"
+  ]
   @issue_transition_query """
   query SymphonyResolveIssueTransition($issueId: String!) {
     issue(id: $issueId) {
@@ -24,7 +30,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   }
   """
   @linear_graphql_description """
-  Execute a raw GraphQL query or mutation against Linear. In Progress to review-state issueUpdate mutations invoke Symphony's before_handoff and automated review gates.
+  Execute a raw GraphQL query or mutation against Linear. In Progress to review-state issueUpdate mutations invoke Symphony's before_handoff and automated review gates. Moving the active issue to Blocked requires a top-level blocker object with a human-actionable kind and summary; Symphony, reviewer, and handoff infrastructure failures are not human blockers.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -39,6 +45,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "type" => ["object", "null"],
         "description" => "Optional GraphQL variables object.",
         "additionalProperties" => true
+      },
+      "blocker" => %{
+        "type" => ["object", "null"],
+        "description" => "Required only for a Blocked transition. Operational Symphony/reviewer/gate failures do not qualify.",
+        "additionalProperties" => false,
+        "required" => ["kind", "summary"],
+        "properties" => %{
+          "kind" => %{"type" => "string", "enum" => @human_blocker_kinds},
+          "summary" => %{"type" => "string", "minLength" => 1}
+        }
       }
     }
   }
@@ -73,7 +89,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
-         :ok <- maybe_run_before_handoff_gate(query, variables, opts, linear_client),
+         :ok <- maybe_run_before_handoff_gate(query, variables, arguments, opts, linear_client),
          {:ok, response} <- linear_client.(query, variables, []) do
       graphql_response(response)
     else
@@ -127,7 +143,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp maybe_run_before_handoff_gate(query, variables, opts, linear_client) do
+  defp maybe_run_before_handoff_gate(query, variables, arguments, opts, linear_client) do
     context = Keyword.get(opts, :handoff_gate_context)
 
     cond do
@@ -138,11 +154,17 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         :ok
 
       true ->
-        resolve_and_run_before_handoff_gate(query, variables, context, linear_client)
+        resolve_and_run_before_handoff_gate(query, variables, arguments, context, linear_client)
     end
   end
 
-  defp resolve_and_run_before_handoff_gate(query, variables, context, linear_client) do
+  defp resolve_and_run_before_handoff_gate(
+         query,
+         variables,
+         arguments,
+         context,
+         linear_client
+       ) do
     issue = Map.get(context, :issue) || Map.get(context, "issue")
     workspace = Map.get(context, :workspace) || Map.get(context, "workspace")
     worker_host = Map.get(context, :worker_host) || Map.get(context, "worker_host")
@@ -169,35 +191,83 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          issue_id when is_binary(issue_id) <- transition_issue_id(query, variables),
          true <- transition_matches_context_issue?(issue, issue_id),
          {:ok, current_state, target_state} <-
-           resolve_transition_states(query, variables, issue, issue_id, linear_client),
-         true <- HandoffGate.handoff_transition?(current_state, target_state) do
-      gate_issue = issue_with_state(issue, current_state)
-
-      case revalidate_base_before_handoff(workspace, gate_issue, worker_host, context) do
-        {:ok, base_drift_decision} ->
-          context = put_base_drift_decision(context, base_drift_decision)
-
-          run_resolved_handoff_gate(
-            %{
-              query: query,
-              variables: variables,
-              workspace: workspace,
-              issue: gate_issue,
-              worker_host: worker_host,
-              target_state: target_state,
-              context: context,
-              linear_client: linear_client
-            },
-            handoff_opts
-          )
-
-        {:base_drift_blocked, _prompt, _decision} = blocked ->
-          blocked
-      end
+           resolve_transition_states(query, variables, issue, issue_id, linear_client) do
+      handle_resolved_transition(
+        %{
+          query: query,
+          variables: variables,
+          arguments: arguments,
+          workspace: workspace,
+          issue: issue,
+          worker_host: worker_host,
+          current_state: current_state,
+          target_state: target_state,
+          context: context,
+          linear_client: linear_client
+        },
+        handoff_opts
+      )
     else
       _ -> :ok
     end
   end
+
+  defp handle_resolved_transition(request, handoff_opts) do
+    cond do
+      HandoffGate.handoff_transition?(request.current_state, request.target_state) ->
+        run_handoff_transition(request, handoff_opts)
+
+      blocked_state?(request.target_state) ->
+        validate_human_blocker(request.arguments)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp run_handoff_transition(request, handoff_opts) do
+    gate_issue = issue_with_state(request.issue, request.current_state)
+
+    case revalidate_base_before_handoff(
+           request.workspace,
+           gate_issue,
+           request.worker_host,
+           request.context
+         ) do
+      {:ok, base_drift_decision} ->
+        context = put_base_drift_decision(request.context, base_drift_decision)
+
+        request
+        |> Map.merge(%{issue: gate_issue, context: context})
+        |> run_resolved_handoff_gate(handoff_opts)
+
+      {:base_drift_blocked, _prompt, _decision} = blocked ->
+        blocked
+    end
+  end
+
+  defp blocked_state?(state) when is_binary(state),
+    do: String.downcase(String.trim(state)) == "blocked"
+
+  defp blocked_state?(_state), do: false
+
+  defp validate_human_blocker(arguments) when is_map(arguments) do
+    blocker = Map.get(arguments, "blocker") || Map.get(arguments, :blocker)
+
+    with blocker when is_map(blocker) <- blocker,
+         kind when kind in @human_blocker_kinds <-
+           Map.get(blocker, "kind") || Map.get(blocker, :kind),
+         summary when is_binary(summary) <-
+           Map.get(blocker, "summary") || Map.get(blocker, :summary),
+         true <- String.trim(summary) != "" do
+      :ok
+    else
+      _ -> {:error, {:blocked_transition_requires_human_blocker, @human_blocker_kinds}}
+    end
+  end
+
+  defp validate_human_blocker(_arguments),
+    do: {:error, {:blocked_transition_requires_human_blocker, @human_blocker_kinds}}
 
   defp run_resolved_handoff_gate(request, handoff_opts) do
     result =
@@ -755,6 +825,21 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`linear_graphql.variables` must be a JSON object when provided."
+      }
+    }
+  end
+
+  defp tool_error_payload({:blocked_transition_requires_human_blocker, allowed_kinds}) do
+    %{
+      "error" => %{
+        "message" =>
+          "Moving an active issue to Blocked requires a structured human blocker. Symphony, reviewer, handoff, CI, and other operational failures must leave the issue active for orchestrator retry.",
+        "requiredArgument" => %{
+          "blocker" => %{
+            "kind" => allowed_kinds,
+            "summary" => "A concise description of the missing human input."
+          }
+        }
       }
     }
   end

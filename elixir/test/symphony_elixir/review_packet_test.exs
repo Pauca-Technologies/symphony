@@ -87,6 +87,31 @@ defmodule SymphonyElixir.ReviewPacketTest do
     assert Enum.any?(first.packet.repository_rules, &(&1.path == "AGENTS.md"))
   end
 
+  test "nested changed files include applicable repository rules without crashing", context do
+    nested_dir = Path.join(context.workspace, "lib/nested")
+    File.mkdir_p!(nested_dir)
+    File.write!(Path.join(context.workspace, "lib/AGENTS.md"), "Keep nested library changes deterministic.\n")
+    File.write!(Path.join(nested_dir, "example.ex"), "defmodule Nested.Example do\nend\n")
+    git!(context.workspace, ["add", "."])
+    git!(context.workspace, ["commit", "--quiet", "-m", "nested candidate"])
+    head_sha = git!(context.workspace, ["rev-parse", "HEAD"])
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("Nested implementation"),
+               %{pr(context) | head_oid: head_sha},
+               head_sha,
+               nil,
+               settings(),
+               attestations: [attestation(head_sha)]
+             )
+
+    assert Enum.any?(result.packet.repository_rules, fn rule ->
+             rule.path == "lib/AGENTS.md" and "lib/nested/example.ex" in rule.applies_to
+           end)
+  end
+
   test "follow-up carries originating findings and a bounded delta; high risk forces a final full diff", context do
     prior = %ReviewOutcome{
       outcome: :request_changes,

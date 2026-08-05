@@ -382,12 +382,12 @@ defmodule SymphonyElixir.ReviewGate do
         run_iteration(Map.put(context, :packet_result, packet_result), 1, nil)
 
       {:error, reason} ->
-        conclude_inconclusive(
+        conclude_infrastructure_failure(
           context.issue,
           context,
           1,
           {:review_packet_unavailable, reason},
-          "Repair exact-candidate packet generation, then start a fresh orchestration run and re-attempt review for the candidate SHA."
+          context.opts
         )
     end
   end

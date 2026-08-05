@@ -52,6 +52,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              "description" => graphql_description,
              "inputSchema" => %{
                "properties" => %{
+                 "blocker" => _,
                  "query" => _,
                  "variables" => _
                },
@@ -64,6 +65,110 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert graphql_description =~ "before_handoff"
 
     assert Enum.map(specs, & &1["name"]) == ["linear_graphql"]
+  end
+
+  test "linear_graphql requires structured human evidence for Blocked transitions" do
+    issue = %Issue{
+      id: "issue-blocked-policy",
+      identifier: "UDPE-7201",
+      title: "Guard Blocked transitions",
+      state: "In Progress"
+    }
+
+    linear_client = fn
+      query, %{"issueId" => "issue-blocked-policy"}, [] ->
+        assert query =~ "SymphonyResolveIssueTransition"
+
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "state" => %{"name" => "In Progress"},
+               "team" => %{
+                 "states" => %{
+                   "nodes" => [%{"id" => "state-blocked", "name" => "Blocked"}]
+                 }
+               }
+             }
+           }
+         }}
+
+      _query, _variables, [] ->
+        flunk("unclassified Blocked mutation should not be sent to Linear")
+    end
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Block($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{
+            "issueId" => "issue-blocked-policy",
+            "stateId" => "state-blocked"
+          }
+        },
+        handoff_gate_context: %{issue: issue, workspace: System.tmp_dir!(), worker_host: nil},
+        linear_client: linear_client
+      )
+
+    refute response["success"]
+    output = Jason.decode!(response["output"])
+    assert get_in(output, ["error", "message"]) =~ "structured human blocker"
+    assert "product_decision" in get_in(output, ["error", "requiredArgument", "blocker", "kind"])
+  end
+
+  test "linear_graphql allows classified human Blocked transitions" do
+    test_pid = self()
+
+    issue = %Issue{
+      id: "issue-human-blocker",
+      identifier: "UDPE-7202",
+      title: "Need a product decision",
+      state: "In Progress"
+    }
+
+    query =
+      "mutation Block($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }"
+
+    variables = %{"issueId" => issue.id, "stateId" => "state-blocked"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => query,
+          "variables" => variables,
+          "blocker" => %{
+            "kind" => "product_decision",
+            "summary" => "Choose the required compatibility behavior."
+          }
+        },
+        handoff_gate_context: %{issue: issue, workspace: System.tmp_dir!(), worker_host: nil},
+        linear_client: fn
+          transition_query, %{"issueId" => "issue-human-blocker"}, []
+          when transition_query != query ->
+            {:ok,
+             %{
+               "data" => %{
+                 "issue" => %{
+                   "state" => %{"name" => "In Progress"},
+                   "team" => %{
+                     "states" => %{
+                       "nodes" => [%{"id" => "state-blocked", "name" => "Blocked"}]
+                     }
+                   }
+                 }
+               }
+             }}
+
+          ^query, ^variables, [] ->
+            send(test_pid, :blocked_mutation_applied)
+            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        end
+      )
+
+    assert response["success"]
+    assert_received :blocked_mutation_applied
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do

@@ -875,6 +875,106 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "deferred review lifecycle" do
+    test "ends the worker attempt when review infrastructure is unavailable" do
+      workspace =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-review-infrastructure-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(workspace)
+      {_, 0} = System.cmd("git", ["-C", workspace, "init", "--quiet"])
+      File.write!(Path.join(workspace, "README.md"), "review target\n")
+      {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          workspace,
+          "-c",
+          "user.name=Symphony Test",
+          "-c",
+          "user.email=symphony@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "review target"
+        ])
+
+      test_pid = self()
+
+      issue = %Issue{
+        id: "issue-review-infrastructure",
+        identifier: "UDPE-7203",
+        title: "Back off after review infrastructure failure",
+        state: "In Progress",
+        labels: []
+      }
+
+      linear_client = fn query, variables, _opts ->
+        send(test_pid, {:unexpected_review_handoff, query, variables})
+        {:ok, %{"data" => %{}}}
+      end
+
+      no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
+
+      request = %{
+        query: "mutation { issueUpdate(input: {stateId: \"in-review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: %{
+          config: %{"review" => %{"require_pr" => false}},
+          prompt: "Review {{ issue.identifier }}",
+          prompt_template: "Review {{ issue.identifier }}"
+        },
+        review_opts: [
+          pr_runner: no_pr,
+          review_packet_builder: fn _workspace, _issue, _pr, _reviewed_sha, _prior_outcome, _settings, _opts ->
+            send(test_pid, :review_packet_failed)
+            {:error, :packet_builder_failed}
+          end,
+          comment_fn: fn _id, _body -> :ok end,
+          linear_client: linear_client
+        ],
+        linear_client: linear_client
+      }
+
+      Application.put_env(:symphony_elixir, :deferred_requests_for_test, [request])
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :deferred_requests_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      state_fetcher = fn [_issue_id] -> {:ok, [issue]} end
+
+      assert {:error,
+              {:review_gate_infrastructure,
+               %{
+                 review: %{
+                   outcome: "infrastructure_unavailable",
+                   failure_reason: failure_reason
+                 }
+               }}} =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {DeferredBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 5
+                 ],
+                 nil
+               )
+
+      assert failure_reason =~ "review_packet_unavailable"
+      assert_received :review_packet_failed
+      refute_received {:unexpected_review_handoff, _, _}
+    end
+
     test "coalesces repeated handoff requests into one review and one mutation" do
       workspace =
         Path.join(System.tmp_dir!(), "symphony-coalesced-review-#{System.unique_integer([:positive])}")

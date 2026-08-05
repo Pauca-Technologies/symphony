@@ -480,6 +480,7 @@ defmodule SymphonyElixir.ReviewPacket do
 
   defp ancestor_dirs(dir) do
     Stream.unfold(dir, fn
+      nil -> nil
       "." -> {".", nil}
       current -> {current, Path.dirname(current)}
     end)

@@ -129,6 +129,24 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_packet_builder, "UDPE-1", "head-7"}
   end
 
+  test "review packet builder failures are infrastructure unavailable", %{workspace: workspace} do
+    assert {:infrastructure_unavailable, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               review_packet_builder: fn _workspace, _issue, _pr, _reviewed_sha, _prior_outcome, _settings, _opts ->
+                 {:error, :packet_builder_failed}
+               end,
+               session_runner: fn _context -> flunk("reviewer must not run without a packet") end,
+               pr_runner: pr_runner()
+             )
+
+    assert outcome.failure_reason == %{
+             class: :transient_infrastructure,
+             reason: {:review_packet_unavailable, :packet_builder_failed}
+           }
+
+    refute outcome.authoritative
+  end
+
   test "review reuses the exact pre-hook base decision instead of fetching again", %{
     workspace: workspace
   } do
