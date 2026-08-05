@@ -171,6 +171,9 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:max_concurrent_agents, :integer, default: 10)
+      # Bounds test-runner fan-out inside each agent process. This is independent
+      # of (and must not alter) Symphony's agent-slot concurrency.
+      field(:test_worker_limit, :integer, default: 2)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       # Hard cap on consecutive failed/stalled agent runs for one issue before
@@ -201,11 +204,21 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_retries, :max_concurrent_agents_by_state, :backend, :pre_command],
+        [
+          :max_concurrent_agents,
+          :test_worker_limit,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_retries,
+          :max_concurrent_agents_by_state,
+          :backend,
+          :pre_command
+        ],
         empty_values: []
       )
       |> cast_embed(:label_presets, with: &LabelPreset.changeset/2)
       |> validate_number(:max_concurrent_agents, greater_than: 0)
+      |> validate_number(:test_worker_limit, greater_than: 0, less_than_or_equal_to: 32)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:max_retries, greater_than: 0)
@@ -439,6 +452,7 @@ defmodule SymphonyElixir.Config.Schema do
       # protocol traces are intentionally shorter-lived and retained only for
       # failures, sampled successes, or an explicit incident-debug override.
       field(:telemetry_retention_days, :integer, default: 30)
+      field(:session_retention_days, :integer, default: 30)
       field(:raw_trace_retention_days, :integer, default: 7)
       field(:raw_trace_policy, :string, default: "failures")
       field(:raw_trace_sample_rate, :float, default: 0.01)
@@ -476,6 +490,7 @@ defmodule SymphonyElixir.Config.Schema do
           :refresh_ms,
           :render_interval_ms,
           :telemetry_retention_days,
+          :session_retention_days,
           :raw_trace_retention_days,
           :raw_trace_policy,
           :raw_trace_sample_rate,
@@ -491,6 +506,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:refresh_ms, greater_than: 0)
       |> validate_number(:render_interval_ms, greater_than: 0)
       |> validate_number(:telemetry_retention_days, greater_than_or_equal_to: 30)
+      |> validate_number(:session_retention_days, greater_than_or_equal_to: 7)
       |> validate_number(:raw_trace_retention_days, greater_than_or_equal_to: 7)
       |> validate_number(:raw_trace_sample_rate, greater_than_or_equal_to: 0.0, less_than_or_equal_to: 1.0)
       |> validate_number(:prompt_debug_max_bytes, greater_than: 0, less_than_or_equal_to: 256_000)

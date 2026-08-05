@@ -140,6 +140,7 @@ defmodule SymphonyElixir.Telemetry do
     _error ->
       %{
         telemetry_retention_days: 30,
+        session_retention_days: 30,
         raw_trace_retention_days: 7,
         raw_trace_policy: "failures",
         raw_trace_sample_rate: 0.01,

@@ -445,6 +445,8 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_attempt, 1, first_prompt}
     assert first_prompt =~ "Review UDPE-1"
     assert first_prompt =~ "Symphony automated-review runtime guard"
+    assert first_prompt =~ "vitest --maxWorkers=2"
+    assert first_prompt =~ "playwright test --workers=2"
     assert first_prompt =~ "you may"
     assert first_prompt =~ "sub-agents"
     refute first_prompt =~ "Do not spawn sub-agents"

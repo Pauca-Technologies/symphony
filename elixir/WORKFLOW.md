@@ -20,6 +20,8 @@ workspace:
 observability:
   # Compact, versioned fleet events are retained for rolling 30-day reports.
   telemetry_retention_days: 30
+  # Compact session logs are eligible for explicit, dry-run-first maintenance.
+  session_retention_days: 30
   # Raw protocol traces are gzip-compressed and retained for failures for 7 days.
   raw_trace_retention_days: 7
   raw_trace_policy: failures # none | failures | sampled | all
@@ -78,6 +80,8 @@ hooks:
 # always starts a fresh one-turn reviewer and requires an exact-head verdict.
 agent:
   max_concurrent_agents: 10
+  # Per-agent test process fan-out; this does not change max_concurrent_agents.
+  test_worker_limit: 2
   max_turns: 20
   # Soft budgets are policy/strategy signals, never completion or approval gates.
   # Shadow mode records proposed routing and transitions without changing prompts.

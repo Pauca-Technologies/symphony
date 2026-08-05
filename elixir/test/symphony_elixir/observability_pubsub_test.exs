@@ -25,19 +25,14 @@ defmodule SymphonyElixir.ObservabilityPubSubTest do
   end
 
   test "broadcast_update is a no-op when pubsub is unavailable" do
-    pubsub_child_id = Phoenix.PubSub.Supervisor
+    server = Module.concat(__MODULE__, :MissingPubSubCoalescer)
+    missing_pubsub = Module.concat(__MODULE__, :MissingPubSub)
 
-    on_exit(fn ->
-      if Process.whereis(SymphonyElixir.PubSub) == nil do
-        assert {:ok, _pid} =
-                 Supervisor.restart_child(SymphonyElixir.Supervisor, pubsub_child_id)
-      end
-    end)
+    start_supervised!({ObservabilityPubSub, name: server, pubsub: missing_pubsub, coalesce_window_ms: 10_000})
 
-    assert is_pid(Process.whereis(SymphonyElixir.PubSub))
-    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, pubsub_child_id)
-    refute Process.whereis(SymphonyElixir.PubSub)
+    assert :ok = ObservabilityPubSub.broadcast_update(server)
+    send(Process.whereis(server), :flush_update)
 
-    assert :ok = ObservabilityPubSub.broadcast_update()
+    assert %{timer: nil} = :sys.get_state(server)
   end
 end

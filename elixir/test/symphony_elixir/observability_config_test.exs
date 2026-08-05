@@ -8,6 +8,7 @@ defmodule SymphonyElixir.ObservabilityConfigTest do
              Schema.parse(%{
                "observability" => %{
                  "telemetry_retention_days" => 45,
+                 "session_retention_days" => 60,
                  "raw_trace_retention_days" => 14,
                  "raw_trace_policy" => "sampled",
                  "raw_trace_sample_rate" => 0.25,
@@ -19,6 +20,7 @@ defmodule SymphonyElixir.ObservabilityConfigTest do
              })
 
     assert settings.observability.telemetry_retention_days == 45
+    assert settings.observability.session_retention_days == 60
     assert settings.observability.raw_trace_retention_days == 14
     assert settings.observability.raw_trace_policy == "sampled"
     assert settings.observability.raw_trace_sample_rate == 0.25
@@ -33,6 +35,7 @@ defmodule SymphonyElixir.ObservabilityConfigTest do
              Schema.parse(%{
                "observability" => %{
                  "telemetry_retention_days" => 29,
+                 "session_retention_days" => 6,
                  "raw_trace_retention_days" => 6,
                  "raw_trace_sample_rate" => 2.0,
                  "raw_trace_policy" => "sometimes"
@@ -40,6 +43,7 @@ defmodule SymphonyElixir.ObservabilityConfigTest do
              })
 
     assert message =~ "telemetry_retention_days"
+    assert message =~ "session_retention_days"
     assert message =~ "raw_trace_retention_days"
     assert message =~ "raw_trace_sample_rate"
     assert message =~ "raw_trace_policy"

@@ -2137,6 +2137,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ remote_workspace
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"
+      assert argv_line =~ "export SYMPHONY_TEST_WORKER_LIMIT=2"
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
@@ -2326,6 +2327,7 @@ defmodule SymphonyElixir.AppServerTest do
       #!/bin/sh
       trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-withhold-linear.trace}"
       printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace_file"
+      printf 'ENV:SYMPHONY_TEST_WORKER_LIMIT=[%s]\\n' "$SYMPHONY_TEST_WORKER_LIMIT" >> "$trace_file"
 
       count=0
       while IFS= read -r line; do
@@ -2375,6 +2377,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       trace = File.read!(trace_file)
       assert trace =~ "ENV:LINEAR_API_KEY=[]"
+      assert trace =~ "ENV:SYMPHONY_TEST_WORKER_LIMIT=[2]"
       refute trace =~ secret
     after
       File.rm_rf(test_root)

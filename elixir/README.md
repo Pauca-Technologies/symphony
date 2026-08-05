@@ -260,6 +260,12 @@ Notes:
   is run through the same sanitizer as a command-sourced file. Unset ⇒ launches are byte-for-byte
   unchanged. (With it set, you can drop the `sh -lc '… && exec …'` sourcing wrapper from
   `codex.command` and leave just the bare agent invocation.)
+- `agent.test_worker_limit` (default `2`) bounds test-runner fan-out inside each agent without
+  changing `agent.max_concurrent_agents`. Every backend receives
+  `SYMPHONY_TEST_WORKER_LIMIT`; the first-turn prompt directs agents to pass
+  [`--maxWorkers=<limit>`](https://vitest.dev/config/maxworkers) to Vitest and
+  [`--workers=<limit>`](https://playwright.dev/docs/test-parallel#limit-workers) to Playwright (or
+  read the neutral variable from repository runner config).
 - `agent.label_presets` chooses the backend (and model) **per task** from the issue's Linear labels,
   overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
   whose `label` is present on the issue wins (positional precedence — list order, first match), and
@@ -531,6 +537,10 @@ codex:
   Keep this mode disabled during normal operation.
 - To render a transcript in a human-readable terminal format, run
   `bin/codex-session-log log/codex_sessions/<session-file>.ndjson`.
+- Compact session-log retention is configured with `observability.session_retention_days` (default
+  30). `mix session_logs.prune --root <codex_sessions-dir>` is always a dry run unless `--apply` is
+  explicit, reports selected file/byte totals, and protects active marker paths. See the
+  [safe rollout and cleanup runbook](docs/operations.md).
 
 ## Web dashboard
 

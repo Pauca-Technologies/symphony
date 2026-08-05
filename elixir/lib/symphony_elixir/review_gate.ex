@@ -82,6 +82,7 @@ defmodule SymphonyElixir.ReviewGate do
     ReviewPacket,
     ReviewTelemetry,
     Telemetry,
+    TestWorkerBudget,
     Tracker
   }
 
@@ -808,7 +809,10 @@ defmodule SymphonyElixir.ReviewGate do
         attachment_urls: []
     }
 
-    prompt = PromptBuilder.build_prompt(thin_issue, per_repo_workflow: review_workflow)
+    prompt =
+      PromptBuilder.build_prompt(thin_issue, per_repo_workflow: review_workflow) <>
+        "\n\n" <> TestWorkerBudget.prompt_section().content
+
     prompt = add_review_packet_contract(prompt, packet_result, settings)
     prompt = add_review_runtime_stability_guard(prompt)
     prompt = add_review_tool_output_guard(prompt)

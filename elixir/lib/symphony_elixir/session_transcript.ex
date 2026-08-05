@@ -17,6 +17,7 @@ defmodule SymphonyElixir.SessionTranscript do
 
   @raw_suffix ".raw.ndjson.gz"
   @pending_suffix ".pending"
+  @active_suffix ".active"
   @max_compact_stream_bytes 65_536
   @compact_boundary_events ~w(session_started turn_started turn_completed turn_failed turn_input_required turn_interruption_signal)
   @codex_tool_types ~w(commandExecution dynamicToolCall fileChange mcpToolCall collabAgentToolCall webSearch)
@@ -37,6 +38,7 @@ defmodule SymphonyElixir.SessionTranscript do
     raw_path = raw_path(compact_path)
 
     with :ok <- File.mkdir_p(Path.dirname(compact_path)),
+         :ok <- ensure_active_marker(compact_path),
          {:ok, log_entry} <- maybe_append_compact(log_entry, record, policy),
          :ok <- maybe_append_raw(raw_path, record, policy) do
       {:ok,
@@ -58,6 +60,7 @@ defmodule SymphonyElixir.SessionTranscript do
         policy = Map.get(entry, :observability_policy) || Telemetry.observability()
         flush_pending(path, entry)
         finalize_raw(raw_path(path), outcome, policy)
+        remove_active_marker(path)
       end
     end)
 
@@ -96,6 +99,11 @@ defmodule SymphonyElixir.SessionTranscript do
   end
 
   def compact_record?(_record), do: false
+
+  @doc "Return the marker path used to protect an active compact transcript and its raw sidecars."
+  @spec active_marker_path(Path.t()) :: Path.t()
+  def active_marker_path(compact_path) when is_binary(compact_path),
+    do: compact_path <> @active_suffix
 
   @doc "Read compact NDJSON or gzip raw fixtures as decoded records."
   @spec read_records(Path.t()) :: [map()]
@@ -503,6 +511,30 @@ defmodule SymphonyElixir.SessionTranscript do
     end
   end
 
+  defp ensure_active_marker(compact_path) do
+    marker = active_marker_path(compact_path)
+
+    contents =
+      Jason.encode!(%{
+        pid: System.pid(),
+        started_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+      }) <> "\n"
+
+    case File.write(marker, contents, [:exclusive]) do
+      :ok -> :ok
+      {:error, :eexist} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp remove_active_marker(compact_path) do
+    case File.rm(active_marker_path(compact_path)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, _reason} -> :ok
+    end
+  end
+
   defp retain_raw?(_path, _outcome, %{raw_trace_debug: true}), do: true
   defp retain_raw?(_path, _outcome, %{raw_trace_policy: "all"}), do: true
   defp retain_raw?(_path, :failure, _policy), do: true
@@ -547,10 +579,23 @@ defmodule SymphonyElixir.SessionTranscript do
   end
 
   defp prune_raw_file(path, cutoff) do
-    case File.stat(path, time: :posix) do
-      {:ok, %{mtime: mtime}} when mtime < cutoff -> File.rm(path)
-      _current -> :ok
+    if active_raw_path?(path) do
+      :ok
+    else
+      case File.stat(path, time: :posix) do
+        {:ok, %{mtime: mtime}} when mtime < cutoff -> File.rm(path)
+        _current -> :ok
+      end
     end
+  end
+
+  defp active_raw_path?(path) do
+    compact_path =
+      path
+      |> String.replace_suffix(@pending_suffix, "")
+      |> String.replace_suffix(@raw_suffix, ".ndjson")
+
+    File.exists?(active_marker_path(compact_path))
   end
 
   defp terminal_method?(method) when is_binary(method) do

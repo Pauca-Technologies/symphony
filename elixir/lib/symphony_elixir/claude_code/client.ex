@@ -39,7 +39,7 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   require Logger
 
   alias SymphonyElixir.Acp.LinearGate
-  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, Telemetry}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, Telemetry, TestWorkerBudget}
 
   # Same vars the ACP path scrubs; the agent reaches Linear only through the
   # gated MCP tools, which hold the token server-side.
@@ -499,7 +499,7 @@ defmodule SymphonyElixir.ClaudeCode.Client do
       [
         {~c"SYMPHONY_RUN", ~c"1"},
         {~c"SYMPHONY_AGENT", ~c"1"}
-      ] ++ issue_context_env(issue_context_file)
+      ] ++ TestWorkerBudget.port_env() ++ issue_context_env(issue_context_file)
 
     if cc.withhold_linear_credentials do
       base ++ Enum.map(@linear_credential_env_vars, &{&1, false})

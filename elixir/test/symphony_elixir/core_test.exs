@@ -1000,11 +1000,17 @@ defmodule SymphonyElixir.CoreTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
     send(pid, {:retry_issue, issue_id, retry_token})
-    Process.sleep(100)
+    :sys.get_state(pid)
 
     dispatches =
       SymphonyElixir.Telemetry.read_events(Date.utc_today(), Date.utc_today())
-      |> Enum.filter(&(&1["event"] == "scheduling" and &1["action"] == "dispatch" and &1["issue_id"] == issue_id))
+      |> Enum.filter(fn event ->
+        event["event"] == "scheduling" and
+          event["action"] == "dispatch" and
+          event["issue_id"] == issue_id and
+          is_integer(event["queue_time_ms"]) and
+          event["queue_time_ms"] >= 1_500
+      end)
 
     assert [%{"queue_time_ms" => queue_time_ms}] = dispatches
     assert queue_time_ms >= 1_500
@@ -1935,7 +1941,7 @@ defmodule SymphonyElixir.CoreTest do
                         issue_id: "issue-continue",
                         issue_identifier: "MT-247",
                         prompt_kind: "initial",
-                        included_sections: ["task_context", "repository_workflow"],
+                        included_sections: ["task_context", "repository_workflow", "test_worker_budget"],
                         turn_number: 1,
                         max_turns: 3
                       }}
@@ -2129,7 +2135,7 @@ defmodule SymphonyElixir.CoreTest do
       assert_receive {:remediation_prompt_built,
                       %{
                         prompt_kind: "initial",
-                        included_sections: ["task_context", "repository_workflow"],
+                        included_sections: ["task_context", "repository_workflow", "test_worker_budget"],
                         turn_number: 1
                       }}
 

@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @behaviour SymphonyElixir.AgentBackend
 
   require Logger
-  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, PathSafety, SSH, Telemetry}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, PathSafety, SSH, Telemetry, TestWorkerBudget}
   alias SymphonyElixir.Codex.InterruptionClassifier
 
   @initialize_id 1
@@ -342,7 +342,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       [
         {~c"SYMPHONY_RUN", ~c"1"},
         {~c"SYMPHONY_AGENT", ~c"1"}
-      ] ++ issue_context_env(issue_context_file)
+      ] ++ TestWorkerBudget.port_env() ++ issue_context_env(issue_context_file)
 
     if Config.settings!().codex.withhold_linear_credentials do
       # A `false` value tells Port.open's `env:` option to unset the variable in
@@ -448,6 +448,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       remote_unset_linear_credentials(),
       "export SYMPHONY_RUN=1",
       "export SYMPHONY_AGENT=1",
+      TestWorkerBudget.shell_export(),
       remote_issue_context_export(issue_context_file),
       AgentTransport.with_pre_command("exec #{Config.settings!().codex.command}")
     ]

@@ -43,6 +43,7 @@ defmodule SymphonyElixirWeb.ObservabilityPubSub do
     {:ok,
      %{
        coalesce_window_ms: Keyword.get(opts, :coalesce_window_ms, @default_coalesce_window_ms),
+       pubsub: Keyword.get(opts, :pubsub, @pubsub),
        timer: nil
      }}
   end
@@ -57,13 +58,13 @@ defmodule SymphonyElixirWeb.ObservabilityPubSub do
 
   @impl true
   def handle_info(:flush_update, state) do
-    broadcast_now()
+    broadcast_now(state.pubsub)
     {:noreply, %{state | timer: nil}}
   end
 
-  defp broadcast_now do
-    case Process.whereis(@pubsub) do
-      pid when is_pid(pid) -> Phoenix.PubSub.broadcast(@pubsub, @topic, @update_message)
+  defp broadcast_now(pubsub) do
+    case Process.whereis(pubsub) do
+      pid when is_pid(pid) -> Phoenix.PubSub.broadcast(pubsub, @topic, @update_message)
       _ -> :ok
     end
   end

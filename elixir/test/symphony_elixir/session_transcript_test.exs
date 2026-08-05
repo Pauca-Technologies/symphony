@@ -23,8 +23,10 @@ defmodule SymphonyElixir.SessionTranscriptTest do
       })
 
     assert {:ok, entry} = SessionTranscript.persist(entry, delta)
+    assert File.exists?(SessionTranscript.active_marker_path(path))
     assert {:ok, entry} = SessionTranscript.persist(entry, completed)
     assert :ok = SessionTranscript.finalize([entry], :failure)
+    refute File.exists?(SessionTranscript.active_marker_path(path))
 
     compact = SessionTranscript.read_records(path)
     raw = SessionTranscript.read_records(String.replace_suffix(path, ".ndjson", ".raw.ndjson.gz"))
@@ -42,6 +44,38 @@ defmodule SymphonyElixir.SessionTranscriptTest do
 
     raw_path = String.replace_suffix(path, ".ndjson", ".raw.ndjson.gz")
     refute File.exists?(raw_path <> ".pending")
+  end
+
+  test "raw retention pruning never removes another active session sidecar", %{root: root} do
+    policy = SymphonyElixir.Telemetry.observability()
+    active_path = Path.join(root, "active-session.ndjson")
+    active_entry = %{session_id: "active-thread", path: active_path}
+
+    assert {:ok, active_entry} =
+             SessionTranscript.persist(
+               active_entry,
+               record("notification", "error", %{"message" => "active"}),
+               policy
+             )
+
+    active_pending = active_entry.raw_trace_pending_path
+    File.touch!(active_pending, System.system_time(:second) - 8 * 86_400)
+
+    completed_path = Path.join(root, "completed-session.ndjson")
+    completed_entry = %{session_id: "completed-thread", path: completed_path}
+
+    assert {:ok, completed_entry} =
+             SessionTranscript.persist(
+               completed_entry,
+               record("notification", "error", %{"message" => "completed"}),
+               policy
+             )
+
+    assert :ok = SessionTranscript.finalize([completed_entry], :failure)
+    assert File.exists?(active_pending)
+    assert File.exists?(SessionTranscript.active_marker_path(active_path))
+
+    assert :ok = SessionTranscript.finalize([active_entry], :success)
   end
 
   test "streaming and token chatter is coalesced from compact NDJSON", %{root: root} do

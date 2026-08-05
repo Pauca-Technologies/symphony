@@ -120,6 +120,7 @@ defmodule SymphonyElixir.TestSupport do
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
+          test_worker_limit: nil,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_retries: nil,
@@ -180,6 +181,7 @@ defmodule SymphonyElixir.TestSupport do
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
+    test_worker_limit = Keyword.get(config, :test_worker_limit)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_retries = Keyword.get(config, :max_retries)
@@ -244,6 +246,7 @@ defmodule SymphonyElixir.TestSupport do
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
+        test_worker_limit && "  test_worker_limit: #{yaml_value(test_worker_limit)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         max_retries && "  max_retries: #{yaml_value(max_retries)}",

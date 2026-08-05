@@ -29,6 +29,7 @@ defmodule SymphonyElixir.AgentRunner do
     SessionStartHook,
     TaskContextPrompt,
     Telemetry,
+    TestWorkerBudget,
     Tracker,
     Workspace
   }
@@ -874,6 +875,7 @@ defmodule SymphonyElixir.AgentRunner do
       TaskContextPrompt.sections(issue, Keyword.get(opts, :session_start_result)) ++
         [
           PromptBuilder.build_section(issue, opts),
+          TestWorkerBudget.prompt_section(),
           prompt_section(
             "review.open_findings",
             :open_findings,
@@ -1897,6 +1899,7 @@ defmodule SymphonyElixir.AgentRunner do
             "task.issue",
             "task.startup_artifacts",
             "repository.workflow",
+            "symphony.test_worker_budget",
             "symphony.handoff_constraints"
           ])
     )
@@ -1909,6 +1912,7 @@ defmodule SymphonyElixir.AgentRunner do
       "task.current_metadata" when prompt_kind == "continuation" -> nil
       "task." <> _rest -> "task_context"
       "repository.workflow" -> "repository_workflow"
+      "symphony.test_worker_budget" -> "test_worker_budget"
       "symphony.handoff_constraints" -> "handoff_tool_guidance"
       "review.open_findings" -> "handoff_gate_remediation"
       "efficiency.current_strategy" -> "efficiency_strategy"

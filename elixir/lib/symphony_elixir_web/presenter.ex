@@ -472,24 +472,50 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp live_transcript_blocks(entry, path, file_info, transcript_cache) do
-    case Map.get(transcript_cache, path) do
-      %{identity: identity, offset: offset, mtime: mtime} = cached
-      when identity == file_info.identity and offset == file_info.size and mtime == file_info.mtime ->
-        {cached.blocks, cached.truncated, transcript_cache}
-
-      %{identity: identity, offset: offset}
-      when identity == file_info.identity and offset == file_info.size ->
-        seed_live_transcript(entry, path, file_info, transcript_cache)
-
-      %{identity: identity, offset: offset} = cached
-      when identity == file_info.identity and offset <= file_info.size and
-             file_info.size - offset <= @live_transcript_read_limit ->
-        append_live_transcript(entry, path, file_info, cached, transcript_cache)
-
-      _stale_or_missing ->
-        seed_live_transcript(entry, path, file_info, transcript_cache)
-    end
+    transcript_cache
+    |> Map.get(path)
+    |> resolve_live_transcript_cache(entry, path, file_info, transcript_cache)
   end
+
+  defp resolve_live_transcript_cache(
+         %{identity: identity, offset: offset, mtime: mtime} = cached,
+         _entry,
+         _path,
+         file_info,
+         transcript_cache
+       )
+       when identity == file_info.identity and offset == file_info.size and mtime == file_info.mtime,
+       do: {cached.blocks, cached.truncated, transcript_cache}
+
+  defp resolve_live_transcript_cache(
+         %{identity: identity, offset: offset},
+         entry,
+         path,
+         file_info,
+         transcript_cache
+       )
+       when identity == file_info.identity and offset == file_info.size,
+       do: seed_live_transcript(entry, path, file_info, transcript_cache)
+
+  defp resolve_live_transcript_cache(
+         %{identity: identity, offset: offset} = cached,
+         entry,
+         path,
+         file_info,
+         transcript_cache
+       )
+       when identity == file_info.identity and offset <= file_info.size and
+              file_info.size - offset <= @live_transcript_read_limit,
+       do: append_live_transcript(entry, path, file_info, cached, transcript_cache)
+
+  defp resolve_live_transcript_cache(
+         _stale_or_missing,
+         entry,
+         path,
+         file_info,
+         transcript_cache
+       ),
+       do: seed_live_transcript(entry, path, file_info, transcript_cache)
 
   defp append_live_transcript(entry, path, file_info, cached, transcript_cache) do
     if cached_sentinel_matches?(path, cached) do

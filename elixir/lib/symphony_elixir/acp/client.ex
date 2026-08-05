@@ -29,7 +29,7 @@ defmodule SymphonyElixir.Acp.Client do
   require Logger
 
   alias SymphonyElixir.Acp.LinearGate
-  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, Telemetry}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, Telemetry, TestWorkerBudget}
 
   @initialize_id 1
   @session_new_id 2
@@ -676,7 +676,7 @@ defmodule SymphonyElixir.Acp.Client do
       [
         {~c"SYMPHONY_RUN", ~c"1"},
         {~c"SYMPHONY_AGENT", ~c"1"}
-      ] ++ issue_context_env(issue_context_file) ++ model_env(acp)
+      ] ++ TestWorkerBudget.port_env() ++ issue_context_env(issue_context_file) ++ model_env(acp)
 
     if acp.withhold_linear_credentials do
       base ++ Enum.map(@linear_credential_env_vars, &{&1, false})

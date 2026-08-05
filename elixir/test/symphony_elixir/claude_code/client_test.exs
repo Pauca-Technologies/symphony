@@ -192,6 +192,7 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
       env_lines = trace |> File.read!() |> String.split("\n", trim: true)
       assert "ENV:LINEAR_API_KEY=[]" in env_lines
       assert "ENV:SYMPHONY_ISSUE_CONTEXT_FILE=[#{issue_context_file}]" in env_lines
+      assert "ENV:SYMPHONY_TEST_WORKER_LIMIT=[2]" in env_lines
     end)
   end
 
@@ -355,6 +356,7 @@ defmodule SymphonyElixir.ClaudeCode.ClientTest do
       printf 'ARGV:%s\\n' "$*" >> "$trace"
       printf 'ENV:LINEAR_API_KEY=[%s]\\n' "$LINEAR_API_KEY" >> "$trace"
       printf 'ENV:SYMPHONY_ISSUE_CONTEXT_FILE=[%s]\\n' "$SYMPHONY_ISSUE_CONTEXT_FILE" >> "$trace"
+      printf 'ENV:SYMPHONY_TEST_WORKER_LIMIT=[%s]\\n' "$SYMPHONY_TEST_WORKER_LIMIT" >> "$trace"
       printf 'ENV:CC_PRECMD=[%s]\\n' "$CC_PRECMD" >> "$trace"
     fi
     IFS= read -r line

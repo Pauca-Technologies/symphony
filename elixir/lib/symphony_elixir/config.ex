@@ -71,6 +71,7 @@ defmodule SymphonyElixir.Config do
           refresh_ms: pos_integer(),
           render_interval_ms: pos_integer(),
           telemetry_retention_days: pos_integer(),
+          session_retention_days: pos_integer(),
           raw_trace_retention_days: pos_integer(),
           raw_trace_policy: String.t(),
           raw_trace_sample_rate: float(),

@@ -382,7 +382,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
                "task.issue",
                "task.current_metadata",
                "task.activity",
-               "repository.workflow"
+               "repository.workflow",
+               "symphony.test_worker_budget"
              ]
 
       assert_receive {:activity_prompt_telemetry,
@@ -404,6 +405,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       assert Enum.sort(reused_ids) == [
                "repository.workflow",
+               "symphony.test_worker_budget",
                "task.current_metadata",
                "task.issue"
              ]
@@ -671,6 +673,9 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert prompt =~ "This issue is marked `needs-human-input`"
       assert prompt =~ "Remove the label only after consuming that response."
       assert prompt =~ "Earlier Linear comments were omitted"
+      assert prompt =~ "## Host test-worker budget"
+      assert prompt =~ "vitest --maxWorkers=2"
+      assert prompt =~ "playwright test --workers=2"
     end
 
     test "preserves injected comments when state refresh builds a continuation issue" do

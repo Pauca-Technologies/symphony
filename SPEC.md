@@ -439,6 +439,11 @@ Fields:
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
+- `test_worker_limit` (positive integer, OPTIONAL extension)
+  - Default: `2`.
+  - Bounds test-runner worker processes inside each agent; it MUST NOT reduce agent-slot concurrency.
+  - The effective value SHOULD be exposed as `SYMPHONY_TEST_WORKER_LIMIT` and in first-turn runtime
+    guidance with runner-supported options.
 - `max_turns` (positive integer)
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
@@ -649,6 +654,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
+- `agent.test_worker_limit`: positive integer, default `2` (OPTIONAL extension)
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
@@ -1638,7 +1644,9 @@ instead of opaque content. Operator-configured redaction names SHOULD extend a m
 baseline rather than permit an empty/custom list to disable baseline privacy protection.
 
 Compact lifecycle/error analytics SHOULD support rolling 7- and 30-day analysis. Retention policy
-MUST define durations, sampling, privacy, recursive secret-field redaction, and cleanup. Benign
+MUST define durations, sampling, privacy, recursive secret-field redaction, and cleanup. Destructive
+session-log cleanup SHOULD be dry-run by default, require explicit apply intent, report selected and
+reclaimed bytes, and protect active session paths. Benign
 per-notification debug logs SHOULD be disabled by default so lifecycle/error history is not rotated
 away by streaming chatter.
 
