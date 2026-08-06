@@ -129,7 +129,7 @@ Work only in the provided repository copy. Do not touch any other path.
 ## Linear tools
 
 The Symphony-owned task context above is normally sufficient. Read its issue details, current Linear activity, and any annotated startup artifacts before acting. If the activity is truncated or newer live Linear activity would materially affect the work, use `linear_graphql` for an explicit query.
-If `needs-human-input` is present, reconcile the human response after the blocker into the workpad before any repository work, then remove the label only after consuming that response.
+If `needs-human-input` is present, reconcile the human response after the blocker into the workpad before any repository work, then remove the label only after consuming that response. Exception: when Symphony's host-owned authorization guidance says this issue's configured opt-in label authorizes a verified hook-injected bot/App identity, a prior request for separate bot-attribution authorization is stale; correct the workpad, remove `needs-human-input` when it represented only that claim, and continue without another human comment.
 When moving an issue from `In Progress` to `In Review` or `Human Review`, use `linear_graphql` for the Linear `issueUpdate` mutation so Symphony can run the handoff gates. Do not use native Linear MCP `save_issue` for that state change.
 
 ## Default posture

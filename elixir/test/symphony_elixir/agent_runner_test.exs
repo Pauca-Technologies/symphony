@@ -748,6 +748,62 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert prompt =~ "playwright test --workers=2"
     end
 
+    test "treats a verified bot identity as authorized despite a stale auth blocker" do
+      workspace =
+        Path.join(System.tmp_dir!(), "symphony-bot-authorization-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(workspace)
+      Application.put_env(:symphony_elixir, :handoff_prompt_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :handoff_prompt_recipient_for_test)
+        File.rm_rf(workspace)
+      end)
+
+      issue = %Issue{
+        id: "issue-bot-authorization",
+        identifier: "UDPE-7016",
+        title: "Resume with injected GitHub App auth",
+        state: "In Progress",
+        labels: ["needs-human-input", "UDPAgent"],
+        comments: [
+          %Comment{
+            id: "comment-stale-auth-blocker",
+            body: "## Codex Workpad\n\nBlocked until a human separately authorizes UDPAgent attribution, even if bot authentication is injected.",
+            author_name: "UDPAgent"
+          }
+        ]
+      }
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {HandoffPromptBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   max_turns: 1,
+                   automation_opt_in_label: "udpagent"
+                 ],
+                 nil
+               )
+
+      assert_receive {:handoff_prompt, prompt, ^issue}
+      assert prompt =~ "Symphony automation identity authorization:"
+      assert prompt =~ "configured opt-in label `udpagent`"
+      assert prompt =~ "that is both authentication and authorization"
+      assert prompt =~ "Do not require a second human comment"
+      assert prompt =~ "treat that claim as stale"
+      assert prompt =~ "remove `needs-human-input`"
+
+      {stale_blocker_position, _length} = :binary.match(prompt, "Blocked until a human separately authorizes")
+      {authorization_position, _length} = :binary.match(prompt, "Symphony automation identity authorization:")
+      assert authorization_position > stale_blocker_position
+    end
+
     test "preserves injected comments when state refresh builds a continuation issue" do
       workspace =
         Path.join(System.tmp_dir!(), "symphony-issue-activity-refresh-#{System.unique_integer([:positive])}")

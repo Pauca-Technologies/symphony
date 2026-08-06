@@ -173,6 +173,11 @@ Notes:
   canonical section. Similar or distinct repository rules are preserved and reported as ambiguous
   overlap rather than being deleted heuristically. Continuations reuse version/hash identities in
   a bounded capsule and include changed current candidate metadata plus only current open findings.
+- When an issue carries the host-configured Linear opt-in label, the host-owned constraints state
+  that repository-hook-injected bot/App credentials are authorized for that unattended run. A
+  verified injected bot identity resolves a stale GitHub-attribution blocker without requiring a
+  second human comment or personal `gh` login; genuinely missing or insufficient credentials can
+  still block after in-session recovery is exhausted.
 - In multi-repository mode, each `repos[]` entry in host-owned
   `~/.symphony/config.yml` has a repository concurrency and overlap policy:
 

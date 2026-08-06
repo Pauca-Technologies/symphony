@@ -150,7 +150,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
-    routed_repo = resolve_routed_repo(issue)
+    {routed_repo, automation_opt_in_label} = resolve_routing_context(issue)
 
     workspace_opts =
       []
@@ -174,6 +174,7 @@ defmodule SymphonyElixir.AgentRunner do
           opts
           |> Keyword.put_new(:issue_comments_fetcher, &Tracker.fetch_issue_comments/1)
           |> maybe_put(:repository_id, routed_repo && routed_repo.id)
+          |> maybe_put(:automation_opt_in_label, automation_opt_in_label)
           |> maybe_put(:base_drift_ref, routed_repo && routed_repo.base_branch)
 
         # When Symphony did the worktree clone (routed_repo present),
@@ -299,20 +300,23 @@ defmodule SymphonyElixir.AgentRunner do
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 
-  defp resolve_routed_repo(%Issue{} = issue) do
+  defp resolve_routing_context(%Issue{} = issue) do
     case RepoConfig.load() do
       {:ok, config} ->
-        case Router.route(issue, config) do
-          {:ok, repo} -> repo
-          _ -> nil
-        end
+        routed_repo =
+          case Router.route(issue, config) do
+            {:ok, repo} -> repo
+            _ -> nil
+          end
+
+        {routed_repo, config.linear.filter_label}
 
       _ ->
-        nil
+        {nil, nil}
     end
   end
 
-  defp resolve_routed_repo(_issue), do: nil
+  defp resolve_routing_context(_issue), do: {nil, nil}
 
   # Load `<workspace>/<workflow_path>` after Symphony has populated the
   # worktree. Returns nil when there's no routed_repo (legacy single-repo
@@ -921,7 +925,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
-    handoff_guidance = handoff_tool_guidance(opts)
+    handoff_guidance = handoff_tool_guidance(issue, opts)
     handoff_gate_prompt = Keyword.get(opts, :handoff_gate_prompt)
 
     sections =
@@ -2061,7 +2065,9 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp handoff_tool_guidance(opts) do
+  defp handoff_tool_guidance(issue, opts) do
+    identity_guidance = automation_identity_guidance(issue, opts)
+
     waiting_guidance = """
     Symphony waiting requirement:
 
@@ -2082,10 +2088,39 @@ defmodule SymphonyElixir.AgentRunner do
         ""
       end
 
-    [waiting_guidance, handoff_guidance]
+    [identity_guidance, waiting_guidance, handoff_guidance]
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n\n")
+  end
+
+  defp automation_identity_guidance(%Issue{labels: labels}, opts) when is_list(labels) do
+    opt_in_label = Keyword.get(opts, :automation_opt_in_label)
+
+    if issue_has_label?(labels, opt_in_label) do
+      """
+      Symphony automation identity authorization:
+
+      - This issue carries Symphony's configured opt-in label `#{opt_in_label}`. That label is explicit authorization for this unattended run to use the bot or GitHub App identity installed by trusted host and repository startup hooks for git and GitHub work.
+      - Verify the injected identity before publishing. If hook-provided bot mode is active (for example `UDP_BOT_MODE=1`) and `gh auth status` identifies the expected bot, that is both authentication and authorization. Do not require a second human comment, restore a personal `gh` login, or block solely because work will be attributed to the bot.
+      - If an older workpad or `needs-human-input` label says the verified bot identity still needs separate attribution authorization, treat that claim as stale: correct the workpad, remove `needs-human-input` when it represented only that claim, and continue.
+      - Authentication remains a valid blocker only when the injected identity is absent, invalid, or lacks a required permission after available in-session recovery has been attempted.
+      """
+      |> String.trim()
+    else
+      ""
+    end
+  end
+
+  defp automation_identity_guidance(_issue, _opts), do: ""
+
+  defp issue_has_label?(_labels, label) when not is_binary(label), do: false
+
+  defp issue_has_label?(labels, label) do
+    normalized_label = String.downcase(String.trim(label))
+
+    normalized_label != "" and
+      Enum.any?(labels, &(is_binary(&1) and String.downcase(String.trim(&1)) == normalized_label))
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, opts)

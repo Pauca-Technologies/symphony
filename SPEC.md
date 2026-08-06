@@ -712,6 +712,11 @@ Important nuance:
 - The first turn SHOULD use typed prompt sections with stable semantic IDs, source identity,
   renderer version, content hash, and byte/token estimates. The canonical task sections own issue
   details and current tracker activity, followed by the rendered repository workflow rules.
+- When an issue carries the host-configured tracker opt-in label, a host-owned constraint SHOULD
+  make explicit that bot or App credentials installed by trusted startup hooks are authorized for
+  that unattended run. After the agent verifies the injected identity, stale workpad claims that
+  bot attribution still needs a separate human authorization MUST NOT cause a Blocked transition;
+  missing, invalid, or insufficient credentials remain valid blockers after in-session recovery.
 - Exact issue prose repeated by the repository workflow MAY be suppressed when the canonical task
   section is present. Formatting-only equivalent rules MAY be suppressed only when ownership and
   precedence are explicit. Similar or ambiguous safety, tenant/auth, validation, acceptance, and
