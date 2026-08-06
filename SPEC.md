@@ -682,7 +682,7 @@ claim state.
 
 2. `Claimed`
    - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
+   - In practice, claimed issues are `Running`, `RetryQueued`, or `Waiting`.
 
 3. `Running`
    - Worker task exists and the issue is tracked in `running` map.
@@ -690,7 +690,12 @@ claim state.
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
 
-5. `Released`
+5. `Waiting`
+   - Worker is not running and consumes no agent slot.
+   - A durable, non-LLM watcher owns a typed external condition and resumes the issue through the
+     normal priority/concurrency scheduler after that condition changes.
+
+6. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -726,6 +731,9 @@ Important nuance:
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
+- If the worker successfully requests a typed external wait, normal exit parks the issue instead
+  of scheduling the short continuation retry. The workspace is retained and the claim remains
+  held so ordinary tracker polling cannot create a duplicate worker.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -1319,7 +1327,7 @@ Unsupported dynamic tool calls:
 Optional client-side tool extension:
 
 - An implementation MAY expose a limited set of client-side tools to the app-server session.
-- Current standardized optional tool: `linear_graphql`.
+- Current standardized optional tools: `linear_graphql` and `wait_for`.
 - If implemented, supported tools SHOULD be advertised to the app-server session during startup
   using the protocol mechanism supported by the targeted Codex app-server version.
 - Unsupported tool names SHOULD still return a failure result using the targeted protocol and
@@ -1360,6 +1368,25 @@ Optional client-side tool extension:
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
 
+`wait_for` extension contract:
+
+- Purpose: stop spending model turns while useful work is blocked only on an external state change.
+- The request MUST include a non-empty reason and one typed condition. Standard condition types are
+  GitHub Actions component recovery, GitHub PR-check state changes, git-ref SHA changes, Linear
+  issue/comment changes, and a future timestamp.
+- Change-based conditions MUST include the observation the agent just saw. The watcher MUST NOT
+  resume merely because it observed the same value again.
+- A successful tool call records the request in the worker lifecycle. The agent SHOULD end its turn;
+  on normal worker exit, the orchestrator retains the workspace and claim, persists the wait, and
+  releases the agent slot.
+- Probes MUST run outside coding-agent/model sessions. Identical condition keys SHOULD share one
+  probe, with bounded exponential backoff for unchanged or failed probes.
+- A changed condition MUST re-enter the normal priority, dependency, capacity, and concurrency
+  scheduler exactly once with a compact prompt describing the state change. Durable ready state
+  SHOULD remain until a replacement worker has actually started.
+- Operators SHOULD be able to resume immediately or cancel the external condition. Cancelling a
+  wait returns the still-active issue to normal scheduling; it does not abandon the tracker issue.
+
 User-input-required policy:
 
 - Implementations MUST document how targeted-protocol user-input-required signals are handled.
@@ -1373,7 +1400,7 @@ User-input-required policy:
 Timeouts:
 
 - `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: total turn stream timeout
+- `codex.turn_timeout_ms`: absolute wall-clock turn timeout; streamed activity MUST NOT reset it
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):
@@ -1576,6 +1603,7 @@ SHOULD return:
 - when issue-aware routing is enabled, each running row SHOULD expose the selected reasoning effort
   and profile
 - `retrying` (list of retry queue rows)
+- `waiting` (list of durable external-condition wait rows)
 - `codex_totals`
   - `input_tokens`
   - `output_tokens`
@@ -1907,6 +1935,10 @@ Minimum endpoints:
     stopping live workers.
 - `POST /api/v1/resume` (extension)
   - Cancels drain mode and schedules an immediate tracker poll.
+- `POST /api/v1/waits/:issue_identifier/resume` (extension)
+  - Wakes one parked issue without waiting for its next probe.
+- `POST /api/v1/waits/:issue_identifier/cancel` (extension)
+  - Cancels the external wait and returns the active issue to normal scheduling.
 
 API design notes:
 
@@ -1989,6 +2021,8 @@ requiring a database or attempting to reattach an Erlang port from a new VM.
 After restart:
 
 - No retry timers are restored from prior process memory.
+- Durable external-condition waits and ready wake-ups MAY be restored independently of the general
+  retry queue. Restored waits retain their claims and resume through the normal scheduler.
 - A baseline implementation MAY assume no running sessions are recoverable and recover by:
   - startup terminal workspace cleanup
   - fresh polling of active issues
@@ -2003,6 +2037,7 @@ Operators can control behavior by:
 
 - Enabling persisted drain mode to pause new work while live workers continue, then cancelling it
   to resume normal dispatch.
+- Resuming one parked wait immediately or cancelling its external condition from the dashboard/API.
 - Editing `WORKFLOW.md` (prompt and most runtime settings).
 - `WORKFLOW.md` changes are detected and re-applied automatically without restart according to
   Section 6.2.

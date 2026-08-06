@@ -40,6 +40,7 @@ defmodule SymphonyElixir.AgentRunner do
   @handoff_gate_infrastructure_failure_key {__MODULE__, :handoff_gate_infrastructure_failure}
   @deferred_handoff_gate_key {__MODULE__, :deferred_handoff_gate}
   @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
+  @agent_wait_request_key {__MODULE__, :agent_wait_request}
 
   # See T04 in /data/projects/coding-harness/implementation-plan.md and audit §5.1 O9.
   # Symphony silently giving up on terminal failure is a trust-killer; we mark the
@@ -767,51 +768,26 @@ defmodule SymphonyElixir.AgentRunner do
           )
 
         infrastructure_failure = pop_handoff_infrastructure_failure()
+        wait_request = pop_agent_wait_request()
+        continuation = continue_with_issue?(issue, issue_state_fetcher, opts)
 
-        case {continue_with_issue?(issue, issue_state_fetcher, opts), infrastructure_failure} do
-          {{:continue, _refreshed_issue}, failure} when not is_nil(failure) ->
-            {:error, failure}
-
-          {{:continue, refreshed_issue}, nil} when turn_number < max_turns ->
-            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-            do_run_codex_turns(
-              backend,
-              app_session,
-              workspace,
-              refreshed_issue,
-              codex_update_recipient,
-              opts
-              |> Keyword.put(:handoff_gate_prompt, handoff_gate_prompt)
-              |> Keyword.put(:prompt_composition_state, prompt_composition.state),
-              issue_state_fetcher,
-              {turn_number + 1, max_turns}
-            )
-
-          {{:continue, refreshed_issue}, nil} when is_binary(handoff_gate_prompt) ->
-            continue_terminal_gate_remediation(%{
-              backend: backend,
-              app_session: app_session,
-              workspace: workspace,
-              issue: refreshed_issue,
-              recipient: codex_update_recipient,
-              opts: opts,
-              prompt: handoff_gate_prompt,
-              prompt_state: prompt_composition.state,
-              issue_state_fetcher: issue_state_fetcher,
-              turn_number: turn_number,
-              max_turns: max_turns
-            })
-
-          {{:continue, refreshed_issue}, nil} ->
-            finish_max_turns(refreshed_issue, turn_number, max_turns)
-
-          {{:done, _refreshed_issue}, _failure} ->
-            :ok
-
-          {{:error, reason}, _failure} ->
-            {:error, reason}
-        end
+        finish_successful_turn(
+          %{
+            backend: backend,
+            app_session: app_session,
+            workspace: workspace,
+            recipient: codex_update_recipient,
+            opts: opts,
+            handoff_gate_prompt: handoff_gate_prompt,
+            prompt_state: prompt_composition.state,
+            issue_state_fetcher: issue_state_fetcher,
+            turn_number: turn_number,
+            max_turns: max_turns
+          },
+          continuation,
+          infrastructure_failure,
+          wait_request
+        )
 
       {:error, reason} = error ->
         # Abnormal turn completion (an interruption surfaces as
@@ -845,6 +821,74 @@ defmodule SymphonyElixir.AgentRunner do
         error
     end
   end
+
+  defp finish_successful_turn(context, {:continue, refreshed_issue}, nil, %{} = request) do
+    :ok =
+      transition_agent_lifecycle(context.recipient, refreshed_issue, :waiting, %{
+        request: request
+      })
+
+    Logger.info("Parking agent work for #{issue_context(refreshed_issue)} condition_key=#{request.condition_key} reason=#{inspect(request.reason)}")
+    :ok
+  end
+
+  defp finish_successful_turn(context, continuation, infrastructure_failure, _wait_request) do
+    continue_successful_turn(context, continuation, infrastructure_failure)
+  end
+
+  defp continue_successful_turn(_context, {:continue, _refreshed_issue}, failure)
+       when not is_nil(failure),
+       do: {:error, failure}
+
+  defp continue_successful_turn(
+         %{turn_number: turn_number, max_turns: max_turns} = context,
+         {:continue, refreshed_issue},
+         nil
+       )
+       when turn_number < max_turns do
+    Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+
+    do_run_codex_turns(
+      context.backend,
+      context.app_session,
+      context.workspace,
+      refreshed_issue,
+      context.recipient,
+      context.opts
+      |> Keyword.put(:handoff_gate_prompt, context.handoff_gate_prompt)
+      |> Keyword.put(:prompt_composition_state, context.prompt_state),
+      context.issue_state_fetcher,
+      {turn_number + 1, max_turns}
+    )
+  end
+
+  defp continue_successful_turn(
+         %{handoff_gate_prompt: prompt} = context,
+         {:continue, refreshed_issue},
+         nil
+       )
+       when is_binary(prompt) do
+    continue_terminal_gate_remediation(%{
+      backend: context.backend,
+      app_session: context.app_session,
+      workspace: context.workspace,
+      issue: refreshed_issue,
+      recipient: context.recipient,
+      opts: context.opts,
+      prompt: prompt,
+      prompt_state: context.prompt_state,
+      issue_state_fetcher: context.issue_state_fetcher,
+      turn_number: context.turn_number,
+      max_turns: context.max_turns
+    })
+  end
+
+  defp continue_successful_turn(context, {:continue, refreshed_issue}, nil) do
+    finish_max_turns(refreshed_issue, context.turn_number, context.max_turns)
+  end
+
+  defp continue_successful_turn(_context, {:done, _refreshed_issue}, _failure), do: :ok
+  defp continue_successful_turn(_context, {:error, reason}, _failure), do: {:error, reason}
 
   defp finish_max_turns(issue, turn_number, max_turns) do
     Logger.info(
@@ -885,6 +929,14 @@ defmodule SymphonyElixir.AgentRunner do
         [
           PromptBuilder.build_section(issue, opts),
           TestWorkerBudget.prompt_section(),
+          prompt_section(
+            "waiting.resume_event",
+            :wait_resume,
+            "symphony:wait_watcher",
+            "wait-resume/v1",
+            Keyword.get(opts, :wait_resume_prompt),
+            false
+          ),
           prompt_section(
             "review.open_findings",
             :open_findings,
@@ -1050,11 +1102,20 @@ defmodule SymphonyElixir.AgentRunner do
       |> maybe_put_map(:deferred_review_callback, deferred_review_callback(per_repo_review_workflow))
       |> maybe_put_map(:review_opts, review_opts)
 
+    wait_context = %{
+      issue: issue,
+      workspace: workspace,
+      worker_host: worker_host,
+      repository_scope: Keyword.get(opts, :repository_id)
+    }
+
     fn tool, arguments ->
       result =
         DynamicTool.execute(tool, arguments,
           linear_client: linear_client,
-          handoff_gate_context: handoff_context
+          handoff_gate_context: handoff_context,
+          wait_context: wait_context,
+          wait_callback: &store_agent_wait_request/1
         )
 
       maybe_store_handoff_gate_prompt(result)
@@ -1108,6 +1169,15 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp pop_handoff_infrastructure_failure do
     Process.delete(@handoff_gate_infrastructure_failure_key)
+  end
+
+  defp store_agent_wait_request(request) when is_map(request) do
+    Process.put(@agent_wait_request_key, request)
+    :ok
+  end
+
+  defp pop_agent_wait_request do
+    Process.delete(@agent_wait_request_key)
   end
 
   defp persist_deferred_handoff_gate(request) do
@@ -1962,6 +2032,7 @@ defmodule SymphonyElixir.AgentRunner do
       "review.open_findings" -> "handoff_gate_remediation"
       "efficiency.current_strategy" -> "efficiency_strategy"
       "continuation.resume_capsule" -> "continuation_guidance"
+      "waiting.resume_event" -> "wait_resume_event"
       id -> id
     end)
     |> Enum.reject(&is_nil/1)
@@ -1991,18 +2062,30 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp handoff_tool_guidance(opts) do
-    if Keyword.has_key?(opts, :per_repo_before_handoff) or Keyword.has_key?(opts, :per_repo_review_workflow) do
-      """
-      Symphony handoff requirement:
+    waiting_guidance = """
+    Symphony waiting requirement:
 
-      - To move this issue from In Progress to In Review or Human Review, use Symphony's `linear_graphql` tool for the Linear `issueUpdate` mutation.
-      - If that tool returns gate remediation, keep the issue In Progress and address the reported gate failures.
-      - Do not use the native Linear MCP `save_issue` tool for that handoff; it cannot run Symphony's before_handoff and automated review gates.
-      """
-      |> String.trim()
-    else
-      ""
-    end
+    - If useful work cannot continue until an external GitHub, git, Linear, or time condition changes, call Symphony's `wait_for` tool once and end the turn.
+    - Do not spend agent turns repeatedly polling an unchanged external condition. Symphony will persist the wait, free the agent slot, and resume this issue after the condition changes.
+    """
+
+    handoff_guidance =
+      if Keyword.has_key?(opts, :per_repo_before_handoff) or Keyword.has_key?(opts, :per_repo_review_workflow) do
+        """
+        Symphony handoff requirement:
+
+        - To move this issue from In Progress to In Review or Human Review, use Symphony's `linear_graphql` tool for the Linear `issueUpdate` mutation.
+        - If that tool returns gate remediation, keep the issue In Progress and address the reported gate failures.
+        - Do not use the native Linear MCP `save_issue` tool for that handoff; it cannot run Symphony's before_handoff and automated review gates.
+        """
+      else
+        ""
+      end
+
+    [waiting_guidance, handoff_guidance]
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n\n")
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, opts)

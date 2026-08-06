@@ -28,8 +28,11 @@ defmodule SymphonyElixir.PersistentWorker do
   @doc "Launch (or reuse) an issue worker and attach a relay client."
   @spec start(Issue.t(), integer() | nil, String.t() | nil, pid()) ::
           {:ok, attachment()} | {:error, term()}
-  def start(%Issue{} = issue, attempt, worker_host, orchestrator) when is_pid(orchestrator) do
-    case Registry.prepare(issue, attempt, worker_host) do
+  @spec start(Issue.t(), integer() | nil, String.t() | nil, pid(), keyword()) ::
+          {:ok, attachment()} | {:error, term()}
+  def start(%Issue{} = issue, attempt, worker_host, orchestrator, runner_opts \\ [])
+      when is_pid(orchestrator) and is_list(runner_opts) do
+    case Registry.prepare(issue, attempt, worker_host, runner_opts) do
       {:ok, manifest} ->
         with :ok <- Launcher.launch(manifest),
              {:ok, spec} <- Registry.load_spec(manifest),

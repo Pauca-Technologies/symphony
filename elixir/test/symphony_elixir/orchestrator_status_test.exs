@@ -2013,6 +2013,113 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     send(worker_pid, :done)
   end
 
+  test "normal worker exit after waiting lifecycle parks the issue without a retry or agent slot" do
+    issue_id = "issue-parked-wait"
+    orchestrator_name = Module.concat(__MODULE__, :ParkedWaitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    previous_probe = Application.get_env(:symphony_elixir, :wait_condition_probe)
+
+    Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
+      {:unchanged, %{"status" => "degraded"}}
+    end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      SymphonyElixir.WaitWatcher.acknowledge(issue_id)
+
+      if is_nil(previous_probe) do
+        Application.delete_env(:symphony_elixir, :wait_condition_probe)
+      else
+        Application.put_env(:symphony_elixir, :wait_condition_probe, previous_probe)
+      end
+    end)
+
+    parent = self()
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          {:park, orchestrator, request} ->
+            result =
+              GenServer.call(
+                orchestrator,
+                {:agent_lifecycle, issue_id, :waiting, %{request: request}}
+              )
+
+            send(parent, {:parked_lifecycle, result})
+
+            receive do
+              :done -> :ok
+            end
+        end
+      end)
+
+    ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "UDPE-WAIT-PARKED",
+      title: "Park without polling",
+      state: "In Progress",
+      priority: 1,
+      created_at: started_at
+    }
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-waiting",
+      backend: "codex",
+      worker_host: nil,
+      workspace_path: "/tmp/UDPE-WAIT-PARKED",
+      codex_session_logs: [],
+      recent_codex_transcript_blocks: [],
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      lifecycle_state: :implementing,
+      lifecycle_started_at: started_at,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.put(state.running, issue_id, running_entry),
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    request = %{
+      condition: %{"type" => "github_actions_recovered", "component" => "Actions"},
+      condition_key: "parked-actions-condition",
+      reason: "GitHub Actions is degraded",
+      min_poll_ms: 15_000,
+      max_poll_ms: 60_000
+    }
+
+    send(worker_pid, {:park, pid, request})
+    assert_receive {:parked_lifecycle, :ok}, 1_000
+    send(pid, {:DOWN, ref, :process, worker_pid, :normal})
+
+    snapshot =
+      wait_for_snapshot(pid, fn snapshot ->
+        Enum.any?(snapshot.waiting, &(&1.issue_id == issue_id))
+      end)
+
+    assert Enum.any?(snapshot.waiting, &(&1.issue_id == issue_id))
+
+    state = :sys.get_state(pid)
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    send(worker_pid, :done)
+  end
+
   test "pending asynchronous handoff gate is observable and excluded from implementor stall retries" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

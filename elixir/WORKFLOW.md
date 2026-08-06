@@ -246,6 +246,7 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
+- If useful work can continue only after GitHub Actions recovers, PR checks change, a git ref advances, Linear activity changes, or a specified time arrives, call Symphony's `wait_for` tool once and end the turn. Do not repeatedly poll an unchanged external condition; Symphony will release the agent slot and resume the issue after the condition changes.
 - Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
 - If a non-GitHub required tool is missing, required non-GitHub auth is unavailable, or a product decision is required, add `needs-human-input` and move the ticket to `Blocked` with a short blocker brief in the workpad that includes:
   - what is missing,

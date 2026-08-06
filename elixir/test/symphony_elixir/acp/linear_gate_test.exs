@@ -27,7 +27,7 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
 
       list = mcp(url, %{"jsonrpc" => "2.0", "id" => 2, "method" => "tools/list"})
       tools = get_in(list.body, ["result", "tools"])
-      assert Enum.map(tools, & &1["name"]) == ["linear_graphql"]
+      assert Enum.map(tools, & &1["name"]) == ["linear_graphql", "wait_for"]
     end
 
     test "an initialized notification gets a 202 with no body" do

@@ -52,6 +52,9 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Telemetry.Report,
           SymphonyElixir.TokenAccounting,
           SymphonyElixir.Utf8,
+          SymphonyElixir.WaitCondition,
+          SymphonyElixir.WaitStore,
+          SymphonyElixir.WaitWatcher,
           SymphonyElixir.Orchestrator,
           SymphonyElixir.Orchestrator.State,
           # These workers cross a detached OS-process boundary. Their focused

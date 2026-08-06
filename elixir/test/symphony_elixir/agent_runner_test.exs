@@ -83,6 +83,35 @@ defmodule SymphonyElixir.AgentRunnerTest.TurnCountingBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.WaitingBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, prompt, _issue, opts) do
+    recipient = Application.fetch_env!(:symphony_elixir, :waiting_backend_recipient)
+    send(recipient, {:waiting_prompt, prompt})
+
+    result =
+      Keyword.fetch!(opts, :tool_executor).(
+        "wait_for",
+        %{
+          "reason" => "GitHub Actions is degraded",
+          "condition" => %{"type" => "github_actions_recovered"}
+        }
+      )
+
+    send(recipient, {:waiting_tool_result, result})
+    {:ok, %{session_id: "waiting-session"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.PendingGateBackend do
   @moduledoc false
   @behaviour SymphonyElixir.AgentBackend
@@ -267,6 +296,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
   alias SymphonyElixir.AgentRunnerTest.PendingGateBackend
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
+  alias SymphonyElixir.AgentRunnerTest.WaitingBackend
   alias SymphonyElixir.Linear.Comment
   alias SymphonyElixir.Linear.Issue
 
@@ -285,6 +315,44 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end)
 
     :ok
+  end
+
+  test "wait_for parks after one turn and emits a durable waiting lifecycle" do
+    Application.put_env(:symphony_elixir, :waiting_backend_recipient, self())
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :waiting_backend_recipient) end)
+
+    issue = %Issue{
+      id: "issue-agent-wait",
+      identifier: "UDPE-WAIT",
+      title: "Wait efficiently",
+      state: "In Progress",
+      labels: [],
+      comments: []
+    }
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               System.tmp_dir!(),
+               issue,
+               self(),
+               [
+                 agent_backend: {WaitingBackend, %{}},
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end,
+                 issue_comments_fetcher: fn _issue_id ->
+                   {:ok, %{comments: [], truncated: false}}
+                 end,
+                 max_turns: 5
+               ],
+               nil
+             )
+
+    assert_receive {:waiting_prompt, prompt}
+    assert prompt =~ "call Symphony's `wait_for` tool once and end the turn"
+    assert_receive {:waiting_tool_result, %{"success" => true}}
+
+    assert_receive {:agent_lifecycle, "issue-agent-wait", :waiting, %{request: request}}
+    assert request.condition["type"] == "github_actions_recovered"
+    refute_receive {:waiting_prompt, _second_turn}, 100
   end
 
   describe "soft-budget continuations" do
@@ -383,7 +451,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
                "task.current_metadata",
                "task.activity",
                "repository.workflow",
-               "symphony.test_worker_budget"
+               "symphony.test_worker_budget",
+               "symphony.handoff_constraints"
              ]
 
       assert_receive {:activity_prompt_telemetry,
@@ -405,6 +474,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       assert Enum.sort(reused_ids) == [
                "repository.workflow",
+               "symphony.handoff_constraints",
                "symphony.test_worker_budget",
                "task.current_metadata",
                "task.issue"

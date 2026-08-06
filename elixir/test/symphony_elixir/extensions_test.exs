@@ -86,6 +86,13 @@ defmodule SymphonyElixir.ExtensionsTest do
           started_at: if(enabled, do: DateTime.utc_now(), else: nil)
         }}, state}
     end
+
+    def handle_call({action, identifier}, _from, state)
+        when action in [:resume_wait, :cancel_wait] and is_binary(identifier) do
+      if recipient = Keyword.get(state, :recipient), do: send(recipient, {action, identifier})
+      action_name = if action == :resume_wait, do: "resumed", else: "cancelled"
+      {:reply, {:ok, %{action: action_name, issue_id: "issue-wait", identifier: identifier}}, state}
+    end
   end
 
   setup do
@@ -526,8 +533,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "queued" => 0, "retrying" => 1},
+             "counts" => %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0},
              "queued" => [],
+             "waiting" => [],
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -653,6 +661,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "context" => %{"tokens" => 0, "window" => nil, "fill_ratio" => nil}
              },
              "retry" => nil,
+             "waiting" => nil,
              "logs" => %{
                "codex_session_logs" => [
                  %{
@@ -706,6 +715,20 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"mode" => %{"draining" => false, "started_at" => nil}} =
              build_conn() |> post("/api/v1/resume", %{}) |> json_response(200)
+
+    assert %{"wait" => %{"action" => "resumed", "issue_id" => "issue-wait", "identifier" => "MT-WAIT"}} =
+             build_conn()
+             |> post("/api/v1/waits/MT-WAIT/resume", %{})
+             |> json_response(200)
+
+    assert_receive {:resume_wait, "MT-WAIT"}
+
+    assert %{"wait" => %{"action" => "cancelled", "identifier" => "MT-WAIT"}} =
+             build_conn()
+             |> post("/api/v1/waits/MT-WAIT/cancel", %{})
+             |> json_response(200)
+
+    assert_receive {:cancel_wait, "MT-WAIT"}
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -716,6 +739,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(get(build_conn(), "/api/v1/waits/MT-1/resume"), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(post(build_conn(), "/", %{}), 405) ==
@@ -744,6 +770,14 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
 
     assert json_response(post(build_conn(), "/api/v1/drain", %{}), 503) ==
+             %{
+               "error" => %{
+                 "code" => "orchestrator_unavailable",
+                 "message" => "Orchestrator is unavailable"
+               }
+             }
+
+    assert json_response(post(build_conn(), "/api/v1/waits/MT-1/resume", %{}), 503) ==
              %{
                "error" => %{
                  "code" => "orchestrator_unavailable",
@@ -1665,7 +1699,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -1730,7 +1764,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     port = HttpServer.bound_port()
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0}
   end
 
   test "http server also listens on loopback when bound to a non-loopback host" do
@@ -1768,7 +1802,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     # ...and always via loopback, thanks to the extra listener.
     loopback = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert loopback.status == 200
-    assert loopback.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1}
+    assert loopback.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0}
   end
 
   defp start_test_endpoint(overrides) do

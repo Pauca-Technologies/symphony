@@ -229,6 +229,14 @@ Notes:
   A newly started backend thread still receives the full first-turn prompt, including on retries,
   because it cannot safely rely on context retained by a previous process. Reaching `max_turns`
   ends only that worker session; it does not change the Linear state or add `needs-human-input`.
+- Agents can call Symphony's typed `wait_for` tool when useful work is blocked only on an external
+  state change: GitHub Actions recovery, PR-check changes, a git ref advancing, Linear issue/comment
+  activity, or a future time. The worker then exits cleanly and releases its concurrency slot while
+  a non-LLM watcher persists the wait in `~/.symphony/waits.json`. Identical conditions share one
+  probe with bounded exponential backoff. When the condition changes, the issue re-enters the
+  normal priority/concurrency scheduler with a compact state-change prompt. The dashboard exposes
+  Waiting rows plus **Resume now** and **Cancel wait**; cancelling the wait returns the issue to
+  normal scheduling rather than abandoning the assigned Linear issue.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
   provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local
@@ -266,6 +274,9 @@ Notes:
   workers. Its state is saved in `~/.symphony/drain-state.json`, so it remains active through the
   restart it is intended to protect. Enable it with `POST /api/v1/drain` or the dashboard button;
   cancel it with `POST /api/v1/resume` or **Cancel drain**. Cancelling schedules an immediate poll.
+- `codex.turn_timeout_ms` is a wall-clock ceiling for one Codex turn, not an idle timeout. Streaming
+  events and subagent activity do not reset it. ACP and Claude Code already apply their
+  `prompt_timeout_ms` values as wall-clock deadlines.
 - `agent.backend` selects the coding-agent backend: `codex` (default, the Codex app-server described
   above), `acp` (the Agent Client Protocol, e.g. `opencode acp`), or `claude_code` (native Claude Code
   `claude -p` stream-json). All backends honor the same handoff gate and observability transcript.

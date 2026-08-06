@@ -23,7 +23,7 @@ When logging Codex execution lifecycle events, include:
 
 - Use explicit `key=value` pairs in message text for high-signal fields.
 - Prefer deterministic wording for recurring lifecycle events.
-- Include the action outcome (`completed`, `failed`, `retrying`) and the reason/error when available.
+- Include the action outcome (`completed`, `failed`, `retrying`, `waiting`, or `resumed`) and the reason/error when available.
 - Avoid logging large payloads unless required for debugging.
 
 ## Scope Guidance

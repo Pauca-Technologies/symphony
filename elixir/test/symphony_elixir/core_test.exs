@@ -2003,7 +2003,7 @@ defmodule SymphonyElixir.CoreTest do
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
       assert String.length(Enum.at(turn_texts, 1)) < String.length(Enum.at(turn_texts, 0))
-      assert String.length(Enum.at(turn_texts, 1)) < 1_000
+      assert String.length(Enum.at(turn_texts, 1)) < 1_200
 
       prompt_event = AgentRunner.prompt_built_telemetry_event()
 
@@ -2013,7 +2013,12 @@ defmodule SymphonyElixir.CoreTest do
                         issue_id: "issue-continue",
                         issue_identifier: "MT-247",
                         prompt_kind: "initial",
-                        included_sections: ["task_context", "repository_workflow", "test_worker_budget"],
+                        included_sections: [
+                          "task_context",
+                          "repository_workflow",
+                          "test_worker_budget",
+                          "handoff_tool_guidance"
+                        ],
                         turn_number: 1,
                         max_turns: 3
                       }}
@@ -2207,7 +2212,12 @@ defmodule SymphonyElixir.CoreTest do
       assert_receive {:remediation_prompt_built,
                       %{
                         prompt_kind: "initial",
-                        included_sections: ["task_context", "repository_workflow", "test_worker_budget"],
+                        included_sections: [
+                          "task_context",
+                          "repository_workflow",
+                          "test_worker_budget",
+                          "handoff_tool_guidance"
+                        ],
                         turn_number: 1
                       }}
 

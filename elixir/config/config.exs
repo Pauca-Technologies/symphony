@@ -7,6 +7,8 @@ test_runtime_root = Path.join(System.tmp_dir!(), "symphony-elixir-test-runtime")
 config :symphony_elixir,
   persistent_workers_enabled: config_env() != :test,
   drain_state_path: if(config_env() == :test, do: Path.join(test_runtime_root, "drain-state.json"), else: nil),
+  wait_state_path: if(config_env() == :test, do: Path.join(test_runtime_root, "waits.json"), else: nil),
+  wait_state_reset_on_start: config_env() == :test,
   persistent_worker_registry_root: if(config_env() == :test, do: Path.join(test_runtime_root, "workers"), else: nil),
   persistent_worker_log_root: if(config_env() == :test, do: Path.join(test_runtime_root, "worker-logs"), else: nil)
 

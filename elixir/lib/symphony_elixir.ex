@@ -32,6 +32,7 @@ defmodule SymphonyElixir.Application do
           SymphonyElixirWeb.ObservabilityPubSub,
           {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
           SymphonyElixir.WorkflowStore,
+          SymphonyElixir.WaitWatcher,
           SymphonyElixir.Orchestrator,
           SymphonyElixir.HttpServer,
           SymphonyElixir.StatusDashboard

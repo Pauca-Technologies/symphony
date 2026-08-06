@@ -64,7 +64,40 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert graphql_description =~ "before_handoff"
 
-    assert Enum.map(specs, & &1["name"]) == ["linear_graphql"]
+    assert %{"description" => wait_description, "inputSchema" => wait_schema, "name" => "wait_for"} =
+             Enum.find(specs, &(&1["name"] == "wait_for"))
+
+    assert wait_description =~ "without consuming an agent slot"
+    assert "condition" in wait_schema["required"]
+    assert Enum.map(specs, & &1["name"]) == ["linear_graphql", "wait_for"]
+  end
+
+  test "wait_for validates and forwards a typed parked-work request" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "wait_for",
+        %{
+          "reason" => "GitHub Actions is degraded",
+          "condition" => %{
+            "type" => "github_actions_recovered",
+            "component" => "Actions"
+          }
+        },
+        wait_context: %{},
+        wait_callback: fn request ->
+          send(test_pid, {:wait_request, request})
+          :ok
+        end
+      )
+
+    assert response["success"]
+    assert_receive {:wait_request, request}
+    assert request.reason == "GitHub Actions is degraded"
+    assert request.condition == %{"component" => "Actions", "type" => "github_actions_recovered"}
+    assert request.min_poll_ms == 60_000
+    assert is_binary(request.condition_key)
   end
 
   test "linear_graphql requires structured human evidence for Blocked transitions" do
@@ -179,7 +212,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => ["linear_graphql", "wait_for"]
              }
            }
 

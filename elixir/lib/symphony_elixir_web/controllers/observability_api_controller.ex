@@ -43,6 +43,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @spec resume(Conn.t(), map()) :: Conn.t()
   def resume(conn, _params), do: set_drain_mode(conn, false)
 
+  @spec resume_wait(Conn.t(), map()) :: Conn.t()
+  def resume_wait(conn, %{"issue_identifier" => identifier}), do: set_wait_mode(conn, :resume, identifier)
+
+  @spec cancel_wait(Conn.t(), map()) :: Conn.t()
+  def cancel_wait(conn, %{"issue_identifier" => identifier}), do: set_wait_mode(conn, :cancel, identifier)
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")
@@ -69,6 +75,19 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       {:error, reason} ->
         error_response(conn, 500, "drain_state_write_failed", inspect(reason))
+    end
+  end
+
+  defp set_wait_mode(conn, action, identifier) do
+    case Presenter.wait_control_payload(action, identifier, orchestrator()) do
+      {:ok, payload} ->
+        json(conn, %{wait: payload})
+
+      {:error, :not_found} ->
+        error_response(conn, 404, "wait_not_found", "Parked wait not found")
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
     end
   end
 

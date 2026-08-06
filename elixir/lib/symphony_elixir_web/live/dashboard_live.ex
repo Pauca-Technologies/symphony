@@ -58,6 +58,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
     {:noreply, set_drain_mode(socket, false)}
   end
 
+  def handle_event("resume-wait", %{"identifier" => identifier}, socket) do
+    {:noreply, control_wait(socket, :resume, identifier)}
+  end
+
+  def handle_event("cancel-wait", %{"identifier" => identifier}, socket) do
+    {:noreply, control_wait(socket, :cancel, identifier)}
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -131,7 +139,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <%= @issue_payload.running.state %>
                   </span>
                 <% else %>
-                  Active retry window.
+                  <%= if @issue_payload.waiting do %>
+                    Parked without an agent slot: <%= @issue_payload.waiting.reason %>
+                  <% else %>
+                    Active retry window.
+                  <% end %>
                 <% end %>
               </p>
             </article>
@@ -190,6 +202,33 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <%= issue_context_detail(@issue_payload) %>
               </p>
             </article>
+          </section>
+
+          <section :if={@issue_payload.waiting} class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Waiting condition</h2>
+                <p class="section-copy"><%= @issue_payload.waiting.reason %></p>
+              </div>
+              <div class="status-stack">
+                <button type="button" class="subtle-button" phx-click="resume-wait" phx-value-identifier={@issue_payload.issue_identifier}>
+                  Resume now
+                </button>
+                <button type="button" class="subtle-button" phx-click="cancel-wait" phx-value-identifier={@issue_payload.issue_identifier}>
+                  Cancel wait
+                </button>
+              </div>
+            </div>
+            <div class="field-list">
+              <div>
+                <span class="field-label">Condition</span>
+                <pre class="code-panel"><%= wait_condition_label(@issue_payload.waiting.condition) %></pre>
+              </div>
+              <div>
+                <span class="field-label">Next probe</span>
+                <pre class="code-panel"><%= full_time(@issue_payload.waiting.next_probe_at) %></pre>
+              </div>
+            </div>
           </section>
 
           <%= if review = issue_review(@issue_payload) do %>
@@ -395,6 +434,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </article>
 
             <article class="metric-card">
+              <p class="metric-label">Waiting</p>
+              <p class="metric-value numeric"><%= @dashboard_payload.counts.waiting %></p>
+              <p class="metric-detail">Parked on external conditions without consuming agent slots.</p>
+            </article>
+
+            <article class="metric-card">
               <p class="metric-label">Total tokens</p>
               <p class="metric-value numeric"><%= format_int(@dashboard_payload.codex_totals.total_tokens) %></p>
               <p class="metric-detail numeric">
@@ -407,6 +452,68 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@dashboard_payload, @now)) %></p>
               <p class="metric-detail">Total agent runtime across completed and active sessions.</p>
             </article>
+          </section>
+
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Waiting work</h2>
+                <p class="section-copy">Persisted external-condition waits checked by lightweight, deduplicated probes.</p>
+              </div>
+            </div>
+
+            <%= if @dashboard_payload.waiting == [] do %>
+              <p class="empty-state">No issues are parked on external conditions.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table" style="min-width: 860px;">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>Condition</th>
+                      <th>Reason</th>
+                      <th>Next probe</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @dashboard_payload.waiting}>
+                      <td>
+                        <div class="issue-stack">
+                          <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
+                            <%= entry.issue_identifier %>
+                          </.link>
+                          <span :if={entry.title} class="issue-title"><%= entry.title %></span>
+                          <span class="muted"><%= entry.status %> · probe <%= entry.probe_attempt %></span>
+                        </div>
+                      </td>
+                      <td><code class="mono"><%= wait_condition_label(entry.condition) %></code></td>
+                      <td>
+                        <div class="detail-stack">
+                          <span><%= entry.reason %></span>
+                          <span :if={entry.last_error} class="muted">Last probe: <%= entry.last_error %></span>
+                        </div>
+                      </td>
+                      <td>
+                        <time :if={entry.next_probe_at} class="event-time-stamp" datetime={entry.next_probe_at} title={full_time(entry.next_probe_at)}>
+                          <%= full_time(entry.next_probe_at) %>
+                        </time>
+                      </td>
+                      <td>
+                        <div class="status-stack">
+                          <button type="button" class="subtle-button" phx-click="resume-wait" phx-value-identifier={entry.issue_identifier}>
+                            Resume now
+                          </button>
+                          <button type="button" class="subtle-button" phx-click="cancel-wait" phx-value-identifier={entry.issue_identifier}>
+                            Cancel wait
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
           </section>
 
           <section class="section-card">
@@ -690,6 +797,30 @@ defmodule SymphonyElixirWeb.DashboardLive do
         put_flash(socket, :error, "Unable to change drain mode: #{inspect(reason)}")
     end
   end
+
+  defp control_wait(socket, action, identifier) do
+    case Presenter.wait_control_payload(action, identifier, orchestrator()) do
+      {:ok, _payload} ->
+        socket
+        |> clear_flash()
+        |> reload_current_page()
+
+      {:error, reason} ->
+        put_flash(socket, :error, "Unable to #{action} wait: #{inspect(reason)}")
+    end
+  end
+
+  defp wait_condition_label(condition) when is_map(condition) do
+    type = Map.get(condition, "type", "unknown")
+
+    detail =
+      condition["repository"] || condition["ref"] || condition["component"] ||
+        condition["issue_id"] || condition["resume_at"]
+
+    if detail, do: "#{type}: #{detail}", else: type
+  end
+
+  defp wait_condition_label(_condition), do: "unknown"
 
   defp draining?(%{mode: %{draining: true}}), do: true
   defp draining?(_payload), do: false

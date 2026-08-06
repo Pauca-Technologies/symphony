@@ -3,9 +3,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{BaseDrift, HandoffGate, Linear.Client, ReviewGate, ReviewOutcome}
+  alias SymphonyElixir.{BaseDrift, HandoffGate, Linear.Client, ReviewGate, ReviewOutcome, WaitCondition}
 
   @linear_graphql_tool "linear_graphql"
+  @wait_for_tool "wait_for"
   @human_blocker_kinds [
     "missing_required_tool",
     "missing_authentication",
@@ -58,11 +59,54 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   }
+  @wait_for_description """
+  Park this issue without consuming an agent slot while an external condition is unchanged. Use this instead of repeatedly polling GitHub, git, Linear, or a clock. After a successful call, end the turn; Symphony persists the workspace and resumes exactly once when the condition changes or a human resumes it.
+  """
+  @wait_for_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["reason", "condition"],
+    "properties" => %{
+      "reason" => %{"type" => "string", "minLength" => 1},
+      "min_poll_seconds" => %{"type" => "integer", "minimum" => 15, "maximum" => 1_800},
+      "max_poll_seconds" => %{"type" => "integer", "minimum" => 60, "maximum" => 21_600},
+      "condition" => %{
+        "type" => "object",
+        "additionalProperties" => false,
+        "required" => ["type"],
+        "properties" => %{
+          "type" => %{
+            "type" => "string",
+            "enum" => [
+              "github_actions_recovered",
+              "github_pr_checks_changed",
+              "git_ref_changed",
+              "linear_issue_changed",
+              "time"
+            ]
+          },
+          "component" => %{"type" => ["string", "null"]},
+          "repository" => %{"type" => ["string", "null"]},
+          "pr_number" => %{"type" => ["integer", "null"], "minimum" => 1},
+          "ref" => %{"type" => ["string", "null"]},
+          "issue_id" => %{"type" => ["string", "null"]},
+          "observed" => %{
+            "description" => "The current value. PR checks may use pending/pass/fail/none; other conditions use the current SHA, updated-at value, or JSON observation.",
+            "type" => ["string", "object", "array", "null"]
+          },
+          "resume_at" => %{"type" => ["string", "null"], "format" => "date-time"}
+        }
+      }
+    }
+  }
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
+
+      @wait_for_tool ->
+        execute_wait_for(arguments, opts)
 
       other ->
         failure_response(%{
@@ -81,8 +125,44 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
+      },
+      %{
+        "name" => @wait_for_tool,
+        "description" => @wait_for_description,
+        "inputSchema" => @wait_for_input_schema
       }
     ]
+  end
+
+  defp execute_wait_for(arguments, opts) do
+    context = Keyword.get(opts, :wait_context, %{})
+    callback = Keyword.get(opts, :wait_callback)
+
+    with {:ok, request} <- WaitCondition.normalize(arguments, context),
+         true <- is_function(callback, 1) or {:error, :wait_unavailable},
+         :ok <- callback.(request) do
+      success_response(%{
+        "status" => "accepted",
+        "message" => "The issue will be parked after this turn. End the turn now; do not poll again.",
+        "conditionKey" => request.condition_key
+      })
+    else
+      {:error, reason} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "Unable to park this issue.",
+            "reason" => inspect(reason)
+          }
+        })
+
+      other ->
+        failure_response(%{
+          "error" => %{
+            "message" => "Unable to park this issue.",
+            "reason" => inspect(other)
+          }
+        })
+    end
   end
 
   defp execute_linear_graphql(arguments, opts) do

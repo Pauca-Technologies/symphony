@@ -39,6 +39,7 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
           issue: Issue.t(),
           attempt: pos_integer(),
           worker_host: String.t() | nil,
+          runner_opts: keyword(),
           auth_token: String.t(),
           workflow_path: Path.t(),
           repo_config_path: Path.t(),
@@ -57,13 +58,15 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
   @doc "Create one exclusive run record for an issue."
   @spec prepare(Issue.t(), integer() | nil, String.t() | nil) ::
           {:ok, manifest()} | {:existing, manifest()} | {:error, term()}
-  def prepare(%Issue{id: issue_id, identifier: identifier} = issue, attempt, worker_host)
-      when is_binary(issue_id) and is_binary(identifier) do
+  @spec prepare(Issue.t(), integer() | nil, String.t() | nil, keyword()) ::
+          {:ok, manifest()} | {:existing, manifest()} | {:error, term()}
+  def prepare(%Issue{id: issue_id, identifier: identifier} = issue, attempt, worker_host, runner_opts \\ [])
+      when is_binary(issue_id) and is_binary(identifier) and is_list(runner_opts) do
     run_dir = run_dir(issue_id)
 
     with :ok <- ensure_roots(),
          :ok <- create_run_dir(run_dir) do
-      do_prepare(run_dir, issue, normalize_attempt(attempt), worker_host)
+      do_prepare(run_dir, issue, normalize_attempt(attempt), worker_host, safe_runner_opts(runner_opts))
     else
       {:error, :eexist} -> existing_manifest(run_dir)
       {:error, reason} -> {:error, reason}
@@ -169,7 +172,7 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
 
   def worker_alive?(_manifest), do: false
 
-  defp do_prepare(run_dir, issue, attempt, worker_host) do
+  defp do_prepare(run_dir, issue, attempt, worker_host, runner_opts) do
     worker_id = random_token()
     auth_token = random_token()
     manifest_path = Path.join(run_dir, @manifest_filename)
@@ -201,6 +204,7 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
       issue: issue,
       attempt: attempt,
       worker_host: worker_host,
+      runner_opts: runner_opts,
       auth_token: auth_token,
       workflow_path: Workflow.workflow_file_path(),
       repo_config_path: RepoConfig.path(),
@@ -361,6 +365,10 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
 
   defp normalize_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
   defp normalize_attempt(_attempt), do: 1
+
+  defp safe_runner_opts(opts) do
+    Keyword.take(opts, [:wait_resume_prompt])
+  end
 
   defp process_exists_fallback?(pid) do
     case System.find_executable("kill") do

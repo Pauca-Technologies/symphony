@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Orchestrator do
     Telemetry,
     TokenAccounting,
     Tracker,
+    WaitWatcher,
     Workspace,
     WorkspaceGc
   }
@@ -182,7 +183,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil,
       backend_rate_limits: %{},
       quota_circuits: quota_circuits,
-      claimed: restored_quota_claims(quota_circuits)
+      claimed: MapSet.new(restored_quota_claims(quota_circuits) ++ restored_wait_claims())
     }
 
     state = arm_all_quota_circuits(state)
@@ -281,21 +282,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> maybe_close_successful_quota_probe(running_entry)
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                issue: Map.get(running_entry, :issue),
-                delay_type: :continuation,
-                backend: Map.get(running_entry, :backend),
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path),
-                codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
-                recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
-              })
+              handle_normal_worker_exit(state, running_entry, issue_id, session_id)
 
             _ ->
               failure = failure_from_exit(reason, running_entry)
@@ -458,6 +445,12 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({:wait_entries_ready, entries}, %State{} = state) when is_list(entries) do
+    state = schedule_ready_wait_entries(state, entries)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
@@ -496,6 +489,28 @@ defmodule SymphonyElixir.Orchestrator do
     |> Map.put(:lifecycle_started_at, lifecycle_started_at)
     |> Map.put(:handoff_gate_job_id, gate_job_id)
     |> Map.put(:handoff_gate_state, gate)
+  end
+
+  defp transition_agent_lifecycle(running_entry, :waiting, %{request: request})
+       when is_map(running_entry) and is_map(request) do
+    now = DateTime.utc_now()
+    issue = Map.get(running_entry, :issue, %{})
+    previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+
+    Logger.info(
+      "Agent lifecycle transition: issue_id=#{Map.get(issue, :id)} issue_identifier=#{Map.get(issue, :identifier)} session_id=#{running_entry_session_id(running_entry)} from=#{previous_state} to=waiting condition_key=#{request.condition_key}"
+    )
+
+    emit_agent_lifecycle(running_entry, previous_state, :waiting, %{
+      condition_key: request.condition_key,
+      condition_type: get_in(request, [:condition, "type"]),
+      reason: request.reason
+    })
+
+    running_entry
+    |> Map.put(:lifecycle_state, :waiting)
+    |> Map.put(:lifecycle_started_at, now)
+    |> Map.put(:wait_request, request)
   end
 
   defp transition_agent_lifecycle(
@@ -616,6 +631,7 @@ defmodule SymphonyElixir.Orchestrator do
       case to do
         :handoff_pending_review -> "review"
         :handoff_pending_gate -> "handoff_gate"
+        :waiting -> "waiting"
         _ -> "implementation"
       end
 
@@ -1559,8 +1575,8 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    {_outcome, state} = dispatch_issue_outcome(state, issue, attempt, preferred_worker_host)
+  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, agent_opts \\ []) do
+    {_outcome, state} = dispatch_issue_outcome(state, issue, attempt, preferred_worker_host, agent_opts)
     state
   end
 
@@ -1575,10 +1591,10 @@ defmodule SymphonyElixir.Orchestrator do
   # skip/error there would strand the claim in `state.claimed` until the next
   # restart (every poll is gated on `!MapSet.member?(claimed, issue.id)`), so it
   # must release the claim or reschedule. See `dispatch_active_retry/4`.
-  defp dispatch_issue_outcome(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp dispatch_issue_outcome(%State{} = state, issue, attempt, preferred_worker_host, agent_opts \\ []) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        {:dispatched, do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)}
+        {:dispatched, do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, agent_opts)}
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -1595,10 +1611,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{draining: true} = state, _issue, _attempt, _preferred_worker_host),
+  defp do_dispatch_issue(%State{draining: true} = state, _issue, _attempt, _preferred_worker_host, _agent_opts),
     do: state
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, agent_opts) do
     recipient = self()
     backend = predicted_backend(issue)
 
@@ -1608,14 +1624,15 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, agent_opts)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case start_issue_worker(issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, agent_opts) do
+    case start_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
       {:ok, pid, persistent_worker_id} ->
         ref = Process.monitor(pid)
+        if Keyword.has_key?(agent_opts, :wait_resume_prompt), do: wait_watcher_acknowledge(issue.id)
 
         Logger.info(
           "Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} persistent_worker_id=#{persistent_worker_id || "none"} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
@@ -1659,24 +1676,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp start_issue_worker(issue, attempt, recipient, worker_host) do
+  defp start_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
     if PersistentWorker.enabled?() do
-      start_persistent_issue_worker(issue, attempt, recipient, worker_host)
+      start_persistent_issue_worker(issue, attempt, recipient, worker_host, agent_opts)
     else
-      start_in_process_issue_worker(issue, attempt, recipient, worker_host)
+      start_in_process_issue_worker(issue, attempt, recipient, worker_host, agent_opts)
     end
   end
 
-  defp start_persistent_issue_worker(issue, attempt, recipient, worker_host) do
-    case PersistentWorker.start(issue, attempt, worker_host, recipient) do
+  defp start_persistent_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
+    case PersistentWorker.start(issue, attempt, worker_host, recipient, agent_opts) do
       {:ok, %{pid: pid, manifest: manifest}} -> {:ok, pid, manifest.worker_id}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_in_process_issue_worker(issue, attempt, recipient, worker_host) do
+  defp start_in_process_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(
+             issue,
+             recipient,
+             Keyword.merge([attempt: attempt, worker_host: worker_host], agent_opts)
+           )
          end) do
       {:ok, pid} -> {:ok, pid, nil}
       {:error, reason} -> {:error, reason}
@@ -1839,6 +1860,191 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
+  defp park_completed_worker(%State{} = state, running_entry) do
+    issue = Map.get(running_entry, :issue)
+    request = Map.get(running_entry, :wait_request)
+
+    entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      issue: issue,
+      backend: Map.get(running_entry, :backend),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+      recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, []),
+      priority: issue.priority,
+      created_at: issue.created_at,
+      request: request
+    }
+
+    case wait_watcher_park(entry) do
+      :ok ->
+        Logger.info("Agent work parked issue_id=#{issue.id} issue_identifier=#{issue.identifier} condition_key=#{request.condition_key}; agent slot released")
+
+        %{
+          state
+          | claimed: MapSet.put(state.claimed, issue.id),
+            retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            failure_counts: Map.delete(state.failure_counts, issue.id)
+        }
+
+      {:error, reason} ->
+        Logger.warning("Unable to persist agent wait for #{issue_context(issue)}: #{inspect(reason)}; falling back to normal continuation")
+
+        schedule_issue_retry(state, issue.id, 1, %{
+          identifier: issue.identifier,
+          issue: issue,
+          delay_type: :continuation,
+          backend: Map.get(running_entry, :backend),
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
+          codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+          recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
+        })
+    end
+  end
+
+  defp handle_normal_worker_exit(state, %{lifecycle_state: :waiting} = running_entry, _issue_id, _session_id) do
+    park_completed_worker(state, running_entry)
+  end
+
+  defp handle_normal_worker_exit(state, running_entry, issue_id, session_id) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+    state
+    |> maybe_close_successful_quota_probe(running_entry)
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      issue: Map.get(running_entry, :issue),
+      delay_type: :continuation,
+      backend: Map.get(running_entry, :backend),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+      recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
+    })
+  end
+
+  defp schedule_ready_wait_entries(%State{} = state, entries) do
+    entries
+    |> Enum.sort_by(fn entry ->
+      created_at = Map.get(entry, :created_at)
+      issue = Map.get(entry, :issue)
+
+      created_at_key =
+        case issue do
+          %Issue{} -> issue_created_at_sort_key(issue)
+          _ -> datetime_sort_key(created_at)
+        end
+
+      {Issue.dispatch_priority_rank(entry.priority), created_at_key, entry.identifier || entry.issue_id}
+    end)
+    |> Enum.with_index()
+    |> Enum.reduce(state, fn {entry, index}, state_acc ->
+      cond do
+        Map.has_key?(state_acc.running, entry.issue_id) ->
+          _ = wait_watcher_acknowledge(entry.issue_id)
+          state_acc
+
+        Map.has_key?(state_acc.retry_attempts, entry.issue_id) ->
+          state_acc
+
+        true ->
+          state_acc
+          |> Map.update!(:claimed, &MapSet.put(&1, entry.issue_id))
+          |> schedule_issue_retry(entry.issue_id, 1, %{
+            identifier: entry.identifier,
+            title: entry.title,
+            issue: Map.get(entry, :issue),
+            delay_type: :continuation,
+            delay_ms_override: index * @quota_resume_spacing_ms,
+            backend: entry.backend,
+            worker_host: entry.worker_host,
+            workspace_path: entry.workspace_path,
+            codex_session_logs: Map.get(entry, :codex_session_logs, []),
+            recent_codex_transcript_blocks: Map.get(entry, :recent_codex_transcript_blocks, []),
+            wait_resume_prompt: entry.resume_prompt
+          })
+      end
+    end)
+  end
+
+  defp datetime_sort_key(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :microsecond)
+  defp datetime_sort_key(_datetime), do: 9_223_372_036_854_775_807
+
+  defp wait_snapshot(now) do
+    wait_watcher_snapshot()
+    |> Enum.map(fn entry ->
+      %{
+        issue_id: entry.issue_id,
+        identifier: entry.identifier,
+        title: entry.title,
+        status: entry.status,
+        reason: entry.request.reason,
+        condition: entry.request.condition,
+        condition_key: entry.request.condition_key,
+        backend: entry.backend,
+        worker_host: entry.worker_host,
+        workspace_path: entry.workspace_path,
+        parked_at: entry.parked_at,
+        next_probe_at: entry.next_probe_at,
+        waiting_seconds: running_seconds(entry.parked_at, now),
+        probe_attempt: entry.probe_attempt,
+        last_observation: Map.get(entry, :last_observation),
+        last_error: Map.get(entry, :last_error),
+        codex_session_logs: Map.get(entry, :codex_session_logs, []),
+        recent_codex_transcript_blocks: Map.get(entry, :recent_codex_transcript_blocks, [])
+      }
+    end)
+  end
+
+  defp restored_wait_claims do
+    case Process.whereis(WaitWatcher) do
+      nil -> []
+      _pid -> WaitWatcher.issue_ids() |> MapSet.to_list()
+    end
+  catch
+    :exit, _reason -> []
+  end
+
+  defp wait_watcher_park(entry) do
+    case Process.whereis(WaitWatcher) do
+      nil -> {:error, :wait_watcher_unavailable}
+      _pid -> WaitWatcher.park(entry)
+    end
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp wait_watcher_snapshot do
+    case Process.whereis(WaitWatcher) do
+      nil -> []
+      _pid -> WaitWatcher.snapshot()
+    end
+  catch
+    :exit, _reason -> []
+  end
+
+  defp wait_watcher_acknowledge(issue_id) do
+    case Process.whereis(WaitWatcher) do
+      nil -> :ok
+      _pid -> WaitWatcher.acknowledge(issue_id)
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp wait_control_payload(entry, action) do
+    %{
+      action: action,
+      issue_id: entry.issue_id,
+      identifier: entry.identifier
+    }
+  end
+
   defp complete_issue(%State{} = state, issue_id) do
     # A normal turn completion is the "made progress" signal that resets the
     # consecutive-failure count, so only genuine stuck loops reach max_retries.
@@ -1871,6 +2077,7 @@ defmodule SymphonyElixir.Orchestrator do
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
     codex_session_logs = pick_retry_codex_session_logs(previous_retry, metadata)
     recent_codex_transcript_blocks = pick_retry_codex_transcript_blocks(previous_retry, metadata)
+    wait_resume_prompt = pick_retry_wait_resume_prompt(previous_retry, metadata)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1898,7 +2105,8 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: workspace_path,
             codex_session_logs: codex_session_logs,
-            recent_codex_transcript_blocks: recent_codex_transcript_blocks
+            recent_codex_transcript_blocks: recent_codex_transcript_blocks,
+            wait_resume_prompt: wait_resume_prompt
           })
     }
     |> emit_retry_policy(issue_id, metadata, :scheduled, next_attempt, delay_ms)
@@ -2219,7 +2427,13 @@ defmodule SymphonyElixir.Orchestrator do
   #   * `:error` — a transient tracker-refresh failure; keep the claim and
   #     reschedule so the continuation check isn't lost.
   defp dispatch_active_retry(state, issue, attempt, metadata) do
-    case dispatch_issue_outcome(state, issue, attempt, metadata[:worker_host]) do
+    agent_opts =
+      case metadata[:wait_resume_prompt] do
+        prompt when is_binary(prompt) -> [wait_resume_prompt: prompt]
+        _ -> []
+      end
+
+    case dispatch_issue_outcome(state, issue, attempt, metadata[:worker_host], agent_opts) do
       {:dispatched, state} ->
         {:noreply, state}
 
@@ -2306,6 +2520,10 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:recent_codex_transcript_blocks] ||
       Map.get(previous_retry, :recent_codex_transcript_blocks) ||
       []
+  end
+
+  defp pick_retry_wait_resume_prompt(previous_retry, metadata) do
+    metadata[:wait_resume_prompt] || Map.get(previous_retry, :wait_resume_prompt)
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
@@ -2494,6 +2712,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Resume a parked issue immediately."
+  @spec resume_wait(String.t()) :: {:ok, map()} | {:error, :not_found} | :unavailable
+  def resume_wait(identifier), do: resume_wait(__MODULE__, identifier)
+
+  @spec resume_wait(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, :not_found} | :unavailable
+  def resume_wait(server, identifier), do: wait_control_call(server, {:resume_wait, identifier})
+
+  @doc "Cancel a parked condition and return the issue to normal scheduling."
+  @spec cancel_wait(String.t()) :: {:ok, map()} | {:error, :not_found} | :unavailable
+  def cancel_wait(identifier), do: cancel_wait(__MODULE__, identifier)
+
+  @spec cancel_wait(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, :not_found} | :unavailable
+  def cancel_wait(server, identifier), do: wait_control_call(server, {:cancel_wait, identifier})
+
+  defp wait_control_call(server, message) do
+    GenServer.call(server, message, 15_000)
+  catch
+    :exit, _ -> :unavailable
+  end
+
   @impl true
   def handle_call(
         {:persistent_worker_checkpoint, worker_id, seq, checkpoint},
@@ -2577,6 +2817,39 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.warning("Unable to persist drain mode change: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:resume_wait, identifier}, _from, %State{} = state)
+      when is_binary(identifier) do
+    case WaitWatcher.resume_now(identifier) do
+      {:ok, entry} ->
+        state = schedule_ready_wait_entries(state, [entry])
+        notify_dashboard()
+        {:reply, {:ok, wait_control_payload(entry, "resumed")}, state}
+
+      {:error, :not_found} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:cancel_wait, identifier}, _from, %State{} = state)
+      when is_binary(identifier) do
+    case WaitWatcher.cancel(identifier) do
+      {:ok, entry} ->
+        entry =
+          Map.put(
+            entry,
+            :resume_prompt,
+            "A human cancelled Symphony's parked wait. Re-check the external state once and continue from the existing workspace without restarting the old polling loop."
+          )
+
+        state = schedule_ready_wait_entries(state, [entry])
+        notify_dashboard()
+        {:reply, {:ok, wait_control_payload(entry, "cancelled")}, state}
+
+      {:error, :not_found} = error ->
+        {:reply, error, state}
     end
   end
 
@@ -2664,6 +2937,7 @@ defmodule SymphonyElixir.Orchestrator do
       end)
 
     parked = quota_parked_snapshot(state.quota_circuits, now)
+    waiting = wait_snapshot(now)
 
     queued =
       state.queued
@@ -2678,6 +2952,7 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        queued: queued,
        retrying: retrying ++ parked,
+       waiting: waiting,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        backend_usage: active_backend_usage(state),
@@ -4599,7 +4874,6 @@ defmodule SymphonyElixir.Orchestrator do
   defp restored_quota_claims(circuits) when is_map(circuits) do
     circuits
     |> Enum.flat_map(fn {_backend, circuit} -> Enum.map(circuit.parked, & &1.issue_id) end)
-    |> MapSet.new()
   end
 
   defp quota_circuit_key(backend, worker_host) when is_binary(backend) do

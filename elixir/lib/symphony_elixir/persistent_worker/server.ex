@@ -199,9 +199,13 @@ defmodule SymphonyElixir.PersistentWorker.Server do
   end
 
   defp run_agent(recipient, spec) do
-    AgentRunner.run(spec.issue, recipient,
-      attempt: spec.attempt,
-      worker_host: spec.worker_host
+    AgentRunner.run(
+      spec.issue,
+      recipient,
+      Keyword.merge(
+        [attempt: spec.attempt, worker_host: spec.worker_host],
+        Map.get(spec, :runner_opts, [])
+      )
     )
   end
 

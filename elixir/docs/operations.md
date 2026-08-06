@@ -35,6 +35,14 @@ orchestrator reconnects to them. Do not remove `~/.symphony/workers` or stop wor
 The first rollout that introduces persistent workers cannot adopt agents launched by an older
 Symphony version; drain those legacy runs fully once. Subsequent rollouts can reconnect.
 
+## Parked external waits
+
+Agents use the typed `wait_for` tool instead of consuming turns while polling unchanged GitHub,
+git, Linear, or time conditions. These waits survive restarts in `~/.symphony/waits.json`, appear in
+the dashboard as **Waiting work**, and do not occupy agent slots. **Resume now** wakes the issue
+without waiting for the next probe. **Cancel wait** removes the external condition and returns the
+issue to normal scheduling; it does not cancel or close the Linear issue.
+
 ## 3. Install and restart
 
 Atomically install the staged binary using the deployment's normal release mechanism, retain the

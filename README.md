@@ -36,6 +36,9 @@ The Elixir implementation isolates each live run in a detached worker process. T
 restart for a deployment and reconnect to those workers without terminating their coding-agent
 sessions. A persisted, reversible drain mode pauses new dispatch while existing work continues, so
 operators can choose either a fully drained rollout or a reconnecting restart.
+Agents can also park work on typed external conditions; durable non-model watchers release the
+agent slot, deduplicate probes, and resume the issue through the normal priority scheduler when the
+condition changes.
 
 The reference implementation also maintains a compact, versioned fleet analytics layer. It
 reconciles cumulative usage by actual parent and delegated threads, retains rolling lifecycle and

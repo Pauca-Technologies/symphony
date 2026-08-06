@@ -623,11 +623,13 @@ defmodule SymphonyElixir.Codex.AppServer do
          auto_approve_requests,
          timeout_ms
        ) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+
     receive_loop(
       port,
       on_message,
       turn_id,
-      timeout_ms,
+      deadline_ms,
       "",
       tool_executor,
       auto_approve_requests
@@ -697,6 +699,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   # *our* turn — see `handle_incoming/7` — so the first subagent to finish is
   # not mistaken for the parent turn completing.
   defp receive_loop(port, on_message, turn_id, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    # `timeout_ms` is an absolute monotonic deadline. Keeping it unchanged
+    # across recursive receives makes codex.turn_timeout_ms a wall-clock cap;
+    # a busy stream can no longer reset the timeout indefinitely.
+    remaining_ms = max(0, timeout_ms - System.monotonic_time(:millisecond))
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
@@ -716,7 +723,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
+      remaining_ms ->
         {:error, :turn_timeout}
     end
   end
