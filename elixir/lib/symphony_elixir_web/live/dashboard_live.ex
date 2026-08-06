@@ -372,6 +372,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
 
             <div class="status-stack">
+              <a
+                :if={waiting_count(@dashboard_payload) > 0}
+                class="status-badge status-badge-waiting"
+                href="#waiting-work"
+              >
+                <span class="status-badge-dot"></span>
+                <%= waiting_count(@dashboard_payload) %> waiting
+              </a>
               <span :if={draining?(@dashboard_payload)} class="status-badge status-badge-draining">
                 <span class="status-badge-dot"></span>
                 Draining
@@ -454,7 +462,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </article>
           </section>
 
-          <section class="section-card">
+          <section id="waiting-work" class="section-card">
             <div class="section-header">
               <div>
                 <h2 class="section-title">Waiting work</h2>
@@ -824,6 +832,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp draining?(%{mode: %{draining: true}}), do: true
   defp draining?(_payload), do: false
+
+  defp waiting_count(%{counts: %{waiting: count}}) when is_integer(count), do: count
+  defp waiting_count(_payload), do: 0
 
   defp load_issue_page(socket, issue_identifier) when is_binary(issue_identifier) do
     transcript_cache = socket.assigns[:transcript_cache] || %{}

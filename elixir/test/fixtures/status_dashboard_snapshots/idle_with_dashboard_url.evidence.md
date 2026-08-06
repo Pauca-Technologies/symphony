@@ -1,6 +1,7 @@
 ```text
 ╭─ SYMPHONY STATUS
 │ Agents: 0/10
+│ Waiting: 0
 │ Throughput: 0 tps
 │ Runtime: 0m 0s
 │ Tokens: in 0 | out 0 | total 0
@@ -17,6 +18,10 @@
 ├─ Repository queue
 │
 │  No repository-contention waits
+│
+├─ Waiting work
+│
+│  No parked external-condition waits
 │
 ├─ Backoff queue
 │

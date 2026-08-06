@@ -2462,7 +2462,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
     assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Repository queue/
-    assert plain =~ ~r/No repository-contention waits\r?\n│\s*\r?\n├─ Backoff queue/
+    assert plain =~ ~r/No repository-contention waits\r?\n│\s*\r?\n├─ Waiting work/
+    assert plain =~ ~r/No parked external-condition waits\r?\n│\s*\r?\n├─ Backoff queue/
   end
 
   test "status dashboard adds a spacer line before backoff queue when agents are active" do
@@ -2501,7 +2502,41 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Backoff queue/s
+    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Repository queue/s
+  end
+
+  test "status dashboard renders parked external-condition waits" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         waiting: [
+           %{
+             issue_id: "issue-7007",
+             identifier: "UDPE-7007",
+             status: :waiting,
+             reason: "GitHub Actions is experiencing a major outage",
+             condition: %{"type" => "github_actions_recovered", "component" => "actions"},
+             next_probe_at: DateTime.add(DateTime.utc_now(), 30, :second),
+             waiting_seconds: 1_200,
+             probe_attempt: 6,
+             last_error: ~s({:github_status_component_missing, "actions"})
+           }
+         ],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+    plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
+
+    assert plain =~ "Waiting: 1"
+    assert plain =~ "├─ Waiting work"
+    assert plain =~ "UDPE-7007"
+    assert plain =~ "github_actions_recovered:actions"
+    assert plain =~ "probe=6"
+    assert plain =~ "github_status_component_missing"
   end
 
   test "status dashboard renders an unstyled closing corner when the retry queue is empty" do

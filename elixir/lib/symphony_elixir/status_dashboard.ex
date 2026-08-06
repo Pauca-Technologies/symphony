@@ -316,6 +316,7 @@ defmodule SymphonyElixir.StatusDashboard do
              running: running,
              queued: Map.get(snapshot, :queued, []),
              retrying: retrying,
+             waiting: Map.get(snapshot, :waiting, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              quota_circuits: Map.get(snapshot, :quota_circuits, []),
@@ -344,12 +345,14 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
+        waiting = Map.get(snapshot, :waiting, [])
         max_agents = Config.settings!().agent.max_concurrent_agents
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
-        running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
+        running_to_repository_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
         scheduling_rows = format_scheduling_rows(Map.get(snapshot, :queued, []))
+        waiting_rows = format_waiting_rows(waiting)
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -357,6 +360,8 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
              colorize("#{max_agents}", @ansi_gray),
+           colorize("│ Waiting: ", @ansi_bold) <>
+             colorize("#{length(waiting)}", if(waiting == [], do: @ansi_gray, else: @ansi_orange)),
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
@@ -376,9 +381,12 @@ defmodule SymphonyElixir.StatusDashboard do
            running_table_separator_row(running_event_width)
          ] ++
            running_rows ++
-           running_to_backoff_spacer ++
+           running_to_repository_spacer ++
            [colorize("├─ Repository queue", @ansi_bold), "│"] ++
            scheduling_rows ++
+           ["│", colorize("├─ Waiting work", @ansi_bold), "│"] ++
+           waiting_rows ++
+           ["│"] ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -568,6 +576,7 @@ defmodule SymphonyElixir.StatusDashboard do
              running: running,
              queued: Map.get(snapshot, :queued, []),
              retrying: retrying,
+             waiting: Map.get(snapshot, :waiting, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              quota_circuits: Map.get(snapshot, :quota_circuits, []),
@@ -672,7 +681,7 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp format_scheduling_rows([]), do: ["│  " <> colorize("No repository-contention waits", @ansi_gray), "│"]
+  defp format_scheduling_rows([]), do: ["│  " <> colorize("No repository-contention waits", @ansi_gray)]
 
   defp format_scheduling_rows(entries) do
     Enum.map(entries, fn entry ->
@@ -685,6 +694,54 @@ defmodule SymphonyElixir.StatusDashboard do
       if paths == "", do: base <> order, else: base <> " overlap=#{paths}" <> order
     end)
   end
+
+  defp format_waiting_rows([]), do: ["│  " <> colorize("No parked external-condition waits", @ansi_gray)]
+
+  defp format_waiting_rows(entries) do
+    entries
+    |> Enum.sort_by(&{Map.get(&1, :next_probe_at), Map.get(&1, :identifier)})
+    |> Enum.map(&format_waiting_summary/1)
+  end
+
+  defp format_waiting_summary(entry) do
+    identifier = Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown"
+    condition = format_wait_condition(Map.get(entry, :condition, %{}))
+    status = Map.get(entry, :status, :waiting)
+    attempt = Map.get(entry, :probe_attempt, 0)
+    waited = Map.get(entry, :waiting_seconds, 0) |> format_runtime_seconds()
+    next_probe = entry |> Map.get(:next_probe_at) |> next_probe_in_words()
+    reason = entry |> Map.get(:reason, "unknown") |> format_inline_text(96)
+    error = format_retry_error(Map.get(entry, :last_error))
+
+    "│  #{colorize("⏸", @ansi_orange)} " <>
+      colorize(identifier, @ansi_cyan) <>
+      " " <>
+      colorize(condition, @ansi_yellow) <>
+      colorize(" status=#{status} wait=#{waited} probe=#{attempt} next=#{next_probe}", @ansi_dim) <>
+      " reason=#{reason}" <>
+      error
+  end
+
+  defp format_wait_condition(condition) when is_map(condition) do
+    type = Map.get(condition, "type", "unknown")
+
+    detail =
+      condition["repository"] || condition["ref"] || condition["component"] ||
+        condition["issue_id"] || condition["resume_at"]
+
+    if detail, do: "#{type}:#{detail}", else: type
+  end
+
+  defp format_wait_condition(_condition), do: "unknown"
+
+  defp next_probe_in_words(%DateTime{} = next_probe_at) do
+    next_probe_at
+    |> DateTime.diff(DateTime.utc_now(), :millisecond)
+    |> max(0)
+    |> next_in_words()
+  end
+
+  defp next_probe_in_words(_next_probe_at), do: "n/a"
 
   defp format_retry_summary(retry_entry) do
     issue_id = retry_entry.issue_id || "unknown"
@@ -733,25 +790,31 @@ defmodule SymphonyElixir.StatusDashboard do
   defp next_in_words(_), do: "n/a"
 
   defp format_retry_error(error) when is_binary(error) do
-    sanitized =
-      error
-      |> String.replace("\\r\\n", " ")
-      |> String.replace("\\r", " ")
-      |> String.replace("\\n", " ")
-      |> String.replace("\r\n", " ")
-      |> String.replace("\r", " ")
-      |> String.replace("\n", " ")
-      |> String.replace(~r/\s+/, " ")
-      |> String.trim()
+    sanitized = format_inline_text(error, 96)
 
     if sanitized == "" do
       ""
     else
-      " " <> colorize("error=#{truncate(sanitized, 96)}", @ansi_dim)
+      " " <> colorize("error=#{sanitized}", @ansi_dim)
     end
   end
 
   defp format_retry_error(_), do: ""
+
+  defp format_inline_text(text, max_length) when is_binary(text) do
+    text
+    |> String.replace("\\r\\n", " ")
+    |> String.replace("\\r", " ")
+    |> String.replace("\\n", " ")
+    |> String.replace("\r\n", " ")
+    |> String.replace("\r", " ")
+    |> String.replace("\n", " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> truncate(max_length)
+  end
+
+  defp format_inline_text(_text, _max_length), do: "unknown"
 
   defp format_runtime_seconds(seconds) when is_integer(seconds) do
     mins = div(seconds, 60)

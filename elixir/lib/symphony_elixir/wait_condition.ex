@@ -55,8 +55,8 @@ defmodule SymphonyElixir.WaitCondition do
     with {:ok, response} <- Req.get(@github_status_url, receive_timeout: 15_000),
          200 <- response.status,
          %{"components" => components} when is_list(components) <- response.body,
-         %{} = match <- Enum.find(components, &(Map.get(&1, "name") == component)) do
-      observation = %{"component" => component, "status" => Map.get(match, "status")}
+         %{} = match <- Enum.find(components, &github_component_match?(&1, component)) do
+      observation = %{"component" => Map.get(match, "name"), "status" => Map.get(match, "status")}
       if observation["status"] == "operational", do: {:changed, observation}, else: {:unchanged, observation}
     else
       status when is_integer(status) -> {:error, {:github_status_http, status}}
@@ -131,6 +131,11 @@ defmodule SymphonyElixir.WaitCondition do
   end
 
   def probe(_request), do: {:error, :invalid_wait_condition}
+
+  @doc false
+  @spec github_component_match_for_test?(map(), String.t()) :: boolean()
+  def github_component_match_for_test?(component, expected_name),
+    do: github_component_match?(component, expected_name)
 
   @doc "Return a compact prompt describing why a parked issue was resumed."
   @spec resume_prompt(request(), map(), :condition_changed | :manual) :: String.t()
@@ -230,6 +235,15 @@ defmodule SymphonyElixir.WaitCondition do
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.url_encode64(padding: false)
   end
+
+  defp github_component_match?(component, expected_name) when is_binary(expected_name) do
+    case Map.get(component, "name") do
+      name when is_binary(name) -> String.downcase(name) == String.downcase(expected_name)
+      _ -> false
+    end
+  end
+
+  defp github_component_match?(_component, _expected_name), do: false
 
   defp checks_observation(checks) do
     normalized =

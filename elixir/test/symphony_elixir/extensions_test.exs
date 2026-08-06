@@ -509,6 +509,45 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
+  test "web dashboard promotes parked waits above the fold" do
+    orchestrator_name = Module.concat(__MODULE__, :WaitingDashboardOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:waiting, [
+        %{
+          issue_id: "issue-wait",
+          identifier: "UDPE-7007",
+          title: "Recover durable work",
+          status: :waiting,
+          reason: "GitHub Actions outage",
+          condition: %{"type" => "github_actions_recovered", "component" => "actions"},
+          condition_key: "actions-wait",
+          backend: "codex",
+          worker_host: nil,
+          workspace_path: "/tmp/UDPE-7007",
+          parked_at: DateTime.utc_now(),
+          next_probe_at: DateTime.add(DateTime.utc_now(), 30, :second),
+          waiting_seconds: 60,
+          probe_attempt: 6,
+          last_observation: nil,
+          last_error: nil
+        }
+      ])
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "status-badge-waiting"
+    assert html =~ "1 waiting"
+    assert html =~ ~s(href="#waiting-work")
+    assert html =~ ~s(id="waiting-work")
+    assert html =~ "UDPE-7007"
+    assert html =~ "github_actions_recovered: actions"
+  end
+
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)

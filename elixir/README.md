@@ -239,9 +239,10 @@ Notes:
   activity, or a future time. The worker then exits cleanly and releases its concurrency slot while
   a non-LLM watcher persists the wait in `~/.symphony/waits.json`. Identical conditions share one
   probe with bounded exponential backoff. When the condition changes, the issue re-enters the
-  normal priority/concurrency scheduler with a compact state-change prompt. The dashboard exposes
-  Waiting rows plus **Resume now** and **Cancel wait**; cancelling the wait returns the issue to
-  normal scheduling rather than abandoning the assigned Linear issue.
+  normal priority/concurrency scheduler with a compact state-change prompt. The terminal dashboard
+  exposes a dedicated Waiting count and row section; the web dashboard adds an above-the-fold
+  Waiting badge linked to the detailed rows plus **Resume now** and **Cancel wait**. Cancelling the
+  wait returns the issue to normal scheduling rather than abandoning the assigned Linear issue.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
   provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local

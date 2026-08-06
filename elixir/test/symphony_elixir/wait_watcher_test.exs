@@ -50,6 +50,14 @@ defmodule SymphonyElixir.WaitWatcherTest do
     assert linear.condition["issue_id"] == "issue-1"
   end
 
+  test "matches GitHub status components without case sensitivity" do
+    component = %{"name" => "Actions", "status" => "major_outage"}
+
+    assert WaitCondition.github_component_match_for_test?(component, "actions")
+    assert WaitCondition.github_component_match_for_test?(component, "Actions")
+    refute WaitCondition.github_component_match_for_test?(component, "Git Operations")
+  end
+
   test "deduplicates identical probes and persists ready work", %{state_path: state_path} do
     test_pid = self()
 
