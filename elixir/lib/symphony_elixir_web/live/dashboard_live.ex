@@ -462,68 +462,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </article>
           </section>
 
-          <section id="waiting-work" class="section-card">
-            <div class="section-header">
-              <div>
-                <h2 class="section-title">Waiting work</h2>
-                <p class="section-copy">Persisted external-condition waits checked by lightweight, deduplicated probes.</p>
-              </div>
-            </div>
-
-            <%= if @dashboard_payload.waiting == [] do %>
-              <p class="empty-state">No issues are parked on external conditions.</p>
-            <% else %>
-              <div class="table-wrap">
-                <table class="data-table" style="min-width: 860px;">
-                  <thead>
-                    <tr>
-                      <th>Issue</th>
-                      <th>Condition</th>
-                      <th>Reason</th>
-                      <th>Next probe</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr :for={entry <- @dashboard_payload.waiting}>
-                      <td>
-                        <div class="issue-stack">
-                          <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
-                            <%= entry.issue_identifier %>
-                          </.link>
-                          <span :if={entry.title} class="issue-title"><%= entry.title %></span>
-                          <span class="muted"><%= entry.status %> · probe <%= entry.probe_attempt %></span>
-                        </div>
-                      </td>
-                      <td><code class="mono"><%= wait_condition_label(entry.condition) %></code></td>
-                      <td>
-                        <div class="detail-stack">
-                          <span><%= entry.reason %></span>
-                          <span :if={entry.last_error} class="muted">Last probe: <%= entry.last_error %></span>
-                        </div>
-                      </td>
-                      <td>
-                        <time :if={entry.next_probe_at} class="event-time-stamp" datetime={entry.next_probe_at} title={full_time(entry.next_probe_at)}>
-                          <%= full_time(entry.next_probe_at) %>
-                        </time>
-                      </td>
-                      <td>
-                        <div class="status-stack">
-                          <button type="button" class="subtle-button" phx-click="resume-wait" phx-value-identifier={entry.issue_identifier}>
-                            Resume now
-                          </button>
-                          <button type="button" class="subtle-button" phx-click="cancel-wait" phx-value-identifier={entry.issue_identifier}>
-                            Cancel wait
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            <% end %>
-          </section>
-
           <section class="section-card">
             <div class="section-header">
               <div>
@@ -698,6 +636,68 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <div :if={ctx_pct} class={"meter meter-sm #{context_meter_level(ctx_pct)}"}>
                             <div class="meter-fill" style={"width: #{ctx_pct}%"}></div>
                           </div>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          </section>
+
+          <section id="waiting-work" class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Waiting work</h2>
+                <p class="section-copy">Persisted external-condition waits checked by lightweight, deduplicated probes.</p>
+              </div>
+            </div>
+
+            <%= if @dashboard_payload.waiting == [] do %>
+              <p class="empty-state">No issues are parked on external conditions.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table" style="min-width: 860px;">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>Condition</th>
+                      <th>Reason</th>
+                      <th>Next probe</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @dashboard_payload.waiting}>
+                      <td>
+                        <div class="issue-stack">
+                          <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
+                            <%= entry.issue_identifier %>
+                          </.link>
+                          <span :if={entry.title} class="issue-title"><%= entry.title %></span>
+                          <span class="muted"><%= entry.status %> · probe <%= entry.probe_attempt %></span>
+                        </div>
+                      </td>
+                      <td><code class="mono"><%= wait_condition_label(entry.condition) %></code></td>
+                      <td>
+                        <div class="detail-stack">
+                          <span><%= entry.reason %></span>
+                          <span :if={entry.last_error} class="muted">Last probe: <%= entry.last_error %></span>
+                        </div>
+                      </td>
+                      <td>
+                        <time :if={entry.next_probe_at} class="event-time-stamp" datetime={entry.next_probe_at} title={full_time(entry.next_probe_at)}>
+                          <%= full_time(entry.next_probe_at) %>
+                        </time>
+                      </td>
+                      <td>
+                        <div class="status-stack">
+                          <button type="button" class="subtle-button" phx-click="resume-wait" phx-value-identifier={entry.issue_identifier}>
+                            Resume now
+                          </button>
+                          <button type="button" class="subtle-button" phx-click="cancel-wait" phx-value-identifier={entry.issue_identifier}>
+                            Cancel wait
+                          </button>
                         </div>
                       </td>
                     </tr>

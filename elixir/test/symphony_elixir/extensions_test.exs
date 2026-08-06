@@ -509,7 +509,7 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
-  test "web dashboard promotes parked waits above the fold" do
+  test "web dashboard promotes parked waits and lists them after running sessions" do
     orchestrator_name = Module.concat(__MODULE__, :WaitingDashboardOrchestrator)
 
     snapshot =
@@ -546,6 +546,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ ~s(id="waiting-work")
     assert html =~ "UDPE-7007"
     assert html =~ "github_actions_recovered: actions"
+
+    {running_position, _length} = :binary.match(html, "Running sessions")
+    {waiting_position, _length} = :binary.match(html, "Waiting work")
+    assert running_position < waiting_position
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
