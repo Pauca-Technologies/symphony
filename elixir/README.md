@@ -476,8 +476,10 @@ Notes:
 
   Symphony clamps unsafe values and always enforces one Codex turn per fresh reviewer attempt.
   It enforces the context budget over the final rendered workflow, guards, and packet using a
-  conservative three UTF-8 bytes per configured token; an oversized prompt is explicitly
-  inconclusive rather than truncated. Successful reviewer dynamic-tool responses larger than
+  conservative three UTF-8 bytes per configured token. If composition exceeds that ceiling,
+  Symphony rebuilds the reproducible packet once to the exact remaining budget; a prompt that
+  still does not fit is explicitly inconclusive rather than truncated. Successful reviewer
+  dynamic-tool responses larger than
   `tool_output_max_bytes` are replaced in both response text fields with a bounded preview plus the
   original size and narrow-query/raw-artifact recovery instructions. Failure responses remain
   intact so diagnostics are never hidden.

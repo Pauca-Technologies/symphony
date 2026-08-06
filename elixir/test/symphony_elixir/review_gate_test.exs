@@ -61,6 +61,32 @@ defmodule SymphonyElixir.ReviewGateTest do
     end
   end
 
+  defp synthetic_packet_result(workspace, reviewed_sha, encoded_bytes) do
+    packet = %{
+      schema_version: 1,
+      packet_id: "packet-#{encoded_bytes}",
+      candidate: %{head_sha: reviewed_sha},
+      diff: %{mode: "first_full_diff"},
+      requested_lenses: []
+    }
+
+    %{
+      packet: packet,
+      encoded: String.duplicate("x", encoded_bytes),
+      path: Path.join(workspace, ".artifacts/symphony-review/packet.v1.json")
+    }
+  end
+
+  defp budget_pressure_workflow do
+    prompt = "Review {{ issue.identifier }}\n" <> String.duplicate("workflow evidence ", 650)
+
+    %{
+      config: %{"review" => %{"context_budget_tokens" => 12_000, "packet_max_bytes" => 48_000}},
+      prompt: prompt,
+      prompt_template: prompt
+    }
+  end
+
   # Stub `gh` runner: pretends a PR exists and accepts edits, so the verdict
   # tests exercise the gate (and PR-section write) without shelling real gh.
   # When given a test pid, it forwards the edited PR body for assertions.
@@ -895,6 +921,105 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     assert actual_bytes > max_bytes
     assert max_bytes == 6_144 * 3
+  end
+
+  test "an incident-sized packet is rebuilt to the actual remaining prompt budget", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    packet_builder = fn workspace, _issue, _pr, reviewed_sha, _prior_outcome, settings, _opts ->
+      send(test_pid, {:packet_max_bytes, settings.packet_max_bytes})
+      encoded_bytes = min(21_054, settings.packet_max_bytes)
+      {:ok, synthetic_packet_result(workspace, reviewed_sha, encoded_bytes)}
+    end
+
+    runner = fn ctx ->
+      send(test_pid, {:fitted_prompt, byte_size(ctx.prompt), ctx.packet.packet_id, ctx.packet.candidate.head_sha})
+      write_verdict(ctx, %{"verdict" => "approve"})
+      {:ok, %{}}
+    end
+
+    assert {:approved, %{authoritative: true} = outcome} =
+             ReviewGate.run(workspace, issue(), nil, budget_pressure_workflow(),
+               review_packet_builder: packet_builder,
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:packet_max_bytes, 48_000}
+    assert_received {:packet_max_bytes, fitted_max_bytes}
+    assert fitted_max_bytes < 21_054
+    expected_packet_id = "packet-#{fitted_max_bytes}"
+    assert_received {:fitted_prompt, prompt_bytes, ^expected_packet_id, "head-7"}
+    assert prompt_bytes <= 36_000
+    assert outcome.packet_id == expected_packet_id
+  end
+
+  test "a packet builder that ignores the tighter budget is refit only once", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    packet_builder = fn workspace, _issue, _pr, reviewed_sha, _prior_outcome, settings, _opts ->
+      send(test_pid, {:ignored_packet_max_bytes, settings.packet_max_bytes})
+      {:ok, synthetic_packet_result(workspace, reviewed_sha, 21_054)}
+    end
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(workspace, issue(), nil, budget_pressure_workflow(),
+               review_packet_builder: packet_builder,
+               session_runner: fn _ctx -> flunk("review session must not start over the context ceiling") end,
+               pr_runner: pr_runner()
+             )
+
+    assert {:review_prompt_unavailable, {:review_context_budget_exceeded, actual_bytes, 36_000}} = outcome.failure_reason
+    assert actual_bytes > 36_000
+    assert_received {:ignored_packet_max_bytes, 48_000}
+    assert_received {:ignored_packet_max_bytes, fitted_max_bytes}
+    assert fitted_max_bytes < 21_054
+    refute_received {:ignored_packet_max_bytes, _third_attempt}
+  end
+
+  test "the verdict retry guard can trigger one fresh packet refit", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    packet_builder = fn workspace, _issue, _pr, reviewed_sha, _prior_outcome, settings, _opts ->
+      send(test_pid, {:retry_packet_max_bytes, settings.packet_max_bytes})
+      encoded_bytes = min(21_054, settings.packet_max_bytes)
+      {:ok, synthetic_packet_result(workspace, reviewed_sha, encoded_bytes)}
+    end
+
+    runner = fn ctx ->
+      attempt = Process.get(:review_prompt_refit_attempt, 0) + 1
+      Process.put(:review_prompt_refit_attempt, attempt)
+      send(test_pid, {:retry_prompt_bytes, attempt, byte_size(ctx.prompt)})
+
+      if attempt == 1 do
+        {:error, :transient_reviewer_failure}
+      else
+        write_verdict(ctx, %{"verdict" => "approve"})
+        {:ok, %{}}
+      end
+    end
+
+    assert {:approved, %{attempts: 2, authoritative: true}} =
+             ReviewGate.run(workspace, issue(), nil, budget_pressure_workflow(),
+               review_packet_builder: packet_builder,
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:retry_packet_max_bytes, 48_000}
+    assert_received {:retry_packet_max_bytes, first_fitted_max}
+    assert_received {:retry_packet_max_bytes, second_fitted_max}
+    assert second_fitted_max < first_fitted_max
+    assert_received {:retry_prompt_bytes, 1, first_prompt_bytes}
+    assert_received {:retry_prompt_bytes, 2, second_prompt_bytes}
+    assert first_prompt_bytes <= 36_000
+    assert second_prompt_bytes <= 36_000
   end
 
   test "minimum context budget admits a normal packet without truncating the candidate", %{

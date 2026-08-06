@@ -379,7 +379,13 @@ defmodule SymphonyElixir.ReviewGate do
            context.opts
          ) do
       {:ok, packet_result} ->
-        run_iteration(Map.put(context, :packet_result, packet_result), 1, nil)
+        review_context =
+          context
+          |> Map.put(:packet_result, packet_result)
+          |> Map.put(:packet_builder, packet_builder)
+          |> Map.put(:prior_outcome, prior_outcome)
+
+        run_iteration(review_context, 1, nil)
 
       {:error, reason} ->
         conclude_infrastructure_failure(
@@ -449,29 +455,20 @@ defmodule SymphonyElixir.ReviewGate do
          %{
            workspace: workspace,
            issue: %Issue{} = issue,
-           worker_host: worker_host,
-           review_workflow: review_workflow,
-           settings: settings,
-           opts: opts
+           worker_host: worker_host
          } = review_context,
          attempt,
          previous_reason
        ) do
-    verdict_path = Path.join(workspace, settings.verdict_path)
+    verdict_path = Path.join(workspace, review_context.settings.verdict_path)
     prepare_verdict_path(verdict_path)
 
-    packet_result = Map.fetch!(review_context, :packet_result)
+    case prepare_review_prompt(review_context, attempt, previous_reason) do
+      {:ok, prompt, fitted_context} ->
+        packet_result = Map.fetch!(fitted_context, :packet_result)
+        settings = fitted_context.settings
+        opts = fitted_context.opts
 
-    case render_review_prompt(
-           issue,
-           review_workflow,
-           attempt,
-           previous_reason,
-           settings.verdict_path,
-           packet_result,
-           settings
-         ) do
-      {:ok, prompt} ->
         {telemetry_handle, on_message} =
           ReviewTelemetry.start(issue, packet_result.packet, Keyword.get(opts, :on_message))
 
@@ -482,7 +479,7 @@ defmodule SymphonyElixir.ReviewGate do
           prompt: prompt,
           packet: packet_result.packet,
           packet_path: packet_result.path,
-          reviewed_sha: review_context.reviewed_sha,
+          reviewed_sha: fitted_context.reviewed_sha,
           verdict_path: verdict_path,
           tool_executor:
             review_tool_executor(
@@ -495,12 +492,21 @@ defmodule SymphonyElixir.ReviewGate do
 
         case run_review_session(ctx, opts) do
           {:ok, session} ->
-            evaluate_verdict(verdict_path, review_context, attempt, telemetry_handle, session)
+            evaluate_verdict(verdict_path, fitted_context, attempt, telemetry_handle, session)
 
           {:error, reason} ->
             ReviewTelemetry.finish(telemetry_handle, :session_failed)
-            handle_review_session_failure(review_context, attempt, reason)
+            handle_review_session_failure(fitted_context, attempt, reason)
         end
+
+      {:packet_error, reason} ->
+        conclude_infrastructure_failure(
+          issue,
+          review_context,
+          attempt,
+          {:review_packet_unavailable, reason},
+          review_context.opts
+        )
 
       {:error, reason} ->
         conclude_inconclusive(
@@ -511,6 +517,91 @@ defmodule SymphonyElixir.ReviewGate do
           "Repair the review prompt/workflow, then start a fresh orchestration run and re-attempt review for the candidate SHA."
         )
     end
+  end
+
+  defp prepare_review_prompt(review_context, attempt, previous_reason) do
+    case render_review_prompt_for_context(review_context, attempt, previous_reason) do
+      {:ok, prompt} ->
+        {:ok, prompt, review_context}
+
+      {:error, {:review_context_budget_exceeded, actual_bytes, max_bytes} = reason} ->
+        refit_review_packet(review_context, attempt, previous_reason, actual_bytes, max_bytes, reason)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp refit_review_packet(
+         review_context,
+         attempt,
+         previous_reason,
+         actual_bytes,
+         max_bytes,
+         original_reason
+       ) do
+    packet_result = Map.fetch!(review_context, :packet_result)
+    prompt_overhead_bytes = actual_bytes - byte_size(packet_result.encoded)
+    available_packet_bytes = max_bytes - prompt_overhead_bytes
+    packet_max_bytes = min(review_context.settings.packet_max_bytes, available_packet_bytes)
+
+    if packet_max_bytes <= 0 or packet_max_bytes >= review_context.settings.packet_max_bytes do
+      {:error, original_reason}
+    else
+      settings = %{review_context.settings | packet_max_bytes: packet_max_bytes}
+
+      case review_context.packet_builder.(
+             review_context.workspace,
+             review_context.issue,
+             review_context.pr,
+             review_context.reviewed_sha,
+             review_context.prior_outcome,
+             settings,
+             review_context.opts
+           ) do
+        {:ok, fitted_packet_result} ->
+          prepare_fitted_review_prompt(
+            review_context,
+            fitted_packet_result,
+            settings,
+            attempt,
+            previous_reason
+          )
+
+        {:error, reason} ->
+          {:packet_error, reason}
+      end
+    end
+  end
+
+  defp prepare_fitted_review_prompt(
+         review_context,
+         fitted_packet_result,
+         settings,
+         attempt,
+         previous_reason
+       ) do
+    fitted_context =
+      review_context
+      |> Map.put(:packet_result, fitted_packet_result)
+      |> Map.put(:settings, settings)
+
+    case render_review_prompt_for_context(fitted_context, attempt, previous_reason) do
+      {:ok, prompt} -> {:ok, prompt, fitted_context}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp render_review_prompt_for_context(review_context, attempt, previous_reason) do
+    render_review_prompt(
+      review_context.issue,
+      review_context.review_workflow,
+      attempt,
+      previous_reason,
+      review_context.settings.verdict_path,
+      review_context.packet_result,
+      review_context.settings
+    )
   end
 
   defp handle_review_session_failure(%{issue: %Issue{} = issue, opts: opts} = review_context, attempt, reason) do
