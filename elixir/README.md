@@ -280,7 +280,10 @@ Notes:
   environment without duplicating the wrapper in each backend's `command`. Any `.env` file it sources
   is run through the same sanitizer as a command-sourced file. Unset ⇒ launches are byte-for-byte
   unchanged. (With it set, you can drop the `sh -lc '… && exec …'` sourcing wrapper from
-  `codex.command` and leave just the bare agent invocation.)
+  `codex.command` and leave just the bare agent invocation.) For Codex, Symphony also disables the
+  per-thread shell snapshot when a pre-command is configured. Otherwise the snapshot's shell-profile
+  reload can reorder `PATH` after startup and bypass a workspace-local executable shim that the
+  pre-command prepended.
 - `agent.test_worker_limit` (default `2`) bounds test-runner fan-out inside each agent without
   changing `agent.max_concurrent_agents`. Every backend receives
   `SYMPHONY_TEST_WORKER_LIMIT`; the first-turn prompt directs agents to pass

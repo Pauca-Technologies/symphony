@@ -1191,6 +1191,8 @@ Subprocess launch parameters:
 Notes:
 
 - The default command is `codex app-server`.
+- When `agent.pre_command` is configured, implementations MAY disable Codex shell snapshots for the
+  thread so a shell-profile reload cannot override environment changes made by the pre-command.
 - Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
   using fields supported by the targeted Codex app-server version.
 

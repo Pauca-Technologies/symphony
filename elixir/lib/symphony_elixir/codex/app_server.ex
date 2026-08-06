@@ -639,11 +639,29 @@ defmodule SymphonyElixir.Codex.AppServer do
       model: non_blank_override(overrides, :model),
       reasoning_effort: non_blank_override(overrides, :reasoning_effort),
       dynamic_tools: Keyword.get(opts, :dynamic_tools, true),
-      config: Keyword.get(opts, :thread_config),
+      config: thread_config(opts),
       ephemeral: Keyword.get(opts, :ephemeral),
       base_instructions: Keyword.get(opts, :base_instructions),
       developer_instructions: Keyword.get(opts, :developer_instructions)
     }
+  end
+
+  defp thread_config(opts) do
+    configured = Keyword.get(opts, :thread_config)
+
+    case AgentTransport.pre_command() do
+      nil ->
+        configured
+
+      _pre_command ->
+        # Codex shell snapshots source the user's shell profile after the app
+        # server inherits `agent.pre_command`'s environment. A profile can
+        # reorder PATH and hide a workspace-local shim that the pre-command
+        # deliberately prepended (for example UDP's GitHub-App `gh` shim).
+        # Without the snapshot, Codex's ordinary login shell preserves the
+        # launch environment, including that PATH ordering.
+        Map.put(configured || %{}, "features.shell_snapshot", false)
+    end
   end
 
   defp non_blank_override(overrides, key) when is_map(overrides) do

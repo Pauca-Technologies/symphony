@@ -478,8 +478,32 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Use pre-command env", issue)
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Use pre-command env", issue,
+                 thread_config: %{
+                   "features.shell_snapshot" => true,
+                   "project_doc_max_bytes" => 12_345
+                 }
+               )
+
       assert File.read!(trace_file) =~ "ENV:available"
+
+      thread_config =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.find_value(fn line ->
+          if String.starts_with?(line, "JSON:") do
+            payload = line |> String.trim_leading("JSON:") |> Jason.decode!()
+
+            if payload["method"] == "thread/start" do
+              get_in(payload, ["params", "config"])
+            end
+          end
+        end)
+
+      assert thread_config["features.shell_snapshot"] == false
+      assert thread_config["project_doc_max_bytes"] == 12_345
 
       sanitized_env = File.read!(env_file)
       refute sanitized_env =~ "Unsupported engine"
