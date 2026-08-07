@@ -96,6 +96,24 @@ defmodule SymphonyElixir.WaitWatcherTest do
            ) == :component_operational
   end
 
+  test "treats skipped PR checks as terminal-neutral" do
+    checks = [
+      %{"name" => "unit-tests", "state" => "SUCCESS", "bucket" => "pass", "workflow" => "Tests"},
+      %{"name" => "docs:check", "state" => "SKIPPED", "bucket" => "skipping", "workflow" => "Lint PR"}
+    ]
+
+    assert %{"aggregate" => "pass", "checks" => normalized} =
+             WaitCondition.checks_observation_for_test(checks)
+
+    assert Enum.any?(normalized, &(&1["bucket"] == "skipping"))
+
+    pending = [%{"name" => "e2e", "state" => "IN_PROGRESS", "bucket" => "pending"} | checks]
+    assert %{"aggregate" => "pending"} = WaitCondition.checks_observation_for_test(pending)
+
+    failing = [%{"name" => "quality", "state" => "FAILURE", "bucket" => "fail"} | pending]
+    assert %{"aggregate" => "fail"} = WaitCondition.checks_observation_for_test(failing)
+  end
+
   test "deduplicates identical probes and persists ready work", %{state_path: state_path} do
     test_pid = self()
 

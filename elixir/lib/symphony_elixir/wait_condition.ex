@@ -152,6 +152,10 @@ defmodule SymphonyElixir.WaitCondition do
   def github_recovery_signal_for_test(component, incidents),
     do: github_recovery_signal(component, incidents)
 
+  @doc false
+  @spec checks_observation_for_test([map()]) :: map()
+  def checks_observation_for_test(checks), do: checks_observation(checks)
+
   @doc "Return a compact prompt describing why a parked issue was resumed."
   @spec resume_prompt(request(), map(), :condition_changed | :manual) :: String.t()
   def resume_prompt(request, observation, trigger) do
@@ -301,7 +305,7 @@ defmodule SymphonyElixir.WaitCondition do
     aggregate =
       cond do
         Enum.any?(normalized, &(&1["bucket"] in ["fail", "cancel"])) -> "fail"
-        Enum.any?(normalized, &(&1["bucket"] in ["pending", "skipping"])) -> "pending"
+        Enum.any?(normalized, &(&1["bucket"] == "pending")) -> "pending"
         normalized == [] -> "none"
         true -> "pass"
       end

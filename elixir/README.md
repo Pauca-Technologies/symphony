@@ -246,6 +246,8 @@ Notes:
   A GitHub Actions recovery wait wakes when the Actions component becomes operational or when every
   active incident affecting Actions formally reaches the `monitoring`/`resolved` phase, allowing one
   controlled retry as soon as GitHub reports mitigation rather than waiting for the component badge.
+  PR-check waits treat GitHub's terminal `SKIPPED` checks as neutral, so passed checks plus intentional
+  skips resolve to `pass` instead of remaining parked as `pending`.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
   provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local
