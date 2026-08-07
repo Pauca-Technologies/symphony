@@ -243,6 +243,9 @@ Notes:
   exposes a dedicated Waiting count and row section; the web dashboard adds an above-the-fold
   Waiting badge linked to the detailed rows plus **Resume now** and **Cancel wait**. Cancelling the
   wait returns the issue to normal scheduling rather than abandoning the assigned Linear issue.
+  A GitHub Actions recovery wait wakes when the Actions component becomes operational or when every
+  active incident affecting Actions formally reaches the `monitoring`/`resolved` phase, allowing one
+  controlled retry as soon as GitHub reports mitigation rather than waiting for the component badge.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
   provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local

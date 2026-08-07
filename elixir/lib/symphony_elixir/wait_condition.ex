@@ -10,7 +10,7 @@ defmodule SymphonyElixir.WaitCondition do
 
   alias SymphonyElixir.{AgentTransport, Tracker}
 
-  @github_status_url "https://www.githubstatus.com/api/v2/components.json"
+  @github_status_url "https://www.githubstatus.com/api/v2/summary.json"
   @command_timeout_ms 30_000
   @max_command_output_bytes 2_000_000
   @condition_types ~w(github_actions_recovered github_pr_checks_changed git_ref_changed linear_issue_changed time)
@@ -54,10 +54,19 @@ defmodule SymphonyElixir.WaitCondition do
 
     with {:ok, response} <- Req.get(@github_status_url, receive_timeout: 15_000),
          200 <- response.status,
-         %{"components" => components} when is_list(components) <- response.body,
+         %{"components" => components, "incidents" => incidents}
+         when is_list(components) and is_list(incidents) <- response.body,
          %{} = match <- Enum.find(components, &github_component_match?(&1, component)) do
-      observation = %{"component" => Map.get(match, "name"), "status" => Map.get(match, "status")}
-      if observation["status"] == "operational", do: {:changed, observation}, else: {:unchanged, observation}
+      signal = github_recovery_signal(match, incidents)
+
+      observation = %{
+        "component" => Map.get(match, "name"),
+        "status" => Map.get(match, "status"),
+        "incident_statuses" => github_incident_statuses(incidents, component),
+        "recovery_signal" => to_string(signal)
+      }
+
+      if signal == :waiting, do: {:unchanged, observation}, else: {:changed, observation}
     else
       status when is_integer(status) -> {:error, {:github_status_http, status}}
       nil -> {:error, {:github_status_component_missing, component}}
@@ -136,6 +145,12 @@ defmodule SymphonyElixir.WaitCondition do
   @spec github_component_match_for_test?(map(), String.t()) :: boolean()
   def github_component_match_for_test?(component, expected_name),
     do: github_component_match?(component, expected_name)
+
+  @doc false
+  @spec github_recovery_signal_for_test(map(), [map()]) ::
+          :component_operational | :incident_monitoring | :waiting
+  def github_recovery_signal_for_test(component, incidents),
+    do: github_recovery_signal(component, incidents)
 
   @doc "Return a compact prompt describing why a parked issue was resumed."
   @spec resume_prompt(request(), map(), :condition_changed | :manual) :: String.t()
@@ -244,6 +259,38 @@ defmodule SymphonyElixir.WaitCondition do
   end
 
   defp github_component_match?(_component, _expected_name), do: false
+
+  defp github_recovery_signal(%{"status" => "operational"}, _incidents),
+    do: :component_operational
+
+  defp github_recovery_signal(component, incidents) do
+    component_name = Map.get(component, "name")
+    relevant_incidents = Enum.filter(incidents, &github_incident_affects_component?(&1, component_name))
+
+    if relevant_incidents != [] and
+         Enum.all?(relevant_incidents, &(Map.get(&1, "status") in ["monitoring", "resolved"])) do
+      :incident_monitoring
+    else
+      :waiting
+    end
+  end
+
+  defp github_incident_statuses(incidents, component_name) do
+    incidents
+    |> Enum.filter(&github_incident_affects_component?(&1, component_name))
+    |> Enum.map(&Map.get(&1, "status"))
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp github_incident_affects_component?(incident, component_name) when is_binary(component_name) do
+    incident
+    |> Map.get("components", [])
+    |> Enum.any?(&github_component_match?(&1, component_name))
+  end
+
+  defp github_incident_affects_component?(_incident, _component_name), do: false
 
   defp checks_observation(checks) do
     normalized =

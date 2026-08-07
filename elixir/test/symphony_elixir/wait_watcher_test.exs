@@ -58,6 +58,44 @@ defmodule SymphonyElixir.WaitWatcherTest do
     refute WaitCondition.github_component_match_for_test?(component, "Git Operations")
   end
 
+  test "treats incident monitoring as a controlled GitHub Actions recovery signal" do
+    degraded_actions = %{"name" => "Actions", "status" => "major_outage"}
+
+    monitoring_incident = %{
+      "status" => "monitoring",
+      "components" => [%{"name" => "Actions", "status" => "major_outage"}]
+    }
+
+    identified_incident = %{
+      "status" => "identified",
+      "components" => [%{"name" => "Actions", "status" => "major_outage"}]
+    }
+
+    unrelated_incident = %{
+      "status" => "monitoring",
+      "components" => [%{"name" => "Pages", "status" => "degraded_performance"}]
+    }
+
+    assert WaitCondition.github_recovery_signal_for_test(degraded_actions, [monitoring_incident]) ==
+             :incident_monitoring
+
+    assert WaitCondition.github_recovery_signal_for_test(degraded_actions, [identified_incident]) ==
+             :waiting
+
+    assert WaitCondition.github_recovery_signal_for_test(degraded_actions, [unrelated_incident]) ==
+             :waiting
+
+    assert WaitCondition.github_recovery_signal_for_test(degraded_actions, [
+             monitoring_incident,
+             identified_incident
+           ]) == :waiting
+
+    assert WaitCondition.github_recovery_signal_for_test(
+             %{"name" => "Actions", "status" => "operational"},
+             [identified_incident]
+           ) == :component_operational
+  end
+
   test "deduplicates identical probes and persists ready work", %{state_path: state_path} do
     test_pid = self()
 
