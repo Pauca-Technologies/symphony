@@ -348,6 +348,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
     assert_receive {:waiting_prompt, prompt}
     assert prompt =~ "call Symphony's `wait_for` tool once and end the turn"
+    assert prompt =~ "Never call `wait_for` because of local CPU"
+    assert prompt =~ "permits validations from multiple agents to overlap"
     assert_receive {:waiting_tool_result, %{"success" => true}}
 
     assert_receive {:agent_lifecycle, "issue-agent-wait", :waiting, %{request: request}}

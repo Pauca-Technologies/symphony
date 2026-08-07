@@ -1378,7 +1378,10 @@ Optional client-side tool extension:
 - Purpose: stop spending model turns while useful work is blocked only on an external state change.
 - The request MUST include a non-empty reason and one typed condition. Standard condition types are
   GitHub Actions component recovery, GitHub PR-check state changes, git-ref SHA changes, Linear
-  issue/comment changes, and a future timestamp.
+  issue/comment changes.
+- Implementations MUST reject clock-only waits. Agents MUST NOT park for local resource pressure,
+  another validation, local process/port contention, or an elapsed-time backoff; independently
+  bounded validations may overlap across agents.
 - Change-based conditions MUST include the observation the agent just saw. The watcher MUST NOT
   resume merely because it observed the same value again.
 - A successful tool call records the request in the worker lifecycle. The agent SHOULD end its turn;

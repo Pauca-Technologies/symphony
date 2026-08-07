@@ -2071,8 +2071,9 @@ defmodule SymphonyElixir.AgentRunner do
     waiting_guidance = """
     Symphony waiting requirement:
 
-    - If useful work cannot continue until an external GitHub, git, Linear, or time condition changes, call Symphony's `wait_for` tool once and end the turn.
+    - If useful work cannot continue until an external GitHub, git, or Linear condition changes, call Symphony's `wait_for` tool once and end the turn.
     - Do not spend agent turns repeatedly polling an unchanged external condition. Symphony will persist the wait, free the agent slot, and resume this issue after the condition changes.
+    - Never call `wait_for` because of local CPU or memory pressure, another validation running, local process or port contention, or a desired time delay. Continue useful work and run repository validations with the configured per-run worker limit; Symphony intentionally permits validations from multiple agents to overlap.
     """
 
     handoff_guidance =

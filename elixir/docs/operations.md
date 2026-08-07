@@ -38,10 +38,13 @@ Symphony version; drain those legacy runs fully once. Subsequent rollouts can re
 ## Parked external waits
 
 Agents use the typed `wait_for` tool instead of consuming turns while polling unchanged GitHub,
-git, Linear, or time conditions. These waits survive restarts in `~/.symphony/waits.json`, appear in
+git, or Linear conditions. These waits survive restarts in `~/.symphony/waits.json`, appear in
 the dashboard as **Waiting work**, and do not occupy agent slots. **Resume now** wakes the issue
 without waiting for the next probe. **Cancel wait** removes the external condition and returns the
 issue to normal scheduling; it does not cancel or close the Linear issue.
+
+Do not park work for local CPU or memory pressure, another validation, local process/port contention,
+or a time delay. Validation runs remain independently worker-bounded and may overlap across agents.
 
 ## 3. Install and restart
 

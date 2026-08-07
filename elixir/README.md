@@ -235,8 +235,8 @@ Notes:
   because it cannot safely rely on context retained by a previous process. Reaching `max_turns`
   ends only that worker session; it does not change the Linear state or add `needs-human-input`.
 - Agents can call Symphony's typed `wait_for` tool when useful work is blocked only on an external
-  state change: GitHub Actions recovery, PR-check changes, a git ref advancing, Linear issue/comment
-  activity, or a future time. The worker then exits cleanly and releases its concurrency slot while
+  state change: GitHub Actions recovery, PR-check changes, a git ref advancing, or Linear
+  issue/comment activity. The worker then exits cleanly and releases its concurrency slot while
   a non-LLM watcher persists the wait in `~/.symphony/waits.json`. Identical conditions share one
   probe with bounded exponential backoff. When the condition changes, the issue re-enters the
   normal priority/concurrency scheduler with a compact state-change prompt. The terminal dashboard
@@ -246,6 +246,8 @@ Notes:
   A GitHub Actions recovery wait wakes when the Actions component becomes operational or when every
   active incident affecting Actions formally reaches the `monitoring`/`resolved` phase, allowing one
   controlled retry as soon as GitHub reports mitigation rather than waiting for the component badge.
+  The tool rejects clock waits and must not be used for local resource pressure, another validation,
+  or local process/port contention; independently bounded validations are allowed to overlap.
   PR-check waits treat GitHub's terminal `SKIPPED` checks as neutral, so passed checks plus intentional
   skips resolve to `pass` instead of remaining parked as `pending`.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent

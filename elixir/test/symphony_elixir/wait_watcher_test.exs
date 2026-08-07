@@ -48,6 +48,22 @@ defmodule SymphonyElixir.WaitWatcherTest do
              )
 
     assert linear.condition["issue_id"] == "issue-1"
+
+    assert {:error, {:unsupported_condition_type, "time"}} =
+             WaitCondition.normalize(
+               %{
+                 "reason" => "retry after local load drops",
+                 "condition" => %{"type" => "time", "resume_at" => "2099-01-01T00:00:00Z"}
+               },
+               context
+             )
+  end
+
+  test "wakes legacy persisted clock waits without accepting new ones" do
+    assert {:changed, %{"now" => _now}} =
+             WaitCondition.probe(%{
+               condition: %{"type" => "time", "resume_at" => "2020-01-01T00:00:00Z"}
+             })
   end
 
   test "matches GitHub status components without case sensitivity" do

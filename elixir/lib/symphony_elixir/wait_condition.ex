@@ -13,7 +13,7 @@ defmodule SymphonyElixir.WaitCondition do
   @github_status_url "https://www.githubstatus.com/api/v2/summary.json"
   @command_timeout_ms 30_000
   @max_command_output_bytes 2_000_000
-  @condition_types ~w(github_actions_recovered github_pr_checks_changed git_ref_changed linear_issue_changed time)
+  @condition_types ~w(github_actions_recovered github_pr_checks_changed git_ref_changed linear_issue_changed)
 
   @type request :: %{
           condition: map(),
@@ -128,6 +128,9 @@ defmodule SymphonyElixir.WaitCondition do
     end
   end
 
+  # Compatibility for timer waits persisted by releases that accepted them. New
+  # requests no longer normalize this condition type, but existing entries must
+  # still wake instead of becoming stranded during an upgrade.
   def probe(%{condition: %{"type" => "time", "resume_at" => resume_at}}) do
     case DateTime.from_iso8601(resume_at) do
       {:ok, datetime, _offset} ->
@@ -234,16 +237,6 @@ defmodule SymphonyElixir.WaitCondition do
     with {:ok, issue_id} <- non_blank(issue_id, :missing_issue_id),
          {:ok, observed} <- normalize_observed(value(condition, "observed")) do
       {:ok, %{"type" => "linear_issue_changed", "issue_id" => issue_id, "observed" => observed}}
-    end
-  end
-
-  defp do_normalize_condition("time", condition, _context) do
-    with {:ok, resume_at} <- non_blank(value(condition, "resume_at"), :missing_resume_at),
-         {:ok, datetime, _offset} <- DateTime.from_iso8601(resume_at),
-         :gt <- DateTime.compare(datetime, DateTime.utc_now()) do
-      {:ok, %{"type" => "time", "resume_at" => DateTime.to_iso8601(datetime)}}
-    else
-      _ -> {:error, :invalid_resume_at}
     end
   end
 
@@ -418,7 +411,6 @@ defmodule SymphonyElixir.WaitCondition do
   defp key_atom("ref"), do: :ref
   defp key_atom("issue_id"), do: :issue_id
   defp key_atom("observed"), do: :observed
-  defp key_atom("resume_at"), do: :resume_at
   defp datetime_string(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
   defp datetime_string(value) when is_binary(value), do: value
   defp datetime_string(_value), do: nil

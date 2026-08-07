@@ -68,7 +68,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              Enum.find(specs, &(&1["name"] == "wait_for"))
 
     assert wait_description =~ "without consuming an agent slot"
+    assert wait_description =~ "Never use this for local CPU"
     assert "condition" in wait_schema["required"]
+    refute "time" in wait_schema["properties"]["condition"]["properties"]["type"]["enum"]
+    refute Map.has_key?(wait_schema["properties"]["condition"]["properties"], "resume_at")
     assert Enum.map(specs, & &1["name"]) == ["linear_graphql", "wait_for"]
   end
 
