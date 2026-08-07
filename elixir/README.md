@@ -313,7 +313,9 @@ Notes:
   `SYMPHONY_TEST_WORKER_LIMIT`; the first-turn prompt directs agents to pass
   [`--maxWorkers=<limit>`](https://vitest.dev/config/maxworkers) to Vitest and
   [`--workers=<limit>`](https://playwright.dev/docs/test-parallel#limit-workers) to Playwright (or
-  read the neutral variable from repository runner config).
+  read the neutral variable from repository runner config). The same neutral limit is exported to
+  outer lifecycle hooks such as `before_handoff`, so detached validation cannot silently regain the
+  host's full CPU count.
 - `agent.label_presets` chooses the backend (and model) **per task** from the issue's Linear labels,
   overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
   whose `label` is present on the issue wins (positional precedence — list order, first match), and

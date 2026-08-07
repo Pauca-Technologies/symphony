@@ -424,13 +424,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <% else %>
           <section class="metric-grid">
             <article class="metric-card">
-              <p class="metric-label">Running</p>
+              <p class="metric-label">Agent slots</p>
               <p class="metric-value numeric"><%= @dashboard_payload.counts.running %></p>
               <p class="metric-detail">
                 <%= if draining?(@dashboard_payload) do %>
-                  Active sessions continue; new dispatch is paused.
+                  <%= @dashboard_payload.counts.implementing %> implementing · <%= @dashboard_payload.counts.handoff %> in handoff; new dispatch is paused.
                 <% else %>
-                  Active issue sessions in the current runtime.
+                  <%= @dashboard_payload.counts.implementing %> implementing · <%= @dashboard_payload.counts.handoff %> in handoff.
                 <% end %>
               </p>
             </article>
@@ -526,16 +526,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           </section>
 
-          <section class="section-card">
+          <section :for={group <- session_groups(@dashboard_payload)} class="section-card">
             <div class="section-header">
               <div>
-                <h2 class="section-title">Running sessions</h2>
-                <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+                <h2 class="section-title"><%= group.title %></h2>
+                <p class="section-copy"><%= group.copy %></p>
               </div>
             </div>
 
-            <%= if @dashboard_payload.running == [] do %>
-              <p class="empty-state">No active sessions.</p>
+            <%= if group.entries == [] do %>
+              <p class="empty-state"><%= group.empty %></p>
             <% else %>
               <div class="table-wrap">
                 <table class="data-table data-table-running">
@@ -560,7 +560,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </tr>
                   </thead>
                   <tbody>
-                    <tr :for={entry <- @dashboard_payload.running}>
+                    <tr :for={entry <- group.entries}>
                       <td>
                         <div class="issue-stack">
                           <.link class="issue-id" navigate={issue_path(entry.issue_identifier)}>
@@ -784,6 +784,31 @@ defmodule SymphonyElixirWeb.DashboardLive do
       <% end %>
     </div>
     """
+  end
+
+  defp session_groups(payload) do
+    implementing = %{
+      title: "Active implementors",
+      copy: "Agent turns that are still implementing, debugging, or running focused validation.",
+      entries: payload.implementing,
+      empty: "No agents are actively implementing."
+    }
+
+    case payload.handoff do
+      [] ->
+        [implementing]
+
+      handoff ->
+        [
+          implementing,
+          %{
+            title: "Handoff validation / review",
+            copy: "Post-turn exact-candidate gates and independent review owned by Symphony.",
+            entries: handoff,
+            empty: "No sessions are in handoff."
+          }
+        ]
+    end
   end
 
   defp load_dashboard_page(socket) do

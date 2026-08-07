@@ -16,15 +16,21 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
+        {handoff, implementing} = Enum.split_with(snapshot.running, &handoff_session?/1)
+
         %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
+            implementing: length(implementing),
+            handoff: length(handoff),
             queued: length(Map.get(snapshot, :queued, [])),
             retrying: length(snapshot.retrying),
             waiting: length(Map.get(snapshot, :waiting, []))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
+          implementing: Enum.map(implementing, &running_entry_payload/1),
+          handoff: Enum.map(handoff, &running_entry_payload/1),
           queued: Enum.map(Map.get(snapshot, :queued, []), &queued_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           waiting: Enum.map(Map.get(snapshot, :waiting, []), &waiting_entry_payload/1),
@@ -133,6 +139,10 @@ defmodule SymphonyElixirWeb.Presenter do
       draining: Map.get(mode, :draining, false),
       started_at: iso8601(Map.get(mode, :started_at))
     }
+  end
+
+  defp handoff_session?(entry) do
+    Map.get(entry, :lifecycle_state) in [:handoff_pending_gate, :handoff_pending_review]
   end
 
   defp issue_payload_body(issue_identifier, running, retry, waiting, transcript_cache, mode) do

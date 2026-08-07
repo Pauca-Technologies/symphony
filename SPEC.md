@@ -445,6 +445,7 @@ Fields:
   - Bounds test-runner worker processes inside each agent; it MUST NOT reduce agent-slot concurrency.
   - The effective value SHOULD be exposed as `SYMPHONY_TEST_WORKER_LIMIT` and in first-turn runtime
     guidance with runner-supported options.
+  - Lifecycle hooks that perform validation SHOULD inherit the same effective value.
 - `max_turns` (positive integer)
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.

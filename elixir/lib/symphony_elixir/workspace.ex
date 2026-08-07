@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{BareClone, Config, PathSafety, SSH}
+  alias SymphonyElixir.{BareClone, Config, PathSafety, SSH, TestWorkerBudget}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -724,7 +724,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp handoff_hook_env(opts) do
-    []
+    [{"SYMPHONY_TEST_WORKER_LIMIT", Integer.to_string(TestWorkerBudget.limit())}]
     |> maybe_put_hook_env("SYMPHONY_HANDOFF_GATE_PROTOCOL", Keyword.get(opts, :gate_protocol))
     |> maybe_put_hook_env("SYMPHONY_HANDOFF_GATE_JOB_ID", Keyword.get(opts, :gate_job_id))
   end

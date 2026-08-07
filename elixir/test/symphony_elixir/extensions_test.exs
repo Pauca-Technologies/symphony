@@ -509,6 +509,38 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
+  test "dashboard separates active implementation from handoff validation" do
+    orchestrator_name = Module.concat(__MODULE__, :HandoffDashboardOrchestrator)
+    active = static_snapshot().running |> List.first()
+
+    handoff =
+      Map.merge(active, %{
+        issue_id: "issue-handoff",
+        identifier: "UDPE-7016",
+        title: "Validate the exact candidate",
+        lifecycle_state: :handoff_pending_gate,
+        last_codex_event: "turn_completed"
+      })
+
+    snapshot = %{static_snapshot() | running: [active, handoff]}
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 50)
+
+    assert payload.counts == %{running: 2, implementing: 1, handoff: 1, queued: 0, retrying: 1, waiting: 0}
+    assert Enum.map(payload.implementing, & &1.issue_identifier) == ["MT-HTTP"]
+    assert Enum.map(payload.handoff, & &1.issue_identifier) == ["UDPE-7016"]
+    assert length(payload.running) == 2
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "Active implementors"
+    assert html =~ "Handoff validation / review"
+    assert html =~ "1 implementing · 1 in handoff"
+    assert html =~ "Post-turn exact-candidate gates"
+  end
+
   test "web dashboard promotes parked waits and lists them after running sessions" do
     orchestrator_name = Module.concat(__MODULE__, :WaitingDashboardOrchestrator)
 
@@ -547,7 +579,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "UDPE-7007"
     assert html =~ "github_actions_recovered: actions"
 
-    {running_position, _length} = :binary.match(html, "Running sessions")
+    {running_position, _length} = :binary.match(html, "Active implementors")
     {waiting_position, _length} = :binary.match(html, "Waiting work")
     assert running_position < waiting_position
   end
@@ -576,9 +608,18 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0},
+             "counts" => %{
+               "running" => 1,
+               "implementing" => 1,
+               "handoff" => 0,
+               "queued" => 0,
+               "retrying" => 1,
+               "waiting" => 0
+             },
              "queued" => [],
              "waiting" => [],
+             "handoff" => [],
+             "implementing" => state_payload["running"],
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -1742,7 +1783,15 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "implementing" => 1,
+             "handoff" => 0,
+             "queued" => 0,
+             "retrying" => 1,
+             "waiting" => 0
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -1807,7 +1856,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     port = HttpServer.bound_port()
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "implementing" => 1,
+             "handoff" => 0,
+             "queued" => 0,
+             "retrying" => 1,
+             "waiting" => 0
+           }
   end
 
   test "http server also listens on loopback when bound to a non-loopback host" do
@@ -1845,7 +1902,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     # ...and always via loopback, thanks to the extra listener.
     loopback = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert loopback.status == 200
-    assert loopback.body["counts"] == %{"running" => 1, "queued" => 0, "retrying" => 1, "waiting" => 0}
+
+    assert loopback.body["counts"] == %{
+             "running" => 1,
+             "implementing" => 1,
+             "handoff" => 0,
+             "queued" => 0,
+             "retrying" => 1,
+             "waiting" => 0
+           }
   end
 
   defp start_test_endpoint(overrides) do

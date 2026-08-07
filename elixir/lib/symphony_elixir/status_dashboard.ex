@@ -345,11 +345,13 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
+        {handoff_sessions, implementing_sessions} = Enum.split_with(running, &handoff_session?/1)
         waiting = Map.get(snapshot, :waiting, [])
         max_agents = Config.settings!().agent.max_concurrent_agents
         running_event_width = running_event_width(terminal_columns_override)
-        running_rows = format_running_rows(running, running_event_width)
-        running_to_repository_spacer = if(running == [], do: [], else: ["│"])
+        running_rows = format_running_rows(implementing_sessions, running_event_width)
+        running_to_handoff_spacer = if(implementing_sessions == [], do: [], else: ["│"])
+        handoff_lines = format_handoff_section(handoff_sessions, running_event_width)
         backoff_rows = format_retry_rows(retrying)
         scheduling_rows = format_scheduling_rows(Map.get(snapshot, :queued, []))
         waiting_rows = format_waiting_rows(waiting)
@@ -381,7 +383,8 @@ defmodule SymphonyElixir.StatusDashboard do
            running_table_separator_row(running_event_width)
          ] ++
            running_rows ++
-           running_to_repository_spacer ++
+           running_to_handoff_spacer ++
+           handoff_lines ++
            [colorize("├─ Repository queue", @ansi_bold), "│"] ++
            scheduling_rows ++
            ["│", colorize("├─ Waiting work", @ansi_bold), "│"] ++
@@ -602,6 +605,21 @@ defmodule SymphonyElixir.StatusDashboard do
       |> Enum.sort_by(& &1.identifier)
       |> Enum.map(&format_running_summary(&1, running_event_width))
     end
+  end
+
+  defp format_handoff_section([], _running_event_width), do: []
+
+  defp format_handoff_section(handoff_sessions, running_event_width) do
+    [
+      colorize("├─ Handoff validation / review", @ansi_bold),
+      "│",
+      running_table_header_row(running_event_width),
+      running_table_separator_row(running_event_width)
+    ] ++ format_running_rows(handoff_sessions, running_event_width) ++ ["│"]
+  end
+
+  defp handoff_session?(entry) do
+    Map.get(entry, :lifecycle_state) in [:handoff_pending_gate, :handoff_pending_review]
   end
 
   # credo:disable-for-next-line

@@ -65,7 +65,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
     try do
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        test_worker_limit: 3
+      )
 
       issue = %Issue{
         id: "issue-context-1",
@@ -126,8 +129,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       updated_issue = %{issue | description: "Updated scope"}
 
-      assert {:ok, ""} =
-               Workspace.run_before_handoff_hook(workspace, updated_issue, nil, hook_command: "true")
+      assert {:ok, "3"} =
+               Workspace.run_before_handoff_hook(workspace, updated_issue, nil, hook_command: "printf '%s' \"$SYMPHONY_TEST_WORKER_LIMIT\"")
 
       assert get_in(context_file |> File.read!() |> Jason.decode!(), ["issue", "description"]) ==
                "Updated scope"
