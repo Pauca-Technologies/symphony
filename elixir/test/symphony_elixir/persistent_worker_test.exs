@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.PersistentWorkerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.PersistentWorker
   alias SymphonyElixir.PersistentWorker.{Client, Registry, Server}
 
   defmodule RelayTarget do
@@ -56,6 +57,20 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     assert updated.status == "running"
 
     assert :ok = Registry.cleanup(updated, updated.worker_id)
+    assert Registry.list() == []
+  end
+
+  test "completed records are reclaimed instead of reattached as failed workers" do
+    issue = issue("completed-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, completed} = Registry.update(manifest, %{status: "completed"})
+
+    assert {:ok, replacement} = Registry.prepare(issue, 2, nil)
+    refute replacement.worker_id == completed.worker_id
+    assert replacement.attempt == 2
+
+    assert {:ok, _completed_replacement} = Registry.update(replacement, %{status: "completed"})
+    assert PersistentWorker.attach_all(self()) == []
     assert Registry.list() == []
   end
 

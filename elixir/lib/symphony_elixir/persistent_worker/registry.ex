@@ -68,8 +68,17 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
          :ok <- create_run_dir(run_dir) do
       do_prepare(run_dir, issue, normalize_attempt(attempt), worker_host, safe_runner_opts(runner_opts))
     else
-      {:error, :eexist} -> existing_manifest(run_dir)
-      {:error, reason} -> {:error, reason}
+      {:error, :eexist} ->
+        prepare_from_existing(
+          run_dir,
+          issue,
+          attempt,
+          worker_host,
+          runner_opts
+        )
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -229,6 +238,33 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
     case load_manifest(Path.join(run_dir, @manifest_filename)) do
       {:ok, manifest} -> {:existing, manifest}
       {:error, reason} -> {:error, {:existing_worker_record_invalid, reason}}
+    end
+  end
+
+  defp prepare_from_existing(run_dir, issue, attempt, worker_host, runner_opts) do
+    case existing_manifest(run_dir) do
+      {:existing, %{status: "completed"} = manifest} ->
+        replace_terminal_manifest(manifest, issue, attempt, worker_host, runner_opts)
+
+      {:existing, %{status: "stopping"} = manifest} ->
+        prepare_from_stopping(manifest, issue, attempt, worker_host, runner_opts)
+
+      result ->
+        result
+    end
+  end
+
+  defp prepare_from_stopping(manifest, issue, attempt, worker_host, runner_opts) do
+    if worker_alive?(manifest) do
+      {:existing, manifest}
+    else
+      replace_terminal_manifest(manifest, issue, attempt, worker_host, runner_opts)
+    end
+  end
+
+  defp replace_terminal_manifest(manifest, issue, attempt, worker_host, runner_opts) do
+    with :ok <- cleanup(manifest, manifest.worker_id) do
+      prepare(issue, attempt, worker_host, runner_opts)
     end
   end
 

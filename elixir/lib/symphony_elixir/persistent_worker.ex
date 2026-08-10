@@ -58,17 +58,7 @@ defmodule SymphonyElixir.PersistentWorker do
       when is_pid(orchestrator) do
     Registry.list()
     |> Enum.reject(&MapSet.member?(tracked_worker_ids, &1.worker_id))
-    |> Enum.flat_map(fn manifest ->
-      case attach_manifest(manifest, orchestrator, false) do
-        {:ok, attachment} ->
-          [attachment]
-
-        {:error, reason} ->
-          Logger.warning("Unable to reconnect persistent worker worker_id=#{manifest.worker_id} issue_id=#{manifest.issue_id}: #{inspect(reason)}")
-
-          []
-      end
-    end)
+    |> Enum.flat_map(&attach_discovered_manifest(&1, orchestrator))
   end
 
   @doc "Request a tracked worker to stop cleanly."
@@ -79,6 +69,31 @@ defmodule SymphonyElixir.PersistentWorker do
     with {:ok, spec} <- Registry.load_spec(manifest),
          {:ok, pid} <- start_client(manifest, orchestrator) do
       {:ok, %{pid: pid, manifest: manifest, spec: spec, launched?: launched?}}
+    end
+  end
+
+  defp attach_discovered_manifest(%{status: "completed"} = manifest, _orchestrator) do
+    _ = Registry.cleanup(manifest, manifest.worker_id)
+    []
+  end
+
+  defp attach_discovered_manifest(%{status: "stopping"} = manifest, _orchestrator) do
+    unless Registry.worker_alive?(manifest) do
+      _ = Registry.cleanup(manifest, manifest.worker_id)
+    end
+
+    []
+  end
+
+  defp attach_discovered_manifest(manifest, orchestrator) do
+    case attach_manifest(manifest, orchestrator, false) do
+      {:ok, attachment} ->
+        [attachment]
+
+      {:error, reason} ->
+        Logger.warning("Unable to reconnect persistent worker worker_id=#{manifest.worker_id} issue_id=#{manifest.issue_id}: #{inspect(reason)}")
+
+        []
     end
   end
 

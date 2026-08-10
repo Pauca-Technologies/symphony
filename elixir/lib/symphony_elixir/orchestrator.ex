@@ -736,6 +736,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec choose_issues_for_test([Issue.t()], term()) :: term()
+  def choose_issues_for_test(issues, %State{} = state) when is_list(issues) do
+    choose_issues(issues, state)
+  end
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -1096,7 +1102,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp consider_issue_for_dispatch(issue, state, repo_config, active_states, terminal_states) do
-    if should_dispatch_issue?(issue, state, active_states, terminal_states) do
+    if eligible_issue_for_dispatch?(issue, state, active_states, terminal_states) do
       issue
       |> gate_routing_and_cardinality(repo_config, active_states)
       |> apply_gate_decision(state, issue, repo_config)
@@ -1108,9 +1114,17 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_gate_decision(:pass, state, issue, repo_config) do
     case RepositoryScheduler.decide(issue, repo_config, state.running) do
       {:allow, decision} ->
-        state
-        |> allow_scheduling_dispatch(issue, decision)
-        |> dispatch_issue(issue)
+        if dispatch_capacity_available?(issue, state) do
+          state
+          |> allow_scheduling_dispatch(issue, decision)
+          |> dispatch_issue(issue)
+        else
+          queue_scheduling_decision(
+            state,
+            issue,
+            Map.put(decision, :reason, "orchestrator_capacity")
+          )
+        end
 
       {:queue, decision} ->
         queue_scheduling_decision(state, issue, decision)
@@ -1458,6 +1472,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
+         %State{} = state,
+         active_states,
+         terminal_states
+       ) do
+    eligible_issue_for_dispatch?(issue, state, active_states, terminal_states) and
+      dispatch_capacity_available?(issue, state)
+  end
+
+  defp eligible_issue_for_dispatch?(
+         %Issue{} = issue,
          %State{running: running, claimed: claimed} = state,
          active_states,
          terminal_states
@@ -1467,13 +1491,12 @@ defmodule SymphonyElixir.Orchestrator do
       !issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
-      backend_dispatch_available?(state, predicted_backend(issue)) and
-      available_slots(state) > 0 and
-      state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      backend_dispatch_available?(state, predicted_backend(issue))
   end
 
-  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp dispatch_capacity_available?(%Issue{} = issue, %State{} = state) do
+    dispatch_slots_available?(issue, state) and worker_slots_available?(state)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -2059,19 +2082,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
-    next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
+    next_attempt = scheduled_attempt(attempt, previous_retry)
     delay_ms = metadata[:delay_ms_override] || retry_delay(next_attempt, metadata)
+    retry_kind = metadata[:retry_kind] || Map.get(previous_retry, :retry_kind)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     title = pick_retry_title(previous_retry, metadata)
-    error = pick_retry_error(previous_retry, metadata)
     backend = metadata[:backend] || Map.get(previous_retry, :backend)
-
-    failure_class =
-      metadata[:failure_class] || retry_failure_class(metadata[:failure]) ||
-        Map.get(previous_retry, :failure_class)
+    {error, failure_class} = retry_failure_details(retry_kind, previous_retry, metadata)
 
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
@@ -2079,15 +2099,10 @@ defmodule SymphonyElixir.Orchestrator do
     recent_codex_transcript_blocks = pick_retry_codex_transcript_blocks(previous_retry, metadata)
     wait_resume_prompt = pick_retry_wait_resume_prompt(previous_retry, metadata)
 
-    if is_reference(old_timer) do
-      Process.cancel_timer(old_timer)
-    end
+    cancel_retry_timer(old_timer)
 
     timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
-
-    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
-
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+    log_scheduled_retry(retry_kind, issue_id, identifier, delay_ms, next_attempt, error)
 
     %{
       state
@@ -2106,11 +2121,55 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: workspace_path,
             codex_session_logs: codex_session_logs,
             recent_codex_transcript_blocks: recent_codex_transcript_blocks,
-            wait_resume_prompt: wait_resume_prompt
+            wait_resume_prompt: wait_resume_prompt,
+            retry_kind: retry_kind
           })
     }
-    |> emit_retry_policy(issue_id, metadata, :scheduled, next_attempt, delay_ms)
+    |> maybe_emit_retry_policy(
+      issue_id,
+      Map.put(metadata, :retry_kind, retry_kind),
+      :scheduled,
+      next_attempt,
+      delay_ms
+    )
   end
+
+  defp scheduled_attempt(attempt, _previous_retry) when is_integer(attempt), do: attempt
+  defp scheduled_attempt(_attempt, previous_retry), do: previous_retry.attempt + 1
+
+  defp retry_failure_details(:queue, _previous_retry, _metadata), do: {nil, nil}
+
+  defp retry_failure_details(_retry_kind, previous_retry, metadata) do
+    error = pick_retry_error(previous_retry, metadata)
+
+    failure_class =
+      metadata[:failure_class] || retry_failure_class(metadata[:failure]) ||
+        Map.get(previous_retry, :failure_class)
+
+    {error, failure_class}
+  end
+
+  defp cancel_retry_timer(timer_ref) when is_reference(timer_ref) do
+    Process.cancel_timer(timer_ref)
+  end
+
+  defp cancel_retry_timer(_timer_ref), do: false
+
+  defp log_scheduled_retry(:queue, issue_id, identifier, delay_ms, _attempt, _error) do
+    Logger.debug("Queued issue_id=#{issue_id} issue_identifier=#{identifier} for another capacity check in #{delay_ms}ms")
+  end
+
+  defp log_scheduled_retry(_retry_kind, issue_id, identifier, delay_ms, attempt, error) do
+    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+
+    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{attempt})#{error_suffix}")
+  end
+
+  defp maybe_emit_retry_policy(state, _issue_id, %{retry_kind: :queue}, _action, _attempt, _delay_ms),
+    do: state
+
+  defp maybe_emit_retry_policy(state, issue_id, metadata, action, attempt, delay_ms),
+    do: emit_retry_policy(state, issue_id, metadata, action, attempt, delay_ms)
 
   # Schedule a retry for a *genuine* agent-run failure (crash, stall,
   # handoff-review timeout, spawn failure), counting it against the
@@ -2244,7 +2303,8 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
           codex_session_logs: Map.get(retry_entry, :codex_session_logs, []),
-          recent_codex_transcript_blocks: Map.get(retry_entry, :recent_codex_transcript_blocks, [])
+          recent_codex_transcript_blocks: Map.get(retry_entry, :recent_codex_transcript_blocks, []),
+          retry_kind: Map.get(retry_entry, :retry_kind)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -2391,7 +2451,7 @@ defmodule SymphonyElixir.Orchestrator do
       match?({:queue, _decision}, scheduling) ->
         {:queue, decision} = scheduling
         queued_state = queue_scheduling_decision(state, issue, decision)
-        schedule_repository_retry(queued_state, issue, attempt, metadata, decision.reason)
+        schedule_queued_retry(queued_state, issue, attempt, metadata)
 
       match?({:allow, _decision}, scheduling) and dispatch_slots_available?(issue, state) and
           worker_slots_available?(state, metadata[:worker_host]) ->
@@ -2402,18 +2462,25 @@ defmodule SymphonyElixir.Orchestrator do
         |> dispatch_active_retry(issue, attempt, metadata)
 
       true ->
-        Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
-        schedule_repository_retry(state, issue, attempt, metadata, "no available orchestrator slots")
+        {:allow, decision} = scheduling
+        capacity_decision = Map.put(decision, :reason, "orchestrator_capacity")
+        queued_state = queue_scheduling_decision(state, issue, capacity_decision)
+        schedule_queued_retry(queued_state, issue, attempt, metadata)
     end
   end
 
-  defp schedule_repository_retry(state, issue, attempt, metadata, reason) do
+  defp schedule_queued_retry(state, issue, attempt, metadata) do
     {:noreply,
      schedule_issue_retry(
        state,
        issue.id,
-       attempt + 1,
-       Map.merge(metadata, %{identifier: issue.identifier, error: reason})
+       attempt,
+       Map.merge(metadata, %{
+         identifier: issue.identifier,
+         issue: issue,
+         delay_ms_override: max(state.poll_interval_ms, 1_000),
+         retry_kind: :queue
+       })
      )}
   end
 
@@ -2918,6 +2985,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     retrying =
       state.retry_attempts
+      |> Enum.reject(fn {_issue_id, retry} -> Map.get(retry, :retry_kind) == :queue end)
       |> Enum.map(fn {issue_id, %{attempt: attempt, due_at_ms: due_at_ms} = retry} ->
         %{
           issue_id: issue_id,

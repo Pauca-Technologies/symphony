@@ -280,9 +280,13 @@ Notes:
   orchestrator owns only a reconnecting relay. Restarting or crashing the orchestrator therefore
   preserves active Codex, ACP, and Claude Code sessions, including remote sessions reached through
   SSH. A replacement orchestrator adopts the workers and replays their latest acknowledged runtime
-  checkpoint plus any events produced while disconnected. Completed records are removed
-  automatically; per-worker logs live under `~/.symphony/worker-logs`. Worker BEAMs use a small
+  checkpoint plus any events produced while disconnected. Completed records are reclaimed rather
+  than adopted, so a cleanly stopped worker cannot become a synthetic failed run after restart;
+  per-worker logs live under `~/.symphony/worker-logs`. Worker BEAMs use a small
   scheduler pool because model and repository work runs in external processes.
+- Eligible issues and continuations that cannot run because the global, per-state, repository, or
+  worker-host capacity is occupied remain visible in the scheduling queue. Capacity checks use the
+  normal polling cadence and do not increment retry attempts or emit agent-failure telemetry.
 - Drain mode pauses new candidate dispatch, retries, and quota probes without stopping active
   workers. Its state is saved in `~/.symphony/drain-state.json`, so it remains active through the
   restart it is intended to protect. Enable it with `POST /api/v1/drain` or the dashboard button;

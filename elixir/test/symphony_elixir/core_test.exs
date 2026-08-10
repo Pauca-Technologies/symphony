@@ -1089,6 +1089,100 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(:sys.get_state(pid).queued, issue_id)
   end
 
+  test "a continuation waiting for capacity stays queued without a failure retry" do
+    previous_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_states = Application.get_env(:symphony_elixir, :memory_tracker_states_by_ids_result)
+    previous_telemetry = Application.get_env(:symphony_elixir, :telemetry_enabled)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"],
+      max_concurrent_agents: 1,
+      poll_interval_ms: 30_000,
+      codex_command: "/bin/false app-server"
+    )
+
+    issue_id = "issue-capacity-wait"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-7164",
+      title: "Resume when a slot opens",
+      description: "Capacity is scheduling state, not an agent failure",
+      state: "In Progress",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_states_by_ids_result, {:ok, [issue]})
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    orchestrator_name = Module.concat(__MODULE__, :CapacityWaitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_issues)
+      restore_app_env(:memory_tracker_states_by_ids_result, previous_states)
+      restore_app_env(:telemetry_enabled, previous_telemetry)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+    retry_token = make_ref()
+
+    occupied_issue = %Issue{
+      id: "occupied",
+      identifier: "MT-OCCUPIED",
+      title: "Occupy the only slot",
+      state: "In Progress",
+      labels: []
+    }
+
+    fresh_queue_state =
+      initial_state
+      |> Map.put(:running, %{"occupied" => %{issue: occupied_issue}})
+      |> Map.put(:claimed, MapSet.new())
+      |> then(&Orchestrator.choose_issues_for_test([issue], &1))
+
+    assert %{reason: "orchestrator_capacity"} = fresh_queue_state.queued[issue_id]
+    refute MapSet.member?(fresh_queue_state.claimed, issue_id)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{"occupied" => %{issue: occupied_issue}})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond) + 1_000,
+          identifier: issue.identifier,
+          error: "old failure",
+          failure_class: :agent_protocol_failure
+        }
+      })
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    send(pid, {:retry_issue, issue_id, retry_token})
+    state = :sys.get_state(pid)
+
+    assert %{reason: "orchestrator_capacity"} = state.queued[issue_id]
+
+    assert %{attempt: 1, retry_kind: :queue, error: nil, failure_class: nil} =
+             state.retry_attempts[issue_id]
+
+    snapshot_state = %{state | running: %{}}
+    assert {:reply, snapshot, ^snapshot_state} = Orchestrator.handle_call(:snapshot, self(), snapshot_state)
+    assert snapshot.retrying == []
+    assert [%{issue_id: ^issue_id, reason: "orchestrator_capacity"}] = snapshot.queued
+
+    refute Enum.any?(SymphonyElixir.Telemetry.read_events(Date.utc_today(), Date.utc_today()), fn event ->
+             event["event"] == "retry_policy" and event["issue_id"] == issue_id
+           end)
+  end
+
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
     now_ms = System.monotonic_time(:millisecond)
     stale_tick_token = make_ref()
