@@ -37,7 +37,7 @@ claude_code:
 | `model` | _(unset)_ | Passed as `--model` (e.g. `opus`, `claude-fable-5`). Unset ⇒ Claude Code's own resolution. |
 | `permission_mode` | `bypassPermissions` | Passed as `--permission-mode`. One of `default`, `acceptEdits`, `bypassPermissions`, `auto`, `dontAsk`, `plan`. Mirrors Codex `approval_policy: never` for non-interactive runs. |
 | `extra_args` | `[]` | Extra raw CLI args appended verbatim (e.g. `["--append-system-prompt", "..."]`). |
-| `prompt_timeout_ms` | `3_600_000` | Max wall-clock for one turn. |
+| `prompt_timeout_ms` | `0` | Optional wall-clock ceiling for one turn; `0` disables it. |
 | `stall_timeout_ms` | `300_000` | Idle timeout between streamed events during a turn. |
 | `withhold_linear_credentials` | `true` | **Load-bearing.** Scrub `LINEAR_API_KEY` (and friends) from the agent's process env. |
 

@@ -1136,7 +1136,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "excludeSlashTmp" => false
            }
 
-    assert config.codex.turn_timeout_ms == 3_600_000
+    assert config.codex.turn_timeout_ms == 0
+    assert config.acp.prompt_timeout_ms == 0
+    assert config.claude_code.prompt_timeout_ms == 0
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
     assert config.hooks.before_handoff_timeout_ms == nil

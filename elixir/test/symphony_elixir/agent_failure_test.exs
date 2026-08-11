@@ -57,6 +57,11 @@ defmodule SymphonyElixir.AgentFailureTest do
     assert AgentFailure.classify({:review_gate_infrastructure, "packet unavailable"}, backend: "codex").class ==
              :transient_infrastructure
 
+    assert AgentFailure.classify(
+             {:review_gate_infrastructure, %{review: %{failure_reason: "{:packet_bound_unachievable, 17417, 17267}"}}},
+             backend: "codex"
+           ).class == :handoff_reviewer_gate
+
     assert %AgentFailure{class: :rate_limited, retry_after_ms: 30_000, scope: :issue} =
              AgentFailure.classify({:rate_limited, 30_000}, backend: "codex")
 

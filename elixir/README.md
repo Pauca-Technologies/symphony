@@ -301,9 +301,11 @@ Notes:
   `~/.symphony/shutdown-policy.json` and can be changed from the dashboard or with
   `POST /api/v1/shutdown-policy/preserve` and `POST /api/v1/shutdown-policy/terminate`. Changing this
   policy does not enable or cancel drain mode.
-- `codex.turn_timeout_ms` is a wall-clock ceiling for one Codex turn, not an idle timeout. Streaming
-  events and subagent activity do not reset it. ACP and Claude Code already apply their
-  `prompt_timeout_ms` values as wall-clock deadlines.
+- Backend turn wall-clock ceilings are disabled by default (`codex.turn_timeout_ms: 0` and
+  `prompt_timeout_ms: 0` for ACP/Claude Code), so an active agent may work for multiple hours.
+  The separate five-minute `stall_timeout_ms` watchdog remains enabled and is refreshed by backend
+  activity. Set a positive turn/prompt timeout only when an operator wants an additional absolute
+  ceiling; streamed activity does not reset that opt-in ceiling.
 - `agent.backend` selects the coding-agent backend: `codex` (default, the Codex app-server described
   above), `acp` (the Agent Client Protocol, e.g. `opencode acp`), or `claude_code` (native Claude Code
   `claude -p` stream-json). All backends honor the same handoff gate and observability transcript.

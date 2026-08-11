@@ -111,6 +111,9 @@ defmodule SymphonyElixir.AgentFailure do
       timeout_or_stall?(reason) ->
         failure(:response_timeout_or_stall, reason, backend)
 
+      deterministic_packet_bound_failure?(reason) ->
+        failure(:handoff_reviewer_gate, reason, backend)
+
       tagged?(reason, @auth_tags) ->
         failure(:authentication_configuration, reason, backend)
 
@@ -170,6 +173,28 @@ defmodule SymphonyElixir.AgentFailure do
   defp timeout_or_stall?(reason) do
     tagged?(reason, [:response_timeout, :turn_timeout, :prompt_timeout, :stall, :stalled])
   end
+
+  defp deterministic_packet_bound_failure?(reason) do
+    contains_atom?(reason, :packet_bound_unachievable) or
+      contains_internal_marker?(reason, "packet_bound_unachievable")
+  end
+
+  defp contains_internal_marker?(value, marker) when is_binary(value),
+    do: String.contains?(value, marker)
+
+  defp contains_internal_marker?(tuple, marker) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.any?(&contains_internal_marker?(&1, marker))
+
+  defp contains_internal_marker?(list, marker) when is_list(list),
+    do: Enum.any?(list, &contains_internal_marker?(&1, marker))
+
+  defp contains_internal_marker?(map, marker) when is_map(map) do
+    Enum.any?(map, fn {key, value} ->
+      contains_internal_marker?(key, marker) or contains_internal_marker?(value, marker)
+    end)
+  end
+
+  defp contains_internal_marker?(_value, _marker), do: false
 
   defp tagged?(reason, tags) when is_list(tags) do
     Enum.any?(tags, &contains_atom?(reason, &1))

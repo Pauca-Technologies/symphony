@@ -513,8 +513,9 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
-- `turn_timeout_ms` (integer)
-  - Default: `3600000` (1 hour)
+- `turn_timeout_ms` (non-negative integer)
+  - Default: `0` (disabled)
+  - A positive value enables an absolute wall-clock ceiling for one turn.
 - `read_timeout_ms` (integer)
   - Default: `5000`
 - `stall_timeout_ms` (integer)
@@ -664,7 +665,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
-- `codex.turn_timeout_ms`: integer, default `3600000`
+- `codex.turn_timeout_ms`: non-negative integer, default `0` (disabled)
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
 
@@ -1409,7 +1410,8 @@ User-input-required policy:
 Timeouts:
 
 - `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: absolute wall-clock turn timeout; streamed activity MUST NOT reset it
+- `codex.turn_timeout_ms`: optional absolute wall-clock turn timeout; `0` disables it and streamed
+  activity MUST NOT reset a positive value
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):

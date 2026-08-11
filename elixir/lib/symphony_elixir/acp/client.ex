@@ -133,7 +133,7 @@ defmodule SymphonyElixir.Acp.Client do
       prompt_id: prompt_id,
       tool_executor: tool_executor,
       pending: "",
-      deadline: now + session.acp.prompt_timeout_ms,
+      deadline: optional_deadline(now, session.acp.prompt_timeout_ms),
       last_activity: now,
       heartbeats: 0
     }
@@ -382,14 +382,17 @@ defmodule SymphonyElixir.Acp.Client do
 
   defp receive_timeout(%{deadline: deadline, last_activity: last, session: %{acp: acp}}) do
     now = System.monotonic_time(:millisecond)
-    turn_remaining = max(0, deadline - now)
 
-    stall_remaining =
-      if acp.stall_timeout_ms > 0, do: max(0, acp.stall_timeout_ms - (now - last)), else: turn_remaining
-
-    heartbeat = if acp.heartbeat_ms > 0, do: acp.heartbeat_ms, else: turn_remaining
-
-    Enum.min([turn_remaining, stall_remaining, heartbeat])
+    [
+      remaining_deadline(deadline, now),
+      optional_remaining(acp.stall_timeout_ms, now - last),
+      optional_interval(acp.heartbeat_ms)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> :infinity
+      timeouts -> Enum.min(timeouts)
+    end
   end
 
   defp stalled?(%{last_activity: last, session: %{acp: %{stall_timeout_ms: stall}}}) do
@@ -416,9 +419,30 @@ defmodule SymphonyElixir.Acp.Client do
     %{state | heartbeats: count}
   end
 
+  defp turn_deadline_passed?(%{deadline: nil}), do: false
+
   defp turn_deadline_passed?(%{deadline: deadline}) do
     System.monotonic_time(:millisecond) >= deadline
   end
+
+  defp optional_deadline(now, timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0,
+    do: now + timeout_ms
+
+  defp optional_deadline(_now, _timeout_ms), do: nil
+
+  defp remaining_deadline(nil, _now), do: nil
+  defp remaining_deadline(deadline, now), do: max(0, deadline - now)
+
+  defp optional_remaining(timeout_ms, elapsed_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0,
+       do: max(0, timeout_ms - elapsed_ms)
+
+  defp optional_remaining(_timeout_ms, _elapsed_ms), do: nil
+
+  defp optional_interval(interval_ms) when is_integer(interval_ms) and interval_ms > 0,
+    do: interval_ms
+
+  defp optional_interval(_interval_ms), do: nil
 
   defp dispatch_line(state, line) do
     case Jason.decode(line) do

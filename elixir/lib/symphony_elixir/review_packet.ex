@@ -211,11 +211,12 @@ defmodule SymphonyElixir.ReviewPacket do
       {"finding_bodies", &compact_findings/1},
       {"repository_rule_excerpts", &compact_rule_excerpts/1},
       {"issue_prose", &compact_issue/1},
-      {"minimal_bounded_representation", &minimal_packet/1}
+      {"minimal_bounded_representation", &minimal_packet/1},
+      {"emergency_bounded_representation", &emergency_packet/1}
     ]
 
     Enum.reduce_while(stages, packet, fn {name, compact}, current ->
-      if encoded_size(current) <= max_bytes do
+      if final_encoded_size(current) <= max_bytes do
         {:halt, current}
       else
         {:cont, current |> compact.() |> mark_compacted(name)}
@@ -297,11 +298,96 @@ defmodule SymphonyElixir.ReviewPacket do
     }
   end
 
+  defp emergency_packet(packet) do
+    raw_evidence_artifact = packet.evidence_status.raw_evidence_artifact
+
+    %{
+      packet
+      | validation_attestations:
+          packet.validation_attestations
+          |> Enum.take(8)
+          |> Enum.map(&Map.take(&1, [:command, :head_sha, :status])),
+        unresolved_findings:
+          packet.unresolved_findings
+          |> Enum.take(12)
+          |> Enum.map(&Map.take(&1, [:severity, :file, :line, :originating_sha])),
+        repository_rules:
+          packet.repository_rules
+          |> Enum.take(12)
+          |> Enum.map(fn rule ->
+            rule
+            |> Map.take([:path, :security_relevant])
+            |> Map.put(
+              :full_rule_instruction,
+              "Read the complete file at #{truncate(rule.path, 240)} before judging affected paths."
+            )
+          end),
+        requested_lenses: Enum.map(packet.requested_lenses, &Map.take(&1, [:name])),
+        risk: %{
+          level: packet.risk.level,
+          rationale: truncate(packet.risk.rationale, 240)
+        },
+        implementation: %{
+          summary: truncate(packet.implementation.summary, 160),
+          known_risks: [],
+          skipped_proof: compact_strings(packet.implementation.skipped_proof, 4, 160),
+          evidence_links: [raw_evidence_artifact]
+        },
+        issue: %{
+          id: truncate(packet.issue.id, 160),
+          identifier: truncate(packet.issue.identifier, 80),
+          title: truncate(packet.issue.title, 240),
+          requested_outcome: truncate(packet.issue.requested_outcome, 280),
+          acceptance_criteria: truncate(packet.issue.acceptance_criteria, 360),
+          non_goals: truncate(packet.issue.non_goals, 200)
+        },
+        diff: %{
+          mode: packet.diff.mode,
+          manifest: %{
+            entries: [],
+            total_files: packet.diff.manifest.total_files,
+            omitted_files: packet.diff.manifest.total_files
+          },
+          diff_stat: truncate(packet.diff.diff_stat, 240),
+          authoritative_full_diff: packet.diff.authoritative_full_diff,
+          missing_artifacts: compact_strings(packet.diff.missing_artifacts, 8, 120)
+        },
+        follow_up: compact_follow_up(packet.follow_up),
+        evidence_status: %{
+          missing_artifacts: compact_strings(packet.evidence_status.missing_artifacts, 8, 120),
+          skipped_proof: [],
+          authoritative_candidate_available: packet.evidence_status.authoritative_candidate_available,
+          prior_review_sha: packet.evidence_status.prior_review_sha,
+          raw_evidence_artifact: raw_evidence_artifact
+        }
+    }
+  end
+
+  defp compact_follow_up(follow_up) do
+    follow_up
+    |> Map.take([
+      :kind,
+      :prior_reviewed_sha,
+      :head_sha,
+      :command,
+      :candidate_base_sha
+    ])
+    |> Map.put(:stat, truncate(Map.get(follow_up, :stat), 180))
+  end
+
+  defp compact_strings(values, count, bytes) when is_list(values) do
+    values |> Enum.take(count) |> Enum.map(&truncate(&1, bytes))
+  end
+
+  defp compact_strings(_values, _count, _bytes), do: []
+
   defp mark_compacted(packet, field) do
     update_in(packet, [:compaction, :compacted_fields], fn fields -> fields ++ [field] end)
   end
 
   defp encoded_size(packet), do: packet |> Jason.encode!(pretty: true) |> byte_size()
+
+  defp final_encoded_size(packet), do: packet |> assign_packet_id() |> encoded_size()
 
   defp resolve_base(workspace, pr, runner) do
     pr_base = map_string(pr, :base_oid)

@@ -247,7 +247,7 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
-      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:turn_timeout_ms, :integer, default: 0)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
       # Load-bearing safety property (§5.5/§14.3), same as the ACP/ClaudeCode
@@ -274,7 +274,7 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
-      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:turn_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
@@ -304,7 +304,7 @@ defmodule SymphonyElixir.Config.Schema do
       # Phase 2 advertises both false so the agent uses its own file/exec tools.
       field(:advertise_fs, :boolean, default: false)
       field(:advertise_terminal, :boolean, default: false)
-      field(:prompt_timeout_ms, :integer, default: 3_600_000)
+      field(:prompt_timeout_ms, :integer, default: 0)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
       # Some ACP agents (notably opencode) don't report a model-stream failure
@@ -336,7 +336,7 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_required([:command])
       |> validate_number(:protocol_version, greater_than: 0)
-      |> validate_number(:prompt_timeout_ms, greater_than: 0)
+      |> validate_number(:prompt_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:heartbeat_ms, greater_than_or_equal_to: 0)
@@ -365,7 +365,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:permission_mode, :string, default: "bypassPermissions")
       # Extra raw CLI args appended verbatim (e.g. ["--append-system-prompt", ...]).
       field(:extra_args, {:array, :string}, default: [])
-      field(:prompt_timeout_ms, :integer, default: 3_600_000)
+      field(:prompt_timeout_ms, :integer, default: 0)
       field(:stall_timeout_ms, :integer, default: 300_000)
       # Load-bearing safety property (§5.5/§14.3), same as the ACP path: never
       # expose Linear credentials to the agent process; the gated MCP tool holds
@@ -391,7 +391,7 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_required([:command])
       |> validate_inclusion(:permission_mode, @permission_modes)
-      |> validate_number(:prompt_timeout_ms, greater_than: 0)
+      |> validate_number(:prompt_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
   end

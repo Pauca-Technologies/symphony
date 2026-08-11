@@ -36,7 +36,7 @@ non-empty (it defaults to `opencode acp`).
 | `withhold_linear_credentials` | `true` | **Load-bearing.** Scrub `LINEAR_API_KEY` (and friends) from the agent's process env. |
 | `advertise_fs` | `false` | Advertise client `fs/*` capability. False ⇒ the agent uses its own file tools. |
 | `advertise_terminal` | `false` | Advertise client `terminal/*` capability. False ⇒ the agent uses its own exec tools. |
-| `prompt_timeout_ms` | `3_600_000` | Max wall-clock for one `session/prompt` turn. |
+| `prompt_timeout_ms` | `0` | Optional wall-clock ceiling for one `session/prompt` turn; `0` disables it. |
 | `read_timeout_ms` | `5_000` | Handshake (`initialize` / `session/new`) response timeout. |
 | `stall_timeout_ms` | `300_000` | Idle timeout between streamed `session/update`s during a turn. |
 | `heartbeat_ms` | `30_000` | While a turn is idle, emit a `:notification` "still waiting" heartbeat (and log line) every this-many ms, so a silent/stalled turn shows a visible countdown to `stall_timeout_ms` instead of dead air. `0` disables. See the stall note below. |

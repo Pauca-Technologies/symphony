@@ -87,6 +87,35 @@ defmodule SymphonyElixir.ReviewPacketTest do
     assert Enum.any?(first.packet.repository_rules, &(&1.path == "AGENTS.md"))
   end
 
+  test "final packet identity and incident metadata still fit the configured bound", context do
+    issue = %{
+      issue(String.duplicate("incident acceptance detail ", 2_000))
+      | title: String.duplicate("Incident-sized title ", 1_000)
+    }
+
+    settings = settings(%{"packet_max_bytes" => 8_192, "context_budget_tokens" => 2_048})
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue,
+               pr(context),
+               context.head_sha,
+               nil,
+               settings,
+               attestations: [
+                 %{attestation(context.head_sha) | artifact_refs: [String.duplicate("artifact/", 2_000)]}
+               ],
+               skipped_proof: [String.duplicate("missing proof ", 2_000)]
+             )
+
+    assert byte_size(result.encoded) <= 8_192
+    assert "emergency_bounded_representation" in result.packet.compaction.compacted_fields
+    assert result.packet.diff.authoritative_full_diff.local_command =~ context.head_sha
+    assert result.packet.evidence_status.raw_evidence_artifact
+    assert result.packet.packet_id =~ "review-packet-v1-"
+  end
+
   test "nested changed files include applicable repository rules without crashing", context do
     nested_dir = Path.join(context.workspace, "lib/nested")
     File.mkdir_p!(nested_dir)

@@ -121,7 +121,7 @@ defmodule SymphonyElixir.ClaudeCode.Client do
       pending: "",
       session_started?: false,
       session_id: session.session_id,
-      deadline: System.monotonic_time(:millisecond) + session.claude_code.prompt_timeout_ms
+      deadline: optional_deadline(session.claude_code.prompt_timeout_ms)
     }
 
     case receive_loop(loop_state) do
@@ -265,15 +265,34 @@ defmodule SymphonyElixir.ClaudeCode.Client do
   end
 
   defp receive_timeout(%{deadline: deadline, session: %{claude_code: cc}}) do
-    remaining = max(0, deadline - System.monotonic_time(:millisecond))
-    stall = cc.stall_timeout_ms
-
-    if stall > 0, do: min(stall, remaining), else: remaining
+    [remaining_deadline(deadline), optional_timeout(cc.stall_timeout_ms)]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> :infinity
+      timeouts -> Enum.min(timeouts)
+    end
   end
+
+  defp turn_deadline_passed?(%{deadline: nil}), do: false
 
   defp turn_deadline_passed?(%{deadline: deadline}) do
     System.monotonic_time(:millisecond) >= deadline
   end
+
+  defp optional_deadline(timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0,
+    do: System.monotonic_time(:millisecond) + timeout_ms
+
+  defp optional_deadline(_timeout_ms), do: nil
+
+  defp remaining_deadline(nil), do: nil
+
+  defp remaining_deadline(deadline),
+    do: max(0, deadline - System.monotonic_time(:millisecond))
+
+  defp optional_timeout(timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0,
+    do: timeout_ms
+
+  defp optional_timeout(_timeout_ms), do: nil
 
   defp dispatch_line(state, line) do
     case Jason.decode(line) do

@@ -623,7 +623,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          auto_approve_requests,
          timeout_ms
        ) do
-    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    deadline_ms = optional_deadline(timeout_ms)
 
     receive_loop(
       port,
@@ -698,23 +698,23 @@ defmodule SymphonyElixir.Codex.AppServer do
   # notifications arrive here too. We only terminate on a terminal event for
   # *our* turn — see `handle_incoming/7` — so the first subagent to finish is
   # not mistaken for the parent turn completing.
-  defp receive_loop(port, on_message, turn_id, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
-    # `timeout_ms` is an absolute monotonic deadline. Keeping it unchanged
-    # across recursive receives makes codex.turn_timeout_ms a wall-clock cap;
-    # a busy stream can no longer reset the timeout indefinitely.
-    remaining_ms = max(0, timeout_ms - System.monotonic_time(:millisecond))
+  defp receive_loop(port, on_message, turn_id, deadline_ms, pending_line, tool_executor, auto_approve_requests) do
+    # A positive configured timeout remains an absolute monotonic deadline.
+    # Zero disables that optional hard cap; the orchestrator's independent
+    # stall watchdog still terminates turns that stop producing activity.
+    remaining_ms = remaining_timeout(deadline_ms)
 
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, turn_id, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, turn_id, complete_line, deadline_ms, tool_executor, auto_approve_requests)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
           port,
           on_message,
           turn_id,
-          timeout_ms,
+          deadline_ms,
           pending_line <> to_string(chunk),
           tool_executor,
           auto_approve_requests
@@ -727,6 +727,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, :turn_timeout}
     end
   end
+
+  defp optional_deadline(timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0,
+    do: System.monotonic_time(:millisecond) + timeout_ms
+
+  defp optional_deadline(_timeout_ms), do: nil
+
+  defp remaining_timeout(nil), do: :infinity
+
+  defp remaining_timeout(deadline_ms),
+    do: max(0, deadline_ms - System.monotonic_time(:millisecond))
 
   defp handle_incoming(port, on_message, turn_id, data, timeout_ms, tool_executor, auto_approve_requests) do
     payload_string = to_string(data)

@@ -125,7 +125,7 @@ backend = SymphonyElixir.AgentBackend.resolve()   # reads config; default Codex.
       field(:withhold_linear_credentials, :boolean, default: true)  # never put LINEAR_API_KEY in agent env
       field(:advertise_fs, :boolean, default: false)
       field(:advertise_terminal, :boolean, default: false)
-      field(:prompt_timeout_ms, :integer, default: 3_600_000)
+      field(:prompt_timeout_ms, :integer, default: 0) # optional hard cap; 0 disables
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
     end
