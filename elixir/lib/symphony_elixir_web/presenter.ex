@@ -110,6 +110,17 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec shutdown_policy_payload(GenServer.name(), :preserve_workers | :terminate_workers) ::
+          {:ok, map()} | {:error, :unavailable | term()}
+  def shutdown_policy_payload(orchestrator, policy)
+      when policy in [:preserve_workers, :terminate_workers] do
+    case Orchestrator.set_shutdown_policy(orchestrator, policy) do
+      {:ok, mode} -> {:ok, mode_payload(%{mode: mode})}
+      {:error, reason} -> {:error, reason}
+      :unavailable -> {:error, :unavailable}
+    end
+  end
+
   @spec wait_control_payload(:resume | :cancel, String.t()) ::
           {:ok, map()} | {:error, :not_found | :unavailable}
   def wait_control_payload(action, identifier),
@@ -137,7 +148,8 @@ defmodule SymphonyElixirWeb.Presenter do
 
     %{
       draining: Map.get(mode, :draining, false),
-      started_at: iso8601(Map.get(mode, :started_at))
+      started_at: iso8601(Map.get(mode, :started_at)),
+      shutdown_policy: Map.get(mode, :shutdown_policy, :preserve_workers)
     }
   end
 

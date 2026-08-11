@@ -116,6 +116,10 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+`mix build` creates the internal `bin/symphony.escript`; start Symphony through the committed
+`bin/symphony` launcher as shown above. The launcher converts terminal Ctrl+C into a graceful
+application stop so the selected worker shutdown policy runs before the VM exits.
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:
@@ -291,6 +295,12 @@ Notes:
   workers. Its state is saved in `~/.symphony/drain-state.json`, so it remains active through the
   restart it is intended to protect. Enable it with `POST /api/v1/drain` or the dashboard button;
   cancel it with `POST /api/v1/resume` or **Cancel drain**. Cancelling schedules an immediate poll.
+- The independent shutdown policy controls what Ctrl+C does to active workers. The default,
+  `preserve_workers`, leaves detached agents running for reconnection. Select `terminate_workers`
+  to stop tracked workers and their subprocess trees before Symphony exits. The choice is saved in
+  `~/.symphony/shutdown-policy.json` and can be changed from the dashboard or with
+  `POST /api/v1/shutdown-policy/preserve` and `POST /api/v1/shutdown-policy/terminate`. Changing this
+  policy does not enable or cancel drain mode.
 - `codex.turn_timeout_ms` is a wall-clock ceiling for one Codex turn, not an idle timeout. Streaming
   events and subagent activity do not reset it. ACP and Claude Code already apply their
   `prompt_timeout_ms` values as wall-clock deadlines.

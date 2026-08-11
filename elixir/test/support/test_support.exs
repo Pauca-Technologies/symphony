@@ -45,6 +45,7 @@ defmodule SymphonyElixir.TestSupport do
         telemetry_dir = Path.join(workflow_root, "telemetry")
         quota_circuit_state_path = Path.join(workflow_root, "quota-circuits.json")
         drain_state_path = Path.join(workflow_root, "drain-state.json")
+        shutdown_policy_path = Path.join(workflow_root, "shutdown-policy.json")
         persistent_worker_registry_root = Path.join(workflow_root, "workers")
         persistent_worker_log_root = Path.join(workflow_root, "worker-logs")
         Application.put_env(:symphony_elixir, :repo_config_path, repo_config_path)
@@ -52,6 +53,7 @@ defmodule SymphonyElixir.TestSupport do
         Application.put_env(:symphony_elixir, :telemetry_enabled, false)
         Application.put_env(:symphony_elixir, :quota_circuit_state_path, quota_circuit_state_path)
         Application.put_env(:symphony_elixir, :drain_state_path, drain_state_path)
+        Application.put_env(:symphony_elixir, :shutdown_policy_path, shutdown_policy_path)
 
         Application.put_env(
           :symphony_elixir,
@@ -72,6 +74,9 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :telemetry_enabled)
           Application.delete_env(:symphony_elixir, :quota_circuit_state_path)
           Application.delete_env(:symphony_elixir, :drain_state_path)
+          Application.delete_env(:symphony_elixir, :shutdown_policy_path)
+          Application.delete_env(:symphony_elixir, :worker_shutdown_grace_ms)
+          Application.delete_env(:symphony_elixir, :worker_shutdown_force_timeout_ms)
           Application.delete_env(:symphony_elixir, :persistent_worker_registry_root)
           Application.delete_env(:symphony_elixir, :persistent_worker_log_root)
           Application.put_env(:symphony_elixir, :persistent_workers_enabled, false)

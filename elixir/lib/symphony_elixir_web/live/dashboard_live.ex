@@ -58,6 +58,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
     {:noreply, set_drain_mode(socket, false)}
   end
 
+  def handle_event("preserve-workers-on-shutdown", _params, socket) do
+    {:noreply, set_shutdown_policy(socket, :preserve_workers)}
+  end
+
+  def handle_event("terminate-workers-on-shutdown", _params, socket) do
+    {:noreply, set_shutdown_policy(socket, :terminate_workers)}
+  end
+
   def handle_event("resume-wait", %{"identifier" => identifier}, socket) do
     {:noreply, control_wait(socket, :resume, identifier)}
   end
@@ -407,6 +415,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 phx-click="enable-drain"
               >
                 Enable drain mode
+              </button>
+              <span class="muted">
+                Ctrl+C: <%= shutdown_policy_label(@dashboard_payload) %>
+              </span>
+              <button
+                :if={terminate_workers_on_shutdown?(@dashboard_payload)}
+                type="button"
+                class="subtle-button"
+                phx-click="preserve-workers-on-shutdown"
+              >
+                Preserve agents on exit
+              </button>
+              <button
+                :if={not terminate_workers_on_shutdown?(@dashboard_payload)}
+                type="button"
+                class="subtle-button"
+                phx-click="terminate-workers-on-shutdown"
+              >
+                Terminate agents on exit
               </button>
             </div>
           </div>
@@ -831,6 +858,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
     end
   end
 
+  defp set_shutdown_policy(socket, policy) do
+    case Presenter.shutdown_policy_payload(orchestrator(), policy) do
+      {:ok, _mode} ->
+        socket
+        |> clear_flash()
+        |> load_dashboard_page()
+
+      {:error, reason} ->
+        put_flash(socket, :error, "Unable to change shutdown policy: #{inspect(reason)}")
+    end
+  end
+
   defp control_wait(socket, action, identifier) do
     case Presenter.wait_control_payload(action, identifier, orchestrator()) do
       {:ok, _payload} ->
@@ -857,6 +896,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp draining?(%{mode: %{draining: true}}), do: true
   defp draining?(_payload), do: false
+
+  defp terminate_workers_on_shutdown?(%{mode: %{shutdown_policy: :terminate_workers}}), do: true
+  defp terminate_workers_on_shutdown?(_payload), do: false
+
+  defp shutdown_policy_label(payload) do
+    if terminate_workers_on_shutdown?(payload), do: "terminate agents", else: "preserve agents"
+  end
 
   defp waiting_count(%{counts: %{waiting: count}}) when is_integer(count), do: count
   defp waiting_count(_payload), do: 0

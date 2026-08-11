@@ -23,6 +23,7 @@ defmodule SymphonyElixir.Orchestrator do
     RepositoryScheduler,
     Router,
     SessionTranscript,
+    ShutdownPolicyStore,
     StatusDashboard,
     Telemetry,
     TokenAccounting,
@@ -126,6 +127,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :poll_backoff_until_ms,
       :drain_started_at,
+      :shutdown_policy,
       draining: false,
       running: %{},
       completed: MapSet.new(),
@@ -169,6 +171,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     quota_circuits = QuotaCircuitStore.load()
     drain_state = DrainStore.load()
+    shutdown_policy = ShutdownPolicyStore.load()
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
@@ -179,6 +182,7 @@ defmodule SymphonyElixir.Orchestrator do
       tick_token: nil,
       draining: drain_state.enabled,
       drain_started_at: drain_state.started_at,
+      shutdown_policy: shutdown_policy,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil,
       backend_rate_limits: %{},
@@ -2762,6 +2766,44 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Choose whether application shutdown preserves or terminates live workers."
+  @spec set_shutdown_policy(ShutdownPolicyStore.policy()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_shutdown_policy(policy), do: set_shutdown_policy(__MODULE__, policy)
+
+  @doc false
+  @spec set_shutdown_policy(GenServer.server(), ShutdownPolicyStore.policy()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_shutdown_policy(server, policy) when policy in [:preserve_workers, :terminate_workers] do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:set_shutdown_policy, policy})
+      catch
+        :exit, _reason -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Stop all workers currently tracked by the orchestrator before application shutdown."
+  @spec stop_all_workers() :: {:ok, non_neg_integer()} | :unavailable
+  def stop_all_workers, do: stop_all_workers(__MODULE__)
+
+  @doc false
+  @spec stop_all_workers(GenServer.server()) :: {:ok, non_neg_integer()} | :unavailable
+  def stop_all_workers(server) do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, :stop_all_workers, 30_000)
+      catch
+        :exit, _reason -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -2885,6 +2927,27 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Unable to persist drain mode change: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
     end
+  end
+
+  def handle_call({:set_shutdown_policy, policy}, _from, %State{} = state)
+      when policy in [:preserve_workers, :terminate_workers] do
+    case ShutdownPolicyStore.persist(policy) do
+      :ok ->
+        state = %{state | shutdown_policy: policy}
+        Logger.info("Shutdown policy changed to #{policy}")
+        notify_dashboard()
+        {:reply, {:ok, drain_mode_payload(state)}, state}
+
+      {:error, reason} ->
+        Logger.warning("Unable to persist shutdown policy change: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:stop_all_workers, _from, %State{} = state) do
+    workers = Map.values(state.running)
+    Enum.each(workers, &stop_running_worker/1)
+    {:reply, {:ok, length(workers)}, %{state | draining: true}}
   end
 
   def handle_call({:resume_wait, identifier}, _from, %State{} = state)
@@ -3058,7 +3121,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp drain_mode_payload(%State{} = state) do
     %{
       draining: state.draining == true,
-      started_at: state.drain_started_at
+      started_at: state.drain_started_at,
+      shutdown_policy: state.shutdown_policy || :preserve_workers
     }
   end
 

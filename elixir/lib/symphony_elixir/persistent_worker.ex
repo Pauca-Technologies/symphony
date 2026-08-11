@@ -9,7 +9,7 @@ defmodule SymphonyElixir.PersistentWorker do
 
   require Logger
 
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.{Linear.Issue, OSProcess}
   alias SymphonyElixir.PersistentWorker.{Client, Launcher, Registry}
 
   @type attachment :: %{
@@ -18,6 +18,8 @@ defmodule SymphonyElixir.PersistentWorker do
           spec: Registry.run_spec(),
           launched?: boolean()
         }
+
+  @type termination_target :: %{manifest: Registry.manifest(), identities: [OSProcess.identity()]}
 
   @doc "Whether detached workers are enabled for dispatch and restart adoption."
   @spec enabled?() :: boolean()
@@ -65,6 +67,31 @@ defmodule SymphonyElixir.PersistentWorker do
   @spec stop(pid()) :: :ok
   def stop(client_pid) when is_pid(client_pid), do: Client.stop(client_pid)
 
+  @doc "Snapshot every registered worker process tree before shutdown begins."
+  @spec termination_targets() :: [termination_target()]
+  def termination_targets do
+    Enum.map(Registry.list(), fn manifest ->
+      identities = if Registry.worker_alive?(manifest), do: OSProcess.snapshot_tree(manifest.os_pid), else: []
+      %{manifest: manifest, identities: identities}
+    end)
+  end
+
+  @doc "Terminate captured and newly registered worker process trees."
+  @spec terminate_all([termination_target()]) :: :ok | {:error, term()}
+  def terminate_all(targets \\ termination_targets()) when is_list(targets) do
+    if targets != [] or Registry.list() != [], do: Process.sleep(shutdown_grace_ms())
+
+    failures =
+      (targets ++ termination_targets())
+      |> merge_termination_targets()
+      |> Enum.flat_map(&terminate_registered_worker/1)
+
+    case failures do
+      [] -> :ok
+      _ -> {:error, {:persistent_workers_still_running, failures}}
+    end
+  end
+
   defp attach_manifest(manifest, orchestrator, launched?) do
     with {:ok, spec} <- Registry.load_spec(manifest),
          {:ok, pid} <- start_client(manifest, orchestrator) do
@@ -101,5 +128,49 @@ defmodule SymphonyElixir.PersistentWorker do
     Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
       Client.run(manifest, orchestrator)
     end)
+  end
+
+  defp terminate_registered_worker(%{manifest: manifest, identities: identities}) do
+    result = OSProcess.terminate_identities(identities, shutdown_force_timeout_ms())
+    worker_alive? = Registry.worker_alive?(manifest)
+
+    if not worker_alive? do
+      _ = Registry.cleanup(manifest, manifest.worker_id)
+    end
+
+    case {result, worker_alive?} do
+      {:ok, false} ->
+        []
+
+      {:ok, true} ->
+        [%{worker_id: manifest.worker_id, issue_id: manifest.issue_id, reason: :worker_still_running}]
+
+      {{:error, reason}, _worker_alive?} ->
+        [%{worker_id: manifest.worker_id, issue_id: manifest.issue_id, reason: reason}]
+    end
+  end
+
+  defp merge_termination_targets(targets) do
+    targets
+    |> Enum.reduce(%{}, fn target, merged ->
+      worker_id = target.manifest.worker_id
+
+      Map.update(merged, worker_id, target, fn existing ->
+        identities =
+          (existing.identities ++ target.identities)
+          |> Enum.uniq_by(&{&1.pid, &1.start_time})
+
+        %{target | identities: identities}
+      end)
+    end)
+    |> Map.values()
+  end
+
+  defp shutdown_grace_ms do
+    Application.get_env(:symphony_elixir, :worker_shutdown_grace_ms, 1_500)
+  end
+
+  defp shutdown_force_timeout_ms do
+    Application.get_env(:symphony_elixir, :worker_shutdown_force_timeout_ms, 2_000)
   end
 end

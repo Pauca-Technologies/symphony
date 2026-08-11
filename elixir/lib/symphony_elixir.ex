@@ -47,6 +47,15 @@ defmodule SymphonyElixir.Application do
   end
 
   @impl true
+  def prep_stop(state) do
+    unless persistent_worker_mode?() do
+      SymphonyElixir.Shutdown.prepare()
+    end
+
+    state
+  end
+
+  @impl true
   def stop(_state) do
     unless persistent_worker_mode?() do
       SymphonyElixir.StatusDashboard.render_offline_status()

@@ -87,6 +87,18 @@ defmodule SymphonyElixir.ExtensionsTest do
         }}, state}
     end
 
+    def handle_call({:set_shutdown_policy, policy}, _from, state) do
+      if recipient = Keyword.get(state, :recipient), do: send(recipient, {:shutdown_policy, policy})
+
+      {:reply,
+       {:ok,
+        %{
+          draining: false,
+          started_at: nil,
+          shutdown_policy: policy
+        }}, state}
+    end
+
     def handle_call({action, identifier}, _from, state)
         when action in [:resume_wait, :cancel_wait] and is_binary(identifier) do
       if recipient = Keyword.get(state, :recipient), do: send(recipient, {action, identifier})
@@ -691,7 +703,11 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "limits" => %{"five_hour" => nil, "weekly" => nil}
                }
              ],
-             "mode" => %{"draining" => false, "started_at" => nil},
+             "mode" => %{
+               "draining" => false,
+               "started_at" => nil,
+               "shutdown_policy" => "preserve_workers"
+             },
              "quota_circuits" => []
            }
 
@@ -800,6 +816,20 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert %{"mode" => %{"draining" => false, "started_at" => nil}} =
              build_conn() |> post("/api/v1/resume", %{}) |> json_response(200)
 
+    assert %{"mode" => %{"shutdown_policy" => "terminate_workers"}} =
+             build_conn()
+             |> post("/api/v1/shutdown-policy/terminate", %{})
+             |> json_response(200)
+
+    assert_receive {:shutdown_policy, :terminate_workers}
+
+    assert %{"mode" => %{"shutdown_policy" => "preserve_workers"}} =
+             build_conn()
+             |> post("/api/v1/shutdown-policy/preserve", %{})
+             |> json_response(200)
+
+    assert_receive {:shutdown_policy, :preserve_workers}
+
     assert %{"wait" => %{"action" => "resumed", "issue_id" => "issue-wait", "identifier" => "MT-WAIT"}} =
              build_conn()
              |> post("/api/v1/waits/MT-WAIT/resume", %{})
@@ -854,6 +884,14 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
 
     assert json_response(post(build_conn(), "/api/v1/drain", %{}), 503) ==
+             %{
+               "error" => %{
+                 "code" => "orchestrator_unavailable",
+                 "message" => "Orchestrator is unavailable"
+               }
+             }
+
+    assert json_response(post(build_conn(), "/api/v1/shutdown-policy/terminate", %{}), 503) ==
              %{
                "error" => %{
                  "code" => "orchestrator_unavailable",
@@ -1394,6 +1432,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
     assert html =~ "Enable drain mode"
+    assert html =~ "Ctrl+C: preserve agents"
+    assert html =~ "Terminate agents on exit"
     assert html =~ "Wire up the HTTP server"
     assert html =~ "Retry the flaky migration"
     assert html =~ "claude-opus-4-8"
@@ -1407,6 +1447,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     _ = render_click(view, "enable-drain")
     assert_receive {:drain_mode, true}
+
+    _ = render_click(view, "terminate-workers-on-shutdown")
+    assert_receive {:shutdown_policy, :terminate_workers}
 
     updated_snapshot =
       put_in(snapshot.running, [

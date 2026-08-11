@@ -192,14 +192,32 @@ defmodule SymphonyElixir.CLI do
 
       pid ->
         ref = Process.monitor(pid)
+        install_shutdown_handler(self())
 
         receive do
+          :symphony_shutdown ->
+            _ = Application.stop(:symphony_elixir)
+            System.halt(0)
+
           {:DOWN, ^ref, :process, ^pid, reason} ->
             case reason do
               :normal -> System.halt(0)
               _ -> System.halt(1)
             end
         end
+    end
+  end
+
+  defp install_shutdown_handler(recipient) do
+    handler_id = {__MODULE__, recipient}
+
+    case System.trap_signal(:sigusr2, handler_id, fn ->
+           send(recipient, :symphony_shutdown)
+           :ok
+         end) do
+      {:ok, ^handler_id} -> :ok
+      {:error, :already_registered} -> :ok
+      {:error, :not_sup} -> :ok
     end
   end
 end

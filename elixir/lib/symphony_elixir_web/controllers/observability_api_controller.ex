@@ -43,6 +43,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @spec resume(Conn.t(), map()) :: Conn.t()
   def resume(conn, _params), do: set_drain_mode(conn, false)
 
+  @spec preserve_workers(Conn.t(), map()) :: Conn.t()
+  def preserve_workers(conn, _params), do: set_shutdown_policy(conn, :preserve_workers)
+
+  @spec terminate_workers(Conn.t(), map()) :: Conn.t()
+  def terminate_workers(conn, _params), do: set_shutdown_policy(conn, :terminate_workers)
+
   @spec resume_wait(Conn.t(), map()) :: Conn.t()
   def resume_wait(conn, %{"issue_identifier" => identifier}), do: set_wait_mode(conn, :resume, identifier)
 
@@ -75,6 +81,19 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       {:error, reason} ->
         error_response(conn, 500, "drain_state_write_failed", inspect(reason))
+    end
+  end
+
+  defp set_shutdown_policy(conn, policy) do
+    case Presenter.shutdown_policy_payload(orchestrator(), policy) do
+      {:ok, mode} ->
+        json(conn, %{mode: mode})
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+
+      {:error, reason} ->
+        error_response(conn, 500, "shutdown_policy_write_failed", inspect(reason))
     end
   end
 

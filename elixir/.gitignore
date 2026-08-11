@@ -38,6 +38,7 @@ erl_crash.dump
 .vscode/
 /bin/*
 !/bin/codex-session-log
+!/bin/symphony
 
 # Local environment and auth artifacts.
 .env

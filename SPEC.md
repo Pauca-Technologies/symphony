@@ -1944,6 +1944,12 @@ Minimum endpoints:
     stopping live workers.
 - `POST /api/v1/resume` (extension)
   - Cancels drain mode and schedules an immediate tracker poll.
+- `POST /api/v1/shutdown-policy/preserve` (extension)
+  - Persists the policy that graceful application shutdown, including Ctrl+C, leaves detached
+    workers running for reconnection.
+- `POST /api/v1/shutdown-policy/terminate` (extension)
+  - Persists the policy that graceful application shutdown stops tracked workers and their owned
+    subprocess trees before exiting.
 - `POST /api/v1/waits/:issue_identifier/resume` (extension)
   - Wakes one parked issue without waiting for its next probe.
 - `POST /api/v1/waits/:issue_identifier/cancel` (extension)
@@ -2046,6 +2052,8 @@ Operators can control behavior by:
 
 - Enabling persisted drain mode to pause new work while live workers continue, then cancelling it
   to resume normal dispatch.
+- Selecting a persisted shutdown policy independently of drain mode. A reconnecting restart
+  preserves workers; a full shutdown terminates workers and their owned subprocess trees.
 - Resuming one parked wait immediately or cancelling its external condition from the dashboard/API.
 - Editing `WORKFLOW.md` (prompt and most runtime settings).
 - `WORKFLOW.md` changes are detected and re-applied automatically without restart according to

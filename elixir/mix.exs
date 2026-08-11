@@ -149,7 +149,7 @@ defmodule SymphonyElixir.MixProject do
       app: nil,
       main_module: SymphonyElixir.CLI,
       name: "symphony",
-      path: "bin/symphony"
+      path: "bin/symphony.escript"
     ]
   end
 end

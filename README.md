@@ -35,7 +35,9 @@ selected execution model and reasoning effort are visible in Symphony's dashboar
 The Elixir implementation isolates each live run in a detached worker process. The orchestrator can
 restart for a deployment and reconnect to those workers without terminating their coding-agent
 sessions. A persisted, reversible drain mode pauses new dispatch while existing work continues, so
-operators can choose either a fully drained rollout or a reconnecting restart.
+operators can choose either a fully drained rollout or a reconnecting restart. A separate persisted
+shutdown policy lets operators choose whether Ctrl+C preserves those workers for reconnection or
+terminates their complete process trees.
 Agents can also park work on typed external conditions; durable non-model watchers release the
 agent slot, deduplicate probes, and resume the issue through the normal priority scheduler when the
 condition changes.
