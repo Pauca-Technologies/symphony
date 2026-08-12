@@ -33,6 +33,11 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Config.AgentEfficiency,
           SymphonyElixir.Config.Schema.LinearGithubMapping,
           SymphonyElixir.FleetEvent,
+          # These GitHub auth boundary modules exercise live API responses,
+          # filesystem locks, generated shims, and child CLI processes. Their
+          # deterministic provider/JWT/cache/retry tests remain in the suite.
+          SymphonyElixir.GitHubAuth.CLI,
+          SymphonyElixir.GitHubAuth.Local,
           SymphonyElixir.Github.PrReviewSection,
           SymphonyElixir.Linear.Client,
           SymphonyElixir.Linear.Adapter,
@@ -113,7 +118,7 @@ defmodule SymphonyElixir.MixProject do
   def application do
     [
       mod: {SymphonyElixir.Application, []},
-      extra_applications: [:logger]
+      extra_applications: [:logger, :public_key]
     ]
   end
 

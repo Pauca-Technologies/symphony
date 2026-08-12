@@ -18,6 +18,18 @@ sha256sum bin/symphony
 Record the source commit, binary checksum, current service command (including `--logs-root` and
 `--port`), and the existing binary path. Do not overwrite the executable used by the live process.
 
+Preflight the mandatory GitHub App identity from a disposable checkout before restarting the
+service:
+
+```bash
+cd /path/to/a/configured/repository
+/path/to/symphony/elixir/bin/symphony github-auth check
+```
+
+The service environment must contain `GITHUB_APP_ID` and either
+`GITHUB_APP_PRIVATE_KEY_FILE` or `GITHUB_APP_PRIVATE_KEY`. Do not print either credential while
+checking deployment configuration.
+
 ## 2. Drain without lowering agent concurrency
 
 Enable Symphony's persisted drain mode; do not change `agent.max_concurrent_agents`. Existing agents
@@ -60,6 +72,12 @@ curl -fsS -X POST http://127.0.0.1:PORT/api/v1/resume
 If verification fails, leave drain mode enabled while investigating or rolling back. Cancelling
 drain mode is reversible and schedules an immediate tracker poll.
 
+During the compatibility rollout, an existing
+`agent.pre_command: . .artifacts/github-app-auth/session.env` may remain configured. Symphony now
+creates that token-free file itself. Remove the pre-command only after consumer repositories have
+moved unrelated additions (for example browser-runtime variables) to a separate repository hook;
+GitHub auth itself must not remain repository-owned.
+
 ## 4. Verify before cleanup
 
 Check all of the following before touching retained files:
@@ -67,6 +85,8 @@ Check all of the following before touching retained files:
 - A disposable issue starts and its agent environment contains
   `SYMPHONY_TEST_WORKER_LIMIT=<configured limit>`; Vitest uses `--maxWorkers` and Playwright uses
   `--workers` with that value.
+- The disposable issue reports `SYMPHONY_GITHUB_AUTH=1`; `gh auth status` identifies the App-backed
+  bot, and `.artifacts/github-app-auth/session.env` contains no `GH_TOKEN` or `GITHUB_TOKEN`.
 - `agent.max_concurrent_agents` is unchanged.
 - A connected dashboard receives coalesced refreshes and its live transcript reports a bounded
   window for a large session; the issue JSON endpoint still exposes explicit full history.

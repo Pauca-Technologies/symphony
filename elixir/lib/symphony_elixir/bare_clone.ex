@@ -27,6 +27,12 @@ defmodule SymphonyElixir.BareClone do
   @repos_dir_relative "_repos"
   @rescue_branch_prefix "symphony/rescue"
   @rescue_stash_message "symphony: rescue uncommitted work before worktree reset"
+  @interrupted_operations [
+    {:rebase, ["rebase-merge", "rebase-apply"], ["rebase", "--quit"]},
+    {:cherry_pick, ["CHERRY_PICK_HEAD"], ["cherry-pick", "--quit"]},
+    {:revert, ["REVERT_HEAD"], ["revert", "--quit"]},
+    {:merge, ["MERGE_HEAD"], ["merge", "--quit"]}
+  ]
 
   @typedoc "Subset of RepoConfig.repo_entry the worktree pipeline needs."
   @type routed_repo :: %{
@@ -89,7 +95,9 @@ defmodule SymphonyElixir.BareClone do
   so `git checkout --force` never silently discards real work (untracked and
   gitignored files survive the reset untouched and need no rescue). If the
   snapshot can't be captured, the reset is refused rather than risk losing
-  the changes.
+  the changes. Unmerged files from an interrupted Git operation are captured
+  with a temporary index, after which the stale operation is quit before the
+  worktree is reset.
 
   The canonical clone is a normal (non-bare) clone and worktrees share its
   object store + `refs/remotes/origin/*`, so the `origin/<branch>` form
@@ -115,6 +123,11 @@ defmodule SymphonyElixir.BareClone do
           # would discard them, so refuse and surface the failure. The
           # worktree is left exactly as-is for a human to recover from.
           Logger.error("Refusing to reset reused worktree with unpreserved local changes: #{worktree_path} (#{inspect(reason)})")
+
+          {:error, reason}
+
+        {:error, {:interrupted_operation_quit_failed, _operation, _status, _output} = reason} ->
+          Logger.error("Refusing to reset reused worktree after interrupted operation cleanup failed: #{worktree_path} (#{inspect(reason)})")
 
           {:error, reason}
 
@@ -192,7 +205,8 @@ defmodule SymphonyElixir.BareClone do
   # `preserve_uncommitted_changes/2`). If that snapshot can't be captured we
   # return `{:error, {:rescue_failed, _}}` and the caller refuses to reset.
   defp refresh_worktree(worktree_path, branch_name, start_point) do
-    with :ok <- preserve_uncommitted_changes(worktree_path, branch_name) do
+    with :ok <- preserve_uncommitted_changes(worktree_path, branch_name),
+         :ok <- quit_interrupted_operation(worktree_path) do
       force_reset_worktree(worktree_path, branch_name, start_point)
     end
   end
@@ -246,16 +260,134 @@ defmodule SymphonyElixir.BareClone do
       {output, 0} ->
         case String.trim(IO.iodata_to_binary(output)) do
           "" ->
-            # Dirty per `status` but nothing to snapshot: refuse rather than
-            # risk discarding whatever `status` saw.
-            {:error, {:rescue_failed, :empty_snapshot}}
+            rescue_empty_snapshot(worktree_path, branch_name)
 
           sha ->
             create_rescue_branch(worktree_path, branch_name, sha)
         end
 
       {output, status} ->
-        {:error, {:rescue_failed, {:stash_create_failed, status, String.trim(IO.iodata_to_binary(output))}}}
+        rescue_failed_stash(worktree_path, branch_name, status, output)
+    end
+  end
+
+  defp rescue_empty_snapshot(worktree_path, branch_name) do
+    if worktree_has_unmerged_entries?(worktree_path) do
+      rescue_unmerged_changes(worktree_path, branch_name)
+    else
+      # Dirty per `status` but nothing to snapshot: refuse rather than risk
+      # discarding whatever `status` saw.
+      {:error, {:rescue_failed, :empty_snapshot}}
+    end
+  end
+
+  defp rescue_failed_stash(worktree_path, branch_name, status, output) do
+    if worktree_has_unmerged_entries?(worktree_path) do
+      rescue_unmerged_changes(worktree_path, branch_name)
+    else
+      {:error, {:rescue_failed, {:stash_create_failed, status, String.trim(IO.iodata_to_binary(output))}}}
+    end
+  end
+
+  # `git stash create` refuses an index with unmerged entries. Build a clean,
+  # temporary index from HEAD and update it from the working tree instead. The
+  # resulting single-parent commit records the exact tracked file contents,
+  # including conflict markers, without mutating the real index or worktree.
+  defp rescue_unmerged_changes(worktree_path, branch_name) do
+    index_file =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-rescue-index-#{System.os_time(:nanosecond)}-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      with {:ok, _output} <- run_rescue_git(worktree_path, index_file, ["read-tree", "HEAD"], :read_tree_failed),
+           {:ok, _output} <- run_rescue_git(worktree_path, index_file, ["add", "-u", "--", "."], :add_tracked_failed),
+           {:ok, tree} <- run_rescue_git(worktree_path, index_file, ["write-tree"], :write_tree_failed),
+           {:ok, sha} <- create_rescue_commit(worktree_path, index_file, tree) do
+        create_rescue_branch(worktree_path, branch_name, sha)
+      else
+        {:error, detail} -> {:error, {:rescue_failed, detail}}
+      end
+    after
+      _ = File.rm(index_file)
+      _ = File.rm(index_file <> ".lock")
+    end
+  end
+
+  defp run_rescue_git(worktree_path, index_file, args, error_tag) do
+    case System.cmd("git", ["-C", worktree_path | args],
+           env: [{"GIT_INDEX_FILE", index_file}],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> {:ok, String.trim(IO.iodata_to_binary(output))}
+      {output, status} -> {:error, {error_tag, status, String.trim(IO.iodata_to_binary(output))}}
+    end
+  end
+
+  defp create_rescue_commit(worktree_path, index_file, tree) do
+    env = [
+      {"GIT_INDEX_FILE", index_file},
+      {"GIT_AUTHOR_NAME", "Symphony"},
+      {"GIT_AUTHOR_EMAIL", "symphony@localhost"},
+      {"GIT_COMMITTER_NAME", "Symphony"},
+      {"GIT_COMMITTER_EMAIL", "symphony@localhost"}
+    ]
+
+    case System.cmd(
+           "git",
+           ["-C", worktree_path, "commit-tree", tree, "-p", "HEAD", "-m", @rescue_stash_message],
+           env: env,
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> {:ok, String.trim(IO.iodata_to_binary(output))}
+      {output, status} -> {:error, {:commit_tree_failed, status, String.trim(IO.iodata_to_binary(output))}}
+    end
+  end
+
+  defp worktree_has_unmerged_entries?(worktree_path) do
+    case System.cmd(
+           "git",
+           ["-C", worktree_path, "diff", "--name-only", "--diff-filter=U"],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> String.trim(IO.iodata_to_binary(output)) != ""
+      _ -> false
+    end
+  end
+
+  # Once the tracked state is safely referenced, forget stale operation
+  # metadata so `checkout --force` can return the worktree to its issue branch.
+  # `--quit` intentionally leaves files untouched; the following checkout owns
+  # the reset.
+  defp quit_interrupted_operation(worktree_path) do
+    case Enum.find(@interrupted_operations, fn {_operation, git_paths, _args} ->
+           Enum.any?(git_paths, &git_internal_path_exists?(worktree_path, &1))
+         end) do
+      nil ->
+        :ok
+
+      {operation, _git_paths, args} ->
+        case System.cmd("git", ["-C", worktree_path | args], stderr_to_stdout: true) do
+          {_output, 0} ->
+            Logger.warning("Quit interrupted Git operation before resetting reused worktree operation=#{operation} workspace=#{worktree_path}")
+
+            :ok
+
+          {output, status} ->
+            {:error, {:interrupted_operation_quit_failed, operation, status, String.trim(IO.iodata_to_binary(output))}}
+        end
+    end
+  end
+
+  defp git_internal_path_exists?(worktree_path, git_path) do
+    case System.cmd(
+           "git",
+           ["-C", worktree_path, "rev-parse", "--git-path", git_path],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> output |> IO.iodata_to_binary() |> String.trim() |> File.exists?()
+      _ -> false
     end
   end
 

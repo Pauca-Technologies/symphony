@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @behaviour SymphonyElixir.AgentBackend
 
   require Logger
-  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, PathSafety, SSH, Telemetry, TestWorkerBudget}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, GitHubAuth, PathSafety, SSH, Telemetry, TestWorkerBudget}
   alias SymphonyElixir.Codex.InterruptionClassifier
 
   @initialize_id 1
@@ -83,8 +83,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          :ok <- prepare_sourced_env_files(expanded_workspace, worker_host),
+         {:ok, github_env} <- GitHubAuth.port_env(expanded_workspace, worker_host: worker_host),
          {:ok, port} <-
-           start_port(expanded_workspace, worker_host, Keyword.get(opts, :issue_context_file)) do
+           start_port(expanded_workspace, worker_host, Keyword.get(opts, :issue_context_file), github_env) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -303,7 +304,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, issue_context_file) do
+  defp start_port(workspace, nil, issue_context_file, github_env) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -324,7 +325,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             # running me as an outer hook". UDP's before-handoff Stop hook
             # reads both vars and skips when SYMPHONY_RUN=1 AND SYMPHONY_AGENT=1.
             # See docs/symphony.md in the consumer repo.
-            env: agent_env(issue_context_file)
+            env: merge_port_env(agent_env(issue_context_file), github_env)
           ]
         )
 
@@ -332,8 +333,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, issue_context_file) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, issue_context_file)
+  defp start_port(workspace, worker_host, issue_context_file, github_env) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, issue_context_file, github_env)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
@@ -433,7 +434,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp remote_launch_command(workspace, issue_context_file) when is_binary(workspace) do
+  defp remote_launch_command(workspace, issue_context_file, github_env) when is_binary(workspace) do
     # SSH does not forward our local env, so the inner-agent markers have to
     # be inlined into the remote shell command. Matches `agent_env/0` for the
     # local Port.open path.
@@ -450,6 +451,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "export SYMPHONY_AGENT=1",
       TestWorkerBudget.shell_export(),
       remote_issue_context_export(issue_context_file),
+      remote_env_exports(github_env),
       AgentTransport.with_pre_command("exec #{Config.settings!().codex.command}")
     ]
     |> Enum.reject(&is_nil/1)
@@ -474,6 +476,22 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp remote_issue_context_export(_path), do: nil
+
+  defp remote_env_exports([]), do: nil
+
+  defp remote_env_exports(env) when is_list(env) do
+    Enum.map_join(env, " && ", fn
+      {name, false} -> "unset #{to_string(name)}"
+      {name, value} -> "export #{to_string(name)}=#{shell_escape(to_string(value))}"
+    end)
+  end
+
+  defp merge_port_env(base, overrides) do
+    base
+    |> Map.new()
+    |> Map.merge(Map.new(overrides))
+    |> Map.to_list()
+  end
 
   defp port_metadata(port, worker_host) when is_port(port) do
     base_metadata =

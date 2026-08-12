@@ -22,7 +22,7 @@ defmodule SymphonyElixir.AgentTransport do
 
   require Logger
 
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, GitHubAuth, PathSafety, SSH}
 
   @port_line_bytes 1_048_576
   @source_env_pattern ~r/(?:^|[\s;&|('"])(?:\.|source)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/
@@ -152,33 +152,37 @@ defmodule SymphonyElixir.AgentTransport do
           {:ok, port()} | {:error, term()}
   def start_port(workspace, nil, command, env)
       when is_binary(workspace) and is_binary(command) and is_list(env) do
-    case System.find_executable("bash") do
-      nil ->
-        {:error, :bash_not_found}
+    with {:ok, github_env} <- GitHubAuth.port_env(workspace) do
+      case System.find_executable("bash") do
+        nil ->
+          {:error, :bash_not_found}
 
-      executable ->
-        port =
-          Port.open(
-            {:spawn_executable, String.to_charlist(executable)},
-            [
-              :binary,
-              :exit_status,
-              :stderr_to_stdout,
-              args: [~c"-lc", String.to_charlist(with_pre_command(command))],
-              cd: String.to_charlist(workspace),
-              line: @port_line_bytes,
-              env: env
-            ]
-          )
+        executable ->
+          port =
+            Port.open(
+              {:spawn_executable, String.to_charlist(executable)},
+              [
+                :binary,
+                :exit_status,
+                :stderr_to_stdout,
+                args: [~c"-lc", String.to_charlist(with_pre_command(command))],
+                cd: String.to_charlist(workspace),
+                line: @port_line_bytes,
+                env: merge_port_env(env, github_env)
+              ]
+            )
 
-        {:ok, port}
+          {:ok, port}
+      end
     end
   end
 
   def start_port(workspace, worker_host, command, env)
       when is_binary(workspace) and is_binary(worker_host) and is_binary(command) and is_list(env) do
-    remote_command = remote_launch_command(workspace, command, env)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+    with {:ok, github_env} <- GitHubAuth.port_env(workspace, worker_host: worker_host) do
+      remote_command = remote_launch_command(workspace, command, merge_port_env(env, github_env))
+      SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+    end
   end
 
   @doc "Best-effort close of a launched port."
@@ -234,6 +238,13 @@ defmodule SymphonyElixir.AgentTransport do
 
     (["cd #{shell_escape(workspace)}"] ++ env_lines ++ [with_pre_command("exec #{command}")])
     |> Enum.join(" && ")
+  end
+
+  defp merge_port_env(base, overrides) do
+    base
+    |> Map.new()
+    |> Map.merge(Map.new(overrides))
+    |> Map.to_list()
   end
 
   defp sourced_env_files(command, workspace) when is_binary(command) and is_binary(workspace) do

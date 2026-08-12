@@ -14,6 +14,7 @@ defmodule SymphonyElixir.AgentRunner do
     AgentRouter,
     BaseDrift,
     Config,
+    GitHubAuth,
     HandoffGate,
     Linear.Client,
     Linear.Comment,
@@ -177,22 +178,16 @@ defmodule SymphonyElixir.AgentRunner do
           |> maybe_put(:automation_opt_in_label, automation_opt_in_label)
           |> maybe_put(:base_drift_ref, routed_repo && routed_repo.base_branch)
 
-        # When Symphony did the worktree clone (routed_repo present),
-        # we now run the per-repo after_create here. The legacy single-
-        # repo path already ran the host-level after_create inside
-        # Workspace.create_for_issue.
-        if routed_repo do
-          _ =
-            Workspace.run_after_create_hook(
-              workspace,
-              issue,
-              worker_host,
-              hook_command: Map.get(repo_hook_opts, :after_create)
-            )
-        end
-
         try do
-          with {:ok, issue_with_comments} <- attach_issue_comments(issue, opts),
+          with :ok <-
+                 maybe_run_routed_after_create(
+                   routed_repo,
+                   workspace,
+                   issue,
+                   worker_host,
+                   Map.get(repo_hook_opts, :after_create)
+                 ),
+               {:ok, issue_with_comments} <- attach_issue_comments(issue, opts),
                {:ok, _context_file} <-
                  Workspace.prepare_issue_context(workspace, issue_with_comments, worker_host) do
             run_prepared_agent(%{
@@ -220,6 +215,17 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp maybe_run_routed_after_create(nil, _workspace, _issue, _worker_host, _command), do: :ok
+
+  defp maybe_run_routed_after_create(_routed_repo, workspace, issue, worker_host, command) do
+    Workspace.run_after_create_hook(
+      workspace,
+      issue,
+      worker_host,
+      hook_command: command
+    )
+  end
+
   defp run_prepared_agent(%{
          workspace: workspace,
          issue: issue,
@@ -240,38 +246,60 @@ defmodule SymphonyElixir.AgentRunner do
       opts
     )
 
-    session_start =
-      SessionStartHook.run(
-        workspace,
-        issue,
-        worker_host,
-        hook_command: Map.get(repo_hook_opts, :session_start)
-      )
+    case prepare_github_auth(workspace, issue, worker_host) do
+      {:ok, _github_auth} ->
+        session_start =
+          SessionStartHook.run(
+            workspace,
+            issue,
+            worker_host,
+            hook_command: Map.get(repo_hook_opts, :session_start)
+          )
 
-    opts =
-      opts
-      |> Keyword.put(:session_start_result, session_start)
-      |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
-      |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
-      |> maybe_put(
-        :per_repo_before_handoff_timeout_ms,
-        Map.get(repo_hook_opts, :before_handoff_timeout_ms)
-      )
-      |> maybe_put(
-        :per_repo_before_handoff_stale_ms,
-        Map.get(repo_hook_opts, :before_handoff_stale_ms)
-      )
-      |> maybe_put(:per_repo_workflow, repo_workflow)
-      |> maybe_put(:per_repo_review_workflow, review_workflow)
+        opts =
+          opts
+          |> Keyword.put(:session_start_result, session_start)
+          |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
+          |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
+          |> maybe_put(
+            :per_repo_before_handoff_timeout_ms,
+            Map.get(repo_hook_opts, :before_handoff_timeout_ms)
+          )
+          |> maybe_put(
+            :per_repo_before_handoff_stale_ms,
+            Map.get(repo_hook_opts, :before_handoff_stale_ms)
+          )
+          |> maybe_put(:per_repo_workflow, repo_workflow)
+          |> maybe_put(:per_repo_review_workflow, review_workflow)
 
-    with :ok <-
-           Workspace.run_before_run_hook(
-             workspace,
-             issue,
-             worker_host,
-             hook_command: Map.get(repo_hook_opts, :before_run)
-           ) do
-      run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+        with :ok <-
+               Workspace.run_before_run_hook(
+                 workspace,
+                 issue,
+                 worker_host,
+                 hook_command: Map.get(repo_hook_opts, :before_run)
+               ) do
+          run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp prepare_github_auth(workspace, issue, worker_host) do
+    case GitHubAuth.prepare(workspace, worker_host: worker_host) do
+      {:ok, session} ->
+        Logger.info(
+          "GitHub App authentication ready #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)} repository=#{session.repo} github_host=#{session.host} expires_at=#{DateTime.to_iso8601(session.expires_at)}"
+        )
+
+        {:ok, session}
+
+      {:error, reason} ->
+        Logger.error("GitHub App authentication failed #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)} reason=#{inspect(reason)}")
+
+        {:error, reason}
     end
   end
 

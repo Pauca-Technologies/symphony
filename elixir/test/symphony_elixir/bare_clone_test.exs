@@ -151,12 +151,49 @@ defmodule SymphonyElixir.BareCloneTest do
     assert git!(wt, ["show", "#{rescue_branch}:new_tracked.txt"]) == "new file from the run"
   end
 
-  test "reusing a clean worktree creates no rescue branch" do
-    branch = "udpe-5-feature"
-    origin = make_origin(feature_branch: branch)
+  test "reusing a worktree recovers tracked files from an interrupted conflicting rebase" do
+    branch = "udpe-5-conflicted-rebase"
+    origin = make_origin()
+
+    git!(origin, ["checkout", "--quiet", "-b", branch])
+    write!(origin, "base.txt", "feature branch\n")
+    git!(origin, ["commit", "--quiet", "-am", "feature change"])
+    git!(origin, ["checkout", "--quiet", "develop"])
+    write!(origin, "base.txt", "advanced base\n")
+    git!(origin, ["commit", "--quiet", "-am", "base change"])
+
     root = tmp!("root")
     repo = routed(origin)
     wt = Path.join(root, "UDPE-5")
+
+    assert {:ok, clone} = BareClone.ensure_and_fetch(root, repo, branch)
+    assert {:ok, %{reused: false}} = BareClone.ensure_worktree(clone, wt, branch, "develop")
+
+    artifact = write!(wt, "node_modules/dep.js", "cached\n")
+    {_output, status} = System.cmd("git", ["-C", wt, "rebase", "origin/develop"], stderr_to_stdout: true)
+    assert status != 0
+    assert git!(wt, ["diff", "--name-only", "--diff-filter=U"]) == "base.txt"
+
+    conflicted_contents = File.read!(Path.join(wt, "base.txt"))
+
+    assert {:ok, %{start_point: "origin/" <> ^branch, reused: true}} =
+             BareClone.ensure_worktree(clone, wt, branch, "develop")
+
+    assert File.read!(Path.join(wt, "base.txt")) == "feature branch\n"
+    assert File.read!(artifact) == "cached\n"
+    assert git!(wt, ["status", "--porcelain", "--untracked-files=no"]) == ""
+    assert git!(wt, ["branch", "--show-current"]) == branch
+
+    rescue_branch = only_rescue_branch(wt)
+    assert git!(wt, ["show", "#{rescue_branch}:base.txt"]) == String.trim(conflicted_contents)
+  end
+
+  test "reusing a clean worktree creates no rescue branch" do
+    branch = "udpe-6-feature"
+    origin = make_origin(feature_branch: branch)
+    root = tmp!("root")
+    repo = routed(origin)
+    wt = Path.join(root, "UDPE-6")
 
     assert {:ok, clone} = BareClone.ensure_and_fetch(root, repo, branch)
     assert {:ok, %{reused: false}} = BareClone.ensure_worktree(clone, wt, branch, "develop")

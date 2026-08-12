@@ -49,6 +49,8 @@ observability:
     - private_key
     - x-api-key
 hooks:
+  # Symphony prepares mandatory GitHub App auth before routed repository
+  # lifecycle hooks; consumer workflows must not mint their own bot token.
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .
     if command -v mise >/dev/null 2>&1; then

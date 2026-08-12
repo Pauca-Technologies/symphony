@@ -317,6 +317,69 @@ defmodule SymphonyElixir.AgentRunnerTest do
     :ok
   end
 
+  test "routed after_create failures stop the run before an agent starts" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-routed-after-create-#{System.unique_integer([:positive])}"
+      )
+
+    origin = Path.join(root, "origin")
+    workspace_root = Path.join(root, "workspaces")
+    File.mkdir_p!(origin)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    System.cmd("git", ["-C", origin, "init", "--quiet", "--initial-branch", "main"])
+    System.cmd("git", ["-C", origin, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", origin, "config", "user.email", "test@example.com"])
+
+    File.write!(
+      Path.join(origin, "WORKFLOW.md"),
+      """
+      ---
+      hooks:
+        after_create: exit 17
+      ---
+      Test routed workflow.
+      """
+    )
+
+    System.cmd("git", ["-C", origin, "add", "WORKFLOW.md"])
+    System.cmd("git", ["-C", origin, "commit", "--quiet", "-m", "initial"])
+
+    write_workflow_file!(SymphonyElixir.Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root
+    )
+
+    File.write!(
+      Application.fetch_env!(:symphony_elixir, :repo_config_path),
+      """
+      linear:
+        team_id: UDPE
+      repos:
+        - id: test-repo
+          label: repo:test-repo
+          repo_url: #{origin}
+          workflow_path: WORKFLOW.md
+          base_branch: main
+      """
+    )
+
+    issue = %Issue{
+      id: "issue-after-create-failure",
+      identifier: "UDPE-AFTER-CREATE",
+      title: "Stop on fatal setup failure",
+      state: "In Progress",
+      labels: ["repo:test-repo"],
+      comments: []
+    }
+
+    assert_raise RuntimeError, ~r/workspace_hook_failed.*after_create.*17/s, fn ->
+      AgentRunner.run(issue)
+    end
+  end
+
   test "wait_for parks after one turn and emits a durable waiting lifecycle" do
     Application.put_env(:symphony_elixir, :waiting_backend_recipient, self())
     on_exit(fn -> Application.delete_env(:symphony_elixir, :waiting_backend_recipient) end)

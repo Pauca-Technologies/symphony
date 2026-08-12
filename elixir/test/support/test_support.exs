@@ -1,3 +1,31 @@
+defmodule SymphonyElixir.TestGitHubAuthProvider do
+  @behaviour SymphonyElixir.GitHubAuth
+
+  @impl true
+  def prepare(workspace, _opts) do
+    {:ok,
+     %{
+       env: [],
+       repo: "test/example",
+       host: "github.com",
+       auth_root: Path.join(workspace, ".artifacts/github-app-auth"),
+       expires_at: ~U[2099-01-01 00:00:00Z]
+     }}
+  end
+
+  @impl true
+  def token(_workspace, _opts) do
+    {:ok,
+     %{
+       token: "test-installation-token",
+       repo: "test/example",
+       host: "github.com",
+       installation_id: 1,
+       expires_at: ~U[2099-01-01 00:00:00Z]
+     }}
+  end
+end
+
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
 
@@ -25,6 +53,15 @@ defmodule SymphonyElixir.TestSupport do
         only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
 
       setup do
+        previous_github_auth_provider =
+          Application.get_env(:symphony_elixir, :github_auth_provider)
+
+        Application.put_env(
+          :symphony_elixir,
+          :github_auth_provider,
+          SymphonyElixir.TestGitHubAuthProvider
+        )
+
         workflow_root =
           Path.join(
             System.tmp_dir!(),
@@ -80,6 +117,17 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :persistent_worker_registry_root)
           Application.delete_env(:symphony_elixir, :persistent_worker_log_root)
           Application.put_env(:symphony_elixir, :persistent_workers_enabled, false)
+
+          if previous_github_auth_provider do
+            Application.put_env(
+              :symphony_elixir,
+              :github_auth_provider,
+              previous_github_auth_provider
+            )
+          else
+            Application.delete_env(:symphony_elixir, :github_auth_provider)
+          end
+
           File.rm_rf(workflow_root)
         end)
 

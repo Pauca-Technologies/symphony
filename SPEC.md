@@ -141,8 +141,9 @@ Symphony is easiest to port when kept in these layers:
 - Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
+- GitHub CLI plus host-owned GitHub App credentials for repository authentication.
 - Coding-agent executable that supports the targeted Codex app-server mode.
-- Host environment authentication for the issue tracker and coding agent.
+- Host environment authentication for the issue tracker, coding agent, and GitHub App.
 
 ## 4. Core Domain Model
 
@@ -1170,7 +1171,34 @@ Failure semantics:
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 
-### 9.5 Safety Invariants
+### 9.5 GitHub App Authentication
+
+Symphony's production execution profile assumes that every routed checkout is hosted on GitHub.
+GitHub App authentication is therefore a required host capability, not an OPTIONAL workflow mode
+or a repository-owned token-minting hook.
+
+Runtime contract:
+
+- The host provides `GITHUB_APP_ID` and either `GITHUB_APP_PRIVATE_KEY_FILE` or
+  `GITHUB_APP_PRIVATE_KEY`. `GITHUB_APP_INSTALLATION_ID` MAY pin an installation; otherwise
+  Symphony resolves the installation for the current `owner/repo`.
+- Before a routed repository lifecycle hook or coding-agent backend starts, Symphony MUST derive
+  the repository identity, resolve a valid installation token, and inject an isolated GitHub CLI
+  environment. Failure is fatal to the current attempt and MUST retain a typed authentication
+  classification.
+- Installation tokens MUST NOT be exported in the general hook/agent environment or compatibility
+  `session.env`. A Symphony-owned `gh` shim MAY inject the token only into the actual `gh` child and
+  MUST refresh it before expiration. On-disk token state MUST use owner-only permissions and MUST
+  be excluded from Git staging in the worktree.
+- The same provider MUST be callable from an interactive shell without a running Symphony service,
+  including explicit activation, restoration, and credential/installation preflight commands.
+- Repository hooks MUST NOT be required to mint GitHub App tokens. A temporary token-free
+  `session.env` compatibility artifact MAY be produced during migration from existing
+  `agent.pre_command` consumers.
+- A routed repository's `after_create` result MUST be observed. A non-zero exit or timeout aborts
+  the attempt before agent startup.
+
+### 9.6 Safety Invariants
 
 This is the most important portability constraint.
 
@@ -1445,10 +1473,11 @@ The `Agent Runner` wraps workspace + prompt + app-server client.
 Behavior:
 
 1. Create/reuse workspace for issue.
-2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
-5. On any error, fail the worker attempt (the orchestrator will retry).
+2. Preflight GitHub App authentication for the checked-out repository.
+3. Build prompt from workflow template.
+4. Start app-server session with the prepared GitHub CLI environment.
+5. Forward app-server events to orchestrator.
+6. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note:
 
@@ -2291,6 +2320,10 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if workspace failed:
     fail_worker("workspace error")
 
+  github_auth = github_app_auth.prepare(workspace.path)
+  if github_auth failed:
+    fail_worker("github authentication configuration error")
+
   run_hook_best_effort("session_start", workspace.path)
 
   if run_hook("before_run", workspace.path) failed:
@@ -2448,6 +2481,14 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
+- GitHub App authentication is prepared before routed lifecycle hooks and every agent backend
+- Missing credentials, an inaccessible installation, or token minting failure aborts the attempt
+  with a typed authentication classification
+- Prepared hook/agent environments contain the Symphony-owned `gh` shim and repository identity,
+  but no `GH_TOKEN` or `GITHUB_TOKEN`
+- Installation-token cache and compatibility environment files use owner-only permissions, and
+  `.artifacts` is excluded from local Git staging
+- Interactive activation and restoration reuse the production provider without a running service
 
 ### 17.3 Issue Tracker Client
 

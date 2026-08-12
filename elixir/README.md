@@ -135,6 +135,50 @@ Optional flags:
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
+## GitHub App authentication
+
+Every Symphony run targets a GitHub repository, so GitHub App authentication is a mandatory host
+capability rather than a repository hook. Before repository lifecycle hooks or an agent backend
+start, Symphony derives `owner/repo` from the checkout, mints a repository-scoped installation
+token, and injects an isolated `gh` environment into hooks and all agent backends. A bootstrap
+failure aborts the attempt as `authentication_configuration`; it is never deferred until the first
+`gh` command or reported as a generic agent-process exit.
+
+Configure the service environment with:
+
+- `GITHUB_APP_ID`
+- either `GITHUB_APP_PRIVATE_KEY_FILE` or `GITHUB_APP_PRIVATE_KEY` (escaped `\\n` newlines are
+  accepted for inline keys)
+- optionally `GITHUB_APP_INSTALLATION_ID`; when omitted, Symphony resolves the installation for
+  the current repository
+- optionally `UDP_AGENT_COMMIT_NAME` and `UDP_AGENT_COMMIT_EMAIL`; when both are present Symphony
+  exports matching Git author and committer identity
+
+Installation tokens are cached per worktree with mode `0600`. The injected `gh` shim refreshes
+tokens before their one-hour expiry, so long sessions do not depend on a startup token remaining
+valid. Tokens are passed only to the real `gh` child; they are not written to `session.env` or
+exported into the general agent shell. Any inherited `GH_TOKEN`, `GITHUB_TOKEN`, or enterprise
+equivalent is explicitly removed from hook and agent environments so a service operator's login
+cannot override the App identity.
+
+The same implementation is available without running the Symphony service:
+
+```bash
+# Validate credentials and the App installation for the current checkout.
+./bin/symphony github-auth check
+
+# Activate the bot identity in an interactive shell, then restore prior values.
+eval "$(./bin/symphony github-auth on)"
+gh auth status
+eval "$(./bin/symphony github-auth off)"
+```
+
+During migration Symphony creates `.artifacts/github-app-auth/session.env` when absent so an older
+`agent.pre_command` can still source it. The native environment injection is authoritative; remove
+that legacy pre-command after repository-specific additions have moved to their own hook or env
+file. Symphony also adds `/.artifacts/` to the checkout's local Git exclude so auth state cannot be
+accidentally staged in repositories that do not globally ignore that directory.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
@@ -218,6 +262,13 @@ Notes:
   dirty worktree is preserved for deliberate agent judgment. The exact passing
   decision is handed to the immediately following review gate so it is not
   fetched twice, while every later handoff attempt performs a new fetch.
+- On redispatch, a routed worktree is reset to the latest pushed issue branch
+  (or the configured base when no issue branch exists). Symphony first saves
+  tracked local changes under `symphony/rescue/*`. If an interrupted rebase,
+  merge, cherry-pick, or revert left unmerged files, Symphony captures their
+  exact working-tree contents with a temporary index, quits the stale Git
+  operation, and then resets. If either preservation or operation cleanup
+  fails, Symphony leaves the worktree untouched and fails the attempt.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -313,17 +364,13 @@ Notes:
   [docs/claude-code.md](docs/claude-code.md) for the Claude Code setup and the `claude_code` config
   block. Both alternative backends share the same local-only gate / non-intercepted `fs`/`terminal`
   limitations as ACP.
-- `agent.pre_command` is an optional shell snippet run (joined with `&&`) in the launch shell —
-  inside the per-issue workspace cwd — **before every backend's** agent process (Codex, ACP, Claude
-  Code alike). Use it to source a per-worktree env file (e.g. a generated GitHub-App session:
-  `pre_command: . .artifacts/github-app-auth/session.env`) so all three backends get the same
-  environment without duplicating the wrapper in each backend's `command`. Any `.env` file it sources
-  is run through the same sanitizer as a command-sourced file. Unset ⇒ launches are byte-for-byte
-  unchanged. (With it set, you can drop the `sh -lc '… && exec …'` sourcing wrapper from
-  `codex.command` and leave just the bare agent invocation.) For Codex, Symphony also disables the
-  per-thread shell snapshot when a pre-command is configured. Otherwise the snapshot's shell-profile
-  reload can reorder `PATH` after startup and bypass a workspace-local executable shim that the
-  pre-command prepended.
+- `agent.pre_command` remains available for non-authentication, host-wide shell preparation. It runs
+  (joined with `&&`) in the per-issue workspace cwd before every backend process. GitHub App auth no
+  longer belongs here: Symphony injects it natively and creates the old
+  `.artifacts/github-app-auth/session.env` only as a migration bridge. Any `.env` file a custom
+  pre-command sources is sanitized before launch. For Codex, Symphony disables the per-thread shell
+  snapshot when a pre-command is configured so a profile reload cannot undo intentional `PATH`
+  changes.
 - `agent.test_worker_limit` (default `2`) bounds test-runner fan-out inside each agent without
   changing `agent.max_concurrent_agents`. Every backend receives
   `SYMPHONY_TEST_WORKER_LIMIT`; the first-turn prompt directs agents to pass
@@ -469,6 +516,10 @@ Notes:
   task context supplies the issue details independently of that template.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- GitHub App auth is prepared before routed repository hooks and injected into `after_create`,
+  `session_start`, `before_run`, `before_handoff`, and `after_run`. Repositories do not need to mint
+  tokens or construct a bot `session.env`. A non-zero routed `after_create` result is fatal and is
+  returned unchanged instead of allowing agent startup to continue.
 - Use `hooks.session_start` to run non-blocking repo-local startup discovery before every fresh or
   resumed Codex session. Symphony captures generated Markdown links under
   `docs/agent-workpad/<branch>/` and annotates them in the startup-artifact section of the canonical

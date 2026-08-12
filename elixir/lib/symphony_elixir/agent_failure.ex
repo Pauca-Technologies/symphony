@@ -50,6 +50,7 @@ defmodule SymphonyElixir.AgentFailure do
     :unauthorized,
     :invalid_api_key,
     :missing_api_key,
+    :github_auth_failed,
     :invalid_configuration,
     :invalid_workflow_config
   ]

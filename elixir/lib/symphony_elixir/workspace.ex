@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{BareClone, Config, PathSafety, SSH, TestWorkerBudget}
+  alias SymphonyElixir.{BareClone, Config, GitHubAuth, PathSafety, SSH, TestWorkerBudget}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -123,7 +123,7 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       command ->
-        run_hook(command, workspace, issue_context, "after_create", worker_host)
+        run_hook(command, workspace, issue_context, "after_create", worker_host, github_auth: Keyword.get(opts, :github_auth, true))
     end
   end
 
@@ -438,7 +438,9 @@ defmodule SymphonyElixir.Workspace do
 
     case {created?, command} do
       {true, command} when is_binary(command) ->
-        run_hook(command, workspace, issue_context, "after_create", worker_host)
+        # In legacy single-repo mode this hook is responsible for cloning the
+        # repository, so GitHub auth cannot derive a repository until it exits.
+        run_hook(command, workspace, issue_context, "after_create", worker_host, github_auth: false)
 
       _ ->
         :ok
@@ -540,53 +542,58 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        # SYMPHONY_RUN=1 marks this as a Symphony-spawned outer hook so the
-        # consumer repo's gates (e.g. UDP's pr:check-scope-conformance and
-        # .claude/hooks/github-app-session-start.sh) can gate on it. We
-        # intentionally do NOT set SYMPHONY_AGENT here — that var is reserved
-        # for inner codex/claude agent processes in Codex.AppServer.
-        System.cmd("sh", ["-lc", command],
-          cd: workspace,
-          stderr_to_stdout: true,
-          env: hook_env(workspace, Keyword.get(opts, :env, []))
-        )
-      end)
+    with {:ok, github_env} <- github_hook_env(workspace, nil, opts) do
+      task =
+        Task.async(fn ->
+          # SYMPHONY_RUN=1 marks this as a Symphony-spawned outer hook so the
+          # consumer repo's gates (e.g. UDP's pr:check-scope-conformance and
+          # .claude/hooks/github-app-session-start.sh) can gate on it. We
+          # intentionally do NOT set SYMPHONY_AGENT here — that var is reserved
+          # for inner codex/claude agent processes in Codex.AppServer.
+          System.cmd("sh", ["-lc", command],
+            cd: workspace,
+            stderr_to_stdout: true,
+            env: hook_env(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
+          )
+        end)
 
-    case Task.yield(task, timeout_ms) do
-      {:ok, cmd_result} ->
-        handle_hook_command_result(cmd_result, workspace, issue_context, hook_name, capture_output?)
+      case Task.yield(task, timeout_ms) do
+        {:ok, cmd_result} ->
+          handle_hook_command_result(cmd_result, workspace, issue_context, hook_name, capture_output?)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
+        nil ->
+          Task.shutdown(task, :brutal_kill)
 
-        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
+          Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
-        {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+          {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+      end
     end
   end
 
   defp run_hook(command, workspace, issue_context, hook_name, worker_host, opts) when is_binary(worker_host) do
     timeout_ms = Keyword.get(opts, :timeout_ms) || Config.settings!().hooks.timeout_ms
     capture_output? = Keyword.get(opts, :capture_output, false)
-    exports = remote_hook_exports(workspace, Keyword.get(opts, :env, []))
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(
-           worker_host,
-           "cd #{shell_escape(workspace)} && #{exports} #{command}",
-           timeout_ms
-         ) do
-      {:ok, cmd_result} ->
-        handle_hook_command_result(cmd_result, workspace, issue_context, hook_name, capture_output?)
+    with {:ok, github_env} <- github_hook_env(workspace, worker_host, opts) do
+      exports = remote_hook_exports(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
 
-      {:error, {:workspace_hook_timeout, ^hook_name, _timeout_ms} = reason} ->
-        {:error, reason}
+      case run_remote_command(
+             worker_host,
+             "cd #{shell_escape(workspace)} && #{exports} #{command}",
+             timeout_ms
+           ) do
+        {:ok, cmd_result} ->
+          handle_hook_command_result(cmd_result, workspace, issue_context, hook_name, capture_output?)
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, {:workspace_hook_timeout, ^hook_name, _timeout_ms} = reason} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -721,6 +728,25 @@ defmodule SymphonyElixir.Workspace do
       {"SYMPHONY_RUN", "1"},
       {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)}
     ] ++ extra_env
+  end
+
+  defp github_hook_env(workspace, worker_host, opts) when is_binary(workspace) do
+    case Keyword.get(opts, :github_auth, true) do
+      false ->
+        {:ok, []}
+
+      true ->
+        with {:ok, %{env: env}} <- GitHubAuth.prepare(workspace, worker_host: worker_host) do
+          {:ok, env}
+        end
+    end
+  end
+
+  defp merge_env(base, overrides) do
+    base
+    |> Map.new()
+    |> Map.merge(Map.new(overrides))
+    |> Map.to_list()
   end
 
   defp handoff_hook_env(opts) do

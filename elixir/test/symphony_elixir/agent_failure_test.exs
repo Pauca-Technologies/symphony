@@ -48,6 +48,9 @@ defmodule SymphonyElixir.AgentFailureTest do
     assert AgentFailure.classify({:invalid_api_key, :missing}, backend: "codex").class ==
              :authentication_configuration
 
+    assert AgentFailure.classify({:github_auth_failed, :missing_credentials}, backend: "codex").class ==
+             :authentication_configuration
+
     assert AgentFailure.classify({:review_timeout, 60_000}, backend: "codex").class ==
              :handoff_reviewer_gate
 
