@@ -33,11 +33,22 @@ defmodule SymphonyElixir.RepositoryScheduler do
   defp decide_for_repo(issue, repo, running) do
     paths = predicted_paths(issue, repo)
     reservations = reservations_for_repo(running, repo.id)
+    implementation_reservations = Enum.filter(reservations, &consumes_implementation_slot?/1)
     override? = override?(issue, repo)
 
     cond do
-      length(reservations) >= Map.get(repo, :max_concurrent, 1) ->
-        {:queue, queue_decision(issue, repo, paths, reservations, "repository_ceiling", [], 1.0, override?)}
+      length(implementation_reservations) >= Map.get(repo, :max_concurrent, 1) ->
+        {:queue,
+         queue_decision(
+           issue,
+           repo,
+           paths,
+           implementation_reservations,
+           "repository_ceiling",
+           [],
+           1.0,
+           override?
+         )}
 
       override? ->
         {:allow, base_decision(issue, repo, paths, "operator_override")}
@@ -162,6 +173,13 @@ defmodule SymphonyElixir.RepositoryScheduler do
       issue = Map.get(entry, :issue, %{})
       {Issue.dispatch_priority_rank(Map.get(issue, :priority)), created_at_key(Map.get(issue, :created_at)), Map.get(entry, :identifier, "")}
     end)
+  end
+
+  defp consumes_implementation_slot?(reservation) when is_map(reservation) do
+    Map.get(reservation, :lifecycle_state, :implementing) not in [
+      :handoff_pending_gate,
+      :handoff_pending_review
+    ]
   end
 
   defp highest_overlap(paths, reservations) do

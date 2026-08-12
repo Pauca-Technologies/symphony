@@ -724,7 +724,13 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp handoff_hook_env(opts) do
-    [{"SYMPHONY_TEST_WORKER_LIMIT", Integer.to_string(TestWorkerBudget.limit())}]
+    [
+      {"SYMPHONY_TEST_WORKER_LIMIT", Integer.to_string(TestWorkerBudget.limit())},
+      {
+        "SYMPHONY_HEAVY_VALIDATION_LIMIT",
+        Integer.to_string(TestWorkerBudget.heavy_validation_limit())
+      }
+    ]
     |> maybe_put_hook_env("SYMPHONY_HANDOFF_GATE_PROTOCOL", Keyword.get(opts, :gate_protocol))
     |> maybe_put_hook_env("SYMPHONY_HANDOFF_GATE_JOB_ID", Keyword.get(opts, :gate_job_id))
   end

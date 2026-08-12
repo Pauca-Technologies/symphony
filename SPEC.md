@@ -446,6 +446,13 @@ Fields:
   - The effective value SHOULD be exposed as `SYMPHONY_TEST_WORKER_LIMIT` and in first-turn runtime
     guidance with runner-supported options.
   - Lifecycle hooks that perform validation SHOULD inherit the same effective value.
+- `heavy_validation_limit` (positive integer, OPTIONAL extension)
+  - Default: `2`.
+  - This is independent of both agent concurrency and per-command test-worker fan-out.
+  - The effective value SHOULD be exposed as `SYMPHONY_HEAVY_VALIDATION_LIMIT` to every supported
+    agent backend and lifecycle hook so repository harnesses can enforce a host-wide admission
+    budget for CPU-heavy validation across worktrees.
+  - Invalid values fail configuration validation.
 - `max_turns` (positive integer)
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
@@ -658,6 +665,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.test_worker_limit`: positive integer, default `2` (OPTIONAL extension)
+- `agent.heavy_validation_limit`: positive integer, default `2` (OPTIONAL extension)
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
@@ -843,20 +851,24 @@ Sorting order (stable intent):
 
 ### 8.3 Concurrency Control
 
-Global limit:
+Global implementation limit:
 
-- `available_slots = max(max_concurrent_agents - running_count, 0)`
+- `available_slots = max(max_concurrent_agents - implementation_count, 0)`
+- `implementation_count` excludes `handoff_pending_gate` and `handoff_pending_review` entries.
+  Those lifecycles remain claimed and visible as running work but have no coding-agent turn in
+  progress.
 
 Per-state limit:
 
 - `max_concurrent_agents_by_state[state]` if present (state key normalized)
 - otherwise fallback to global limit
 
-The runtime counts issues by their current tracked state in the `running` map.
+The runtime counts implementing issues by their current tracked state in the `running` map.
 
 Repository-aware extension:
 
-- A configured `repos[].max_concurrent` is an additional hard ceiling.
+- A configured `repos[].max_concurrent` is an additional implementation ceiling. Detached handoff
+  entries do not consume it, but remain repository/path reservations for overlap decisions.
 - `overlap_policy` is `serialize` (default), `advisory`, or `off`;
   `overlap_threshold` defaults to `0.5`.
 - Signals progress from repository identity and issue label/path hints, through

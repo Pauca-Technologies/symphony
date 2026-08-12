@@ -1228,6 +1228,38 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-b"
   end
 
+  test "detached handoff lifecycles release implementation and host slots" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    running = %{
+      "gate" => %{
+        worker_host: "worker-a",
+        lifecycle_state: :handoff_pending_gate,
+        issue: %Issue{state: "Todo"}
+      },
+      "review" => %{
+        worker_host: "worker-a",
+        lifecycle_state: :handoff_pending_review,
+        issue: %Issue{state: "Todo"}
+      },
+      "implementation" => %{
+        worker_host: "worker-b",
+        lifecycle_state: :implementing,
+        issue: %Issue{state: "Todo"}
+      }
+    }
+
+    state = %Orchestrator.State{running: running, max_concurrent_agents: 2}
+    candidate = %Issue{id: "candidate", identifier: "UDPE-NEXT", title: "Next", state: "Todo"}
+
+    assert Orchestrator.implementation_slots_used_for_test(running) == 1
+    assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-a"
+    assert Orchestrator.should_dispatch_issue_for_test(candidate, state)
+  end
+
   test "select_worker_host_for_test returns no_worker_capacity when every ssh host is full" do
     write_workflow_file!(Workflow.workflow_file_path(),
       worker_ssh_hosts: ["worker-a", "worker-b"],

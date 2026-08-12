@@ -81,6 +81,30 @@ defmodule SymphonyElixir.RepositorySchedulerTest do
              )
   end
 
+  test "handoff reservations preserve path serialization without consuming implementation capacity" do
+    config = repo_config(max_concurrent: 1)
+
+    handoff =
+      reservation("one", "UDPE-1", ["lib/accounts/user.ex"], "actual")
+      |> Map.put(:lifecycle_state, :handoff_pending_gate)
+
+    running = %{"one" => handoff}
+
+    assert {:allow, %{reason: "disjoint_or_unknown"}} =
+             RepositoryScheduler.decide(
+               issue("two", "UDPE-2", ["path:lib/billing/invoice.ex"]),
+               config,
+               running
+             )
+
+    assert {:queue, %{reason: "path_overlap"}} =
+             RepositoryScheduler.decide(
+               issue("three", "UDPE-3", ["path:lib/accounts/user.ex"]),
+               config,
+               running
+             )
+  end
+
   test "restart recovery has no stale reservations or deadlock" do
     config = repo_config(max_concurrent: 1)
     issue = issue("two", "UDPE-2", ["path:lib/a.ex"])

@@ -174,6 +174,10 @@ defmodule SymphonyElixir.Config.Schema do
       # Bounds test-runner fan-out inside each agent process. This is independent
       # of (and must not alter) Symphony's agent-slot concurrency.
       field(:test_worker_limit, :integer, default: 2)
+      # Bounds concurrent CPU-heavy validation jobs across repository worktrees
+      # on one host. Consumer harnesses enforce the shared budget via the
+      # exported SYMPHONY_HEAVY_VALIDATION_LIMIT environment variable.
+      field(:heavy_validation_limit, :integer, default: 2)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       # Threshold for consecutive failed/stalled agent runs. Human-actionable
@@ -205,6 +209,7 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :max_concurrent_agents,
           :test_worker_limit,
+          :heavy_validation_limit,
           :max_turns,
           :max_retry_backoff_ms,
           :max_retries,
@@ -217,6 +222,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> cast_embed(:label_presets, with: &LabelPreset.changeset/2)
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:test_worker_limit, greater_than: 0, less_than_or_equal_to: 32)
+      |> validate_number(:heavy_validation_limit, greater_than: 0, less_than_or_equal_to: 32)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:max_retries, greater_than: 0)

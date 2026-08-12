@@ -332,6 +332,13 @@ Notes:
   read the neutral variable from repository runner config). The same neutral limit is exported to
   outer lifecycle hooks such as `before_handoff`, so detached validation cannot silently regain the
   host's full CPU count.
+- `agent.heavy_validation_limit` (default `2`) is exported as
+  `SYMPHONY_HEAVY_VALIDATION_LIMIT` to agents and lifecycle hooks so repository harnesses can admit
+  CPU-heavy validation across worktrees independently of per-command test worker fan-out.
+- Detached `handoff_pending_gate` and `handoff_pending_review` lifecycles keep their issue claim and
+  path-overlap reservation, but no longer consume global, per-state, per-host, or per-repository
+  implementation capacity. Disjoint implementation can therefore continue while a completed
+  candidate validates or is reviewed without allowing overlapping work into reserved paths.
 - `agent.label_presets` chooses the backend (and model) **per task** from the issue's Linear labels,
   overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
   whose `label` is present on the issue wins (positional precedence — list order, first match), and

@@ -82,6 +82,8 @@ agent:
   max_concurrent_agents: 10
   # Per-agent test process fan-out; this does not change max_concurrent_agents.
   test_worker_limit: 2
+  # Shared host admission for CPU-heavy repository validation across worktrees.
+  heavy_validation_limit: 2
   # This is a worker-session boundary only; exhaustion does not move Linear to Blocked.
   max_turns: 20
   # Operational failures stay active at capped backoff after this threshold.

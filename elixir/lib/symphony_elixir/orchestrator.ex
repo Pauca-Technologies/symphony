@@ -766,6 +766,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec implementation_slots_used_for_test(map()) :: non_neg_integer()
+  def implementation_slots_used_for_test(running) when is_map(running) do
+    implementation_slots_used(running)
+  end
+
+  @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
@@ -1514,8 +1520,9 @@ defmodule SymphonyElixir.Orchestrator do
     normalized_state = normalize_issue_state(issue_state)
 
     Enum.count(running, fn
-      {_id, %{issue: %Issue{state: state_name}}} ->
-        normalize_issue_state(state_name) == normalized_state
+      {_id, %{issue: %Issue{state: state_name}} = running_entry} ->
+        consumes_implementation_slot?(running_entry) and
+          normalize_issue_state(state_name) == normalized_state
 
       _ ->
         false
@@ -2676,8 +2683,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_worker_host_count(running, worker_host) when is_map(running) and is_binary(worker_host) do
     Enum.count(running, fn
-      {_issue_id, %{worker_host: ^worker_host}} -> true
-      _ -> false
+      {_issue_id, %{worker_host: ^worker_host} = running_entry} ->
+        consumes_implementation_slot?(running_entry)
+
+      _ ->
+        false
     end)
   end
 
@@ -2728,10 +2738,25 @@ defmodule SymphonyElixir.Orchestrator do
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
-        map_size(state.running),
+        implementation_slots_used(state.running),
       0
     )
   end
+
+  defp implementation_slots_used(running) when is_map(running) do
+    Enum.count(running, fn {_issue_id, running_entry} ->
+      consumes_implementation_slot?(running_entry)
+    end)
+  end
+
+  defp consumes_implementation_slot?(running_entry) when is_map(running_entry) do
+    Map.get(running_entry, :lifecycle_state, :implementing) not in [
+      :handoff_pending_gate,
+      :handoff_pending_review
+    ]
+  end
+
+  defp consumes_implementation_slot?(_running_entry), do: true
 
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do
