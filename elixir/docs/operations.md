@@ -11,8 +11,8 @@ Build away from the live executable and keep the currently installed binary avai
 ```bash
 cd /path/to/symphony/elixir
 mise exec -- make all
-mise exec -- make build
-sha256sum bin/symphony.escript bin/udp-gh
+mise exec -- mix build
+sha256sum bin/symphony.escript
 ```
 
 Record the source commit, binary checksum, current service command (including `--logs-root` and

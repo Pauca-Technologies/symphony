@@ -112,14 +112,13 @@ cd symphony/elixir
 mise trust
 mise install
 mise exec -- mix setup
-mise exec -- make build
+mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
-`make build` creates the internal `bin/symphony.escript` and the independent `bin/udp-gh`
-executable. Start Symphony through the committed `bin/symphony` launcher as shown above. The
-launcher converts terminal Ctrl+C into a graceful application stop so the selected worker shutdown
-policy runs before the VM exits.
+`mix build` creates the internal `bin/symphony.escript`; start Symphony through the committed
+`bin/symphony` launcher as shown above. The launcher converts terminal Ctrl+C into a graceful
+application stop so the selected worker shutdown policy runs before the VM exits.
 
 ## Configuration
 
@@ -139,8 +138,9 @@ Optional flags:
 ## GitHub App authentication
 
 Every Symphony run targets a GitHub repository, so GitHub App authentication is a mandatory host
-capability rather than a repository hook. The standalone [`udp-gh`](tools/udp-gh/README.md) CLI owns
-repository discovery, JWT signing, installation-token caching, and the refreshing `gh` shim.
+capability rather than a repository hook. The independently maintained
+[`udp-gh`](https://github.com/Pauca-Technologies/udp-gh) CLI owns repository discovery, JWT signing,
+installation-token caching, and the refreshing `gh` shim.
 Symphony invokes `udp-gh prepare --cwd <workspace>`, validates its versioned token-free JSON
 contract, and injects the returned environment into lifecycle hooks and agent backends. A preflight
 failure aborts the attempt as `authentication_configuration`; it is never deferred until the first
@@ -157,12 +157,11 @@ Configure the service environment with:
   exports matching Git author and committer identity
 
 Install `udp-gh` on the service `PATH`, or place it beside `bin/symphony.escript`. It is a static
-executable with no Symphony, Elixir, Node.js, or repository-package runtime dependency. To install
-only the authentication CLI:
+executable with no Symphony, Elixir, Node.js, or repository-package runtime dependency:
 
 ```bash
-make udp-gh
-make install-udp-gh PREFIX="$HOME/.local"
+git clone git@github.com:Pauca-Technologies/udp-gh.git
+make -C udp-gh install PREFIX="$HOME/.local"
 ```
 
 Installation tokens are cached per worktree under `.artifacts/udp-gh/` with mode `0600`. The

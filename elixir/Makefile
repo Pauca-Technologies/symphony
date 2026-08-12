@@ -1,14 +1,9 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e udp-gh udp-gh-test install-udp-gh
+.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e
 
 MIX ?= mix
-GO ?= go
-PREFIX ?= /usr/local
-UDP_GH_DIR := tools/udp-gh
-UDP_GH_BINARY := bin/udp-gh
-UDP_GH_VERSION ?= dev
 
 help:
-	@echo "Targets: setup, deps, build, udp-gh, install-udp-gh, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, ci"
+	@echo "Targets: setup, deps, build, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, ci"
 
 setup:
 	$(MIX) setup
@@ -16,28 +11,16 @@ setup:
 deps:
 	$(MIX) deps.get
 
-build: udp-gh
+build:
 	$(MIX) build
 
-udp-gh:
-	cd $(UDP_GH_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(UDP_GH_VERSION)" -o ../../$(UDP_GH_BINARY) ./cmd/udp-gh
-
-udp-gh-test:
-	cd $(UDP_GH_DIR) && $(GO) test ./...
-	cd $(UDP_GH_DIR) && $(GO) vet ./...
-
-install-udp-gh: udp-gh
-	install -Dm755 $(UDP_GH_BINARY) $(DESTDIR)$(PREFIX)/bin/udp-gh
-
 fmt:
-	cd $(UDP_GH_DIR) && gofmt -w .
 	$(MIX) format
 
 fmt-check:
-	test -z "$$(cd $(UDP_GH_DIR) && gofmt -l .)"
 	$(MIX) format --check-formatted
 
-lint: udp-gh-test
+lint:
 	$(MIX) lint
 
 coverage:
