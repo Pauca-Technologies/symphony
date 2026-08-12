@@ -553,7 +553,7 @@ defmodule SymphonyElixir.Workspace do
           System.cmd("sh", ["-lc", command],
             cd: workspace,
             stderr_to_stdout: true,
-            env: hook_env(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
+            env: system_cmd_hook_env(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
           )
         end)
 
@@ -730,6 +730,15 @@ defmodule SymphonyElixir.Workspace do
     ] ++ extra_env
   end
 
+  defp system_cmd_hook_env(workspace, extra_env) do
+    workspace
+    |> hook_env(extra_env)
+    |> Enum.map(fn
+      {name, false} -> {name, nil}
+      entry -> entry
+    end)
+  end
+
   defp github_hook_env(workspace, worker_host, opts) when is_binary(workspace) do
     case Keyword.get(opts, :github_auth, true) do
       false ->
@@ -769,7 +778,10 @@ defmodule SymphonyElixir.Workspace do
        {"SYMPHONY_RUN", "1"},
        {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)}
      ] ++ extra_env)
-    |> Enum.map_join(" ", fn {name, value} -> "export #{name}=#{shell_escape(value)} &&" end)
+    |> Enum.map_join(" ", fn
+      {name, false} -> "unset #{name} &&"
+      {name, value} -> "export #{name}=#{shell_escape(value)} &&"
+    end)
   end
 
   defp encode_issue_context(issue_or_identifier) do

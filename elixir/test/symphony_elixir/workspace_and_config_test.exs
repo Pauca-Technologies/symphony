@@ -6,6 +6,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.Linear.Comment
 
+  defmodule UnsetTokenGitHubAuthProvider do
+    @behaviour SymphonyElixir.GitHubAuth
+
+    @impl true
+    def prepare(workspace, _opts) do
+      {:ok,
+       %{
+         env: [
+           {"GH_TOKEN", false},
+           {"GITHUB_ENTERPRISE_TOKEN", false},
+           {"GITHUB_TOKEN", false},
+           {"GH_ENTERPRISE_TOKEN", false}
+         ],
+         repo: "test/example",
+         host: "github.com",
+         auth_root: Path.join(workspace, ".artifacts/github-app-auth"),
+         expires_at: ~U[2099-01-01 00:00:00Z]
+       }}
+    end
+
+    @impl true
+    def token(_workspace, _opts), do: {:error, :not_implemented}
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -55,6 +79,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert first_workspace == second_workspace
     assert Path.basename(first_workspace) == "MT_Det"
+  end
+
+  test "workspace hooks remove inherited token variables for GitHub App auth" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-auth-#{System.unique_integer([:positive])}"
+      )
+
+    token_variables = [
+      "GH_TOKEN",
+      "GITHUB_ENTERPRISE_TOKEN",
+      "GITHUB_TOKEN",
+      "GH_ENTERPRISE_TOKEN"
+    ]
+
+    previous_values = Map.new(token_variables, &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      Enum.each(previous_values, fn {name, value} -> restore_env(name, value) end)
+      File.rm_rf(workspace_root)
+    end)
+
+    Enum.each(token_variables, &System.put_env(&1, "inherited-personal-token"))
+
+    Application.put_env(
+      :symphony_elixir,
+      :github_auth_provider,
+      UnsetTokenGitHubAuthProvider
+    )
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOK-AUTH")
+
+    assert {:ok, "unset:unset:unset:unset"} =
+             Workspace.run_session_start_hook(workspace, "MT-HOOK-AUTH", nil,
+               hook_command: "printf '%s:%s:%s:%s' \"${GH_TOKEN-unset}\" \"${GITHUB_ENTERPRISE_TOKEN-unset}\" \"${GITHUB_TOKEN-unset}\" \"${GH_ENTERPRISE_TOKEN-unset}\""
+             )
   end
 
   test "workspace publishes and refreshes trusted issue context for hooks and agents" do
