@@ -12,18 +12,6 @@ defmodule SymphonyElixir.TestGitHubAuthProvider do
        expires_at: ~U[2099-01-01 00:00:00Z]
      }}
   end
-
-  @impl true
-  def token(_workspace, _opts) do
-    {:ok,
-     %{
-       token: "test-installation-token",
-       repo: "test/example",
-       host: "github.com",
-       installation_id: 1,
-       expires_at: ~U[2099-01-01 00:00:00Z]
-     }}
-  end
 end
 
 defmodule SymphonyElixir.TestSupport do

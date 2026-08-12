@@ -3,7 +3,6 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.GitHubAuth.CLI, as: GitHubAuthCLI
   alias SymphonyElixir.{LogFile, PersistentWorker}
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
@@ -31,10 +30,6 @@ defmodule SymphonyElixir.CLI do
       end
 
     System.halt(exit_status)
-  end
-
-  def main(["github-auth" | args]) do
-    System.halt(GitHubAuthCLI.run(args))
   end
 
   def main(args) do
@@ -91,8 +86,7 @@ defmodule SymphonyElixir.CLI do
 
   @spec usage_message() :: String.t()
   defp usage_message do
-    "Usage: symphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]\n" <>
-      "       symphony github-auth <on|off|check|gh [arguments...]>"
+    "Usage: symphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
   end
 
   @spec runtime_deps() :: deps()

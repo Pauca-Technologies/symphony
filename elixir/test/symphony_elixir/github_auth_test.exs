@@ -1,413 +1,236 @@
 defmodule SymphonyElixir.GitHubAuthTest do
   use SymphonyElixir.TestSupport
 
-  import ExUnit.CaptureIO
-
   alias SymphonyElixir.GitHubAuth
-  alias SymphonyElixir.GitHubAuth.CLI
-  alias SymphonyElixir.GitHubAuth.Local
+  alias SymphonyElixir.GitHubAuth.External
 
   defmodule ControlledProvider do
     @behaviour SymphonyElixir.GitHubAuth
 
     @impl true
     def prepare(_workspace, _opts), do: Process.get(:github_auth_prepare_result)
-
-    @impl true
-    def token(_workspace, _opts), do: Process.get(:github_auth_token_result)
   end
 
   setup do
     root =
       Path.join(
         System.tmp_dir!(),
-        "symphony-github-auth-#{System.unique_integer([:positive])}"
+        "symphony-external-github-auth-#{System.unique_integer([:positive])}"
       )
 
     workspace = Path.join(root, "workspace")
     File.mkdir_p!(workspace)
-    System.cmd("git", ["-C", workspace, "init", "--quiet"])
-    System.cmd("git", ["-C", workspace, "remote", "add", "origin", "git@github.com:Acme/widgets.git"])
-
-    cli_path = executable!(root, "symphony", "#!/bin/sh\nexit 0\n")
-    real_gh = executable!(root, "gh", "#!/bin/sh\nexit 0\n")
-
-    private_key = :public_key.generate_key({:rsa, 1024, 65_537})
-    pem_entry = :public_key.pem_entry_encode(:RSAPrivateKey, private_key)
-    pem = :public_key.pem_encode([pem_entry])
-
-    env = %{
-      "GITHUB_APP_ID" => "12345",
-      "GITHUB_APP_PRIVATE_KEY" => pem,
-      "PATH" => System.get_env("PATH", "")
-    }
-
     on_exit(fn -> File.rm_rf(root) end)
 
-    %{workspace: workspace, cli_path: cli_path, real_gh: real_gh, env: env}
+    %{root: root, workspace: workspace}
   end
 
-  test "parses supported GitHub remote forms" do
-    assert {:ok, "Acme/widgets"} =
-             Local.parse_repository("git@github.com:Acme/widgets.git")
+  test "decodes udp-gh's typed machine contract", context do
+    executable = fake_udp_gh!(context.root, valid_contract(context.workspace))
 
-    assert {:ok, "Acme/widgets"} =
-             Local.parse_repository("https://github.com/Acme/widgets.git")
-
-    assert {:ok, "Acme/widgets"} =
-             Local.parse_repository("ssh://git@github.com/Acme/widgets.git")
-
-    assert {:error, {:unsupported_github_remote, _url}} =
-             Local.parse_repository("git@gitlab.com:Acme/widgets.git")
-  end
-
-  test "preflights auth, writes a token-free session, and reuses the cache", context do
-    test_pid = self()
-
-    request = fn request ->
-      send(test_pid, {:github_request, request})
-
-      case request.method do
-        :get -> {:ok, %{status: 200, body: %{"id" => 987}}}
-        :post -> {:ok, %{status: 201, body: token_response()}}
-      end
-    end
-
-    opts = auth_opts(context, request)
-
-    assert {:ok, session} = Local.prepare(context.workspace, opts)
+    assert {:ok, session} = External.prepare(context.workspace, executable: executable)
     assert session.repo == "Acme/widgets"
     assert session.host == "github.com"
+    assert session.auth_root == Path.join(context.workspace, ".artifacts/udp-gh")
+    assert session.expires_at == ~U[2099-01-01 00:00:00Z]
 
     env = Map.new(session.env)
+    assert env["UDP_GH_AUTH"] == "1"
     assert env["SYMPHONY_GITHUB_AUTH"] == "1"
     assert env["SYMPHONY_GITHUB_REPOSITORY"] == "Acme/widgets"
-    assert env["SYMPHONY_REAL_GH"] == context.real_gh
+    assert env["SYMPHONY_REAL_GH"] == "/usr/bin/gh"
     assert env["GH_TOKEN"] == false
     assert env["GITHUB_TOKEN"] == false
-
-    assert_received {:github_request, %{method: :get, headers: headers}}
-    assert_received {:github_request, %{method: :post}}
-    assert jwt_payload(headers)["iss"] == "12345"
-
-    auth_root = Path.join(context.workspace, ".artifacts/github-app-auth")
-    session_path = Path.join(auth_root, "session.env")
-    cache_path = Path.join(auth_root, "installation-token.json")
-    shim_path = Path.join([auth_root, "shims", "gh"])
-
-    session_contents = File.read!(session_path)
-    refute session_contents =~ "secret-installation-token"
-    assert session_contents =~ "unset GH_TOKEN"
-    assert session_contents =~ "unset GITHUB_TOKEN"
-    assert session_contents =~ "SYMPHONY_GITHUB_AUTH"
-    assert File.read!(shim_path) =~ context.cli_path
-    assert private_mode(session_path) == 0o600
-    assert private_mode(cache_path) == 0o600
-    assert private_mode(shim_path) == 0o700
-
-    {ignored, 0} =
-      System.cmd("git", ["-C", context.workspace, "check-ignore", ".artifacts/github-app-auth/session.env"])
-
-    assert String.trim(ignored) == ".artifacts/github-app-auth/session.env"
-
-    assert {:ok, _cached_session} =
-             Local.prepare(
-               context.workspace,
-               Keyword.put(opts, :request, fn _request -> flunk("valid token cache should be reused") end)
-             )
   end
 
-  test "anchors interactive auth artifacts at the Git toplevel", context do
-    nested = Path.join(context.workspace, "elixir")
-    File.mkdir_p!(nested)
+  test "passes workspace as an argument without shell interpolation", context do
+    workspace = Path.join(context.root, "workspace with spaces; untouched")
+    File.mkdir_p!(workspace)
+    contract = valid_contract(workspace)
 
-    request = fn
-      %{method: :get} -> {:ok, %{status: 200, body: %{"id" => 987}}}
-      %{method: :post} -> {:ok, %{status: 201, body: token_response()}}
+    command = fn executable, args, opts ->
+      send(self(), {:udp_gh_command, executable, args, opts})
+      {Jason.encode!(contract), 0}
     end
 
-    assert {:ok, session} = Local.prepare(nested, auth_opts(context, request))
+    assert {:ok, _session} =
+             External.prepare(workspace,
+               executable: fake_udp_gh!(context.root, contract),
+               command: command
+             )
 
-    assert session.auth_root ==
-             Path.join(context.workspace, ".artifacts/github-app-auth")
-
-    refute File.exists?(Path.join(nested, ".artifacts"))
+    assert_received {:udp_gh_command, _executable, ["prepare", "--cwd", ^workspace], [stderr_to_stdout: true]}
   end
 
-  test "force refresh replaces a still-valid cached installation token", context do
-    counter = start_supervised!({Agent, fn -> 0 end})
+  test "discovers a configured or PATH-installed udp-gh executable", context do
+    executable = fake_udp_gh!(context.root, valid_contract(context.workspace), "udp-gh")
+    previous_cli = Application.get_env(:symphony_elixir, :udp_gh_cli)
+    previous_path = System.get_env("PATH")
 
-    request = fn request ->
-      Agent.update(counter, &(&1 + 1))
+    on_exit(fn ->
+      restore_application_env(:udp_gh_cli, previous_cli)
+      restore_system_env("PATH", previous_path)
+    end)
 
-      case request.method do
-        :get -> {:ok, %{status: 200, body: %{"id" => 987}}}
-        :post -> {:ok, %{status: 201, body: token_response()}}
-      end
-    end
+    Application.put_env(:symphony_elixir, :udp_gh_cli, executable)
+    assert {:ok, %{repo: "Acme/widgets"}} = External.prepare(context.workspace)
 
-    opts = auth_opts(context, request)
-    assert {:ok, _token} = Local.token(context.workspace, opts)
-    assert Agent.get(counter, & &1) == 2
-
-    assert {:ok, _token} =
-             Local.token(context.workspace, Keyword.put(opts, :force_refresh, true))
-
-    assert Agent.get(counter, & &1) == 4
+    Application.delete_env(:symphony_elixir, :udp_gh_cli)
+    System.put_env("PATH", context.root <> ":" <> (previous_path || ""))
+    assert {:ok, %{repo: "Acme/widgets"}} = External.prepare(context.workspace)
   end
 
-  test "missing App credentials fail with a typed configuration error", context do
-    assert {:error, {:missing_github_app_credential, "GITHUB_APP_ID"}} =
-             Local.prepare(
-               context.workspace,
-               cli_path: context.cli_path,
-               real_gh: context.real_gh,
-               env: %{}
+  test "reports failure when default executable discovery finds no udp-gh", context do
+    previous_cli = Application.get_env(:symphony_elixir, :udp_gh_cli)
+    previous_path = System.get_env("PATH")
+    original_cwd = File.cwd!()
+
+    on_exit(fn ->
+      File.cd!(original_cwd)
+      restore_application_env(:udp_gh_cli, previous_cli)
+      restore_system_env("PATH", previous_path)
+    end)
+
+    Application.delete_env(:symphony_elixir, :udp_gh_cli)
+    System.put_env("PATH", context.root)
+    File.cd!(context.root)
+
+    assert {:error, :udp_gh_cli_not_found} = External.prepare(context.workspace)
+  end
+
+  test "rejects malformed, conflicting, and unsupported contracts", context do
+    base = valid_contract(context.workspace)
+
+    cases = [
+      %{},
+      Map.put(base, "version", 2),
+      Map.put(base, "set", nil),
+      Map.put(base, "set", %{"BAD-NAME" => "value"}),
+      Map.put(base, "set", %{"VALID_NAME" => 123}),
+      Map.put(base, "unset", nil),
+      Map.put(base, "unset", [123]),
+      Map.put(base, "unset", ["GH_TOKEN", "GH_TOKEN"]),
+      base |> Map.put("set", %{"GH_TOKEN" => "secret"}) |> Map.put("unset", ["GH_TOKEN"]),
+      Map.put(base, "expiresAt", "not-a-date"),
+      Map.put(base, "expiresAt", nil),
+      Map.put(base, "repository", "")
+    ]
+
+    Enum.each(cases, fn contract ->
+      executable = fake_udp_gh!(context.root, contract)
+
+      assert {:error, {:udp_gh_invalid_contract, _reason}} =
+               External.prepare(context.workspace, executable: executable)
+    end)
+
+    executable = fake_udp_gh!(context.root, base)
+
+    assert {:error, {:udp_gh_invalid_contract, _reason}} =
+             External.prepare(context.workspace,
+               executable: executable,
+               command: fn _executable, _args, _opts -> {"not json", 0} end
              )
   end
 
-  test "remote workers fail before reading local credentials", context do
-    assert {:error, {:github_auth_remote_worker_unsupported, "builder.example"}} =
-             Local.prepare(context.workspace, worker_host: "builder.example")
+  test "accepts a contract without an optional real-gh path", context do
+    contract = update_in(valid_contract(context.workspace), ["set"], &Map.delete(&1, "UDP_GH_REAL_GH"))
+    executable = fake_udp_gh!(context.root, contract)
 
-    assert {:error, {:github_auth_remote_worker_unsupported, "builder.example"}} =
-             Local.token(context.workspace, worker_host: "builder.example")
+    assert {:ok, session} = External.prepare(context.workspace, executable: executable)
+    refute Map.has_key?(Map.new(session.env), "SYMPHONY_REAL_GH")
   end
 
-  test "private-key files and pinned installation ids avoid the installation lookup", context do
-    key_path = Path.join(context.workspace, "app-key.pem")
-    File.write!(key_path, context.env["GITHUB_APP_PRIVATE_KEY"])
+  test "preserves typed command and discovery failures", context do
+    executable = fake_udp_gh!(context.root, valid_contract(context.workspace))
 
-    env = %{
-      "GITHUB_APP_ID" => "12345",
-      "GITHUB_APP_PRIVATE_KEY_FILE" => "app-key.pem",
-      "GITHUB_APP_INSTALLATION_ID" => "987",
-      "UDP_AGENT_COMMIT_NAME" => "Automation Bot",
-      "UDP_AGENT_COMMIT_EMAIL" => "bot@example.com",
-      "PATH" => System.get_env("PATH", "")
-    }
-
-    request = fn
-      %{method: :post} -> {:ok, %{status: 201, body: token_response()}}
-      %{method: :get} -> flunk("pinned installation id should skip lookup")
-    end
-
-    assert {:ok, session} =
-             Local.prepare(
-               context.workspace,
-               env: env,
-               request: request,
-               now: fn -> ~U[2026-08-12 16:00:00Z] end,
-               cli_path: context.cli_path,
-               real_gh: context.real_gh
+    assert {:error, {:udp_gh_prepare_failed, 7, "preflight failed\n"}} =
+             External.prepare(context.workspace,
+               executable: executable,
+               command: fn _executable, _args, _opts -> {"preflight failed\n", 7} end
              )
 
-    prepared_env = Map.new(session.env)
-    assert prepared_env["GIT_AUTHOR_NAME"] == "Automation Bot"
-    assert prepared_env["GIT_COMMITTER_EMAIL"] == "bot@example.com"
-  end
-
-  test "invalid keys and installation ids fail before an API request", context do
-    base_opts = [cli_path: context.cli_path, real_gh: context.real_gh]
-
-    assert {:error, :github_app_private_key_invalid} =
-             Local.prepare(
-               context.workspace,
-               Keyword.put(base_opts, :env, %{
-                 "GITHUB_APP_ID" => "12345",
-                 "GITHUB_APP_PRIVATE_KEY" => "not a PEM"
-               })
+    assert {:error, {:udp_gh_prepare_failed, 9, output}} =
+             External.prepare(context.workspace,
+               executable: executable,
+               command: fn _executable, _args, _opts -> {String.duplicate("x", 3_000), 9} end
              )
 
-    assert {:error, {:invalid_github_app_installation_id, _message}} =
-             Local.prepare(
-               context.workspace,
-               Keyword.put(base_opts, :env, Map.put(context.env, "GITHUB_APP_INSTALLATION_ID", "zero"))
+    assert byte_size(output) < 2_100
+    assert String.ends_with?(output, "... (truncated)")
+
+    assert {:error, {:udp_gh_prepare_failed, :enoent}} =
+             External.prepare(context.workspace,
+               executable: executable,
+               command: fn _executable, _args, _opts -> raise ErlangError, original: :enoent end
+             )
+
+    assert {:error, :udp_gh_cli_not_found} =
+             External.prepare(context.workspace, executable: Path.join(context.root, "missing"))
+
+    assert {:error, {:github_auth_remote_worker_unsupported, "worker-01"}} =
+             External.prepare(context.workspace,
+               executable: executable,
+               worker_host: "worker-01"
              )
   end
 
-  test "GitHub API failures retain their operation and status", context do
-    opts =
-      auth_opts(context, fn _request ->
-        {:ok, %{status: 403, body: %{"message" => "App is not installed"}}}
-      end)
-
-    assert {:error, {:github_api_error, :resolve_installation, 403, "App is not installed"}} =
-             Local.prepare(context.workspace, opts)
-  end
-
-  test "interactive off restores every managed value without reading credentials" do
-    output = capture_io(fn -> assert CLI.run(["off"]) == 0 end)
-
-    assert output =~ "SYMPHONY_GITHUB_PREV_PATH"
-    assert output =~ ~S(if [ "${SYMPHONY_GITHUB_PREV_PATH+x}" = x ])
-    assert output =~ "unset SYMPHONY_GITHUB_AUTH"
-    assert output =~ "unset UDP_BOT_MODE"
-  end
-
-  test "provider facade normalizes environments and preserves typed failures", context do
+  test "provider facade normalizes environments and failures", context do
     Application.put_env(:symphony_elixir, :github_auth_provider, ControlledProvider)
 
     Process.put(
       :github_auth_prepare_result,
-      session(context.workspace, [{"PATH", "/auth/bin"}, {"GH_TOKEN", false}])
+      {:ok,
+       %{
+         env: [{"GH_TOKEN", false}, {"PATH", "/tmp/shims:/usr/bin"}],
+         repo: "Acme/widgets",
+         host: "github.com",
+         auth_root: "/tmp/auth",
+         expires_at: ~U[2099-01-01 00:00:00Z]
+       }}
     )
-
-    Process.put(:github_auth_token_result, {:ok, token()})
 
     assert {:ok, %{repo: "Acme/widgets"}} = GitHubAuth.prepare(context.workspace)
 
-    assert {:ok, [{~c"PATH", ~c"/auth/bin"}, {~c"GH_TOKEN", false}]} =
+    assert {:ok, [{~c"GH_TOKEN", false}, {~c"PATH", ~c"/tmp/shims:/usr/bin"}]} =
              GitHubAuth.port_env(context.workspace)
 
-    assert {:ok, %{token: "test-installation-token"}} = GitHubAuth.token(context.workspace)
+    Process.put(:github_auth_prepare_result, {:error, :untyped_prepare})
+    assert {:error, {:github_auth_failed, :untyped_prepare}} = GitHubAuth.prepare(context.workspace)
 
     Process.put(:github_auth_prepare_result, {:error, {:github_auth_failed, :already_typed}})
-    assert {:error, {:github_auth_failed, :already_typed}} = GitHubAuth.prepare(context.workspace, [])
-
-    Process.put(:github_auth_prepare_result, {:error, :untyped_prepare})
-    assert {:error, {:github_auth_failed, :untyped_prepare}} = GitHubAuth.prepare(context.workspace, [])
-
-    Process.put(:github_auth_token_result, {:error, {:github_auth_failed, :already_typed}})
-    assert {:error, {:github_auth_failed, :already_typed}} = GitHubAuth.token(context.workspace, [])
-
-    Process.put(:github_auth_token_result, {:error, :untyped_token})
-    assert {:error, {:github_auth_failed, :untyped_token}} = GitHubAuth.token(context.workspace, [])
+    assert {:error, {:github_auth_failed, :already_typed}} = GitHubAuth.prepare(context.workspace)
   end
 
-  test "interactive activation and check reuse the configured provider", context do
-    Application.put_env(:symphony_elixir, :github_auth_provider, ControlledProvider)
-
-    Process.put(
-      :github_auth_prepare_result,
-      session(context.workspace, [
-        {"PATH", "/auth/bin"},
-        {"GH_TOKEN", false},
-        {"GITHUB_TOKEN", false},
-        {"SYMPHONY_GITHUB_AUTH", "1"},
-        {"SYMPHONY_GITHUB_REPOSITORY", "Acme/widgets"}
-      ])
-    )
-
-    on_output = capture_io(fn -> assert CLI.run(["on"], workspace: context.workspace) == 0 end)
-    assert on_output =~ "export PATH='/auth/bin'"
-    assert on_output =~ "unset GH_TOKEN"
-    assert on_output =~ "unset GITHUB_TOKEN"
-    assert on_output =~ "export SYMPHONY_GITHUB_AUTH='1'"
-    assert on_output =~ "SYMPHONY_GITHUB_PREV_PATH"
-
-    check_output = capture_io(fn -> assert CLI.run(["check"], workspace: context.workspace) == 0 end)
-    assert check_output =~ "GitHub App authentication ready for Acme/widgets"
-    refute check_output =~ "test-installation-token"
-  end
-
-  test "interactive gh refreshes once after an authentication failure", context do
-    Application.put_env(:symphony_elixir, :github_auth_provider, ControlledProvider)
-    Process.put(:github_auth_token_result, {:ok, token()})
-
-    counter = Path.join(Path.dirname(context.real_gh), "gh-invoked")
-
-    real_gh =
-      executable!(
-        Path.dirname(context.real_gh),
-        "retry-gh",
-        "#!/bin/sh\nif [ ! -f '#{counter}' ]; then touch '#{counter}'; echo 'Bad credentials'; exit 1; fi\necho \"refreshed: $*\"\n"
-      )
-
-    previous_real_gh = System.get_env("SYMPHONY_REAL_GH")
-    System.put_env("SYMPHONY_REAL_GH", real_gh)
-    on_exit(fn -> restore_env("SYMPHONY_REAL_GH", previous_real_gh) end)
-
-    output =
-      capture_io(fn ->
-        assert CLI.run(["gh", "auth", "status"], workspace: context.workspace) == 0
-      end)
-
-    assert output =~ "Bad credentials"
-    assert output =~ "refreshed: auth status"
-  end
-
-  test "interactive commands report provider, executable, and usage errors", context do
-    Application.put_env(:symphony_elixir, :github_auth_provider, ControlledProvider)
-    Process.put(:github_auth_prepare_result, {:error, :credential_error})
-    Process.put(:github_auth_token_result, {:ok, token()})
-
-    assert capture_io(:stderr, fn ->
-             assert CLI.run(["on"], workspace: context.workspace) == 1
-           end) =~ "credential_error"
-
-    assert capture_io(:stderr, fn ->
-             assert CLI.run(["check"], workspace: context.workspace) == 1
-           end) =~ "credential_error"
-
-    previous_real_gh = System.get_env("SYMPHONY_REAL_GH")
-    System.delete_env("SYMPHONY_REAL_GH")
-    on_exit(fn -> restore_env("SYMPHONY_REAL_GH", previous_real_gh) end)
-
-    assert capture_io(:stderr, fn ->
-             assert CLI.run(["gh", "auth", "status"], workspace: context.workspace) == 1
-           end) =~ "symphony_real_gh_missing"
-
-    assert capture_io(:stderr, fn -> assert CLI.run(["unknown"]) == 2 end) =~
-             "Usage: symphony github-auth"
-  end
-
-  defp auth_opts(context, request) do
-    [
-      cli_path: context.cli_path,
-      real_gh: context.real_gh,
-      env: context.env,
-      request: request,
-      now: fn -> ~U[2026-08-12 16:00:00Z] end
-    ]
-  end
-
-  defp token_response do
+  defp valid_contract(workspace) do
     %{
-      "token" => "secret-installation-token",
-      "expires_at" => "2026-08-12T18:00:00Z"
+      "version" => 1,
+      "repository" => "Acme/widgets",
+      "host" => "github.com",
+      "authRoot" => Path.join(workspace, ".artifacts/udp-gh"),
+      "expiresAt" => "2099-01-01T00:00:00Z",
+      "installationId" => 987,
+      "set" => %{
+        "GH_CONFIG_DIR" => Path.join(workspace, ".artifacts/udp-gh/gh-config"),
+        "PATH" => Path.join(workspace, ".artifacts/udp-gh/shims") <> ":/usr/bin",
+        "UDP_GH_AUTH" => "1",
+        "UDP_GH_REAL_GH" => "/usr/bin/gh"
+      },
+      "unset" => ["GH_TOKEN", "GITHUB_TOKEN"]
     }
   end
 
-  defp session(workspace, env) do
-    {:ok,
-     %{
-       env: env,
-       repo: "Acme/widgets",
-       host: "github.com",
-       auth_root: Path.join(workspace, ".artifacts/github-app-auth"),
-       expires_at: ~U[2026-08-12 18:00:00Z]
-     }}
-  end
-
-  defp token do
-    %{
-      token: "test-installation-token",
-      repo: "Acme/widgets",
-      host: "github.com",
-      installation_id: 987,
-      expires_at: ~U[2026-08-12 18:00:00Z]
-    }
-  end
-
-  defp jwt_payload(headers) do
-    {"authorization", "Bearer " <> jwt} =
-      Enum.find(headers, fn {name, _value} -> name == "authorization" end)
-
-    [_header, payload, _signature] = String.split(jwt, ".")
-    {:ok, decoded} = Base.url_decode64(payload, padding: false)
-    Jason.decode!(decoded)
-  end
-
-  defp private_mode(path) do
-    {:ok, %{mode: mode}} = File.stat(path)
-    Bitwise.band(mode, 0o777)
-  end
-
-  defp executable!(root, name, body) do
-    path = Path.join(root, name)
-    File.write!(path, body)
+  defp fake_udp_gh!(root, contract, filename \\ nil) do
+    path = Path.join(root, filename || "udp-gh-#{System.unique_integer([:positive])}")
+    payload = Jason.encode!(contract)
+    quoted_payload = "'" <> String.replace(payload, "'", "'\"'\"'") <> "'"
+    File.write!(path, "#!/bin/sh\nprintf '%s\\n' #{quoted_payload}\n")
     File.chmod!(path, 0o700)
     path
   end
+
+  defp restore_application_env(name, nil), do: Application.delete_env(:symphony_elixir, name)
+  defp restore_application_env(name, value), do: Application.put_env(:symphony_elixir, name, value)
+
+  defp restore_system_env(name, nil), do: System.delete_env(name)
+  defp restore_system_env(name, value), do: System.put_env(name, value)
 end

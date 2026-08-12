@@ -11,8 +11,8 @@ Build away from the live executable and keep the currently installed binary avai
 ```bash
 cd /path/to/symphony/elixir
 mise exec -- make all
-mise exec -- mix build
-sha256sum bin/symphony
+mise exec -- make build
+sha256sum bin/symphony.escript bin/udp-gh
 ```
 
 Record the source commit, binary checksum, current service command (including `--logs-root` and
@@ -23,10 +23,11 @@ service:
 
 ```bash
 cd /path/to/a/configured/repository
-/path/to/symphony/elixir/bin/symphony github-auth check
+udp-gh check
 ```
 
-The service environment must contain `GITHUB_APP_ID` and either
+The independently installed `udp-gh` executable and the service environment must contain
+`GITHUB_APP_ID` and either
 `GITHUB_APP_PRIVATE_KEY_FILE` or `GITHUB_APP_PRIVATE_KEY`. Do not print either credential while
 checking deployment configuration.
 
@@ -72,11 +73,9 @@ curl -fsS -X POST http://127.0.0.1:PORT/api/v1/resume
 If verification fails, leave drain mode enabled while investigating or rolling back. Cancelling
 drain mode is reversible and schedules an immediate tracker poll.
 
-During the compatibility rollout, an existing
-`agent.pre_command: . .artifacts/github-app-auth/session.env` may remain configured. Symphony now
-creates that token-free file itself. Remove the pre-command only after consumer repositories have
-moved unrelated additions (for example browser-runtime variables) to a separate repository hook;
-GitHub auth itself must not remain repository-owned.
+Repository-specific environment preparation, such as browser-runtime variables, may still use
+`agent.pre_command` and a repository-owned environment file. GitHub authentication must not be
+written into or sourced from that file; Symphony injects the validated `udp-gh` contract directly.
 
 ## 4. Verify before cleanup
 
@@ -86,7 +85,8 @@ Check all of the following before touching retained files:
   `SYMPHONY_TEST_WORKER_LIMIT=<configured limit>`; Vitest uses `--maxWorkers` and Playwright uses
   `--workers` with that value.
 - The disposable issue reports `SYMPHONY_GITHUB_AUTH=1`; `gh auth status` identifies the App-backed
-  bot, and `.artifacts/github-app-auth/session.env` contains no `GH_TOKEN` or `GITHUB_TOKEN`.
+  bot, `.artifacts/udp-gh/installation-token.json` has mode `0600`, and no `GH_TOKEN` or
+  `GITHUB_TOKEN` is present in the general agent environment.
 - `agent.max_concurrent_agents` is unchanged.
 - A connected dashboard receives coalesced refreshes and its live transcript reports a bounded
   window for a large session; the issue JSON endpoint still exposes explicit full history.

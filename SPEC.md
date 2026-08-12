@@ -1179,22 +1179,24 @@ or a repository-owned token-minting hook.
 
 Runtime contract:
 
+- GitHub App authentication MUST be implemented by an independently installable CLI that does not
+  require Symphony or a consumer repository's runtime dependencies. Symphony MUST consume a
+  versioned machine contract with separate string-valued `set` and name-only `unset` collections;
+  it MUST NOT parse shell activation output.
 - The host provides `GITHUB_APP_ID` and either `GITHUB_APP_PRIVATE_KEY_FILE` or
   `GITHUB_APP_PRIVATE_KEY`. `GITHUB_APP_INSTALLATION_ID` MAY pin an installation; otherwise
-  Symphony resolves the installation for the current `owner/repo`.
+  the standalone CLI resolves the installation for the current `owner/repo`.
 - Before a routed repository lifecycle hook or coding-agent backend starts, Symphony MUST derive
-  the repository identity, resolve a valid installation token, and inject an isolated GitHub CLI
-  environment. Failure is fatal to the current attempt and MUST retain a typed authentication
-  classification.
-- Installation tokens MUST NOT be exported in the general hook/agent environment or compatibility
-  `session.env`. A Symphony-owned `gh` shim MAY inject the token only into the actual `gh` child and
-  MUST refresh it before expiration. On-disk token state MUST use owner-only permissions and MUST
-  be excluded from Git staging in the worktree.
-- The same provider MUST be callable from an interactive shell without a running Symphony service,
-  including explicit activation, restoration, and credential/installation preflight commands.
-- Repository hooks MUST NOT be required to mint GitHub App tokens. A temporary token-free
-  `session.env` compatibility artifact MAY be produced during migration from existing
-  `agent.pre_command` consumers.
+  the repository identity and resolve a valid installation token through that CLI, then inject the
+  returned isolated GitHub environment. Failure is fatal to the current attempt and MUST retain a
+  typed authentication classification.
+- Installation tokens MUST NOT be exported in the general hook/agent environment or a sourced
+  environment file. A standalone-CLI-owned `gh` shim MAY inject the token only into the actual `gh`
+  child and MUST refresh it before expiration. On-disk token state MUST use owner-only permissions
+  and MUST be excluded from Git staging in the worktree.
+- The standalone CLI MUST support interactive activation, restoration, one-command `gh` execution,
+  and credential/installation preflight without a running or installed Symphony service.
+- Repository hooks MUST NOT mint GitHub App tokens or construct a bot authentication environment.
 - A routed repository's `after_create` result MUST be observed. A non-zero exit or timeout aborts
   the attempt before agent startup.
 
@@ -2484,11 +2486,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - GitHub App authentication is prepared before routed lifecycle hooks and every agent backend
 - Missing credentials, an inaccessible installation, or token minting failure aborts the attempt
   with a typed authentication classification
-- Prepared hook/agent environments contain the Symphony-owned `gh` shim and repository identity,
+- Prepared hook/agent environments contain the standalone-CLI-owned `gh` shim and repository identity,
   but no `GH_TOKEN` or `GITHUB_TOKEN`
-- Installation-token cache and compatibility environment files use owner-only permissions, and
-  `.artifacts` is excluded from local Git staging
-- Interactive activation and restoration reuse the production provider without a running service
+- Installation-token cache files use owner-only permissions, and `.artifacts` is excluded from
+  local Git staging
+- Interactive activation and restoration reuse the production CLI without installing or running
+  Symphony
 
 ### 17.3 Issue Tracker Client
 

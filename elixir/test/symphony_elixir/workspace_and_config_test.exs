@@ -25,9 +25,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
          expires_at: ~U[2099-01-01 00:00:00Z]
        }}
     end
-
-    @impl true
-    def token(_workspace, _opts), do: {:error, :not_implemented}
   end
 
   test "workspace bootstrap can be implemented in after_create hook" do

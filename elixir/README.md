@@ -112,13 +112,14 @@ cd symphony/elixir
 mise trust
 mise install
 mise exec -- mix setup
-mise exec -- mix build
+mise exec -- make build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
-`mix build` creates the internal `bin/symphony.escript`; start Symphony through the committed
-`bin/symphony` launcher as shown above. The launcher converts terminal Ctrl+C into a graceful
-application stop so the selected worker shutdown policy runs before the VM exits.
+`make build` creates the internal `bin/symphony.escript` and the independent `bin/udp-gh`
+executable. Start Symphony through the committed `bin/symphony` launcher as shown above. The
+launcher converts terminal Ctrl+C into a graceful application stop so the selected worker shutdown
+policy runs before the VM exits.
 
 ## Configuration
 
@@ -138,9 +139,10 @@ Optional flags:
 ## GitHub App authentication
 
 Every Symphony run targets a GitHub repository, so GitHub App authentication is a mandatory host
-capability rather than a repository hook. Before repository lifecycle hooks or an agent backend
-start, Symphony derives `owner/repo` from the checkout, mints a repository-scoped installation
-token, and injects an isolated `gh` environment into hooks and all agent backends. A bootstrap
+capability rather than a repository hook. The standalone [`udp-gh`](tools/udp-gh/README.md) CLI owns
+repository discovery, JWT signing, installation-token caching, and the refreshing `gh` shim.
+Symphony invokes `udp-gh prepare --cwd <workspace>`, validates its versioned token-free JSON
+contract, and injects the returned environment into lifecycle hooks and agent backends. A preflight
 failure aborts the attempt as `authentication_configuration`; it is never deferred until the first
 `gh` command or reported as a generic agent-process exit.
 
@@ -149,35 +151,45 @@ Configure the service environment with:
 - `GITHUB_APP_ID`
 - either `GITHUB_APP_PRIVATE_KEY_FILE` or `GITHUB_APP_PRIVATE_KEY` (escaped `\\n` newlines are
   accepted for inline keys)
-- optionally `GITHUB_APP_INSTALLATION_ID`; when omitted, Symphony resolves the installation for
-  the current repository
-- optionally `UDP_AGENT_COMMIT_NAME` and `UDP_AGENT_COMMIT_EMAIL`; when both are present Symphony
+- optionally `GITHUB_APP_INSTALLATION_ID`; when omitted, `udp-gh` resolves the installation for the
+  current repository
+- optionally `UDP_AGENT_COMMIT_NAME` and `UDP_AGENT_COMMIT_EMAIL`; when both are present `udp-gh`
   exports matching Git author and committer identity
 
-Installation tokens are cached per worktree with mode `0600`. The injected `gh` shim refreshes
-tokens before their one-hour expiry, so long sessions do not depend on a startup token remaining
-valid. Tokens are passed only to the real `gh` child; they are not written to `session.env` or
-exported into the general agent shell. Any inherited `GH_TOKEN`, `GITHUB_TOKEN`, or enterprise
-equivalent is explicitly removed from hook and agent environments so a service operator's login
-cannot override the App identity.
+Install `udp-gh` on the service `PATH`, or place it beside `bin/symphony.escript`. It is a static
+executable with no Symphony, Elixir, Node.js, or repository-package runtime dependency. To install
+only the authentication CLI:
 
-The same implementation is available without running the Symphony service:
+```bash
+make udp-gh
+make install-udp-gh PREFIX="$HOME/.local"
+```
+
+Installation tokens are cached per worktree under `.artifacts/udp-gh/` with mode `0600`. The
+injected `gh` shim refreshes tokens before their one-hour expiry, so long sessions do not depend on
+a startup token remaining valid. Tokens are passed only to the real `gh` child; they are not
+exported into the general hook or agent shell. Any inherited `GH_TOKEN`, `GITHUB_TOKEN`, or
+enterprise equivalent is explicitly removed so an operator's login cannot override the App
+identity.
+
+Interactive use requires only the installed `udp-gh` executable, not Symphony:
 
 ```bash
 # Validate credentials and the App installation for the current checkout.
-./bin/symphony github-auth check
+udp-gh check
 
 # Activate the bot identity in an interactive shell, then restore prior values.
-eval "$(./bin/symphony github-auth on)"
+eval "$(udp-gh on)"
 gh auth status
-eval "$(./bin/symphony github-auth off)"
+eval "$(udp-gh off)"
+
+# Or run one App-authenticated GitHub CLI command without changing this shell.
+udp-gh gh pr list
 ```
 
-During migration Symphony creates `.artifacts/github-app-auth/session.env` when absent so an older
-`agent.pre_command` can still source it. The native environment injection is authoritative; remove
-that legacy pre-command after repository-specific additions have moved to their own hook or env
-file. Symphony also adds `/.artifacts/` to the checkout's local Git exclude so auth state cannot be
-accidentally staged in repositories that do not globally ignore that directory.
+`udp-gh` adds `/.artifacts/` to the checkout's local Git exclude so auth state cannot be
+accidentally staged in repositories that do not globally ignore that directory. It does not create
+or source a shell `session.env`; machine consumers receive explicit `set` and `unset` collections.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
@@ -365,12 +377,11 @@ Notes:
   block. Both alternative backends share the same local-only gate / non-intercepted `fs`/`terminal`
   limitations as ACP.
 - `agent.pre_command` remains available for non-authentication, host-wide shell preparation. It runs
-  (joined with `&&`) in the per-issue workspace cwd before every backend process. GitHub App auth no
-  longer belongs here: Symphony injects it natively and creates the old
-  `.artifacts/github-app-auth/session.env` only as a migration bridge. Any `.env` file a custom
-  pre-command sources is sanitized before launch. For Codex, Symphony disables the per-thread shell
-  snapshot when a pre-command is configured so a profile reload cannot undo intentional `PATH`
-  changes.
+  (joined with `&&`) in the per-issue workspace cwd before every backend process. GitHub App auth
+  does not belong here: Symphony injects the validated `udp-gh` environment natively. Any `.env`
+  file a custom pre-command sources is sanitized before launch. For Codex, Symphony disables the
+  per-thread shell snapshot when a pre-command is configured so a profile reload cannot undo
+  intentional `PATH` changes.
 - `agent.test_worker_limit` (default `2`) bounds test-runner fan-out inside each agent without
   changing `agent.max_concurrent_agents`. Every backend receives
   `SYMPHONY_TEST_WORKER_LIMIT`; the first-turn prompt directs agents to pass
@@ -518,7 +529,7 @@ Notes:
   `git clone ... .` there, along with any other setup commands you need.
 - GitHub App auth is prepared before routed repository hooks and injected into `after_create`,
   `session_start`, `before_run`, `before_handoff`, and `after_run`. Repositories do not need to mint
-  tokens or construct a bot `session.env`. A non-zero routed `after_create` result is fatal and is
+  tokens or construct a bot environment. A non-zero routed `after_create` result is fatal and is
   returned unchanged instead of allowing agent startup to continue.
 - Use `hooks.session_start` to run non-blocking repo-local startup discovery before every fresh or
   resumed Codex session. Symphony captures generated Markdown links under
