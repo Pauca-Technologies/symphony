@@ -304,6 +304,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp run_handoff_transition(request, handoff_opts) do
+    run_with_handoff_gate_lifecycle(request, fn ->
+      do_run_handoff_transition(request, handoff_opts)
+    end)
+  end
+
+  defp do_run_handoff_transition(request, handoff_opts) do
     gate_issue = issue_with_state(request.issue, request.current_state)
 
     case revalidate_base_before_handoff(
@@ -322,6 +328,75 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:base_drift_blocked, _prompt, _decision} = blocked ->
         blocked
     end
+  end
+
+  defp run_with_handoff_gate_lifecycle(request, run) when is_function(run, 0) do
+    gate_job_id = "inline-#{System.unique_integer([:positive, :monotonic])}"
+    started_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+    gate = %{
+      job_id: gate_job_id,
+      status: :running,
+      candidate_hash: nil,
+      exact_hash: nil,
+      identity: %{"mode" => "inline"},
+      heartbeat_at: started_at,
+      heartbeat_age_ms: 0,
+      next_poll_ms: nil,
+      progress: %{"stage" => "before_handoff"},
+      started_at: started_at
+    }
+
+    notify_handoff_gate_lifecycle(request.context, :started, %{
+      gate_job_id: gate_job_id,
+      gate: gate
+    })
+
+    result =
+      try do
+        run.()
+      catch
+        kind, reason ->
+          notify_handoff_gate_lifecycle(request.context, :finished, %{
+            gate_job_id: gate_job_id,
+            outcome: :crashed
+          })
+
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    notify_handoff_gate_lifecycle(request.context, :finished, %{
+      gate_job_id: gate_job_id,
+      outcome: handoff_gate_outcome(result)
+    })
+
+    result
+  end
+
+  defp notify_handoff_gate_lifecycle(context, event, metadata) do
+    case Map.get(context, :handoff_gate_lifecycle_callback) ||
+           Map.get(context, "handoff_gate_lifecycle_callback") do
+      callback when is_function(callback, 2) -> callback.(event, metadata)
+      _callback -> :ok
+    end
+  end
+
+  defp handoff_gate_outcome(result) do
+    tag = if is_tuple(result), do: elem(result, 0), else: result
+
+    Map.get(
+      %{
+        ok: :passed,
+        handoff_blocked: :blocked,
+        handoff_infrastructure_error: :infrastructure_error,
+        base_drift_blocked: :base_drift_blocked,
+        review_blocked: :review_blocked,
+        review_deferred: :review_deferred,
+        handoff_deferred: :handoff_deferred
+      },
+      tag,
+      :completed
+    )
   end
 
   defp blocked_state?(state) when is_binary(state),

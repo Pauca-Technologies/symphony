@@ -290,6 +290,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       state: "In Progress"
     }
 
+    test_pid = self()
+
     response =
       DynamicTool.execute(
         "linear_graphql",
@@ -297,7 +299,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
           "variables" => %{"issueId" => "issue-gate", "stateId" => "state-review"}
         },
-        handoff_gate_context: %{issue: issue, workspace: workspace, worker_host: nil},
+        handoff_gate_context: %{
+          issue: issue,
+          workspace: workspace,
+          worker_host: nil,
+          handoff_gate_lifecycle_callback: fn event, metadata ->
+            send(test_pid, {:handoff_gate_lifecycle, event, metadata})
+          end
+        },
         linear_client: fn
           query, %{"issueId" => "issue-gate"}, [] ->
             assert query =~ "SymphonyResolveIssueTransition"
@@ -336,6 +345,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert %{event: "gate.before_handoff", outcome: :failed, gates: gates} = telemetry
 
     assert [%{name: "landable-check", passed: false}] = gates
+
+    assert_receive {:handoff_gate_lifecycle, :started, %{gate_job_id: gate_job_id, gate: %{status: :running}}}
+
+    assert_receive {:handoff_gate_lifecycle, :finished, %{gate_job_id: ^gate_job_id, outcome: :blocked}}
   end
 
   test "linear_graphql defers a protocol-v1 pending handoff without applying the mutation" do

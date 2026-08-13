@@ -926,8 +926,9 @@ Reconciliation runs every tick and has two parts.
 
 Part A: Stall detection
 
-- Each running issue has a lifecycle state. Normal agent work uses `implementing`; an asynchronous
-  shell gate uses `handoff_pending_gate`, and an accepted deferred handoff review uses
+- Each running issue has a lifecycle state. Normal agent work uses `implementing`; any in-flight
+  shell gate (including a synchronous initial invocation) uses `handoff_pending_gate`, and an
+  accepted deferred handoff review uses
   `handoff_pending_review`. Both pending states remain in the running/claimed sets.
 - For `implementing`, compute `elapsed_ms` since the newest of:
   - `last_codex_timestamp` if any event has been seen,
@@ -942,8 +943,9 @@ Part A: Stall detection
   accounting. Terminate the worker with a visible review-timeout retry if reviewer inactivity
   exceeds the review timeout.
 - For `handoff_pending_gate`, do not apply the implementor activity clock, failure retry, or
-  max-turn accounting and do not dispatch a replacement implementor. Poll the durable gate by job
-  ID without starting a coding-agent turn. Status surfaces MUST expose the job and candidate
+  max-turn accounting and do not dispatch a replacement implementor. A synchronous invocation
+  remains governed by the hook invocation timeout. Poll a durable asynchronous gate by job ID
+  without starting a coding-agent turn. Status surfaces MUST expose the available job and candidate
   identity, pending age, heartbeat age/time, progress stage, and next-poll delay.
 - Persist the captured tracker mutation and pending gate identity outside the agent-writable
   workspace. After process restart, reattach to that job before starting a coding-agent session.
@@ -1073,6 +1075,8 @@ Execution contract:
   before session startup and before `hooks.before_handoff`.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. `before_handoff` may override each
   invocation with `hooks.before_handoff_timeout_ms`.
+- On timeout, worker stop, or worker exit, terminate the hook's external descendant processes before
+  releasing the worker so commands cannot survive as orphaned process trees.
 - Log hook start, failures, and timeouts.
 - Emit `gate.before_handoff` telemetry when `before_handoff` fires, including the per-gate
   pass/fail breakdown parsed from hook JSON output when available.

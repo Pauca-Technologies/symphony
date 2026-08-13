@@ -190,6 +190,39 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     if Process.alive?(second), do: GenServer.stop(second)
   end
 
+  test "stopping a detached worker terminates its external child processes" do
+    test_pid = self()
+    issue = issue("stop-descendants")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, spec} = Registry.load_spec(manifest)
+
+    runner_fun = fn _recipient ->
+      receive do
+        :never -> :ok
+      end
+    end
+
+    process_terminator = fn ->
+      send(test_pid, :worker_descendants_terminated)
+      :ok
+    end
+
+    {:ok, server} =
+      Server.start_link(spec,
+        runner_fun: runner_fun,
+        process_terminator: process_terminator
+      )
+
+    server_ref = Process.monitor(server)
+    assert {:ok, _attachment} = GenServer.call(server, {:attach, self(), spec.auth_token})
+
+    GenServer.cast(server, {:stop, self()})
+
+    assert_receive :worker_descendants_terminated, 1_000
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 1_000
+    assert Registry.list() == []
+  end
+
   defp issue(suffix) do
     %Issue{
       id: "persistent-worker-#{suffix}",

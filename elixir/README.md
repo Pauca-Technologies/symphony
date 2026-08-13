@@ -392,7 +392,8 @@ Notes:
 - `agent.heavy_validation_limit` (default `2`) is exported as
   `SYMPHONY_HEAVY_VALIDATION_LIMIT` to agents and lifecycle hooks so repository harnesses can admit
   CPU-heavy validation across worktrees independently of per-command test worker fan-out.
-- Detached `handoff_pending_gate` and `handoff_pending_review` lifecycles keep their issue claim and
+- In-flight `before_handoff` validation (including a synchronous initial hook invocation) and
+  detached `handoff_pending_gate` / `handoff_pending_review` lifecycles keep their issue claim and
   path-overlap reservation, but no longer consume global, per-state, per-host, or per-repository
   implementation capacity. Disjoint implementation can therefore continue while a completed
   candidate validates or is reviewed without allowing overlapping work into reserved paths.
@@ -542,7 +543,9 @@ Notes:
   per-script timings reported by the hook output.
 - Use `hooks.before_handoff` to run a repo-local gate before an agent moves a Linear issue from
   `In Progress` to a review handoff state such as `In Review`. A non-zero exit blocks the status
-  transition and the parsed gate remediation is included in the next agent turn.
+  transition and the parsed gate remediation is included in the next agent turn. Symphony marks
+  the issue `handoff_pending_gate` before invoking even a legacy synchronous hook, so a long valid
+  hook uses its configured hook timeout instead of the coding-agent stall timeout.
   Protocol-aware hooks receive `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. Exit `3` with a version 1
   `pending`/`running` JSON report to defer the mutation; subsequent lightweight polls receive
   `SYMPHONY_HANDOFF_GATE_JOB_ID`. Configure the hook invocation deadline independently with
@@ -563,6 +566,8 @@ Notes:
   session or token accounting; a silent reviewer is timed out with a review-specific log and retry.
   Symphony also pins the reviewed PR head and rechecks it before applying the transition, so a push
   during review requires a fresh handoff review.
+  When a worker is stopped or exits, Symphony terminates its external descendant processes before
+  discarding the worker, preventing hook and validation commands from being orphaned.
   Reviewer session/verdict failures receive one bounded retry and are then latched for that
   candidate during the current orchestration run; budget exhaustion is likewise latched and never
   spawns another reviewer in that run. To recover, repair reviewer tool/auth/runtime or verdict

@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{BareClone, Config, GitHubAuth, PathSafety, SSH, TestWorkerBudget}
+  alias SymphonyElixir.{BareClone, Config, GitHubAuth, OSProcess, PathSafety, SSH, TestWorkerBudget}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -543,26 +543,15 @@ defmodule SymphonyElixir.Workspace do
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     with {:ok, github_env} <- github_hook_env(workspace, nil, opts) do
-      task =
-        Task.async(fn ->
-          # SYMPHONY_RUN=1 marks this as a Symphony-spawned outer hook so the
-          # consumer repo's gates (e.g. UDP's pr:check-scope-conformance and
-          # .claude/hooks/github-app-session-start.sh) can gate on it. We
-          # intentionally do NOT set SYMPHONY_AGENT here — that var is reserved
-          # for inner codex/claude agent processes in Codex.AppServer.
-          System.cmd("sh", ["-lc", command],
-            cd: workspace,
-            stderr_to_stdout: true,
-            env: system_cmd_hook_env(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
-          )
-        end)
+      env = port_hook_env(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
+      {port, root_identity} = start_local_hook_port(command, workspace, env)
 
-      case Task.yield(task, timeout_ms) do
+      case collect_local_hook_port(port, timeout_ms) do
         {:ok, cmd_result} ->
           handle_hook_command_result(cmd_result, workspace, issue_context, hook_name, capture_output?)
 
-        nil ->
-          Task.shutdown(task, :brutal_kill)
+        :timeout ->
+          terminate_local_hook_port(port, root_identity, issue_context, hook_name)
 
           Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
@@ -571,7 +560,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host, opts) when is_binary(worker_host) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host, opts)
+       when is_binary(worker_host) do
     timeout_ms = Keyword.get(opts, :timeout_ms) || Config.settings!().hooks.timeout_ms
     capture_output? = Keyword.get(opts, :capture_output, false)
 
@@ -595,6 +585,91 @@ defmodule SymphonyElixir.Workspace do
           {:error, reason}
       end
     end
+  end
+
+  defp start_local_hook_port(command, workspace, env) do
+    executable = System.find_executable("sh") || raise "sh executable not found"
+
+    port =
+      Port.open(
+        {:spawn_executable, String.to_charlist(executable)},
+        [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: [~c"-lc", String.to_charlist(command)],
+          cd: String.to_charlist(workspace),
+          env: env
+        ]
+      )
+
+    {port, local_hook_root_identity(port)}
+  end
+
+  defp collect_local_hook_port(port, timeout_ms) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    collect_local_hook_port(port, deadline_ms, [])
+  end
+
+  defp collect_local_hook_port(port, deadline_ms, output) do
+    timeout_ms = max(0, deadline_ms - System.monotonic_time(:millisecond))
+
+    receive do
+      {^port, {:data, data}} ->
+        collect_local_hook_port(port, deadline_ms, [output, data])
+
+      {^port, {:exit_status, status}} ->
+        {:ok, {IO.iodata_to_binary(output), status}}
+    after
+      timeout_ms -> :timeout
+    end
+  end
+
+  defp local_hook_root_identity(port) do
+    case :erlang.port_info(port, :os_pid) do
+      {:os_pid, os_pid} when is_integer(os_pid) ->
+        os_pid
+        |> OSProcess.snapshot_tree()
+        |> Enum.find(&(&1.pid == os_pid))
+
+      _port_info ->
+        nil
+    end
+  end
+
+  defp terminate_local_hook_port(port, root_identity, issue_context, hook_name) do
+    identities = local_hook_process_tree(root_identity)
+    close_hook_port(port)
+
+    case OSProcess.terminate_identities(identities) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Workspace hook process cleanup failed hook=#{hook_name} #{issue_log_context(issue_context)} reason=#{inspect(reason)}")
+
+        :ok
+    end
+  end
+
+  defp local_hook_process_tree(%{pid: os_pid, start_time: start_time} = root_identity) do
+    if OSProcess.alive?(root_identity) do
+      tree = OSProcess.snapshot_tree(os_pid)
+
+      if Enum.any?(tree, &(&1.pid == os_pid and &1.start_time == start_time)),
+        do: tree,
+        else: []
+    else
+      []
+    end
+  end
+
+  defp local_hook_process_tree(_root_identity), do: []
+
+  defp close_hook_port(port) do
+    if :erlang.port_info(port) != :undefined, do: Port.close(port)
+  rescue
+    ArgumentError -> :ok
   end
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name, false) do
@@ -730,12 +805,14 @@ defmodule SymphonyElixir.Workspace do
     ] ++ extra_env
   end
 
-  defp system_cmd_hook_env(workspace, extra_env) do
+  # SYMPHONY_RUN=1 marks this as a Symphony-spawned outer hook so consumer
+  # repositories can distinguish it from an inner coding-agent process.
+  defp port_hook_env(workspace, extra_env) do
     workspace
     |> hook_env(extra_env)
     |> Enum.map(fn
-      {name, false} -> {name, nil}
-      entry -> entry
+      {name, false} -> {String.to_charlist(name), false}
+      {name, value} -> {String.to_charlist(name), String.to_charlist(value)}
     end)
   end
 

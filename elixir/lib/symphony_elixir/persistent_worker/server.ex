@@ -7,7 +7,7 @@ defmodule SymphonyElixir.PersistentWorker.Server do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.{AgentRunner, OSProcess}
   alias SymphonyElixir.PersistentWorker.{Protocol, Registry}
 
   defmodule State do
@@ -22,6 +22,7 @@ defmodule SymphonyElixir.PersistentWorker.Server do
       :connection_ref,
       :checkpoint,
       :terminal_seq,
+      :process_terminator,
       checkpoint_seq: 0,
       next_seq: 1,
       events: [],
@@ -60,7 +61,17 @@ defmodule SymphonyElixir.PersistentWorker.Server do
            }) do
       server = self()
       acceptor = spawn_link(fn -> accept_loop(listener, server) end)
-      state = %State{spec: spec, listener: listener, acceptor: acceptor}
+
+      process_terminator =
+        Keyword.get(opts, :process_terminator, default_process_terminator())
+
+      state = %State{
+        spec: spec,
+        listener: listener,
+        acceptor: acceptor,
+        process_terminator: process_terminator
+      }
+
       {:ok, state, {:continue, {:start_runner, opts}}}
     else
       {:error, reason} -> {:stop, reason}
@@ -138,9 +149,11 @@ defmodule SymphonyElixir.PersistentWorker.Server do
     _ = Registry.update(state.spec.manifest_path, %{status: "stopping"})
 
     if is_pid(state.runner_pid) and Process.alive?(state.runner_pid) do
+      terminate_worker_processes(state)
       Process.exit(state.runner_pid, :shutdown)
       {:noreply, state}
     else
+      terminate_worker_processes(state)
       finish_worker(state, connection)
     end
   end
@@ -159,6 +172,7 @@ defmodule SymphonyElixir.PersistentWorker.Server do
         {:DOWN, ref, :process, _pid, reason},
         %State{runner_ref: ref} = state
       ) do
+    terminate_worker_processes(state)
     reason = normalize_runner_exit(reason)
     state = record_event(%{state | runner_pid: nil, runner_ref: nil}, {:persistent_worker_completed, reason})
     state = %{state | terminal_seq: state.next_seq - 1}
@@ -322,6 +336,44 @@ defmodule SymphonyElixir.PersistentWorker.Server do
 
   defp normalize_runner_exit(reason) do
     {:persistent_worker_exit, inspect(reason, limit: 50, printable_limit: 2_000)}
+  end
+
+  defp terminate_worker_processes(%State{process_terminator: terminator})
+       when is_function(terminator, 0) do
+    case terminator.() do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Unable to terminate persistent worker child processes: #{inspect(reason)}")
+        :ok
+    end
+  rescue
+    error ->
+      Logger.warning("Unable to terminate persistent worker child processes: #{Exception.message(error)}")
+
+      :ok
+  end
+
+  defp terminate_worker_descendants do
+    case os_pid() do
+      worker_pid when is_integer(worker_pid) and worker_pid > 0 ->
+        worker_pid
+        |> OSProcess.snapshot_tree()
+        |> Enum.reject(&(&1.pid == worker_pid))
+        |> OSProcess.terminate_identities()
+
+      _worker_pid ->
+        :ok
+    end
+  end
+
+  defp default_process_terminator do
+    if Application.get_env(:symphony_elixir, :persistent_worker_mode, false) do
+      &terminate_worker_descendants/0
+    else
+      fn -> :ok end
+    end
   end
 
   defp os_pid do

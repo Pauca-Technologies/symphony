@@ -48,11 +48,12 @@ defmodule SymphonyElixir.HandoffGateTest do
 
   test "run_before_handoff blocks generic hook failures" do
     workspace = temp_workspace!("handoff-timeout")
+    child_pid_file = Path.join(workspace, "hook-child.pid")
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: Path.dirname(workspace),
-      hook_before_handoff: "sleep 1",
-      hook_timeout_ms: 1
+      hook_before_handoff: "sleep 30 & child=$!; printf '%s' \"$child\" > #{child_pid_file}; wait",
+      hook_timeout_ms: 500
     )
 
     assert {:blocked, prompt, [gate]} =
@@ -61,6 +62,9 @@ defmodule SymphonyElixir.HandoffGateTest do
     assert prompt =~ "workspace_hook_timeout"
     assert gate.name == "before_handoff"
     assert gate.passed == false
+
+    child_pid = child_pid_file |> File.read!() |> String.to_integer()
+    refute File.exists?("/proc/#{child_pid}")
   end
 
   test "remediation prompt falls back to raw output when all gates pass" do

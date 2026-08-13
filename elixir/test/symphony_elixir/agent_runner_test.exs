@@ -112,6 +112,36 @@ defmodule SymphonyElixir.AgentRunnerTest.WaitingBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.HandoffToolBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, _prompt, issue, opts) do
+    result =
+      Keyword.fetch!(opts, :tool_executor).(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
+        }
+      )
+
+    send(Application.fetch_env!(:symphony_elixir, :handoff_tool_recipient), {
+      :handoff_tool_result,
+      result
+    })
+
+    {:ok, %{session_id: "handoff-tool-session"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.PendingGateBackend do
   @moduledoc false
   @behaviour SymphonyElixir.AgentBackend
@@ -293,6 +323,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.EfficiencyBackend
   alias SymphonyElixir.AgentRunnerTest.Fix2AbnormalBackend
   alias SymphonyElixir.AgentRunnerTest.HandoffPromptBackend
+  alias SymphonyElixir.AgentRunnerTest.HandoffToolBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
   alias SymphonyElixir.AgentRunnerTest.PendingGateBackend
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
@@ -418,6 +449,76 @@ defmodule SymphonyElixir.AgentRunnerTest do
     assert_receive {:agent_lifecycle, "issue-agent-wait", :waiting, %{request: request}}
     assert request.condition["type"] == "github_actions_recovered"
     refute_receive {:waiting_prompt, _second_turn}, 100
+  end
+
+  test "synchronous handoff hooks publish a pending lifecycle around the tool call" do
+    Application.put_env(:symphony_elixir, :handoff_tool_recipient, self())
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :handoff_tool_recipient) end)
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-inline-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(workspace_root, "UDPE-INLINE-HANDOFF")
+    File.mkdir_p!(workspace)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", workspace_root: workspace_root)
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+
+    issue = %Issue{
+      id: "issue-inline-handoff",
+      identifier: "UDPE-INLINE-HANDOFF",
+      title: "Keep a synchronous handoff alive",
+      state: "In Progress",
+      labels: [],
+      comments: []
+    }
+
+    issue_id = issue.id
+
+    linear_client = fn
+      query, %{"issueId" => issue_id}, [] when issue_id == issue.id ->
+        if String.contains?(query, "SymphonyResolveIssueTransition") do
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{
+                 "state" => %{"name" => "In Progress"},
+                 "team" => %{
+                   "states" => %{
+                     "nodes" => [%{"id" => "state-review", "name" => "In Review"}]
+                   }
+                 }
+               }
+             }
+           }}
+        else
+          flunk("blocked handoff mutation should not reach Linear")
+        end
+    end
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               self(),
+               [
+                 agent_backend: {HandoffToolBackend, %{}},
+                 linear_client: linear_client,
+                 per_repo_before_handoff: "sleep 0.2; exit 2",
+                 per_repo_before_handoff_timeout_ms: 2_000,
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                 max_turns: 1
+               ],
+               nil
+             )
+
+    assert_receive {:agent_lifecycle, ^issue_id, :handoff_pending_gate, %{gate_job_id: gate_job_id, gate: %{status: :running}}}
+
+    assert_receive {:agent_lifecycle, ^issue_id, :implementing, %{gate_job_id: ^gate_job_id, gate_outcome: :blocked}}
+
+    assert_receive {:handoff_tool_result, %{"success" => false}}
   end
 
   describe "soft-budget continuations" do

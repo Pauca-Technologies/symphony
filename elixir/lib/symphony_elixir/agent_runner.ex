@@ -746,7 +746,15 @@ defmodule SymphonyElixir.AgentRunner do
       max_turns
     )
 
-    tool_executor = dynamic_tool_executor(issue, workspace, app_session.worker_host, opts)
+    tool_executor =
+      dynamic_tool_executor(
+        issue,
+        workspace,
+        app_session.worker_host,
+        codex_update_recipient,
+        opts
+      )
+
     budget_ref = AgentBudgetCollector.ref(budget_collector)
     started_ms = System.monotonic_time(:millisecond)
     :ok = AgentBudgetCollector.start_turn(budget_collector, prompt, started_ms)
@@ -1109,7 +1117,7 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp dynamic_tool_executor(issue, workspace, worker_host, opts) do
+  defp dynamic_tool_executor(issue, workspace, worker_host, lifecycle_recipient, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
     per_repo_before_handoff = Keyword.get(opts, :per_repo_before_handoff)
     per_repo_before_handoff_timeout_ms = Keyword.get(opts, :per_repo_before_handoff_timeout_ms)
@@ -1130,6 +1138,10 @@ defmodule SymphonyElixir.AgentRunner do
       |> maybe_put_map(:before_handoff_stale_ms, per_repo_before_handoff_stale_ms)
       |> Map.put(:deferred_handoff_gate_callback, &store_deferred_handoff_gate/1)
       |> Map.put(:handoff_infrastructure_failure_callback, &store_handoff_infrastructure_failure/2)
+      |> Map.put(
+        :handoff_gate_lifecycle_callback,
+        handoff_gate_lifecycle_callback(lifecycle_recipient, issue)
+      )
       |> maybe_put_map(:review_workflow, per_repo_review_workflow)
       |> maybe_put_map(:deferred_review_callback, deferred_review_callback(per_repo_review_workflow))
       |> maybe_put_map(:review_opts, review_opts)
@@ -1157,6 +1169,22 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp maybe_put_map(map, _key, nil), do: map
   defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
+
+  defp handoff_gate_lifecycle_callback(recipient, issue) do
+    fn
+      :started, %{gate_job_id: gate_job_id, gate: gate} ->
+        transition_agent_lifecycle(recipient, issue, :handoff_pending_gate, %{
+          gate_job_id: gate_job_id,
+          gate: gate
+        })
+
+      :finished, %{gate_job_id: gate_job_id, outcome: outcome} ->
+        transition_agent_lifecycle(recipient, issue, :implementing, %{
+          gate_job_id: gate_job_id,
+          gate_outcome: outcome
+        })
+    end
+  end
 
   defp deferred_review_callback(nil), do: nil
   defp deferred_review_callback(_review_workflow), do: &store_deferred_review_handoff/1
