@@ -408,8 +408,14 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
 
   defp process_exists_fallback?(pid) do
     case System.find_executable("kill") do
-      nil -> false
-      executable -> match?({_output, 0}, System.cmd(executable, ["-0", Integer.to_string(pid)]))
+      nil ->
+        false
+
+      executable ->
+        match?(
+          {_output, 0},
+          System.cmd(executable, ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+        )
     end
   rescue
     _error -> false

@@ -10,6 +10,8 @@ defmodule SymphonyElixir.PersistentWorker.Server do
   alias SymphonyElixir.{AgentRunner, OSProcess}
   alias SymphonyElixir.PersistentWorker.{Protocol, Registry}
 
+  @runtime_process_names MapSet.new(["beam.smp", "erl_child_setup", "inet_gethost"])
+
   defmodule State do
     @moduledoc false
     defstruct [
@@ -63,7 +65,7 @@ defmodule SymphonyElixir.PersistentWorker.Server do
       acceptor = spawn_link(fn -> accept_loop(listener, server) end)
 
       process_terminator =
-        Keyword.get(opts, :process_terminator, default_process_terminator())
+        Keyword.get_lazy(opts, :process_terminator, fn -> default_process_terminator(opts) end)
 
       state = %State{
         spec: spec,
@@ -355,26 +357,36 @@ defmodule SymphonyElixir.PersistentWorker.Server do
       :ok
   end
 
-  defp terminate_worker_descendants do
+  defp snapshot_worker_processes do
     case os_pid() do
       worker_pid when is_integer(worker_pid) and worker_pid > 0 ->
-        worker_pid
-        |> OSProcess.snapshot_tree()
-        |> Enum.reject(&(&1.pid == worker_pid))
-        |> OSProcess.terminate_identities()
+        OSProcess.snapshot_tree(worker_pid)
 
       _worker_pid ->
-        :ok
+        []
     end
   end
 
-  defp default_process_terminator do
-    if Application.get_env(:symphony_elixir, :persistent_worker_mode, false) do
-      &terminate_worker_descendants/0
+  defp default_process_terminator(opts) do
+    process_snapshotter = Keyword.get(opts, :process_snapshotter, &snapshot_worker_processes/0)
+    identity_terminator = Keyword.get(opts, :identity_terminator, &OSProcess.terminate_identities/1)
+
+    if Application.get_env(:symphony_elixir, :persistent_worker_mode, false) or
+         Keyword.has_key?(opts, :process_snapshotter) do
+      fn ->
+        process_snapshotter.()
+        |> Enum.reject(&runtime_process?/1)
+        |> identity_terminator.()
+      end
     else
       fn -> :ok end
     end
   end
+
+  defp runtime_process?(%{name: name}) when is_binary(name),
+    do: MapSet.member?(@runtime_process_names, name)
+
+  defp runtime_process?(_identity), do: false
 
   defp os_pid do
     case Integer.parse(System.pid()) do

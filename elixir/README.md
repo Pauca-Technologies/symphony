@@ -347,9 +347,10 @@ Notes:
   preserves active Codex, ACP, and Claude Code sessions, including remote sessions reached through
   SSH. A replacement orchestrator adopts the workers and replays their latest acknowledged runtime
   checkpoint plus any events produced while disconnected. Completed records are reclaimed rather
-  than adopted, so a cleanly stopped worker cannot become a synthetic failed run after restart;
-  per-worker logs live under `~/.symphony/worker-logs`. Worker BEAMs use a small
-  scheduler pool because model and repository work runs in external processes.
+  than adopted. Records marked active are also liveness-checked before adoption; dead records are
+  removed without replacing an already-scheduled retry, so a crashed worker cannot indefinitely
+  postpone its own retry. Per-worker logs live under `~/.symphony/worker-logs`. Worker BEAMs use a
+  small scheduler pool because model and repository work runs in external processes.
 - Eligible issues and continuations that cannot run because the global, per-state, repository, or
   worker-host capacity is occupied remain visible in the scheduling queue. Capacity checks use the
   normal polling cadence and do not increment retry attempts or emit agent-failure telemetry.
@@ -567,7 +568,8 @@ Notes:
   Symphony also pins the reviewed PR head and rechecks it before applying the transition, so a push
   during review requires a fresh handoff review.
   When a worker is stopped or exits, Symphony terminates its external descendant processes before
-  discarding the worker, preventing hook and validation commands from being orphaned.
+  discarding the worker, preventing hook and validation commands from being orphaned while
+  preserving the worker BEAM's own runtime helpers until the VM exits normally.
   Reviewer session/verdict failures receive one bounded retry and are then latched for that
   candidate during the current orchestration run; budget exhaustion is likewise latched and never
   spawns another reviewer in that run. To recover, repair reviewer tool/auth/runtime or verdict

@@ -2093,7 +2093,11 @@ After restart:
   - re-dispatching eligible work
 - A reconnectable-worker implementation SHOULD adopt authenticated live workers before dispatch,
   claim their issue ids, restore their last acknowledged runtime checkpoint, and replay later
-  events. An unreachable worker record must not authorize duplicate concurrent work.
+  events. It MUST liveness-check records marked active before adoption. A dead record SHOULD be
+  reclaimed without replacing an existing retry deadline; an unreachable worker record must not
+  authorize duplicate concurrent work or indefinitely postpone recovery.
+- Stopping a detached worker SHOULD terminate agent-owned external descendants while preserving the
+  worker VM's runtime helpers long enough to record terminal state and exit normally.
 
 ### 14.4 Operator Intervention Points
 

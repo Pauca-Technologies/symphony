@@ -92,6 +92,7 @@ defmodule SymphonyElixir.ShutdownPolicyTest do
       })
 
     assert OSProcess.snapshot_tree(100, tree_deps) |> Enum.map(& &1.pid) |> Enum.sort() == [100, 101]
+    assert OSProcess.snapshot_tree(100, tree_deps) |> Enum.map(& &1.name) == ["test process", "test process"]
     assert OSProcess.alive?(identity, tree_deps)
 
     assert OSProcess.snapshot_tree(100, os_deps(%{list_proc: fn -> {:error, :enoent} end})) == []
@@ -99,6 +100,14 @@ defmodule SymphonyElixir.ShutdownPolicyTest do
     malformed = os_deps(%{list_proc: fn -> {:ok, ["100"]} end, read_stat: fn _pid -> {:ok, "bad"} end})
     assert OSProcess.snapshot_tree(100, malformed) == []
     refute OSProcess.alive?(identity, malformed)
+
+    unterminated =
+      os_deps(%{
+        list_proc: fn -> {:ok, ["100"]} end,
+        read_stat: fn _pid -> {:ok, "100 (unterminated"} end
+      })
+
+    assert OSProcess.snapshot_tree(100, unterminated) == []
 
     no_kill = os_deps(%{read_stat: fn _pid -> {:ok, proc_stat(100, 1, "55")} end, find_kill: fn -> nil end})
     assert {:error, :kill_executable_not_found} = OSProcess.terminate_identities([identity], 0, no_kill)

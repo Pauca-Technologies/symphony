@@ -3,7 +3,12 @@ defmodule SymphonyElixir.OSProcess do
 
   @poll_interval_ms 50
 
-  @type identity :: %{pid: pos_integer(), ppid: non_neg_integer(), start_time: String.t()}
+  @type identity :: %{
+          required(:pid) => pos_integer(),
+          required(:ppid) => non_neg_integer(),
+          required(:start_time) => String.t(),
+          optional(:name) => String.t()
+        }
   @type deps :: %{
           list_proc: (-> {:ok, [String.t()]} | {:error, term()}),
           read_stat: (pos_integer() -> {:ok, binary()} | {:error, term()}),
@@ -135,12 +140,15 @@ defmodule SymphonyElixir.OSProcess do
 
   defp process_identity(pid, deps) do
     with {:ok, stat} <- deps.read_stat.(pid),
+         {open, 1} <- :binary.match(stat, "("),
          close when is_integer(close) <- last_close_paren(stat),
+         true <- close > open,
+         name <- binary_part(stat, open + 1, close - open - 1),
          fields <- stat |> binary_part(close + 2, byte_size(stat) - close - 2) |> String.split(),
          [_, ppid_text | _] <- fields,
          {ppid, ""} <- Integer.parse(ppid_text),
          start_time when is_binary(start_time) <- Enum.at(fields, 19) do
-      {:ok, %{pid: pid, ppid: ppid, start_time: start_time}}
+      {:ok, %{pid: pid, ppid: ppid, start_time: start_time, name: name}}
     else
       _other -> {:error, :invalid_proc_stat}
     end

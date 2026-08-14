@@ -74,6 +74,22 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     assert Registry.list() == []
   end
 
+  test "dead running records are reclaimed before adoption" do
+    issue = issue("dead-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+
+    assert {:ok, dead} =
+             Registry.update(manifest, %{
+               status: "running",
+               os_pid: 2_147_483_647,
+               port: 65_535
+             })
+
+    refute Registry.worker_alive?(dead)
+    assert PersistentWorker.attach_all(self()) == []
+    assert Registry.list() == []
+  end
+
   test "detached server keeps the run alive and replays its checkpoint to a replacement relay" do
     test_pid = self()
     issue = issue("reconnect")
@@ -160,6 +176,16 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     server_ref = Process.monitor(server)
     assert_receive {:adoption_runner_started, runner_pid, ^server}
 
+    Application.put_env(
+      :symphony_elixir,
+      :persistent_worker_liveness_check,
+      fn candidate -> candidate.worker_id == manifest.worker_id end
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_liveness_check)
+    end)
+
     first_name = :persistent_adoption_first
     {:ok, first} = Orchestrator.start_link(name: first_name)
 
@@ -219,6 +245,49 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     GenServer.cast(server, {:stop, self()})
 
     assert_receive :worker_descendants_terminated, 1_000
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 1_000
+    assert Registry.list() == []
+  end
+
+  test "default descendant cleanup preserves Erlang runtime helpers" do
+    test_pid = self()
+    issue = issue("runtime-helper-cleanup")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, spec} = Registry.load_spec(manifest)
+
+    identities = [
+      %{pid: 100, ppid: 1, start_time: "1", name: "beam.smp"},
+      %{pid: 101, ppid: 100, start_time: "2", name: "erl_child_setup"},
+      %{pid: 102, ppid: 101, start_time: "3", name: "inet_gethost"},
+      %{pid: 103, ppid: 101, start_time: "4", name: "sh"},
+      %{pid: 104, ppid: 103, start_time: "5", name: "node"}
+    ]
+
+    runner_fun = fn _recipient ->
+      receive do
+        :never -> :ok
+      end
+    end
+
+    identity_terminator = fn selected ->
+      send(test_pid, {:worker_processes_terminated, selected})
+      :ok
+    end
+
+    {:ok, server} =
+      Server.start_link(spec,
+        runner_fun: runner_fun,
+        process_snapshotter: fn -> identities end,
+        identity_terminator: identity_terminator
+      )
+
+    server_ref = Process.monitor(server)
+    assert {:ok, _attachment} = GenServer.call(server, {:attach, self(), spec.auth_token})
+
+    GenServer.cast(server, {:stop, self()})
+
+    assert_receive {:worker_processes_terminated, selected}, 1_000
+    assert Enum.map(selected, & &1.pid) == [103, 104]
     assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 1_000
     assert Registry.list() == []
   end

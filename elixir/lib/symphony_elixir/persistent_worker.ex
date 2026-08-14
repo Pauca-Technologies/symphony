@@ -105,7 +105,7 @@ defmodule SymphonyElixir.PersistentWorker do
   end
 
   defp attach_discovered_manifest(%{status: "stopping"} = manifest, _orchestrator) do
-    unless Registry.worker_alive?(manifest) do
+    unless registered_worker_alive?(manifest) do
       _ = Registry.cleanup(manifest, manifest.worker_id)
     end
 
@@ -113,14 +113,27 @@ defmodule SymphonyElixir.PersistentWorker do
   end
 
   defp attach_discovered_manifest(manifest, orchestrator) do
-    case attach_manifest(manifest, orchestrator, false) do
-      {:ok, attachment} ->
-        [attachment]
+    if registered_worker_alive?(manifest) do
+      case attach_manifest(manifest, orchestrator, false) do
+        {:ok, attachment} ->
+          [attachment]
 
-      {:error, reason} ->
-        Logger.warning("Unable to reconnect persistent worker worker_id=#{manifest.worker_id} issue_id=#{manifest.issue_id}: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.warning("Unable to reconnect persistent worker worker_id=#{manifest.worker_id} issue_id=#{manifest.issue_id}: #{inspect(reason)}")
 
-        []
+          []
+      end
+    else
+      Logger.warning("Removing dead persistent worker record worker_id=#{manifest.worker_id} issue_id=#{manifest.issue_id}")
+      _ = Registry.cleanup(manifest, manifest.worker_id)
+      []
+    end
+  end
+
+  defp registered_worker_alive?(manifest) do
+    case Application.get_env(:symphony_elixir, :persistent_worker_liveness_check) do
+      check when is_function(check, 1) -> check.(manifest)
+      _other -> Registry.worker_alive?(manifest)
     end
   end
 
