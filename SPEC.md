@@ -959,7 +959,10 @@ Part A: Stall detection
   project/repository and PR identity, resolved base/head SHAs and fingerprint, issue outcome and
   acceptance/non-goals, changed-file/stat manifest, authoritative full-diff commands, applicable
   repository rules, risk/lens rationale, exact-head attestations, prior unresolved findings with
-  their reviewed SHA, implementation risks/skipped proof/evidence, and a bounded follow-up delta.
+  their reviewed SHA, implementation risks/skipped proof/evidence, PR-body attachment links, and a
+  bounded follow-up delta. Exact-candidate attestations from a passed protocol-aware handoff gate,
+  including candidate/exact/mutable-PR-state identity, MUST be forwarded into this packet rather
+  than requiring the reviewer to rediscover already-accepted proof.
 - Packet size and reviewer context/tool-output/timeout settings are repository-configurable with a
   deterministic hard bound and compaction order. Compaction MUST NOT remove access to the complete
   meaningful diff or applicable security/tenant/auth rules. Budget pressure is handled by explicit
@@ -980,6 +983,10 @@ Part A: Stall detection
   apply the captured tracker transition. Missing/malformed verdicts, reviewer infrastructure or
   session failures, and an exhausted review budget are explicit non-approval outcomes; they retain
   findings and escalation evidence and withhold the captured transition for human resolution.
+  A reviewer MAY report `infrastructure_unavailable` for reviewer-side tool, authentication,
+  network, or provider failures, including inability to authenticate to private evidence. That
+  verdict MUST include a failure reason and resume condition, MUST NOT be represented as a candidate
+  `request_changes`, and MUST NOT consume a substantive review iteration.
 
 Part B: Tracker state refresh
 

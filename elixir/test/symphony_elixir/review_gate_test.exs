@@ -513,6 +513,82 @@ defmodule SymphonyElixir.ReviewGateTest do
     refute_received {:review_comment, _, _}
   end
 
+  test "reviewer-reported private-evidence auth failure is infrastructure and consumes no review iteration", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    runner = fn ctx ->
+      send(test_pid, {:infrastructure_prompt, ctx.prompt})
+
+      write_verdict(ctx, %{
+        "verdict" => "infrastructure_unavailable",
+        "summary" => "Could not authenticate the private GitHub attachment request.",
+        "failure_reason" => "Authenticated GitHub attachment fetch was unavailable; anonymous fetch returned 404.",
+        "resume_condition" => "Restore repository-scoped GitHub authentication and rerun the exact-head review.",
+        "comments" => [%{"severity" => "major", "body" => "The attachment could not be inspected."}]
+      })
+
+      {:ok, %{}}
+    end
+
+    assert {:infrastructure_unavailable, outcome} =
+             ReviewGate.run(
+               workspace,
+               %{issue() | id: "issue-private-evidence"},
+               nil,
+               review_workflow(%{"max_iterations" => 1}),
+               session_runner: runner,
+               pr_runner: pr_runner(),
+               comment_fn: capture_comments(test_pid)
+             )
+
+    assert outcome.iteration == 0
+    assert outcome.max_iterations == 1
+    assert outcome.findings == []
+    assert outcome.inspected == ["authoritative full diff"]
+
+    assert outcome.failure_reason ==
+             {:reviewer_reported_infrastructure, "Authenticated GitHub attachment fetch was unavailable; anonymous fetch returned 404."}
+
+    refute outcome.authoritative
+
+    assert_received {:infrastructure_prompt, prompt}
+    assert prompt =~ "infrastructure_unavailable"
+    assert prompt =~ "private GitHub attachment"
+    assert prompt =~ "authoritative repository authentication"
+
+    assert_received {:review_comment, "issue-private-evidence", body}
+    assert body =~ "infrastructure_unavailable"
+    refute body =~ "budget_exhausted_with_findings"
+  end
+
+  test "infrastructure verdict requires a reason and resume condition", %{workspace: workspace} do
+    test_pid = self()
+
+    runner = fn ctx ->
+      send(test_pid, :invalid_infrastructure_verdict_attempt)
+      write_verdict(ctx, %{"verdict" => "infrastructure_unavailable"})
+      {:ok, %{}}
+    end
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(
+               workspace,
+               %{issue() | id: "issue-invalid-infrastructure-verdict"},
+               nil,
+               review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert outcome.failure_reason ==
+             {:verdict_unreadable, :infrastructure_verdict_missing_failure_reason}
+
+    assert_received :invalid_infrastructure_verdict_attempt
+    assert_received :invalid_infrastructure_verdict_attempt
+  end
+
   for {label, reason, expected_class} <- [
         {"timeout", {:turn_timeout, 60_000}, :response_timeout_or_stall},
         {"tool failure", {:tool_error, :unavailable}, :agent_protocol_failure},

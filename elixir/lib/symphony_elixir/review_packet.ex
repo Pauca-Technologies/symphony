@@ -18,6 +18,7 @@ defmodule SymphonyElixir.ReviewPacket do
   @review_prompt_reserve_bytes 10_000
   @delta_stat_limit 2_000
   @security_terms ~w(auth authorization authz tenant security permission access secret injection)
+  @github_user_attachment_regex ~r{https://github\.com/user-attachments/assets/[A-Za-z0-9-]+}
 
   @type packet :: map()
   @type build_result :: %{
@@ -141,6 +142,53 @@ defmodule SymphonyElixir.ReviewPacket do
   @spec schema_version() :: pos_integer()
   def schema_version, do: @schema_version
 
+  @doc "Convert a passed before-handoff protocol result into exact-candidate review attestations."
+  @spec handoff_gate_attestations(map(), term()) :: [map()]
+  def handoff_gate_attestations(gate, worker_host \\ nil)
+
+  def handoff_gate_attestations(gate, worker_host) when is_map(gate) do
+    case map_value(gate, :status) do
+      status when status in [:passed, "passed"] -> build_handoff_gate_attestations(gate, worker_host)
+      _status -> []
+    end
+  end
+
+  def handoff_gate_attestations(_gate, _worker_host), do: []
+
+  defp build_handoff_gate_attestations(gate, worker_host) do
+    identity = map_value(gate, :identity) || %{}
+
+    artifact_refs =
+      gate
+      |> map_value(:result_artifact)
+      |> List.wrap()
+      |> Enum.filter(&present?/1)
+      |> compact_strings(4, 500)
+
+    Enum.map(handoff_gate_checks(gate), fn check ->
+      %{
+        command: "before_handoff/#{first_map_string(check, [:id, :name]) || "check"}",
+        head_sha: first_map_string(identity, [:headSha, :head_sha]),
+        status: map_string(check, :status) || "unknown",
+        duration_ms: first_map_integer(check, [:durationMs, :duration_ms]),
+        environment: worker_environment(worker_host),
+        harness_version: "handoff-gate-protocol/v#{map_integer(gate, :protocol_version) || 1}",
+        artifact_refs: artifact_refs,
+        candidate_hash: first_map_string(identity, [:candidateHash, :candidate_hash]),
+        exact_hash: first_map_string(identity, [:exactHash, :exact_hash]),
+        mutable_pr_state_hash: first_map_string(identity, [:mutablePrStateHash, :mutable_pr_state_hash]),
+        pr_number: first_map_string(identity, [:prNumber, :pr_number])
+      }
+    end)
+  end
+
+  defp handoff_gate_checks(gate) do
+    case map_value(gate, :checks) do
+      checks when is_list(checks) and checks != [] -> checks
+      _checks -> [%{"id" => "before_handoff", "status" => "passed"}]
+    end
+  end
+
   defp effective_max_bytes(settings) do
     # Match ReviewGate's conservative three-byte/token whole-prompt ceiling and
     # reserve deterministic space for the repository workflow plus guards.
@@ -235,7 +283,21 @@ defmodule SymphonyElixir.ReviewPacket do
     update_in(packet, [:validation_attestations], fn entries ->
       entries
       |> Enum.take(20)
-      |> Enum.map(&Map.take(&1, [:command, :head_sha, :status, :duration_ms, :environment, :harness_version, :artifact_refs]))
+      |> Enum.map(
+        &Map.take(&1, [
+          :command,
+          :head_sha,
+          :status,
+          :duration_ms,
+          :environment,
+          :harness_version,
+          :artifact_refs,
+          :candidate_hash,
+          :exact_hash,
+          :mutable_pr_state_hash,
+          :pr_number
+        ])
+      )
     end)
   end
 
@@ -275,7 +337,20 @@ defmodule SymphonyElixir.ReviewPacket do
   defp minimal_packet(packet) do
     %{
       packet
-      | validation_attestations: Enum.map(packet.validation_attestations, &Map.take(&1, [:command, :head_sha, :status, :artifact_refs])),
+      | validation_attestations:
+          Enum.map(
+            packet.validation_attestations,
+            &Map.take(&1, [
+              :command,
+              :head_sha,
+              :status,
+              :artifact_refs,
+              :candidate_hash,
+              :exact_hash,
+              :mutable_pr_state_hash,
+              :pr_number
+            ])
+          ),
         unresolved_findings: Enum.map(packet.unresolved_findings, &Map.take(&1, [:severity, :file, :line, :originating_sha])),
         repository_rules: Enum.map(packet.repository_rules, &Map.take(&1, [:path, :applies_to, :security_relevant, :full_rule_instruction])),
         implementation: %{
@@ -306,7 +381,17 @@ defmodule SymphonyElixir.ReviewPacket do
       | validation_attestations:
           packet.validation_attestations
           |> Enum.take(8)
-          |> Enum.map(&Map.take(&1, [:command, :head_sha, :status])),
+          |> Enum.map(
+            &Map.take(&1, [
+              :command,
+              :head_sha,
+              :status,
+              :candidate_hash,
+              :exact_hash,
+              :mutable_pr_state_hash,
+              :pr_number
+            ])
+          ),
         unresolved_findings:
           packet.unresolved_findings
           |> Enum.take(12)
@@ -709,7 +794,7 @@ defmodule SymphonyElixir.ReviewPacket do
             "#{skipped.command}: #{skipped.reason} (#{skipped.originating_sha || "unknown SHA"})"
           end),
       evidence_links:
-        [issue.url, map_string(pr, :url)]
+        ([issue.url, map_string(pr, :url)] ++ pull_request_evidence_links(pr))
         |> Enum.reject(&is_nil/1)
         |> Enum.uniq()
     }
@@ -727,9 +812,19 @@ defmodule SymphonyElixir.ReviewPacket do
 
   defp load_attestations(workspace, head_sha, opts) do
     source = Keyword.get_lazy(opts, :attestations, fn -> read_attestations(workspace) end)
+    supplemental = Keyword.get(opts, :handoff_gate_attestations, [])
 
-    normalize_attestations(source, head_sha)
+    source
+    |> merge_attestation_sources(supplemental)
+    |> normalize_attestations(head_sha)
   end
+
+  defp merge_attestation_sources(source, supplemental) when is_list(source) and is_list(supplemental),
+    do: source ++ supplemental
+
+  defp merge_attestation_sources(source, []), do: source
+  defp merge_attestation_sources(_source, supplemental) when is_list(supplemental), do: supplemental
+  defp merge_attestation_sources(source, _supplemental), do: source
 
   defp read_attestations(workspace) do
     path = Path.join(workspace, ".artifacts/symphony-review/attestations.json")
@@ -769,7 +864,11 @@ defmodule SymphonyElixir.ReviewPacket do
       duration_ms: map_integer(entry, :duration_ms),
       environment: map_string(entry, :environment) || "unspecified",
       harness_version: map_string(entry, :harness_version) || "unspecified",
-      artifact_refs: map_list(entry, :artifact_refs)
+      artifact_refs: map_list(entry, :artifact_refs),
+      candidate_hash: map_string(entry, :candidate_hash),
+      exact_hash: map_string(entry, :exact_hash),
+      mutable_pr_state_hash: map_string(entry, :mutable_pr_state_hash),
+      pr_number: map_string(entry, :pr_number)
     }
   end
 
@@ -782,6 +881,24 @@ defmodule SymphonyElixir.ReviewPacket do
       id: map_string(pr, :id)
     }
   end
+
+  defp pull_request_evidence_links(pr) do
+    case map_string(pr, :body) do
+      body when is_binary(body) -> Regex.scan(@github_user_attachment_regex, body) |> List.flatten() |> Enum.uniq()
+      _body -> []
+    end
+  end
+
+  defp worker_environment(nil), do: "local"
+  defp worker_environment(worker_host) when is_binary(worker_host), do: worker_host
+  defp worker_environment(worker_host), do: inspect(worker_host)
+
+  defp map_value(map, key) when is_map(map) do
+    Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  end
+
+  defp first_map_string(map, keys), do: Enum.find_value(keys, &map_string(map, &1))
+  defp first_map_integer(map, keys), do: Enum.find_value(keys, &map_integer(map, &1))
 
   defp diff_range(base_sha, head_sha) when is_binary(base_sha) and is_binary(head_sha),
     do: "#{base_sha}...#{head_sha}"

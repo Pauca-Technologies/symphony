@@ -65,6 +65,62 @@ defmodule SymphonyElixir.ReviewPacketTest do
              result.evidence_path |> File.read!() |> Jason.decode!()
   end
 
+  test "passed handoff checks and private PR attachments become exact-head review evidence", context do
+    attachment = "https://github.com/user-attachments/assets/03e0db7e-ea58-4ce2-b451-b4f4844399bc"
+
+    gate = %{
+      protocol_version: 1,
+      status: :passed,
+      result_artifact: ".artifacts/before-handoff/result.json",
+      identity: %{
+        "headSha" => context.head_sha,
+        "candidateHash" => "candidate-hash",
+        "exactHash" => "exact-hash",
+        "mutablePrStateHash" => "mutable-pr-state-hash",
+        "prNumber" => "18"
+      },
+      checks: [%{"id" => "check-evidence-fresh", "status" => "passed", "durationMs" => 42}]
+    }
+
+    assert [handoff_attestation] = ReviewPacket.handoff_gate_attestations(gate, "worker-a")
+
+    assert handoff_attestation == %{
+             command: "before_handoff/check-evidence-fresh",
+             head_sha: context.head_sha,
+             status: "passed",
+             duration_ms: 42,
+             environment: "worker-a",
+             harness_version: "handoff-gate-protocol/v1",
+             artifact_refs: [".artifacts/before-handoff/result.json"],
+             candidate_hash: "candidate-hash",
+             exact_hash: "exact-hash",
+             mutable_pr_state_hash: "mutable-pr-state-hash",
+             pr_number: "18"
+           }
+
+    pr = Map.put(pr(context), :body, "## Evidence\n\n[Video](#{attachment})")
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("Handoff evidence"),
+               pr,
+               context.head_sha,
+               nil,
+               settings(),
+               attestations: [attestation(context.head_sha)],
+               handoff_gate_attestations: [handoff_attestation]
+             )
+
+    assert Enum.any?(result.packet.validation_attestations, fn entry ->
+             entry.command == "before_handoff/check-evidence-fresh" and
+               entry.exact_hash == "exact-hash" and
+               entry.mutable_pr_state_hash == "mutable-pr-state-hash"
+           end)
+
+    assert attachment in result.packet.implementation.evidence_links
+  end
+
   test "oversized issue prose compacts deterministically without reducing candidate access", context do
     huge = String.duplicate("accept every edge case and preserve tenant isolation ", 5_000)
     settings = settings(%{"packet_max_bytes" => 8_192, "context_budget_tokens" => 2_048})

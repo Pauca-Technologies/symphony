@@ -61,15 +61,21 @@ Each pass starts a fresh, ephemeral reviewer thread with no implementor transcri
 issue-context file. Symphony gives it a versioned JSON packet pinned to the resolved base and head
 SHAs and a diff fingerprint. The packet carries the compact issue contract, changed-file manifest,
 area-specific repository rules, risk/lens rationale, exact-head validation attestations, prior open
-findings with their reviewed SHA, and a bounded follow-up delta. Packet compaction never removes
-the commands for reading the authoritative full diff or the applicable security/tenant/auth rule
-paths. High-risk follow-ups must finish with another complete base-to-head pass.
+findings with their reviewed SHA, PR-body attachment links, and a bounded follow-up delta. A passed
+protocol-aware `before_handoff` result is forwarded as an exact-candidate attestation, including its
+candidate/exact/mutable-PR-state hashes, so the reviewer can reuse proof already accepted by the
+handoff gate. Packet compaction never removes the commands for reading the authoritative full diff,
+the passed-gate identity, or the applicable security/tenant/auth rule paths. High-risk follow-ups
+must finish with another complete base-to-head pass.
 
 The reviewer is fail-safe. Its terminal outcomes are `approved`, `request_changes`,
 `automation_inconclusive`, `infrastructure_unavailable`, and
 `budget_exhausted_with_findings`. Only `approved` for the exact pinned candidate SHA may apply the
 captured Linear mutation. Missing or malformed verdicts, reviewer timeout/crash/tool/auth failures,
-and unresolved findings at the iteration limit remain visibly unapproved. Symphony posts a
+and unresolved findings at the iteration limit remain visibly unapproved. A reviewer may explicitly
+report `infrastructure_unavailable` when authenticated private evidence cannot be inspected; that
+outcome consumes no substantive request-changes iteration and must include a failure reason and
+resume condition. Symphony posts a
 marker-delimited, note-once escalation containing the candidate SHA, passes attempted, failure
 reason, severity counts, findings, and resume condition; the runtime API and dashboard expose the
 same review state.
@@ -605,7 +611,10 @@ Notes:
   intact so diagnostics are never hidden.
   The verdict must report the packet's exact `reviewed_sha`, a non-empty `inspected` list, and
   `attestations.reused` / `attestations.rerun`; missing or stale candidate evidence is
-  `automation_inconclusive`. Parent reviewer and delegated lens threads emit independent local
+  `automation_inconclusive`. `request_changes` is reserved for candidate defects or proof gaps the
+  implementor can fix. Reviewer-side tool/auth/network/provider failures use
+  `infrastructure_unavailable` with `failure_reason` and `resume_condition`, consume no substantive
+  review iteration, and enter orchestrator backoff. Parent reviewer and delegated lens threads emit independent local
   telemetry with packet/head identity, tokens, duration, model, reasoning effort, and findings.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.

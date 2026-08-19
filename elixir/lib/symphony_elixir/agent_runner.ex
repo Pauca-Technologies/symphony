@@ -26,6 +26,7 @@ defmodule SymphonyElixir.AgentRunner do
     RepoConfig,
     ReviewGate,
     ReviewOutcome,
+    ReviewPacket,
     Router,
     SessionStartHook,
     TaskContextPrompt,
@@ -1809,7 +1810,11 @@ defmodule SymphonyElixir.AgentRunner do
     do: Config.backend_review_timeout_ms(backend_name)
 
   defp review_opts_with_progress(request, recipient, issue, review_job_id) do
-    review_opts = Map.get(request, :review_opts, [])
+    review_opts =
+      request
+      |> Map.get(:review_opts, [])
+      |> put_handoff_gate_attestations(Map.get(request, :gate), Map.get(request, :worker_host))
+
     existing_on_message = Keyword.get(review_opts, :on_message)
     worker_pid = self()
 
@@ -1826,6 +1831,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
 
     Keyword.put(review_opts, :on_message, on_message)
+  end
+
+  defp put_handoff_gate_attestations(review_opts, gate, worker_host) do
+    case ReviewPacket.handoff_gate_attestations(gate, worker_host) do
+      [] -> review_opts
+      attestations -> Keyword.update(review_opts, :handoff_gate_attestations, attestations, &(&1 ++ attestations))
+    end
   end
 
   defp send_handoff_review_heartbeat(

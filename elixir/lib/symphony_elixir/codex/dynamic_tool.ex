@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{BaseDrift, HandoffGate, Linear.Client, ReviewGate, ReviewOutcome, WaitCondition}
+  alias SymphonyElixir.{BaseDrift, HandoffGate, Linear.Client, ReviewGate, ReviewOutcome, ReviewPacket, WaitCondition}
 
   @linear_graphql_tool "linear_graphql"
   @wait_for_tool "wait_for"
@@ -433,13 +433,28 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       )
 
     case result do
-      :ok -> run_review_gate_for_request(request)
-      {:passed, _gate} -> run_review_gate_for_request(request)
-      {:pending, gate} -> defer_handoff_gate(request, gate)
-      {:blocked, prompt, gates} -> {:handoff_blocked, prompt, gates}
-      {:failed, prompt, gate} -> {:handoff_blocked, prompt, protocol_gate_list(gate)}
-      {:invalidated, prompt, gate} -> {:handoff_blocked, prompt, protocol_gate_list(gate)}
-      {:infrastructure_error, prompt, gate} -> {:handoff_infrastructure_error, prompt, gate}
+      :ok ->
+        run_review_gate_for_request(request)
+
+      {:passed, gate} ->
+        request
+        |> put_handoff_gate_attestations(gate)
+        |> run_review_gate_for_request()
+
+      {:pending, gate} ->
+        defer_handoff_gate(request, gate)
+
+      {:blocked, prompt, gates} ->
+        {:handoff_blocked, prompt, gates}
+
+      {:failed, prompt, gate} ->
+        {:handoff_blocked, prompt, protocol_gate_list(gate)}
+
+      {:invalidated, prompt, gate} ->
+        {:handoff_blocked, prompt, protocol_gate_list(gate)}
+
+      {:infrastructure_error, prompt, gate} ->
+        {:handoff_infrastructure_error, prompt, gate}
     end
   end
 
@@ -453,6 +468,20 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       request.context,
       request.linear_client
     )
+  end
+
+  defp put_handoff_gate_attestations(request, gate) do
+    attestations = ReviewPacket.handoff_gate_attestations(gate, request.worker_host)
+    context = request.context
+    review_opts = Map.get(context, :review_opts) || Map.get(context, "review_opts") || []
+
+    review_opts =
+      case attestations do
+        [] -> review_opts
+        entries -> Keyword.update(review_opts, :handoff_gate_attestations, entries, &(&1 ++ entries))
+      end
+
+    %{request | context: Map.put(context, :review_opts, review_opts)}
   end
 
   defp defer_handoff_gate(request_context, gate) do

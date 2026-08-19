@@ -1291,6 +1291,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
         ])
 
       test_pid = self()
+      {head_sha, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+      head_sha = String.trim(head_sha)
 
       issue = %Issue{
         id: "issue-coalesced",
@@ -1306,7 +1308,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       end
 
       review_runner = fn ctx ->
-        send(test_pid, :review_session_started)
+        send(test_pid, {:review_session_started, ctx.packet.validation_attestations})
         write_review_verdict(ctx, %{"verdict" => "approve"})
         {:ok, %{}}
       end
@@ -1325,6 +1327,17 @@ defmodule SymphonyElixir.AgentRunnerTest do
         workspace: workspace,
         issue: issue,
         worker_host: nil,
+        gate: %{
+          async_gate(:passed)
+          | identity:
+              Map.merge(async_gate(:passed).identity, %{
+                "headSha" => head_sha,
+                "mutablePrStateHash" => "mutable-state-7157",
+                "prNumber" => "18"
+              }),
+            checks: [%{"id" => "check-evidence-fresh", "status" => "passed"}],
+            result_artifact: ".artifacts/before-handoff/result.json"
+        },
         review_workflow: review_workflow,
         review_opts: [
           pr_runner: no_pr,
@@ -1357,8 +1370,16 @@ defmodule SymphonyElixir.AgentRunnerTest do
                  nil
                )
 
-      assert_received :review_session_started
-      refute_received :review_session_started
+      assert_received {:review_session_started, attestations}
+
+      assert Enum.any?(attestations, fn attestation ->
+               attestation.command == "before_handoff/check-evidence-fresh" and
+                 attestation.head_sha == head_sha and
+                 attestation.exact_hash == "exact-7157" and
+                 attestation.mutable_pr_state_hash == "mutable-state-7157"
+             end)
+
+      refute_received {:review_session_started, _attestations}
       assert_received {:handoff_mutation_applied, query, %{}}
       assert query =~ "issueUpdate"
       refute_received {:handoff_mutation_applied, _, _}

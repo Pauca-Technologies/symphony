@@ -810,6 +810,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       )
 
     File.mkdir_p!(workspace)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
     on_exit(fn -> File.rm_rf(workspace) end)
 
     review_workflow = %{
@@ -818,13 +819,36 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       prompt_template: "Review {{ issue.identifier }}"
     }
 
+    test_pid = self()
+
     session_runner = fn ctx ->
+      send(test_pid, {:inline_review_attestations, ctx.packet.validation_attestations})
       write_review_verdict(ctx, %{"verdict" => "approve", "comments" => []})
       {:ok, %{}}
     end
 
     issue = %Issue{id: "issue-ok", identifier: "UDPE-3", title: "Ship it", state: "In Progress"}
-    test_pid = self()
+
+    gate_report = %{
+      "protocolVersion" => 1,
+      "jobId" => "job-inline-passed",
+      "status" => "passed",
+      "identity" => %{
+        "repositoryIdentity" => "repo-inline",
+        "worktreeIdentity" => "worktree-inline",
+        "prNumber" => "7",
+        "baseRef" => "main",
+        "baseSha" => "base-7",
+        "headSha" => "head-7",
+        "candidateFingerprint" => "fingerprint-inline",
+        "gateConfigHash" => "config-inline",
+        "mutablePrStateHash" => "mutable-inline",
+        "candidateHash" => "candidate-inline",
+        "exactHash" => "exact-inline"
+      },
+      "resultArtifact" => ".artifacts/before-handoff/result.json",
+      "checks" => [%{"id" => "check-evidence-fresh", "status" => "passed"}]
+    }
 
     response =
       DynamicTool.execute(
@@ -837,6 +861,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           issue: issue,
           workspace: workspace,
           worker_host: nil,
+          before_handoff_command: "printf '%s' '#{Jason.encode!(gate_report)}'",
           review_workflow: review_workflow,
           review_opts: [session_runner: session_runner, pr_runner: stub_pr_runner()]
         },
@@ -862,6 +887,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       )
 
     assert response["success"] == true
+    assert_received {:inline_review_attestations, attestations}
+
+    assert Enum.any?(attestations, fn attestation ->
+             attestation.command == "before_handoff/check-evidence-fresh" and
+               attestation.exact_hash == "exact-inline" and
+               attestation.mutable_pr_state_hash == "mutable-inline"
+           end)
+
     assert_received :mutation_sent
   end
 

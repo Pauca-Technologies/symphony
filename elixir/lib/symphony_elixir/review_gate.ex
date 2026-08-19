@@ -26,9 +26,10 @@ defmodule SymphonyElixir.ReviewGate do
       escalation note. The deferred handoff remains blocked until a human
       resolves the findings or a new candidate is reviewed.
     * Missing or malformed reviewer output ->
-      `{:automation_inconclusive, evidence}`. Reviewer session/tool/auth/timeout
-      failures -> `{:infrastructure_unavailable, evidence}`. Neither outcome
-      is approval and neither applies the deferred handoff mutation.
+      `{:automation_inconclusive, evidence}`. Reviewer-reported or runtime
+      session/tool/auth/timeout failures -> `{:infrastructure_unavailable,
+      evidence}`. Neither outcome is approval, consumes a substantive review
+      iteration, or applies the deferred handoff mutation.
 
   The iteration counter lives in the process dictionary of the `AgentRunner`
   run process (the same place the handoff-gate prompt is stashed), so it
@@ -101,11 +102,13 @@ defmodule SymphonyElixir.ReviewGate do
 
   @type review_effort :: :none | :skim | :focused | :thorough
   @type verdict :: %{
-          verdict: :approve | :request_changes,
+          verdict: :approve | :request_changes | :infrastructure_unavailable,
           summary: String.t(),
           review_effort: review_effort(),
           human_review: String.t(),
-          comments: [map()]
+          comments: [map()],
+          failure_reason: String.t() | nil,
+          resume_condition: String.t() | nil
         }
   @type result ::
           {:approved, ReviewOutcome.t()}
@@ -651,6 +654,10 @@ defmodule SymphonyElixir.ReviewGate do
         ReviewTelemetry.finish(telemetry_handle, :request_changes, verdict)
         conclude_request_changes(review_context, verdict, attempt)
 
+      {:ok, %{verdict: :infrastructure_unavailable} = verdict} ->
+        ReviewTelemetry.finish(telemetry_handle, :infrastructure_unavailable, verdict)
+        conclude_reported_infrastructure(review_context, verdict, attempt)
+
       {:error, reason} ->
         ReviewTelemetry.finish(telemetry_handle, :automation_inconclusive)
 
@@ -959,6 +966,14 @@ defmodule SymphonyElixir.ReviewGate do
     with `reused` and `rerun` arrays. A changed or missing identity is inconclusive, never approval.
     High-risk `high_risk_final_full_diff` mode additionally requires `full_diff_inspected: true`
     after a final complete base-to-head diff pass following delta reconciliation.
+
+    The final `verdict` must be one of `approve`, `request_changes`, or
+    `infrastructure_unavailable`. Use `request_changes` only for a candidate defect or evidence gap
+    the implementor can fix. Use `infrastructure_unavailable` only when reviewer-side tooling,
+    authentication, network, or provider availability prevents authoritative inspection, and include
+    non-empty `failure_reason` and `resume_condition` strings. In particular, a 401, 403, or 404 for
+    a private GitHub attachment is not evidence that the attachment is missing unless the request
+    used authoritative repository authentication; otherwise report `infrastructure_unavailable`.
     """
   end
 
@@ -1001,7 +1016,8 @@ defmodule SymphonyElixir.ReviewGate do
     output with a narrow pattern, `--max-count`, `head`, or a small `sed -n` range. Do not run a
     long check in parallel with a command that may produce large output. If a command returns
     unexpectedly large output, stop broad searching and write the verdict from the evidence already
-    gathered, using `request_changes` when the uncertainty meets the review severity bar.
+    gathered. Use `request_changes` when candidate uncertainty meets the review severity bar, or
+    `infrastructure_unavailable` when an operational tool/auth/network failure prevents inspection.
     """
   end
 
@@ -1020,8 +1036,10 @@ defmodule SymphonyElixir.ReviewGate do
 
     Do not make a slow check the last thing standing between Symphony and the verdict file. If a
     validation command is interrupted, times out, or returns partial evidence, keep or write the
-    verdict from the evidence already gathered, using `"request_changes"` when uncertainty meets
-    the review severity bar.
+    verdict from the evidence already gathered. Use `"request_changes"` when candidate uncertainty
+    meets the review severity bar. Use `"infrastructure_unavailable"` with `failure_reason` and
+    `resume_condition` when reviewer-side tooling, authentication, network, or provider availability
+    prevents authoritative inspection.
     """
   end
 
@@ -1073,6 +1091,17 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp validate_verdict_candidate(verdict, expected_sha, expected_packet_id, review_mode)
        when is_binary(expected_sha) and expected_sha != "" do
+    with :ok <- validate_verdict_identity(verdict, expected_sha, expected_packet_id),
+         :ok <- validate_verdict_evidence_contract(verdict),
+         :ok <- validate_infrastructure_verdict(verdict) do
+      validate_full_diff_verdict(verdict, review_mode)
+    end
+  end
+
+  defp validate_verdict_candidate(_verdict, _expected_sha, _expected_packet_id, _review_mode),
+    do: :ok
+
+  defp validate_verdict_identity(verdict, expected_sha, expected_packet_id) do
     cond do
       verdict.packet_id != expected_packet_id ->
         {:error, {:verdict_packet_mismatch, %{expected: expected_packet_id, reported: verdict.packet_id}}}
@@ -1080,22 +1109,38 @@ defmodule SymphonyElixir.ReviewGate do
       verdict.reviewed_sha != expected_sha ->
         {:error, {:verdict_head_mismatch, %{expected: expected_sha, reported: verdict.reviewed_sha}}}
 
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_verdict_evidence_contract(verdict) do
+    cond do
       verdict.inspected == [] ->
         {:error, :verdict_missing_inspected_scope}
 
       not verdict.attestation_contract? ->
         {:error, :verdict_missing_attestation_report}
 
-      review_mode == "high_risk_final_full_diff" and not verdict.full_diff_inspected ->
-        {:error, :verdict_missing_high_risk_full_diff_attestation}
-
       true ->
         :ok
     end
   end
 
-  defp validate_verdict_candidate(_verdict, _expected_sha, _expected_packet_id, _review_mode),
-    do: :ok
+  defp validate_infrastructure_verdict(%{verdict: :infrastructure_unavailable, failure_reason: nil}),
+    do: {:error, :infrastructure_verdict_missing_failure_reason}
+
+  defp validate_infrastructure_verdict(%{verdict: :infrastructure_unavailable, resume_condition: nil}),
+    do: {:error, :infrastructure_verdict_missing_resume_condition}
+
+  defp validate_infrastructure_verdict(_verdict), do: :ok
+
+  defp validate_full_diff_verdict(%{verdict: :infrastructure_unavailable}, _review_mode), do: :ok
+
+  defp validate_full_diff_verdict(%{full_diff_inspected: false}, "high_risk_final_full_diff"),
+    do: {:error, :verdict_missing_high_risk_full_diff_attestation}
+
+  defp validate_full_diff_verdict(_verdict, _review_mode), do: :ok
 
   defp reject_interim_verdict(%{"symphony_interim" => true}), do: {:error, :interim_verdict}
 
@@ -1154,7 +1199,9 @@ defmodule SymphonyElixir.ReviewGate do
            inspected: normalize_string_list(Map.get(decoded, "inspected")),
            attestations: normalize_attestation_report(Map.get(decoded, "attestations")),
            attestation_contract?: valid_attestation_report?(Map.get(decoded, "attestations")),
-           full_diff_inspected: Map.get(decoded, "full_diff_inspected") == true
+           full_diff_inspected: Map.get(decoded, "full_diff_inspected") == true,
+           failure_reason: string_or_nil(Map.get(decoded, "failure_reason")),
+           resume_condition: string_or_nil(Map.get(decoded, "resume_condition"))
          }}
 
       :error ->
@@ -1189,6 +1236,7 @@ defmodule SymphonyElixir.ReviewGate do
     case value |> String.trim() |> String.downcase() do
       v when v in ["approve", "approved", "lgtm", "pass", "ok"] -> {:ok, :approve}
       v when v in ["request_changes", "request-changes", "changes_requested", "reject", "fail"] -> {:ok, :request_changes}
+      v when v in ["infrastructure_unavailable", "infrastructure-unavailable"] -> {:ok, :infrastructure_unavailable}
       _ -> :error
     end
   end
@@ -1351,7 +1399,7 @@ defmodule SymphonyElixir.ReviewGate do
   defp infrastructure_outcome(settings, iteration, reviewed_sha, reason, resume_condition, attempts) do
     %ReviewOutcome{
       outcome: :infrastructure_unavailable,
-      iteration: iteration + 1,
+      iteration: iteration,
       max_iterations: settings.max_iterations,
       reviewed_sha: reviewed_sha,
       failure_reason: reason,
@@ -1427,6 +1475,38 @@ defmodule SymphonyElixir.ReviewGate do
 
     Logger.warning("review.gate infrastructure unavailable #{issue_context(issue)} reason=#{inspect(reason)}; withholding handoff")
     note_nonapproval(issue, outcome, opts)
+    put_terminal_outcome(issue.id, outcome)
+    emit_outcome_telemetry(issue, outcome)
+    {:infrastructure_unavailable, outcome}
+  end
+
+  defp conclude_reported_infrastructure(
+         %{issue: %Issue{} = issue} = review_context,
+         verdict,
+         attempt
+       ) do
+    outcome = %ReviewOutcome{
+      outcome: :infrastructure_unavailable,
+      iteration: review_context.iteration,
+      max_iterations: review_context.settings.max_iterations,
+      reviewed_sha: review_context.reviewed_sha,
+      packet_id: context_packet_id(review_context),
+      summary: verdict.summary,
+      failure_reason: {:reviewer_reported_infrastructure, verdict.failure_reason},
+      resume_condition: verdict.resume_condition,
+      review_effort: verdict.review_effort,
+      attempts: attempt,
+      authoritative: false,
+      inspected: verdict.inspected,
+      attestation_report: verdict.attestations
+    }
+
+    Logger.warning(
+      "review.gate reviewer reported infrastructure unavailable #{issue_context(issue)} " <>
+        "reason=#{inspect(verdict.failure_reason)}; withholding handoff"
+    )
+
+    note_nonapproval(issue, outcome, review_context.opts)
     put_terminal_outcome(issue.id, outcome)
     emit_outcome_telemetry(issue, outcome)
     {:infrastructure_unavailable, outcome}
