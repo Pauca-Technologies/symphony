@@ -1000,7 +1000,8 @@ defmodule SymphonyElixir.AgentRunner do
       TaskContextPrompt.canonical_fragments(issue) ++
         canonical_handoff_fragments(handoff_guidance)
 
-    PromptComposer.compose(sections, canonical_fragments: canonical_fragments)
+    composition = PromptComposer.compose(sections, canonical_fragments: canonical_fragments)
+    %{composition | state: TaskContextPrompt.put_activity_cursor(composition.state, issue)}
   end
 
   defp build_turn_prompt(issue, opts, turn_number, max_turns) do
@@ -1014,6 +1015,16 @@ defmodule SymphonyElixir.AgentRunner do
       |> Enum.filter(&(&1.id in ["task.current_metadata", "task.activity"]))
 
     {reused, changed_current} = PromptComposer.reused_sections(prior_state, current_sections)
+
+    changed_for_prompt =
+      Enum.map(changed_current, fn
+        %{id: "task.activity"} = full_activity ->
+          TaskContextPrompt.activity_delta_section(issue, prior_state) || full_activity
+
+        section ->
+          section
+      end)
+
     static_reused = reusable_static_sections(prior_state)
 
     sections = [
@@ -1038,13 +1049,14 @@ defmodule SymphonyElixir.AgentRunner do
         :continuation_capsule,
         "symphony:agent_runner",
         "resume-capsule/v1",
-        continuation_capsule(static_reused, reused, changed_current, turn_number, max_turns),
+        continuation_capsule(static_reused, reused, changed_for_prompt, turn_number, max_turns),
         false
       )
-      | changed_current
+      | changed_for_prompt
     ]
 
     composition = PromptComposer.compose(sections)
+    current_state = PromptComposer.compose(current_sections).state
 
     reuse_decisions =
       Enum.map(static_reused ++ reused, fn identity ->
@@ -1061,7 +1073,11 @@ defmodule SymphonyElixir.AgentRunner do
       composition
       | decisions: composition.decisions ++ reuse_decisions,
         suppressed_bytes: composition.suppressed_bytes + Enum.sum(Enum.map(static_reused ++ reused, & &1.bytes)),
-        state: Map.merge(prior_state, composition.state)
+        state:
+          prior_state
+          |> Map.merge(composition.state)
+          |> Map.merge(current_state)
+          |> TaskContextPrompt.put_activity_cursor(issue)
     }
   end
 
@@ -1155,13 +1171,17 @@ defmodule SymphonyElixir.AgentRunner do
     }
 
     fn tool, arguments ->
-      result =
-        DynamicTool.execute(tool, arguments,
+      dynamic_tool_opts =
+        [
           linear_client: linear_client,
           handoff_gate_context: handoff_context,
           wait_context: wait_context,
           wait_callback: &store_agent_wait_request/1
-        )
+        ]
+        |> maybe_put(:wait_observer, Keyword.get(opts, :wait_observer))
+
+      result =
+        DynamicTool.execute(tool, arguments, dynamic_tool_opts)
 
       maybe_store_handoff_gate_prompt(result)
       result
@@ -2080,16 +2100,19 @@ defmodule SymphonyElixir.AgentRunner do
   defp reusable_static_sections(prior_state) do
     prior_state
     |> Map.values()
-    |> Enum.filter(
-      &(&1.reusable and
-          &1.id in [
-            "task.issue",
-            "task.startup_artifacts",
-            "repository.workflow",
-            "symphony.test_worker_budget",
-            "symphony.handoff_constraints"
-          ])
-    )
+    |> Enum.filter(fn
+      %{reusable: true, id: id} ->
+        id in [
+          "task.issue",
+          "task.startup_artifacts",
+          "repository.workflow",
+          "symphony.test_worker_budget",
+          "symphony.handoff_constraints"
+        ]
+
+      _non_section_state ->
+        false
+    end)
     |> Enum.sort_by(& &1.id)
   end
 

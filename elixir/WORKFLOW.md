@@ -132,9 +132,9 @@ Work only in the provided repository copy. Do not touch any other path.
 
 ## Linear tools
 
-The Symphony-owned task context above is normally sufficient. Read its issue details, current Linear activity, and any annotated startup artifacts before acting. If the activity is truncated or newer live Linear activity would materially affect the work, use `linear_graphql` for an explicit query.
+The Symphony-owned task context above is normally sufficient. Read its issue details, current Linear activity, and any annotated startup artifacts before acting. If the activity is truncated or newer live Linear activity would materially affect the work, use `linear_issue` with `operation: "get"`.
 If `needs-human-input` is present, reconcile the human response after the blocker into the workpad before any repository work, then remove the label only after consuming that response. Exception: when Symphony's host-owned authorization guidance says this issue's configured opt-in label authorizes a verified hook-injected bot/App identity, a prior request for separate bot-attribution authorization is stale; correct the workpad, remove `needs-human-input` when it represented only that claim, and continue without another human comment.
-When moving an issue from `In Progress` to `In Review` or `Human Review`, use `linear_graphql` for the Linear `issueUpdate` mutation so Symphony can run the handoff gates. Do not use native Linear MCP `save_issue` for that state change.
+Use `linear_issue` for the current workpad, labels, and workflow transitions. In particular, move an issue from `In Progress` to `In Review` or `Human Review` with `operation: "transition"` so Symphony can run the handoff gates. Use `linear_graphql` only when no typed operation fits; do not use native Linear MCP `save_issue`.
 
 ## Default posture
 
@@ -256,7 +256,7 @@ Use this only when completion is blocked by missing required tools or missing au
   - what is missing,
   - why it blocks required acceptance/validation,
   - exact human action needed to unblock.
-- The `linear_graphql` call that moves an issue to `Blocked` must include a top-level `blocker` object with a concise `summary` and one of these `kind` values: `missing_required_tool`, `missing_authentication`, `missing_permission`, or `product_decision`. Symphony, reviewer, handoff, CI, and other operational failures are not valid blocker kinds; leave the issue active for orchestrator retry.
+- A `linear_issue` transition (or fallback `linear_graphql` mutation) that moves an issue to `Blocked` must include a top-level `blocker` object with a concise `summary` and one of these `kind` values: `missing_required_tool`, `missing_authentication`, `missing_permission`, or `product_decision`. Symphony, reviewer, handoff, CI, and other operational failures are not valid blocker kinds; leave the issue active for orchestrator retry.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad. The human response belongs in a separate Linear comment; on redispatch, reconcile it into the workpad and remove `needs-human-input` before resuming.
 
 ## Step 2: Execution phase (Todo -> In Progress -> Human Review)

@@ -31,6 +31,7 @@ defmodule SymphonyElixir.Application do
           {Phoenix.PubSub, name: SymphonyElixir.PubSub},
           SymphonyElixirWeb.ObservabilityPubSub,
           {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+          SymphonyElixir.Linear.RateLimit,
           SymphonyElixir.WorkflowStore,
           SymphonyElixir.WaitWatcher,
           SymphonyElixir.Orchestrator,

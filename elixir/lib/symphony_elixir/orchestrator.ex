@@ -1426,6 +1426,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp rate_limit_backoff_ms(_retry_after_ms), do: @default_rate_limit_backoff_ms
 
+  # Issue-specific retries can safely honor the full tracker hint. The poll
+  # loop remains capped so it can probe for recovery, but retrying the same
+  # issue early only spends more of the exhausted budget.
+  defp tracker_retry_delay_ms(retry_after_ms)
+       when is_integer(retry_after_ms) and retry_after_ms > 0,
+       do: max(retry_after_ms, @default_rate_limit_backoff_ms)
+
+  defp tracker_retry_delay_ms(_retry_after_ms), do: @default_rate_limit_backoff_ms
+
   defp poll_delay_ms(%State{poll_backoff_until_ms: until, poll_interval_ms: interval})
        when is_integer(until) do
     max(interval, until - System.monotonic_time(:millisecond))
@@ -2315,6 +2324,7 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(retry_entry, :workspace_path),
           codex_session_logs: Map.get(retry_entry, :codex_session_logs, []),
           recent_codex_transcript_blocks: Map.get(retry_entry, :recent_codex_transcript_blocks, []),
+          wait_resume_prompt: Map.get(retry_entry, :wait_resume_prompt),
           retry_kind: Map.get(retry_entry, :retry_kind)
         }
 
@@ -2346,6 +2356,22 @@ defmodule SymphonyElixir.Orchestrator do
         issues
         |> find_issue_by_id(issue_id)
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+
+      {:error, {:rate_limited, retry_after_ms} = reason} ->
+        Logger.warning("Retry poll rate-limited for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+        state = arm_poll_backoff(state, retry_after_ms)
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             error: "retry poll failed: #{inspect(reason)}",
+             delay_ms_override: tracker_retry_delay_ms(retry_after_ms)
+           })
+         )}
 
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
@@ -2380,10 +2406,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
+  defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
+    maybe_acknowledge_wait_resume(issue_id, metadata)
     {:noreply, release_issue_claim(state, issue_id)}
   end
+
+  defp maybe_acknowledge_wait_resume(issue_id, %{wait_resume_prompt: prompt})
+       when is_binary(prompt) do
+    wait_watcher_acknowledge(issue_id)
+  end
+
+  defp maybe_acknowledge_wait_resume(_issue_id, _metadata), do: :ok
 
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
 

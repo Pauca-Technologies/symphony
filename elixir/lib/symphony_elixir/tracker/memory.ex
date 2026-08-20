@@ -9,7 +9,10 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
-    {:ok, issue_entries()}
+    case Application.get_env(:symphony_elixir, :memory_tracker_candidate_issues_result) do
+      nil -> {:ok, issue_entries()}
+      result -> result
+    end
   end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -74,6 +77,12 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec update_workpad(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_workpad(issue_id, body) do
+    send_event({:memory_tracker_workpad, issue_id, body})
+    :ok
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     send_event({:memory_tracker_state_update, issue_id, state_name})
@@ -97,6 +106,13 @@ defmodule SymphonyElixir.Tracker.Memory do
         send_event({:memory_tracker_add_label_missing, issue_id, label_name})
         {:error, :label_missing}
     end
+  end
+
+  @spec remove_label(String.t(), String.t()) ::
+          :ok | {:error, :label_missing} | {:error, term()}
+  def remove_label(issue_id, label_name) do
+    send_event({:memory_tracker_remove_label, issue_id, label_name})
+    :ok
   end
 
   defp configured_issues do

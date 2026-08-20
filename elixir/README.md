@@ -33,10 +33,13 @@ Symphony writes the same issue and comment snapshot outside the agent-writable w
 its path as `SYMPHONY_ISSUE_CONTEXT_FILE` to lifecycle hooks and the agent process. Version 2 adds
 `issue.comments` and `issue.commentsTruncated`; the file never contains a Linear credential.
 Consumer-repository scripts can therefore use current task context without receiving that
-credential. `linear_graphql` remains available when newer live Linear data or an operation is
-materially needed. Handoff state changes must use that gated tool; Symphony does not auto-approve
-native Linear MCP `save_issue` calls because they cannot run `hooks.before_handoff` or the automated
-review gate.
+credential. Later turns receive only comments added or updated since the previous turn. Equivalent
+repeated automated-review outcomes for the same candidate are collapsed, while human comments and
+the single workpad remain verbatim. The typed `linear_issue` tool handles current-issue reads,
+workpad updates, labels, and transitions; `linear_graphql` remains available for uncommon operations
+that have no typed form. Both transition paths preserve handoff gates. Symphony disables the native
+Linear MCP in managed Codex sessions because its writes cannot run `hooks.before_handoff` or the
+automated review gate.
 
 `hooks.before_handoff` may implement the version 1 asynchronous gate protocol. Symphony sets
 `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`; a `pending` or `running` report exits `3` and supplies a durable
@@ -91,8 +94,8 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill can use `linear_graphql` for optional live reads and operations such as
-     comment editing or upload flows.
+   - The `linear` skill should prefer `linear_issue` for the current workpad, labels, activity, and
+     state. It can use `linear_graphql` for uncommon operations such as uploads.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
@@ -307,8 +310,10 @@ Notes:
   because it cannot safely rely on context retained by a previous process. Reaching `max_turns`
   ends only that worker session; it does not change the Linear state or add `needs-human-input`.
 - Agents can call Symphony's typed `wait_for` tool when useful work is blocked only on an external
-  state change: GitHub Actions recovery, PR-check changes, a git ref advancing, or Linear
-  issue/comment activity. The worker then exits cleanly and releases its concurrency slot while
+  state change: GitHub Actions recovery, all PR-check changes, one named PR-check change, a PR gate
+  settling to pass/fail, a git ref advancing, or Linear issue/comment activity. Symphony observes
+  the initial value itself; agent-supplied observations are rejected. The worker then exits cleanly
+  and releases its concurrency slot while
   a non-LLM watcher persists the wait in `~/.symphony/waits.json`. Identical conditions share one
   probe with bounded exponential backoff. When the condition changes, the issue re-enters the
   normal priority/concurrency scheduler with a compact state-change prompt. The terminal dashboard
@@ -322,6 +327,9 @@ Notes:
   or local process/port contention; independently bounded validations are allowed to overlap.
   PR-check waits treat GitHub's terminal `SKIPPED` checks as neutral, so passed checks plus intentional
   skips resolve to `pass` instead of remaining parked as `pending`.
+- Every Linear caller shares one process-wide rate-limit cooldown. A rate-limit response pauses
+  polling, workpad/label writes, and agent tool requests together, honoring a longer `Retry-After`
+  hint when Linear supplies one instead of letting concurrent callers immediately refill the limit.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
   provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local

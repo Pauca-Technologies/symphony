@@ -435,6 +435,15 @@ defmodule SymphonyElixir.AgentRunnerTest do
                  issue_comments_fetcher: fn _issue_id ->
                    {:ok, %{comments: [], truncated: false}}
                  end,
+                 wait_observer: fn _request ->
+                   {:ok,
+                    %{
+                      "status" => "degraded",
+                      "component" => "Actions",
+                      "incident_statuses" => ["investigating"],
+                      "recovery_signal" => "waiting"
+                    }}
+                 end,
                  max_turns: 5
                ],
                nil

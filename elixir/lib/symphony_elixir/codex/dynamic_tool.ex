@@ -3,8 +3,20 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{BaseDrift, HandoffGate, Linear.Client, ReviewGate, ReviewOutcome, ReviewPacket, WaitCondition}
+  alias SymphonyElixir.{
+    BaseDrift,
+    HandoffGate,
+    Linear.Client,
+    ReviewGate,
+    ReviewOutcome,
+    ReviewPacket,
+    Tracker,
+    WaitCondition
+  }
 
+  alias SymphonyElixir.Linear.{Comment, Issue}
+
+  @linear_issue_tool "linear_issue"
   @linear_graphql_tool "linear_graphql"
   @wait_for_tool "wait_for"
   @human_blocker_kinds [
@@ -30,6 +42,55 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   }
   """
+  @typed_state_lookup_query """
+  query SymphonyResolveTypedState($issueId: String!, $stateName: String!) {
+    issue(id: $issueId) {
+      team {
+        states(filter: {name: {eq: $stateName}}, first: 1) {
+          nodes {
+            id
+          }
+        }
+      }
+    }
+  }
+  """
+  @typed_transition_mutation """
+  mutation SymphonyTypedIssueTransition($issueId: String!, $stateId: String!) {
+    issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+      success
+    }
+  }
+  """
+  @linear_issue_description """
+  Read or update the current Linear issue through typed operations. Use this for activity, the single `## Codex Workpad`, labels, and workflow transitions. Transitions to review states still run Symphony's before_handoff and automated review gates. Use `linear_graphql` only when no typed operation fits.
+  """
+  @linear_issue_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["operation"],
+    "properties" => %{
+      "operation" => %{
+        "type" => "string",
+        "enum" => ["get", "update_workpad", "add_label", "remove_label", "transition"]
+      },
+      "body" => %{
+        "type" => ["string", "null"],
+        "description" => "Complete workpad body beginning with `## Codex Workpad`."
+      },
+      "label" => %{"type" => ["string", "null"]},
+      "state" => %{"type" => ["string", "null"]},
+      "blocker" => %{
+        "type" => ["object", "null"],
+        "additionalProperties" => false,
+        "required" => ["kind", "summary"],
+        "properties" => %{
+          "kind" => %{"type" => "string", "enum" => @human_blocker_kinds},
+          "summary" => %{"type" => "string", "minLength" => 1}
+        }
+      }
+    }
+  }
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear. In Progress to review-state issueUpdate mutations invoke Symphony's before_handoff and automated review gates. Moving the active issue to Blocked requires a top-level blocker object with a human-actionable kind and summary; Symphony, reviewer, and handoff infrastructure failures are not human blockers.
   """
@@ -80,6 +141,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
             "enum" => [
               "github_actions_recovered",
               "github_pr_checks_changed",
+              "github_pr_check_changed",
+              "github_pr_gate_settled",
               "git_ref_changed",
               "linear_issue_changed"
             ]
@@ -87,12 +150,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           "component" => %{"type" => ["string", "null"]},
           "repository" => %{"type" => ["string", "null"]},
           "pr_number" => %{"type" => ["integer", "null"], "minimum" => 1},
+          "check_name" => %{"type" => ["string", "null"], "minLength" => 1},
           "ref" => %{"type" => ["string", "null"]},
-          "issue_id" => %{"type" => ["string", "null"]},
-          "observed" => %{
-            "description" => "The current value. PR checks may use pending/pass/fail/none; other conditions use the current SHA, updated-at value, or JSON observation.",
-            "type" => ["string", "object", "array", "null"]
-          }
+          "issue_id" => %{"type" => ["string", "null"]}
         }
       }
     }
@@ -100,6 +160,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
+      @linear_issue_tool ->
+        execute_linear_issue(arguments, opts)
+
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
 
@@ -120,6 +183,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   def tool_specs do
     [
       %{
+        "name" => @linear_issue_tool,
+        "description" => @linear_issue_description,
+        "inputSchema" => @linear_issue_input_schema
+      },
+      %{
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
@@ -132,11 +200,114 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     ]
   end
 
+  defp execute_linear_issue(arguments, opts) when is_map(arguments) do
+    with {:ok, operation} <- typed_operation(arguments),
+         {:ok, issue} <- current_issue(opts),
+         {:ok, issue_id} <- current_issue_id(issue) do
+      execute_typed_issue_operation(operation, issue_id, arguments, opts)
+    else
+      {:error, reason} -> failure_response(linear_issue_error(reason))
+    end
+  end
+
+  defp execute_linear_issue(_arguments, _opts),
+    do: failure_response(linear_issue_error(:invalid_arguments))
+
+  defp execute_typed_issue_operation("get", issue_id, _arguments, opts) do
+    fetch_issue = Keyword.get(opts, :tracker_fetch_issue, &Tracker.fetch_issue_states_by_ids/1)
+    fetch_comments = Keyword.get(opts, :tracker_fetch_comments, &Tracker.fetch_issue_comments/1)
+
+    with {:ok, [issue | _]} <- fetch_issue.([issue_id]),
+         {:ok, %{comments: comments, truncated: truncated}} <- fetch_comments.(issue_id) do
+      success_response(%{
+        "issue" => typed_issue_payload(issue),
+        "activity" => %{
+          "comments" => Enum.map(comments, &typed_comment_payload/1),
+          "truncated" => truncated
+        }
+      })
+    else
+      {:ok, []} -> failure_response(linear_issue_error(:issue_not_found))
+      {:error, reason} -> failure_response(linear_issue_error(reason))
+      other -> failure_response(linear_issue_error({:invalid_tracker_response, other}))
+    end
+  end
+
+  defp execute_typed_issue_operation("update_workpad", issue_id, arguments, opts) do
+    update_workpad = Keyword.get(opts, :tracker_update_workpad, &Tracker.update_workpad/2)
+
+    with {:ok, body} <- typed_workpad_body(arguments),
+         :ok <- update_workpad.(issue_id, body) do
+      success_response(%{"status" => "updated", "operation" => "update_workpad"})
+    else
+      {:error, reason} -> failure_response(linear_issue_error(reason))
+      other -> failure_response(linear_issue_error({:workpad_update_failed, other}))
+    end
+  end
+
+  defp execute_typed_issue_operation(operation, issue_id, arguments, opts)
+       when operation in ["add_label", "remove_label"] do
+    label_operation =
+      case operation do
+        "add_label" -> Keyword.get(opts, :tracker_add_label, &Tracker.add_label/2)
+        "remove_label" -> Keyword.get(opts, :tracker_remove_label, &Tracker.remove_label/2)
+      end
+
+    with {:ok, label} <- typed_non_blank(arguments, "label", :missing_label),
+         :ok <- label_operation.(issue_id, label) do
+      success_response(%{"status" => "updated", "operation" => operation, "label" => label})
+    else
+      {:error, reason} -> failure_response(linear_issue_error(reason))
+      other -> failure_response(linear_issue_error({:label_update_failed, other}))
+    end
+  end
+
+  defp execute_typed_issue_operation("transition", issue_id, arguments, opts) do
+    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+
+    with {:ok, state_name} <- typed_non_blank(arguments, "state", :missing_state),
+         {:ok, response} <-
+           linear_client.(
+             @typed_state_lookup_query,
+             %{"issueId" => issue_id, "stateName" => state_name},
+             []
+           ),
+         state_id when is_binary(state_id) <-
+           get_in(response, [
+             "data",
+             "issue",
+             "team",
+             "states",
+             "nodes",
+             Access.at(0),
+             "id"
+           ]) do
+      transition_arguments = %{
+        "query" => @typed_transition_mutation,
+        "variables" => %{"issueId" => issue_id, "stateId" => state_id}
+      }
+
+      transition_arguments =
+        case Map.get(arguments, "blocker") || Map.get(arguments, :blocker) do
+          blocker when is_map(blocker) -> Map.put(transition_arguments, "blocker", blocker)
+          _blocker -> transition_arguments
+        end
+
+      execute_linear_graphql(transition_arguments, opts)
+    else
+      nil -> failure_response(linear_issue_error({:state_not_found, typed_value(arguments, "state")}))
+      {:error, reason} -> failure_response(linear_issue_error(reason))
+      other -> failure_response(linear_issue_error({:state_lookup_failed, other}))
+    end
+  end
+
   defp execute_wait_for(arguments, opts) do
     context = Keyword.get(opts, :wait_context, %{})
     callback = Keyword.get(opts, :wait_callback)
+    observer = Keyword.get(opts, :wait_observer, &WaitCondition.observe/1)
 
     with {:ok, request} <- WaitCondition.normalize(arguments, context),
+         {:ok, request} <- WaitCondition.capture_baseline(request, observer: observer),
          true <- is_function(callback, 1) or {:error, :wait_unavailable},
          :ok <- callback.(request) do
       success_response(%{
@@ -1043,6 +1214,17 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload({:linear_api_status, status, errors}) when is_list(errors) do
+    %{
+      "error" => %{
+        "message" => "Linear GraphQL request failed with HTTP #{status}.",
+        "status" => status,
+        "graphqlErrors" => errors,
+        "hint" => "Prefer `linear_issue` for current-issue reads, workpad updates, labels, and transitions. For raw GraphQL, query issues through `issue(id: ...)` rather than guessing root fields."
+      }
+    }
+  end
+
   defp tool_error_payload({:linear_api_request, reason}) do
     %{
       "error" => %{
@@ -1060,6 +1242,156 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   end
+
+  defp typed_operation(arguments) do
+    case typed_value(arguments, "operation") do
+      operation
+      when operation in ["get", "update_workpad", "add_label", "remove_label", "transition"] ->
+        {:ok, operation}
+
+      _operation ->
+        {:error, :invalid_operation}
+    end
+  end
+
+  defp current_issue(opts) do
+    issue =
+      [:handoff_gate_context, :wait_context]
+      |> Enum.find_value(fn key ->
+        context = Keyword.get(opts, key, %{})
+        Map.get(context, :issue) || Map.get(context, "issue")
+      end)
+
+    if is_map(issue), do: {:ok, issue}, else: {:error, :missing_issue_context}
+  end
+
+  defp current_issue_id(issue) when is_map(issue) do
+    case Map.get(issue, :id) || Map.get(issue, "id") do
+      issue_id when is_binary(issue_id) and issue_id != "" -> {:ok, issue_id}
+      _issue_id -> {:error, :missing_issue_context}
+    end
+  end
+
+  defp typed_workpad_body(arguments) do
+    with {:ok, body} <- typed_non_blank(arguments, "body", :missing_workpad_body),
+         true <- String.starts_with?(String.trim_leading(body), "## Codex Workpad") do
+      {:ok, body}
+    else
+      false -> {:error, :invalid_workpad_heading}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp typed_non_blank(arguments, key, error) do
+    case typed_value(arguments, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> {:error, error}
+          trimmed -> {:ok, trimmed}
+        end
+
+      _value ->
+        {:error, error}
+    end
+  end
+
+  defp typed_value(arguments, key) when is_map(arguments) do
+    Map.get(arguments, key) || Map.get(arguments, String.to_atom(key))
+  end
+
+  defp typed_issue_payload(%Issue{} = issue) do
+    %{
+      "id" => issue.id,
+      "identifier" => issue.identifier,
+      "title" => issue.title,
+      "description" => issue.description,
+      "state" => issue.state,
+      "labels" => issue.labels,
+      "url" => issue.url,
+      "updatedAt" => typed_datetime(issue.updated_at)
+    }
+  end
+
+  defp typed_issue_payload(issue) when is_map(issue) do
+    %{
+      "id" => typed_map_value(issue, :id, "id"),
+      "identifier" => typed_map_value(issue, :identifier, "identifier"),
+      "title" => typed_map_value(issue, :title, "title"),
+      "description" => typed_map_value(issue, :description, "description"),
+      "state" => typed_map_value(issue, :state, "state"),
+      "labels" => typed_map_value(issue, :labels, "labels", []),
+      "url" => typed_map_value(issue, :url, "url"),
+      "updatedAt" => typed_datetime(typed_map_value(issue, :updated_at, "updatedAt"))
+    }
+  end
+
+  defp typed_comment_payload(%Comment{} = comment) do
+    %{
+      "id" => comment.id,
+      "body" => comment.body,
+      "author" => comment.author_name,
+      "createdAt" => typed_datetime(comment.created_at),
+      "updatedAt" => typed_datetime(comment.updated_at)
+    }
+  end
+
+  defp typed_comment_payload(comment) when is_map(comment) do
+    %{
+      "id" => typed_map_value(comment, :id, "id"),
+      "body" => typed_map_value(comment, :body, "body"),
+      "author" => typed_map_value(comment, :author_name, "author"),
+      "createdAt" => typed_datetime(typed_map_value(comment, :created_at, "createdAt")),
+      "updatedAt" => typed_datetime(typed_map_value(comment, :updated_at, "updatedAt"))
+    }
+  end
+
+  defp typed_map_value(map, atom_key, string_key, default \\ nil) do
+    Map.get(map, atom_key) || Map.get(map, string_key) || default
+  end
+
+  defp typed_datetime(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp typed_datetime(value) when is_binary(value), do: value
+  defp typed_datetime(_value), do: nil
+
+  defp linear_issue_error(:invalid_arguments),
+    do: %{"error" => %{"message" => "`linear_issue` expects an object argument."}}
+
+  defp linear_issue_error(:invalid_operation),
+    do: %{
+      "error" => %{
+        "message" => "Unsupported `linear_issue` operation.",
+        "supportedOperations" => [
+          "get",
+          "update_workpad",
+          "add_label",
+          "remove_label",
+          "transition"
+        ]
+      }
+    }
+
+  defp linear_issue_error(:missing_issue_context),
+    do: %{
+      "error" => %{
+        "message" => "`linear_issue` is available only inside a Symphony issue session."
+      }
+    }
+
+  defp linear_issue_error(:invalid_workpad_heading),
+    do: %{
+      "error" => %{
+        "message" => "The workpad body must begin with `## Codex Workpad`."
+      }
+    }
+
+  defp linear_issue_error(reason),
+    do: %{
+      "error" => %{
+        "message" => "The typed Linear issue operation failed.",
+        "reason" => inspect(reason),
+        "hint" => "Use `linear_graphql` only if the required operation is not available through `linear_issue`."
+      }
+    }
 
   defp supported_tool_names do
     Enum.map(tool_specs(), & &1["name"])

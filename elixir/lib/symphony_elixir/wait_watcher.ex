@@ -218,7 +218,7 @@ defmodule SymphonyElixir.WaitWatcher do
 
     task_result =
       Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-        result = safe_probe(entry.request)
+        result = safe_observe(entry.request)
         send(parent, {:probe_result, condition_key, probe_token, result})
       end)
 
@@ -250,6 +250,28 @@ defmodule SymphonyElixir.WaitWatcher do
     update_backoff(state, condition_key, observation, nil)
   end
 
+  defp apply_probe_result(state, condition_key, {:ok, observation}) when is_map(observation) do
+    {ready, entries} =
+      Enum.reduce(waiting_entries(state, condition_key), {[], state.entries}, fn entry, {ready_acc, entries_acc} ->
+        if WaitCondition.changed?(entry.request, observation) do
+          updated = ready_entry(entry, observation, :condition_changed)
+          {[updated | ready_acc], Map.put(entries_acc, entry.issue_id, updated)}
+        else
+          updated = backoff_entry(entry, observation, nil)
+          {ready_acc, Map.put(entries_acc, entry.issue_id, updated)}
+        end
+      end)
+
+    if ready != [] do
+      Logger.info("Wait condition changed condition_key=#{condition_key} resuming_issues=#{length(ready)}")
+    end
+
+    state = %{state | entries: entries}
+    WaitStore.save(entries)
+    notify_orchestrator(ready)
+    arm_condition(state, condition_key)
+  end
+
   defp apply_probe_result(state, condition_key, {:error, reason}) do
     Logger.warning("Wait condition probe failed condition_key=#{condition_key} reason=#{inspect(reason)}")
     update_backoff(state, condition_key, nil, inspect(reason))
@@ -258,17 +280,7 @@ defmodule SymphonyElixir.WaitWatcher do
   defp update_backoff(state, condition_key, observation, error) do
     entries =
       Enum.reduce(waiting_entries(state, condition_key), state.entries, fn entry, acc ->
-        attempt = entry.probe_attempt + 1
-        delay_ms = min(entry.request.min_poll_ms * Integer.pow(2, min(attempt - 1, 10)), entry.request.max_poll_ms)
-
-        updated =
-          entry
-          |> Map.put(:probe_attempt, attempt)
-          |> Map.put(:next_probe_at, DateTime.add(DateTime.utc_now(), delay_ms, :millisecond))
-          |> Map.put(:last_observation, observation || entry.last_observation)
-          |> Map.put(:last_error, error)
-
-        Map.put(acc, entry.issue_id, updated)
+        Map.put(acc, entry.issue_id, backoff_entry(entry, observation, error))
       end)
 
     state = %{state | entries: entries}
@@ -282,6 +294,22 @@ defmodule SymphonyElixir.WaitWatcher do
     |> Map.put(:last_observation, observation)
     |> Map.put(:last_error, nil)
     |> Map.put(:resume_prompt, WaitCondition.resume_prompt(entry.request, observation, trigger))
+  end
+
+  defp backoff_entry(entry, observation, error) do
+    attempt = entry.probe_attempt + 1
+
+    delay_ms =
+      min(
+        entry.request.min_poll_ms * Integer.pow(2, min(attempt - 1, 10)),
+        entry.request.max_poll_ms
+      )
+
+    entry
+    |> Map.put(:probe_attempt, attempt)
+    |> Map.put(:next_probe_at, DateTime.add(DateTime.utc_now(), delay_ms, :millisecond))
+    |> Map.put(:last_observation, observation || entry.last_observation)
+    |> Map.put(:last_error, error)
   end
 
   defp arm_condition(%State{} = state, condition_key) do
@@ -333,15 +361,15 @@ defmodule SymphonyElixir.WaitWatcher do
 
   defp first_probe_at(_entry, fallback), do: fallback
 
-  defp probe(request) do
+  defp observe(request) do
     case Application.get_env(:symphony_elixir, :wait_condition_probe) do
       fun when is_function(fun, 1) -> fun.(request)
-      _ -> WaitCondition.probe(request)
+      _ -> WaitCondition.observe(request)
     end
   end
 
-  defp safe_probe(request) do
-    probe(request)
+  defp safe_observe(request) do
+    observe(request)
   rescue
     error -> {:error, {:probe_crashed, Exception.message(error)}}
   catch

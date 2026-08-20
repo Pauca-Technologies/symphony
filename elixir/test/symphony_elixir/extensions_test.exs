@@ -25,6 +25,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, issue_ids}
     end
 
+    def fetch_issue_comments(issue_id) do
+      send(self(), {:fetch_issue_comments_called, issue_id})
+      Process.get({__MODULE__, :comments_result}, {:ok, %{comments: [], truncated: false}})
+    end
+
     def graphql(query, variables) do
       send(self(), {:graphql_called, query, variables})
 
@@ -227,9 +232,13 @@ defmodule SymphonyElixir.ExtensionsTest do
              SymphonyElixir.Tracker.fetch_issue_comments("issue-1")
 
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert :ok = SymphonyElixir.Tracker.update_workpad("issue-1", "## Codex Workpad\n\nUpdated")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
+    assert :ok = SymphonyElixir.Tracker.remove_label("issue-1", "needs-human-input")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_workpad, "issue-1", "## Codex Workpad\n\nUpdated"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
+    assert_receive {:memory_tracker_remove_label, "issue-1", "needs-human-input"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
@@ -237,6 +246,55 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
+  end
+
+  test "linear adapter updates an existing workpad and creates one when absent" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    Process.put(
+      {FakeLinearClient, :comments_result},
+      {:ok,
+       %{
+         comments: [
+           %SymphonyElixir.Linear.Comment{id: "comment-human", body: "Human decision."},
+           %SymphonyElixir.Linear.Comment{id: "comment-workpad", body: "  ## Codex Workpad\n\nOld"}
+         ],
+         truncated: false
+       }}
+    )
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentUpdate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.update_workpad("issue-1", "## Codex Workpad\n\nNew")
+    assert_receive {:fetch_issue_comments_called, "issue-1"}
+
+    assert_receive {:graphql_called, update_query, %{commentId: "comment-workpad", body: "## Codex Workpad\n\nNew"}}
+
+    assert update_query =~ "commentUpdate"
+
+    Process.put(
+      {FakeLinearClient, :comments_result},
+      {:ok,
+       %{
+         comments: [%SymphonyElixir.Linear.Comment{id: "comment-human", body: "Human decision."}],
+         truncated: false
+       }}
+    )
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.update_workpad("issue-1", "## Codex Workpad\n\nCreated")
+    assert_receive {:fetch_issue_comments_called, "issue-1"}
+
+    assert_receive {:graphql_called, create_query, %{issueId: "issue-1", body: "## Codex Workpad\n\nCreated"}}
+
+    assert create_query =~ "commentCreate"
   end
 
   test "linear adapter delegates reads and validates mutation responses" do
@@ -415,6 +473,32 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert create_query =~ "issueLabelCreate"
 
     assert_receive {:graphql_called, _add_query, %{issueId: "issue-1", labelId: "label-new"}}
+  end
+
+  test "linear adapter remove_label resolves an existing label without creating it" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "team" => %{"id" => "team-1", "labels" => %{"nodes" => [%{"id" => "label-1"}]}}
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueRemoveLabel" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.remove_label("issue-1", "needs-human-input")
+    assert_receive {:graphql_called, lookup_query, %{issueId: "issue-1", labelName: "needs-human-input"}}
+    assert lookup_query =~ "labels(filter"
+    assert_receive {:graphql_called, remove_query, %{issueId: "issue-1", labelId: "label-1"}}
+    assert remove_query =~ "issueRemoveLabel"
+    refute_received {:graphql_called, _create_query, %{name: _, teamId: _}}
   end
 
   test "linear adapter add_label surfaces missing team and create failures" do

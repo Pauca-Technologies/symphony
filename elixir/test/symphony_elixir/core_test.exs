@@ -947,6 +947,137 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.retry_attempts, issue_id)
   end
 
+  test "wait resume is acknowledged when the issue is no longer a candidate" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"],
+      poll_interval_ms: 30_000
+    )
+
+    issue_id = "issue-wait-resume-gone"
+    identifier = "MT-7299"
+    SymphonyElixir.WaitWatcher.acknowledge(issue_id)
+
+    orchestrator_name = Module.concat(__MODULE__, :MissingWaitResumeOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    request = %{
+      condition: %{"type" => "github_actions_recovered", "component" => "Actions"},
+      condition_key: "missing-wait-resume-condition",
+      reason: "GitHub Actions outage",
+      min_poll_ms: 60_000,
+      max_poll_ms: 60_000
+    }
+
+    :ok =
+      SymphonyElixir.WaitWatcher.park(%{
+        issue_id: issue_id,
+        identifier: identifier,
+        title: "Resume after wait",
+        backend: "codex",
+        worker_host: nil,
+        workspace_path: "/tmp/#{identifier}",
+        priority: 1,
+        created_at: DateTime.utc_now(),
+        request: request
+      })
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      SymphonyElixir.WaitWatcher.acknowledge(issue_id)
+    end)
+
+    initial_state = :sys.get_state(pid)
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: identifier,
+          wait_resume_prompt: "The wait condition changed. Resume work."
+        }
+      })
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+
+    refute MapSet.member?(SymphonyElixir.WaitWatcher.issue_ids(), issue_id)
+
+    state = :sys.get_state(pid)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  test "rate-limited retry lookup honors the tracker delay and preserves wait context" do
+    previous_result =
+      Application.get_env(:symphony_elixir, :memory_tracker_candidate_issues_result)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 30_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitedRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Process.sleep(50)
+
+    retry_after_ms = 3_600_000
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_candidate_issues_result,
+      {:error, {:rate_limited, retry_after_ms}}
+    )
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_candidate_issues_result, previous_result)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    issue_id = "issue-rate-limited-wait-resume"
+    retry_token = make_ref()
+    resume_prompt = "The wait condition changed. Resume work."
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: "MT-7299",
+          wait_resume_prompt: resume_prompt
+        }
+      })
+    end)
+
+    start_ms = System.monotonic_time(:millisecond)
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{
+             attempt: 2,
+             due_at_ms: due_at_ms,
+             wait_resume_prompt: ^resume_prompt,
+             error: error
+           } = state.retry_attempts[issue_id]
+
+    assert error =~ "rate_limited"
+    assert_due_in_range(due_at_ms, start_ms, retry_after_ms)
+    assert is_integer(state.poll_backoff_until_ms)
+  end
+
   # Regression: a *transient* revalidation failure during continuation dispatch
   # must keep the claim and reschedule, not drop the claim or strand it.
   test "continuation dispatch keeps the claim and reschedules on a transient revalidation error" do

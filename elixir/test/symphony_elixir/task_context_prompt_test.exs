@@ -86,4 +86,60 @@ defmodule SymphonyElixir.TaskContextPromptTest do
     assert prompt =~ "No startup artifacts were found."
     refute prompt =~ "secret or noisy output"
   end
+
+  test "compresses only equivalent machine review outcomes and preserves human comments" do
+    repeated_review = fn id, created_at ->
+      %Comment{
+        id: id,
+        author_name: "UDPAgent",
+        created_at: created_at,
+        body: """
+        <!-- symphony:review-skipped -->
+        Automated review outcome: `infrastructure_unavailable` (not approved).
+
+        Candidate SHA: `abc123`
+        """
+      }
+    end
+
+    prompt =
+      TaskContextPrompt.render(%Issue{
+        identifier: "UDPE-7062",
+        comments: [
+          repeated_review.("review-old", ~U[2026-08-18 10:00:00Z]),
+          %Comment{id: "human-1", author_name: "Reviewer", body: "Please keep both tenant guards."},
+          repeated_review.("review-new", ~U[2026-08-19 10:00:00Z]),
+          %Comment{id: "workpad", author_name: "UDPAgent", body: "## Codex Workpad\n\nCurrent plan."}
+        ]
+      })
+
+    refute prompt =~ "id=\"review-old\""
+    assert prompt =~ "id=\"review-new\""
+    assert prompt =~ "omitted-equivalent-comments=\"1\""
+    assert prompt =~ "Please keep both tenant guards."
+    assert prompt =~ "## Codex Workpad"
+  end
+
+  test "renders only new and updated activity after the previous prompt cursor" do
+    original = %Comment{id: "human-1", author_name: "Reviewer", body: "Keep the tenant guard."}
+    workpad = %Comment{id: "workpad", author_name: "UDPAgent", body: "## Codex Workpad\n\nOld plan."}
+    prior_issue = %Issue{identifier: "UDPE-7062", comments: [original, workpad]}
+    prior_state = TaskContextPrompt.put_activity_cursor(%{}, prior_issue)
+
+    changed_issue = %Issue{
+      prior_issue
+      | comments: [
+          original,
+          %{workpad | body: "## Codex Workpad\n\nUpdated plan."},
+          %Comment{id: "human-2", author_name: "Product owner", body: "Use option B."}
+        ]
+    }
+
+    delta = TaskContextPrompt.activity_delta_section(changed_issue, prior_state)
+
+    assert delta.content =~ "## Linear activity since the previous turn"
+    assert delta.content =~ "Updated plan."
+    assert delta.content =~ "Use option B."
+    refute delta.content =~ "Keep the tenant guard."
+  end
 end

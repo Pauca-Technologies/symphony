@@ -259,8 +259,8 @@ defmodule SymphonyElixir.WarningFloodGuardTest do
                )
     end
 
-    test "a non-rate-limit 400 stays a generic api-status error" do
-      assert {:error, {:linear_api_status, 400}} =
+    test "a non-rate-limit 400 returns bounded actionable GraphQL errors" do
+      assert {:error, {:linear_api_status, 400, [%{"code" => "BAD_USER_INPUT", "message" => "The request was invalid", "path" => ["issue"]}]}} =
                Client.graphql(
                  "query Viewer { viewer { id } }",
                  %{},
@@ -268,7 +268,16 @@ defmodule SymphonyElixir.WarningFloodGuardTest do
                    {:ok,
                     %{
                       status: 400,
-                      body: %{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"}}]}
+                      body: %{
+                        "errors" => [
+                          %{
+                            "message" => "The request was invalid",
+                            "path" => ["issue"],
+                            "extensions" => %{"code" => "BAD_USER_INPUT", "debug" => "not exposed"},
+                            "private" => "not exposed"
+                          }
+                        ]
+                      }
                     }}
                  end
                )

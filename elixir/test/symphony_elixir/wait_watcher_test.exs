@@ -28,6 +28,58 @@ defmodule SymphonyElixir.WaitWatcherTest do
                  "reason" => "base branch has not advanced",
                  "condition" => %{
                    "type" => "git_ref_changed",
+                   "ref" => "refs/heads/main"
+                 }
+               },
+               context
+             )
+
+    assert git.baseline == nil
+    assert git.condition["workspace"] == "/tmp/workspace"
+
+    assert {:ok, linear} =
+             WaitCondition.normalize(
+               %{
+                 "reason" => "await issue update",
+                 "condition" => %{"type" => "linear_issue_changed"}
+               },
+               context
+             )
+
+    assert linear.condition["issue_id"] == "issue-1"
+
+    assert {:ok, named_check} =
+             WaitCondition.normalize(
+               %{
+                 "reason" => "await one check",
+                 "condition" => %{
+                   "type" => "github_pr_check_changed",
+                   "pr_number" => 42,
+                   "check_name" => "quality"
+                 }
+               },
+               context
+             )
+
+    assert named_check.condition["check_name"] == "quality"
+
+    assert {:ok, gate} =
+             WaitCondition.normalize(
+               %{
+                 "reason" => "await terminal gate",
+                 "condition" => %{"type" => "github_pr_gate_settled", "pr_number" => 42}
+               },
+               context
+             )
+
+    assert gate.condition["type"] == "github_pr_gate_settled"
+
+    assert {:error, :agent_observation_not_allowed} =
+             WaitCondition.normalize(
+               %{
+                 "reason" => "do not trust agent snapshots",
+                 "condition" => %{
+                   "type" => "git_ref_changed",
                    "ref" => "refs/heads/main",
                    "observed" => "abc123"
                  }
@@ -35,19 +87,15 @@ defmodule SymphonyElixir.WaitWatcherTest do
                context
              )
 
-    assert git.condition["observed"] == "abc123"
-    assert git.condition["workspace"] == "/tmp/workspace"
-
-    assert {:ok, linear} =
+    assert {:error, :agent_observation_not_allowed} =
              WaitCondition.normalize(
                %{
-                 "reason" => "await issue update",
-                 "condition" => %{"type" => "linear_issue_changed", "observed" => "2026-08-06T00:00:00Z"}
+                 "reason" => "do not trust agent baselines",
+                 "baseline" => %{"sha" => "abc123"},
+                 "condition" => %{"type" => "linear_issue_changed"}
                },
                context
              )
-
-    assert linear.condition["issue_id"] == "issue-1"
 
     assert {:error, {:unsupported_condition_type, "time"}} =
              WaitCondition.normalize(
@@ -190,6 +238,46 @@ defmodule SymphonyElixir.WaitWatcherTest do
     assert ready.status == :ready
     assert ready.resume_prompt =~ "human requested an immediate resume"
     assert ready.resume_prompt =~ "Do not repeat the old polling loop"
+  end
+
+  test "one shared observation is compared against each wait's server baseline" do
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
+      send(test_pid, :baseline_probe_started)
+
+      receive do
+        :release_baseline_probe -> :ok
+      end
+
+      {:ok, %{"sha" => "sha-b"}}
+    end)
+
+    name = :"wait-watcher-baseline-#{System.unique_integer([:positive])}"
+    start_supervised!({WaitWatcher, name: name})
+
+    request = fn baseline ->
+      %{
+        condition: %{"type" => "git_ref_changed", "ref" => "refs/heads/main"},
+        condition_key: "shared-ref-condition",
+        baseline: %{"sha" => baseline},
+        reason: "await main",
+        min_poll_ms: 15_000,
+        max_poll_ms: 60_000
+      }
+    end
+
+    :ok = WaitWatcher.park(name, entry("issue-a", "UDPE-A", request.("sha-a")))
+    assert_receive :baseline_probe_started, 1_000
+    :ok = WaitWatcher.park(name, entry("issue-b", "UDPE-B", request.("sha-b")))
+
+    probe_pid = :sys.get_state(name).probes["shared-ref-condition"].pid
+    send(probe_pid, :release_baseline_probe)
+
+    assert eventually(fn ->
+             statuses = Map.new(WaitWatcher.snapshot(name), &{&1.issue_id, &1.status})
+             statuses == %{"issue-a" => :ready, "issue-b" => :waiting}
+           end)
   end
 
   defp entry(issue_id, identifier, request) do

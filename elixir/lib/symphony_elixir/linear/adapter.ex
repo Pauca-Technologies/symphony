@@ -5,11 +5,19 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.{Client, Comment}
 
   @create_comment_mutation """
   mutation SymphonyCreateComment($issueId: String!, $body: String!) {
     commentCreate(input: {issueId: $issueId, body: $body}) {
+      success
+    }
+  }
+  """
+
+  @update_comment_mutation """
+  mutation SymphonyUpdateWorkpad($commentId: String!, $body: String!) {
+    commentUpdate(id: $commentId, input: {body: $body}) {
       success
     }
   }
@@ -71,6 +79,14 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @remove_label_mutation """
+  mutation SymphonyRemoveLabel($issueId: String!, $labelId: String!) {
+    issueRemoveLabel(id: $issueId, labelId: $labelId) {
+      success
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues, do: client_module().fetch_candidate_issues()
 
@@ -97,6 +113,19 @@ defmodule SymphonyElixir.Linear.Adapter do
       false -> {:error, :comment_create_failed}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :comment_create_failed}
+    end
+  end
+
+  @spec update_workpad(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_workpad(issue_id, body) when is_binary(issue_id) and is_binary(body) do
+    with {:ok, %{comments: comments}} <- fetch_issue_comments(issue_id) do
+      case Enum.find(comments, &workpad_comment?/1) do
+        %Comment{id: comment_id} when is_binary(comment_id) ->
+          update_comment(comment_id, body)
+
+        _missing ->
+          create_comment(issue_id, body)
+      end
     end
   end
 
@@ -135,8 +164,63 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  @spec remove_label(String.t(), String.t()) ::
+          :ok | {:error, :label_missing} | {:error, term()}
+  def remove_label(issue_id, label_name)
+      when is_binary(issue_id) and is_binary(label_name) do
+    with {:ok, label_id} <- resolve_existing_label_id(issue_id, label_name),
+         {:ok, response} <-
+           client_module().graphql(@remove_label_mutation, %{
+             issueId: issue_id,
+             labelId: label_id
+           }),
+         true <- get_in(response, ["data", "issueRemoveLabel", "success"]) == true do
+      :ok
+    else
+      false -> {:error, :remove_label_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :remove_label_failed}
+    end
+  end
+
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
+  end
+
+  defp update_comment(comment_id, body) do
+    with {:ok, response} <-
+           client_module().graphql(@update_comment_mutation, %{
+             commentId: comment_id,
+             body: body
+           }),
+         true <- get_in(response, ["data", "commentUpdate", "success"]) == true do
+      :ok
+    else
+      false -> {:error, :comment_update_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :comment_update_failed}
+    end
+  end
+
+  defp workpad_comment?(%Comment{body: body}) when is_binary(body) do
+    body |> String.trim_leading() |> String.starts_with?("## Codex Workpad")
+  end
+
+  defp workpad_comment?(_comment), do: false
+
+  defp resolve_existing_label_id(issue_id, label_name) do
+    with {:ok, response} <-
+           client_module().graphql(@label_lookup_query, %{
+             issueId: issue_id,
+             labelName: label_name
+           }),
+         label_id when is_binary(label_id) <-
+           get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
+      {:ok, label_id}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :label_missing}
+    end
   end
 
   # Resolve the id of `label_name` on the issue's team, creating the label

@@ -571,6 +571,7 @@ defmodule SymphonyElixir.AppServerTest do
         end)
 
       assert thread_config["features.shell_snapshot"] == false
+      assert thread_config["mcp_servers.linear.enabled"] == false
       assert thread_config["project_doc_max_bytes"] == 12_345
 
       sanitized_env = File.read!(env_file)
@@ -758,7 +759,7 @@ defmodule SymphonyElixir.AppServerTest do
 
                      _ ->
                        false
-                   end) and length(tools) == 2
+                   end) and length(tools) == 3
                else
                  false
                end

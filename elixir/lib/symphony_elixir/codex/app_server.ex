@@ -667,7 +667,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp thread_config(opts) do
-    configured = Keyword.get(opts, :thread_config)
+    configured =
+      opts
+      |> Keyword.get(:thread_config, %{})
+      |> Map.put("mcp_servers.linear.enabled", false)
 
     case AgentTransport.pre_command() do
       nil ->
@@ -680,7 +683,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         # deliberately prepended (for example UDP's GitHub-App `gh` shim).
         # Without the snapshot, Codex's ordinary login shell preserves the
         # launch environment, including that PATH ordering.
-        Map.put(configured || %{}, "features.shell_snapshot", false)
+        Map.put(configured, "features.shell_snapshot", false)
     end
   end
 

@@ -1387,11 +1387,25 @@ Unsupported dynamic tool calls:
 Optional client-side tool extension:
 
 - An implementation MAY expose a limited set of client-side tools to the app-server session.
-- Current standardized optional tools: `linear_graphql` and `wait_for`.
+- Current standardized optional tools: `linear_issue`, `linear_graphql`, and `wait_for`.
 - If implemented, supported tools SHOULD be advertised to the app-server session during startup
   using the protocol mechanism supported by the targeted Codex app-server version.
 - Unsupported tool names SHOULD still return a failure result using the targeted protocol and
   continue the session.
+
+`linear_issue` extension contract:
+
+- Purpose: perform common operations on the current Symphony-owned issue without requiring the
+  coding agent to construct Linear GraphQL.
+- The tool MUST derive the issue identity from host-owned session context. It MUST NOT accept an
+  arbitrary issue ID from the coding agent.
+- Standard operations are `get`, `update_workpad`, `add_label`, `remove_label`, and `transition`.
+- `update_workpad` MUST update the existing comment whose trimmed body starts with
+  `## Codex Workpad`, or create it if absent.
+- Review-state transitions MUST pass through the same `before_handoff` and automated-review gates as
+  raw GraphQL transitions.
+- A transition to `Blocked` MUST require the same structured human blocker as the raw extension.
+- Implementations MAY expose `linear_graphql` for operations with no typed form.
 
 `linear_graphql` extension contract:
 
@@ -1437,8 +1451,15 @@ Optional client-side tool extension:
 - Implementations MUST reject clock-only waits. Agents MUST NOT park for local resource pressure,
   another validation, local process/port contention, or an elapsed-time backoff; independently
   bounded validations may overlap across agents.
-- Change-based conditions MUST include the observation the agent just saw. The watcher MUST NOT
-  resume merely because it observed the same value again.
+- Standard condition types include GitHub Actions recovery, all PR-check changes, one named
+  PR-check change, a PR gate settling to pass/fail, git-ref SHA changes, and Linear issue/comment
+  changes.
+- The coding agent MUST identify only the typed target and desired event. The implementation MUST
+  capture the initial external observation before accepting the wait and MUST reject agent-supplied
+  observation or baseline fields.
+- The watcher MUST compare later observations with the server-captured baseline and MUST NOT resume
+  merely because it observed the same value again. A recovery or gate-settled condition that is
+  already satisfied MUST be rejected instead of parked.
 - A successful tool call records the request in the worker lifecycle. The agent SHOULD end its turn;
   on normal worker exit, the orchestrator retains the workspace and claim, persists the wait, and
   releases the agent slot.
@@ -2575,6 +2596,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - unsupported tool names still fail without stalling the session
   - session observability records retain normalized tool result details so deferred handoffs and
     failure categories remain distinguishable
+- If the `linear_issue` client-side tool extension is implemented:
+  - the tool is advertised to the session
+  - it is scoped to the host-owned current issue
+  - typed workpad, label, activity, and transition operations return structured results
+  - review and blocked-state transitions preserve the same gates as `linear_graphql`
 ### 17.6 Observability
 
 - Validation failures are operator-visible
@@ -2641,14 +2667,14 @@ Use the same validation profiles as Section 17:
 
 - HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
-  app-server session using configured Symphony auth.
+- `linear_issue` exposes host-scoped typed current-issue operations, with `linear_graphql` retained
+  as a fallback for operations without a typed form.
 - TODO: Persist the general retry queue across process restarts. Live detached workers already
   retain their current session metadata in the Elixir implementation.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
+- TODO: Expand first-class tracker APIs only when a repeated operation cannot fit the scoped
+  `linear_issue` contract.
 - TODO: Add pluggable issue tracker adapters beyond Linear.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)

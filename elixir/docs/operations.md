@@ -56,6 +56,11 @@ the dashboard as **Waiting work**, and do not occupy agent slots. **Resume now**
 without waiting for the next probe. **Cancel wait** removes the external condition and returns the
 issue to normal scheduling; it does not cancel or close the Linear issue.
 
+Agents describe only the typed target and event. Symphony captures the external baseline before it
+accepts the wait, rejects already-satisfied waits, and ignores no agent-shaped observation data.
+For PRs, use an all-check change, one named-check change, or a gate-settled wait instead of repeatedly
+running a long CLI polling command.
+
 Do not park work for local CPU or memory pressure, another validation, local process/port contention,
 or a time delay. Validation runs remain independently worker-bounded and may overlap across agents.
 

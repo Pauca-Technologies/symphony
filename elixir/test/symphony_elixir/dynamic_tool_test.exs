@@ -49,6 +49,25 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     specs = DynamicTool.tool_specs()
 
     assert %{
+             "description" => typed_description,
+             "inputSchema" => %{
+               "properties" => %{"operation" => %{"enum" => typed_operations}},
+               "required" => ["operation"]
+             },
+             "name" => "linear_issue"
+           } = Enum.find(specs, &(&1["name"] == "linear_issue"))
+
+    assert typed_description =~ "current Linear issue"
+
+    assert typed_operations == [
+             "get",
+             "update_workpad",
+             "add_label",
+             "remove_label",
+             "transition"
+           ]
+
+    assert %{
              "description" => graphql_description,
              "inputSchema" => %{
                "properties" => %{
@@ -72,7 +91,116 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert "condition" in wait_schema["required"]
     refute "time" in wait_schema["properties"]["condition"]["properties"]["type"]["enum"]
     refute Map.has_key?(wait_schema["properties"]["condition"]["properties"], "resume_at")
-    assert Enum.map(specs, & &1["name"]) == ["linear_graphql", "wait_for"]
+    assert Enum.map(specs, & &1["name"]) == ["linear_issue", "linear_graphql", "wait_for"]
+  end
+
+  test "linear_issue reads current activity and updates only the current issue" do
+    issue = %SymphonyElixir.Linear.Issue{
+      id: "issue-typed",
+      identifier: "UDPE-typed",
+      title: "Use typed Linear operations",
+      state: "In Progress",
+      labels: ["udpagent"]
+    }
+
+    response =
+      DynamicTool.execute("linear_issue", %{"operation" => "get"},
+        handoff_gate_context: %{issue: issue},
+        tracker_fetch_issue: fn ["issue-typed"] -> {:ok, [issue]} end,
+        tracker_fetch_comments: fn "issue-typed" ->
+          {:ok,
+           %{
+             comments: [
+               %SymphonyElixir.Linear.Comment{
+                 id: "comment-workpad",
+                 body: "## Codex Workpad\n\nCurrent plan.",
+                 author_name: "UDPAgent"
+               }
+             ],
+             truncated: false
+           }}
+        end
+      )
+
+    assert response["success"]
+    payload = Jason.decode!(response["output"])
+    assert get_in(payload, ["issue", "identifier"]) == "UDPE-typed"
+    assert get_in(payload, ["activity", "comments", Access.at(0), "id"]) == "comment-workpad"
+
+    test_pid = self()
+
+    update_response =
+      DynamicTool.execute(
+        "linear_issue",
+        %{"operation" => "update_workpad", "body" => "## Codex Workpad\n\nUpdated."},
+        handoff_gate_context: %{issue: issue},
+        tracker_update_workpad: fn issue_id, body ->
+          send(test_pid, {:updated_workpad, issue_id, body})
+          :ok
+        end
+      )
+
+    assert update_response["success"]
+    assert_received {:updated_workpad, "issue-typed", "## Codex Workpad\n\nUpdated."}
+  end
+
+  test "linear_issue resolves typed state transitions before using the gated mutation path" do
+    issue = %SymphonyElixir.Linear.Issue{
+      id: "issue-transition",
+      identifier: "UDPE-transition",
+      title: "Use a typed transition",
+      state: "Todo"
+    }
+
+    test_pid = self()
+
+    linear_client = fn query, variables, [] ->
+      cond do
+        query =~ "SymphonyResolveTypedState" ->
+          assert variables == %{
+                   "issueId" => "issue-transition",
+                   "stateName" => "In Progress"
+                 }
+
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{"team" => %{"states" => %{"nodes" => [%{"id" => "state-progress"}]}}}
+             }
+           }}
+
+        query =~ "SymphonyResolveIssueTransition" ->
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{
+                 "state" => %{"name" => "Todo"},
+                 "team" => %{
+                   "states" => %{
+                     "nodes" => [%{"id" => "state-progress", "name" => "In Progress"}]
+                   }
+                 }
+               }
+             }
+           }}
+
+        query =~ "SymphonyTypedIssueTransition" ->
+          send(test_pid, {:typed_transition, variables})
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+    end
+
+    response =
+      DynamicTool.execute(
+        "linear_issue",
+        %{"operation" => "transition", "state" => "In Progress"},
+        handoff_gate_context: %{issue: issue, workspace: "/tmp/typed-linear-transition"},
+        linear_client: linear_client
+      )
+
+    assert response["success"]
+
+    assert_received {:typed_transition, %{"issueId" => "issue-transition", "stateId" => "state-progress"}}
   end
 
   test "wait_for validates and forwards a typed parked-work request" do
@@ -89,6 +217,15 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           }
         },
         wait_context: %{},
+        wait_observer: fn _request ->
+          {:ok,
+           %{
+             "component" => "Actions",
+             "status" => "major_outage",
+             "incident_statuses" => ["investigating"],
+             "recovery_signal" => "waiting"
+           }}
+        end,
         wait_callback: fn request ->
           send(test_pid, {:wait_request, request})
           :ok
@@ -99,6 +236,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert_receive {:wait_request, request}
     assert request.reason == "GitHub Actions is degraded"
     assert request.condition == %{"component" => "Actions", "type" => "github_actions_recovered"}
+    assert request.baseline["recovery_signal"] == "waiting"
     assert request.min_poll_ms == 60_000
     assert is_binary(request.condition_key)
   end
@@ -215,7 +353,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql", "wait_for"]
+               "supportedTools" => ["linear_issue", "linear_graphql", "wait_for"]
              }
            }
 
@@ -1270,6 +1408,19 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "status" => 503
              }
            }
+
+    detailed_error =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Bad { issueByKey(key: \"UDPE-1\") { id } }"},
+        linear_client: fn _query, _variables, _opts ->
+          {:error, {:linear_api_status, 400, [%{"message" => "Unknown field issueByKey", "code" => "GRAPHQL_VALIDATION_FAILED"}]}}
+        end
+      )
+
+    decoded_detail = Jason.decode!(detailed_error["output"])
+    assert decoded_detail["error"]["graphqlErrors"] == [%{"message" => "Unknown field issueByKey", "code" => "GRAPHQL_VALIDATION_FAILED"}]
+    assert decoded_detail["error"]["hint"] =~ "Prefer `linear_issue`"
 
     request_error =
       DynamicTool.execute(

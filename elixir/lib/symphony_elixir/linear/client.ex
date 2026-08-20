@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Comment, Linear.Issue}
+  alias SymphonyElixir.{Config, Linear.Comment, Linear.Issue, Linear.RateLimit, Utf8}
 
   @issue_page_size 50
   @issue_comment_limit 50
@@ -775,14 +775,18 @@ defmodule SymphonyElixir.Linear.Client do
       when is_binary(query) and is_map(variables) and is_list(opts) do
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
     request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
+    rate_limit_gate? = Keyword.get(opts, :rate_limit_gate, !Keyword.has_key?(opts, :request_fun))
 
-    with {:ok, headers} <- graphql_headers(),
+    with :ok <- check_rate_limit(rate_limit_gate?),
+         {:ok, headers} <- graphql_headers(),
          {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
       {:ok, body}
     else
       {:ok, response} ->
         case rate_limit_retry_after_ms(response) do
           {:rate_limited, retry_after_ms} ->
+            record_rate_limit(rate_limit_gate?, retry_after_ms)
+
             Logger.warning(
               "Linear GraphQL request rate-limited status=#{response.status} retry_after_ms=#{inspect(retry_after_ms)}" <>
                 linear_error_context(payload, response)
@@ -796,12 +800,25 @@ defmodule SymphonyElixir.Linear.Client do
                 linear_error_context(payload, response)
             )
 
-            {:error, {:linear_api_status, response.status}}
+            linear_status_error(response)
         end
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
         {:error, {:linear_api_request, reason}}
+    end
+  end
+
+  defp check_rate_limit(true), do: RateLimit.check()
+  defp check_rate_limit(false), do: :ok
+
+  defp record_rate_limit(true, retry_after_ms), do: RateLimit.backoff(retry_after_ms)
+  defp record_rate_limit(false, _retry_after_ms), do: :ok
+
+  defp linear_status_error(response) do
+    case sanitized_graphql_errors(response) do
+      [] -> {:error, {:linear_api_status, response.status}}
+      errors -> {:error, {:linear_api_status, response.status, errors}}
     end
   end
 
@@ -831,6 +848,44 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp rate_limited_body?(_body), do: false
+
+  defp sanitized_graphql_errors(%{body: %{"errors" => errors}}) when is_list(errors) do
+    errors
+    |> Enum.take(3)
+    |> Enum.map(&sanitize_graphql_error/1)
+    |> Enum.reject(&(&1 == %{}))
+  end
+
+  defp sanitized_graphql_errors(_response), do: []
+
+  defp sanitize_graphql_error(error) when is_map(error) do
+    extensions = Map.get(error, "extensions", %{})
+
+    %{}
+    |> put_bounded_error_value("message", Map.get(error, "message"), 500)
+    |> put_error_path(Map.get(error, "path"))
+    |> put_bounded_error_value("code", Map.get(extensions, "code"), 100)
+    |> put_bounded_error_value("type", Map.get(extensions, "type"), 100)
+  end
+
+  defp sanitize_graphql_error(_error), do: %{}
+
+  defp put_bounded_error_value(target, key, value, max_bytes) when is_binary(value) do
+    Map.put(target, key, Utf8.safe_byte_prefix(value, max_bytes))
+  end
+
+  defp put_bounded_error_value(target, _key, _value, _max_bytes), do: target
+
+  defp put_error_path(target, path) when is_list(path) do
+    safe_path =
+      path
+      |> Enum.take(12)
+      |> Enum.filter(&(is_binary(&1) or is_integer(&1)))
+
+    if safe_path == [], do: target, else: Map.put(target, "path", safe_path)
+  end
+
+  defp put_error_path(target, _path), do: target
 
   defp retry_after_header_ms(%{headers: headers}) when is_map(headers) do
     headers

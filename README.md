@@ -25,7 +25,11 @@ _In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Line
 Before each outer agent dispatch, the reference implementation builds a canonical task context from
 the current issue details, a bounded Linear comment window, and annotated repository startup
 artifacts. That context precedes the repository workflow, so workpads and human unblock decisions
-are deterministic agent input without exposing the tracker credential to repository code.
+are deterministic agent input without exposing the tracker credential to repository code. Later
+turns receive only added or updated activity, and equivalent repeated automation outcomes are
+collapsed while human comments and the workpad remain verbatim. Typed current-issue operations and
+server-captured wait baselines keep routine tracker writes and external waits out of ad-hoc agent
+GraphQL and polling loops.
 
 Routed repositories can also version issue-aware Codex profiles in their own `WORKFLOW.md`. A small,
 classification-only turn chooses the execution profile from bounded issue context, while
