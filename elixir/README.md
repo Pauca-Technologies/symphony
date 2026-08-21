@@ -43,9 +43,12 @@ automated review gate.
 
 `hooks.before_handoff` may implement the version 1 asynchronous gate protocol. Symphony sets
 `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`; a `pending` or `running` report exits `3` and supplies a durable
-job ID, exact candidate identity, heartbeat, progress, and next-poll delay. Symphony persists the
-captured Linear mutation outside the agent-writable worktree, closes the active model turn, and
-polls with `SYMPHONY_HANDOFF_GATE_JOB_ID` without consuming model turns or tokens. Only a `passed`
+job ID, exact candidate identity, heartbeat, progress, and next-poll delay. Before the initial hook
+invocation, Symphony persists the captured Linear mutation outside the agent-writable worktree. If
+that invocation is interrupted or has an infrastructure failure before returning a job ID, the next
+worker attempt retries the hook directly without opening another model session. Once a job exists,
+Symphony closes the active model turn and polls with `SYMPHONY_HANDOFF_GATE_JOB_ID` without consuming
+model turns or tokens. Only a `passed`
 report for the original candidate can release the mutation. Failed and invalidated outcomes resume
 the implementor once with compact remediation. Stale-heartbeat, malformed-protocol, and other
 infrastructure outcomes fail the worker attempt and enter orchestrator backoff without consuming
@@ -566,7 +569,9 @@ Notes:
   Protocol-aware hooks receive `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. Exit `3` with a version 1
   `pending`/`running` JSON report to defer the mutation; subsequent lightweight polls reuse
   `before_handoff` with `SYMPHONY_HANDOFF_GATE_JOB_ID` and skip GitHub auth preparation and
-  issue-context refresh. The hook should read that job before normal setup. Configure the invocation deadline with
+  issue-context refresh. The hook should read that job before normal setup. Symphony durably records
+  the attempted mutation before the initial invocation too, so an infrastructure failure before job
+  creation retries the hook without starting another model session. Configure the invocation deadline with
   `before_handoff_timeout_ms` and the maximum accepted heartbeat age with
   `before_handoff_stale_ms`. The runtime APIs expose job/candidate identity, pending age,
   heartbeat age, progress stage, and next-poll delay while the issue is `handoff_pending_gate`.

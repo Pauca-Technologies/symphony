@@ -73,7 +73,9 @@ hooks:
   # Async protocol invocations receive SYMPHONY_HANDOFF_GATE_PROTOCOL=1. Polls
   # reuse before_handoff with SYMPHONY_HANDOFF_GATE_JOB_ID and skip repeated
   # GitHub auth and issue-context preparation, so the command should branch to
-  # its cheap durable-job read before normal setup.
+  # its cheap durable-job read before normal setup. Symphony persists the
+  # attempted mutation before initial startup so infrastructure retries rerun
+  # this hook directly instead of opening another model session.
   # These limits are independent of other lifecycle hooks.
   before_handoff_timeout_ms: 60000
   before_handoff_stale_ms: 120000

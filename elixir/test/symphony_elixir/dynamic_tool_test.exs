@@ -544,6 +544,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           workspace: workspace,
           worker_host: nil,
           before_handoff_command: "printf '%s' '#{Jason.encode!(report)}'; exit 3",
+          handoff_gate_start_callback: fn request ->
+            send(test_pid, {:starting_handoff, request})
+            :ok
+          end,
+          handoff_gate_clear_callback: fn _request ->
+            send(test_pid, :starting_handoff_cleared)
+            :ok
+          end,
           deferred_handoff_gate_callback: fn request ->
             send(test_pid, {:pending_handoff, request})
             :ok
@@ -575,7 +583,9 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert output["status"] == "handoff_gate_pending"
     assert get_in(output, ["gate", "jobId"]) == "job-7157"
 
+    assert_receive {:starting_handoff, %{target_state: "In Review"}}
     assert_receive {:pending_handoff, %{gate: %{job_id: "job-7157"}, target_state: "In Review"}}
+    refute_receive :starting_handoff_cleared
   end
 
   test "linear_graphql reports protocol infrastructure failures to the runner" do
@@ -631,6 +641,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           workspace: workspace,
           worker_host: nil,
           before_handoff_command: "printf '%s' '#{Jason.encode!(report)}'; exit 1",
+          handoff_gate_start_callback: fn request ->
+            send(test_pid, {:starting_handoff, request})
+            :ok
+          end,
+          handoff_gate_clear_callback: fn _request ->
+            send(test_pid, :starting_handoff_cleared)
+            :ok
+          end,
           handoff_infrastructure_failure_callback: fn prompt, gate ->
             send(test_pid, {:handoff_infrastructure_failure, prompt, gate})
           end
@@ -658,9 +676,11 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
+    assert_receive {:starting_handoff, %{target_state: "In Review"}}
     assert_receive {:handoff_infrastructure_failure, prompt, %{job_id: "job-infrastructure", status: :infrastructure_error}}
 
     assert prompt =~ "gate runner unavailable"
+    assert_receive :starting_handoff_cleared
   end
 
   test "linear_graphql runs handoff gates when issueUpdate uses the issue identifier" do

@@ -949,7 +949,10 @@ Part A: Stall detection
   without starting a coding-agent turn. Status surfaces MUST expose the available job and candidate
   identity, pending age, heartbeat age/time, progress stage, and next-poll delay.
 - Persist the captured tracker mutation and pending gate identity outside the agent-writable
-  workspace. After process restart, reattach to that job before starting a coding-agent session.
+  workspace. Persist the mutation before the initial asynchronous hook invocation as a starting
+  handoff intent. If that invocation ends with infrastructure failure before returning a job ID,
+  retry the hook from the durable intent before starting a coding-agent session. After process
+  restart, reattach to an existing job before starting a coding-agent session.
   Repeated requests for the same candidate MUST coalesce. A changed candidate cancels or
   supersedes the old request; a stale pass MUST NOT authorize the mutation.
 - A pending review is keyed to the issue and reviewed PR head. Repeated requests while that job is
@@ -1101,7 +1104,9 @@ Execution contract:
   `progress.stage`; they exit `3`. Passed reports exit `0`; failed/invalidated reports exit `2`;
   infrastructure errors exit `1`. Polls set `SYMPHONY_HANDOFF_GATE_JOB_ID` and MUST attach to the
   named job rather than starting another underlying gate.
-- On pending/running, durably record the original tracker mutation, end the active model turn, and
+- Before the initial protocol-aware invocation, durably record the original tracker mutation. On
+  pre-job infrastructure failure, preserve that intent and retry the hook without a model turn. On
+  pending/running, replace the intent with the durable job identity, end the active model turn, and
   poll without a model turn. Apply the mutation only after a passed report is revalidated for the
   exact current candidate. Failed or invalidated terminal results clear pending state and resume
   the implementor once with bounded remediation. Infrastructure terminal results clear pending

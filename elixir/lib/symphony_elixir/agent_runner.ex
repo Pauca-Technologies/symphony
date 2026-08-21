@@ -1153,6 +1153,8 @@ defmodule SymphonyElixir.AgentRunner do
       |> maybe_put_map(:before_handoff_command, per_repo_before_handoff)
       |> maybe_put_map(:before_handoff_timeout_ms, per_repo_before_handoff_timeout_ms)
       |> maybe_put_map(:before_handoff_stale_ms, per_repo_before_handoff_stale_ms)
+      |> Map.put(:handoff_gate_start_callback, &persist_starting_handoff_gate/1)
+      |> Map.put(:handoff_gate_clear_callback, &clear_starting_handoff_gate/1)
       |> Map.put(:deferred_handoff_gate_callback, &store_deferred_handoff_gate/1)
       |> Map.put(:handoff_infrastructure_failure_callback, &store_handoff_infrastructure_failure/2)
       |> Map.put(
@@ -1214,7 +1216,9 @@ defmodule SymphonyElixir.AgentRunner do
     existing = Process.get(@deferred_handoff_gate_key)
 
     if same_pending_candidate?(existing, request) do
-      :already_pending
+      with :ok <- persist_deferred_handoff_gate(request) do
+        :already_pending
+      end
     else
       with :ok <- persist_deferred_handoff_gate(request) do
         Process.put(@deferred_handoff_gate_key, request)
@@ -1269,26 +1273,50 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp durable_handoff_request(request) do
-    gate = Map.fetch!(request, :gate)
+  defp persist_starting_handoff_gate(request) when is_map(request) do
+    Workspace.persist_handoff_gate_state(
+      Map.fetch!(request, :workspace),
+      durable_handoff_request(request),
+      Map.get(request, :worker_host)
+    )
+  end
 
-    %{
+  defp clear_starting_handoff_gate(request) when is_map(request) do
+    Workspace.clear_handoff_gate_state(
+      Map.fetch!(request, :workspace),
+      Map.get(request, :worker_host)
+    )
+  end
+
+  defp durable_handoff_request(request) do
+    durable = %{
+      "phase" => "starting",
       "query" => Map.fetch!(request, :query),
       "variables" => Map.get(request, :variables, %{}),
-      "targetState" => Map.fetch!(request, :target_state),
-      "gate" => %{
-        "jobId" => gate.job_id,
-        "status" => to_string(gate.status),
-        "candidateHash" => gate.candidate_hash,
-        "exactHash" => gate.exact_hash,
-        "identity" => gate.identity,
-        "heartbeatAt" => gate.heartbeat_at,
-        "heartbeatAgeMs" => gate.heartbeat_age_ms,
-        "nextPollMs" => gate.next_poll_ms,
-        "progress" => gate.progress,
-        "startedAt" => gate.started_at
-      }
+      "targetState" => Map.fetch!(request, :target_state)
     }
+
+    case Map.fetch(request, :gate) do
+      {:ok, gate} ->
+        Map.merge(durable, %{
+          "phase" => "polling",
+          "gate" => %{
+            "jobId" => gate.job_id,
+            "status" => to_string(gate.status),
+            "candidateHash" => gate.candidate_hash,
+            "exactHash" => gate.exact_hash,
+            "identity" => gate.identity,
+            "heartbeatAt" => gate.heartbeat_at,
+            "heartbeatAgeMs" => gate.heartbeat_age_ms,
+            "nextPollMs" => gate.next_poll_ms,
+            "progress" => gate.progress,
+            "startedAt" => gate.started_at
+          }
+        })
+
+      :error ->
+        durable
+    end
   end
 
   defp pop_deferred_handoff_gate do
@@ -1369,6 +1397,17 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:ok, durable_request} ->
         case restore_handoff_request(durable_request, workspace, issue, worker_host, opts) do
+          {:ok, %{phase: :starting} = request} ->
+            Logger.info("handoff.gate resuming durable start #{issue_context(issue)}")
+
+            resume_starting_handoff_gate(
+              request,
+              recipient,
+              backend,
+              issue_state_fetcher,
+              opts
+            )
+
           {:ok, request} ->
             Logger.info("handoff.gate recovering durable job #{issue_context(issue)} job_id=#{request.gate.job_id}")
 
@@ -1392,6 +1431,20 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp restore_handoff_request(
+         %{"phase" => "starting", "query" => query, "targetState" => target_state} = durable,
+         workspace,
+         issue,
+         worker_host,
+         opts
+       )
+       when is_binary(query) and is_binary(target_state) do
+    {:ok,
+     durable
+     |> restore_handoff_request_base(workspace, issue, worker_host, opts)
+     |> Map.put(:phase, :starting)}
+  end
+
+  defp restore_handoff_request(
          %{"query" => query, "targetState" => target_state, "gate" => durable_gate} = durable,
          workspace,
          issue,
@@ -1400,33 +1453,36 @@ defmodule SymphonyElixir.AgentRunner do
        )
        when is_binary(query) and is_binary(target_state) and is_map(durable_gate) do
     with {:ok, gate} <- restore_durable_gate(durable_gate) do
-      linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
-
-      review_opts =
-        []
-        |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
-
       {:ok,
-       %{
-         query: query,
-         variables: Map.get(durable, "variables", %{}),
-         workspace: workspace,
-         issue: issue,
-         worker_host: worker_host,
-         target_state: target_state,
-         gate: gate,
-         before_handoff_command: Keyword.get(opts, :per_repo_before_handoff),
-         before_handoff_timeout_ms: Keyword.get(opts, :per_repo_before_handoff_timeout_ms),
-         before_handoff_stale_ms: Keyword.get(opts, :per_repo_before_handoff_stale_ms),
-         review_workflow: Keyword.get(opts, :per_repo_review_workflow),
-         review_opts: review_opts,
-         linear_client: linear_client
-       }}
+       durable
+       |> restore_handoff_request_base(workspace, issue, worker_host, opts)
+       |> Map.merge(%{phase: :polling, gate: gate})}
     end
   end
 
   defp restore_handoff_request(_durable, _workspace, _issue, _worker_host, _opts),
     do: {:error, :invalid_request}
+
+  defp restore_handoff_request_base(durable, workspace, issue, worker_host, opts) do
+    review_opts =
+      []
+      |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
+
+    %{
+      query: Map.fetch!(durable, "query"),
+      variables: Map.get(durable, "variables", %{}),
+      workspace: workspace,
+      issue: issue,
+      worker_host: worker_host,
+      target_state: Map.fetch!(durable, "targetState"),
+      before_handoff_command: Keyword.get(opts, :per_repo_before_handoff),
+      before_handoff_timeout_ms: Keyword.get(opts, :per_repo_before_handoff_timeout_ms),
+      before_handoff_stale_ms: Keyword.get(opts, :per_repo_before_handoff_stale_ms),
+      review_workflow: Keyword.get(opts, :per_repo_review_workflow),
+      review_opts: review_opts,
+      linear_client: Keyword.get(opts, :linear_client, &Client.graphql/3)
+    }
+  end
 
   defp restore_durable_gate(
          %{
@@ -1464,6 +1520,138 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp restore_gate_status("running"), do: :running
   defp restore_gate_status(_status), do: :pending
+
+  defp resume_starting_handoff_gate(request, recipient, backend, issue_state_fetcher, opts) do
+    case continue_with_issue?(request.issue, issue_state_fetcher, opts) do
+      {:continue, refreshed_issue} ->
+        request
+        |> Map.put(:issue, refreshed_issue)
+        |> run_starting_handoff_gate(recipient, backend, issue_state_fetcher, opts)
+
+      {:done, refreshed_issue} ->
+        case Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
+          :ok -> {:completed, refreshed_issue}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp run_starting_handoff_gate(request, recipient, backend, issue_state_fetcher, opts) do
+    starter = Keyword.get(opts, :handoff_gate_starter, &HandoffGate.run_before_handoff/5)
+
+    start_opts =
+      [async: true]
+      |> maybe_put(:hook_command, request.before_handoff_command)
+      |> maybe_put(:timeout_ms, request.before_handoff_timeout_ms)
+      |> maybe_put(:stale_ms, request.before_handoff_stale_ms)
+
+    result =
+      starter.(
+        request.workspace,
+        request.issue,
+        request.worker_host,
+        request.target_state,
+        start_opts
+      )
+
+    handle_starting_handoff_result(
+      result,
+      request,
+      recipient,
+      backend,
+      issue_state_fetcher,
+      opts
+    )
+  end
+
+  defp handle_starting_handoff_result(
+         {:pending, gate},
+         request,
+         recipient,
+         backend,
+         issue_state_fetcher,
+         opts
+       ) do
+    request = Map.merge(request, %{phase: :polling, gate: gate})
+
+    case persist_deferred_handoff_gate(request) do
+      :ok -> poll_pending_handoff_gate(request, recipient, backend, issue_state_fetcher, opts, true)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp handle_starting_handoff_result(
+         {:infrastructure_error, prompt, gate},
+         request,
+         _recipient,
+         _backend,
+         _issue_state_fetcher,
+         _opts
+       ) do
+    store_handoff_infrastructure_failure(prompt, gate)
+    {:resume, prompt, request.issue}
+  end
+
+  defp handle_starting_handoff_result(
+         {:passed, gate},
+         request,
+         recipient,
+         backend,
+         _issue_state_fetcher,
+         _opts
+       ) do
+    finish_starting_handoff_gate(Map.put(request, :gate, gate), recipient, backend)
+  end
+
+  defp handle_starting_handoff_result(
+         :ok,
+         request,
+         recipient,
+         backend,
+         _issue_state_fetcher,
+         _opts
+       ) do
+    finish_starting_handoff_gate(request, recipient, backend)
+  end
+
+  defp handle_starting_handoff_result(
+         {:blocked, prompt, _gates},
+         request,
+         _recipient,
+         _backend,
+         _issue_state_fetcher,
+         _opts
+       ) do
+    resume_after_starting_handoff_gate(request, prompt)
+  end
+
+  defp handle_starting_handoff_result(
+         {status, prompt, gate},
+         request,
+         _recipient,
+         _backend,
+         _issue_state_fetcher,
+         _opts
+       )
+       when status in [:failed, :invalidated] do
+    resume_after_starting_handoff_gate(Map.put(request, :gate, gate), prompt)
+  end
+
+  defp finish_starting_handoff_gate(request, recipient, backend) do
+    with :ok <- Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
+      apply_passed_handoff_gate(request, recipient, backend)
+    end
+  end
+
+  defp resume_after_starting_handoff_gate(request, prompt) do
+    case Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
+      :ok -> {:resume, prompt, request.issue}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp maybe_run_deferred_handoff_gate(
          nil,

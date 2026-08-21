@@ -528,6 +528,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
     assert_receive {:agent_lifecycle, ^issue_id, :implementing, %{gate_job_id: ^gate_job_id, gate_outcome: :blocked}}
 
     assert_receive {:handoff_tool_result, %{"success" => false}}
+    assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
   end
 
   describe "soft-budget continuations" do
@@ -1760,6 +1761,95 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "asynchronous handoff gate recovery" do
+    test "retries a durable gate start without opening another model session" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-start-recovery-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7370")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-start-recovery",
+        identifier: "UDPE-7370",
+        title: "Recover a gate start timeout",
+        state: "In Progress",
+        labels: []
+      }
+
+      query =
+        "mutation Move { issueUpdate(id: \"issue-gate-start-recovery\", input: {stateId: \"review\"}) { success } }"
+
+      assert :ok =
+               Workspace.persist_handoff_gate_state(workspace, %{
+                 "phase" => "starting",
+                 "query" => query,
+                 "variables" => %{},
+                 "targetState" => "In Review"
+               })
+
+      Application.put_env(:symphony_elixir, :turn_count_recipient_for_test, self())
+      {:ok, starts} = Agent.start_link(fn -> 0 end)
+      test_pid = self()
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
+        if Process.alive?(starts), do: Agent.stop(starts)
+        File.rm_rf(workspace_root)
+      end)
+
+      starter = fn ^workspace, ^issue, nil, "In Review", start_opts ->
+        assert start_opts[:async] == true
+        attempt = Agent.get_and_update(starts, fn count -> {count, count + 1} end)
+        send(test_pid, {:durable_gate_start_attempt, attempt + 1})
+
+        if attempt == 0 do
+          {:infrastructure_error, "gate start timed out", %{status: :infrastructure_error}}
+        else
+          {:pending, async_gate(:pending)}
+        end
+      end
+
+      poller = fn ^workspace, ^issue, nil, "In Review", "job-7157", _poll_opts ->
+        send(test_pid, :recovered_gate_polled)
+        {:passed, async_gate(:passed)}
+      end
+
+      linear_client = fn ^query, %{}, [] ->
+        send(test_pid, :recovered_gate_handoff_applied)
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+
+      state_fetcher = fn ["issue-gate-start-recovery"] -> {:ok, [issue]} end
+
+      opts = [
+        agent_backend: {TurnCountingBackend, %{}},
+        issue_context_file: Workspace.issue_context_path(workspace),
+        issue_state_fetcher: state_fetcher,
+        handoff_gate_starter: starter,
+        handoff_gate_poller: poller,
+        handoff_gate_sleep: fn _milliseconds -> :ok end,
+        linear_client: linear_client,
+        max_turns: 1
+      ]
+
+      assert {:error, {:handoff_gate_infrastructure, %{message: "gate start timed out", gate: %{status: :infrastructure_error}}}} =
+               AgentRunner.run_codex_turns_for_test(workspace, issue, nil, opts, nil)
+
+      assert_received {:durable_gate_start_attempt, 1}
+      refute_received :turn_ran
+
+      assert {:ok, %{"phase" => "starting"}} = Workspace.load_handoff_gate_state(workspace)
+
+      assert :ok = AgentRunner.run_codex_turns_for_test(workspace, issue, nil, opts, nil)
+
+      assert_received {:durable_gate_start_attempt, 2}
+      assert_received :recovered_gate_polled
+      assert_received :recovered_gate_handoff_applied
+      refute_received :turn_ran
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
     test "reattaches to a durable job and applies an exact-candidate pass without a model turn" do
       workspace_root =
         Path.join(System.tmp_dir!(), "symphony-gate-recovery-#{System.unique_integer([:positive])}")

@@ -594,40 +594,77 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     do: {:error, {:blocked_transition_requires_human_blocker, @human_blocker_kinds}}
 
   defp run_resolved_handoff_gate(request, handoff_opts) do
-    result =
-      HandoffGate.run_before_handoff(
-        request.workspace,
-        request.issue,
-        request.worker_host,
-        request.target_state,
-        handoff_opts
-      )
+    durable_request = handoff_request(request)
 
-    case result do
+    case persist_starting_handoff_gate(request.context, durable_request) do
       :ok ->
-        run_review_gate_for_request(request)
+        result =
+          HandoffGate.run_before_handoff(
+            request.workspace,
+            request.issue,
+            request.worker_host,
+            request.target_state,
+            handoff_opts
+          )
 
-      {:passed, gate} ->
-        request
-        |> put_handoff_gate_attestations(gate)
-        |> run_review_gate_for_request()
+        handle_resolved_handoff_gate_result(result, request, durable_request)
 
-      {:pending, gate} ->
-        defer_handoff_gate(request, gate)
-
-      {:blocked, prompt, gates} ->
-        {:handoff_blocked, prompt, gates}
-
-      {:failed, prompt, gate} ->
-        {:handoff_blocked, prompt, protocol_gate_list(gate)}
-
-      {:invalidated, prompt, gate} ->
-        {:handoff_blocked, prompt, protocol_gate_list(gate)}
-
-      {:infrastructure_error, prompt, gate} ->
-        {:handoff_infrastructure_error, prompt, gate}
+      {:error, reason} ->
+        prompt = "Symphony could not persist the handoff attempt before starting the gate: #{inspect(reason)}"
+        {:handoff_infrastructure_error, prompt, %{status: :infrastructure_error, reason: reason}}
     end
   end
+
+  defp handle_resolved_handoff_gate_result({:pending, gate}, request, _durable_request) do
+    defer_handoff_gate(request, gate)
+  end
+
+  defp handle_resolved_handoff_gate_result(
+         {:infrastructure_error, prompt, gate},
+         request,
+         durable_request
+       ) do
+    if is_binary(Map.get(gate, :job_id)) do
+      case clear_starting_handoff_gate(request.context, durable_request) do
+        :ok ->
+          {:handoff_infrastructure_error, prompt, gate}
+
+        {:error, reason} ->
+          clear_prompt = "Symphony could not clear the durable handoff attempt after the gate completed: #{inspect(reason)}"
+          {:handoff_infrastructure_error, clear_prompt, %{status: :infrastructure_error, reason: reason}}
+      end
+    else
+      {:handoff_infrastructure_error, prompt, gate}
+    end
+  end
+
+  defp handle_resolved_handoff_gate_result(result, request, durable_request) do
+    case clear_starting_handoff_gate(request.context, durable_request) do
+      :ok ->
+        handle_terminal_handoff_gate_result(result, request)
+
+      {:error, reason} ->
+        prompt = "Symphony could not clear the durable handoff attempt after the gate completed: #{inspect(reason)}"
+        {:handoff_infrastructure_error, prompt, %{status: :infrastructure_error, reason: reason}}
+    end
+  end
+
+  defp handle_terminal_handoff_gate_result(:ok, request), do: run_review_gate_for_request(request)
+
+  defp handle_terminal_handoff_gate_result({:passed, gate}, request) do
+    request
+    |> put_handoff_gate_attestations(gate)
+    |> run_review_gate_for_request()
+  end
+
+  defp handle_terminal_handoff_gate_result({:blocked, prompt, gates}, _request),
+    do: {:handoff_blocked, prompt, gates}
+
+  defp handle_terminal_handoff_gate_result({:failed, prompt, gate}, _request),
+    do: {:handoff_blocked, prompt, protocol_gate_list(gate)}
+
+  defp handle_terminal_handoff_gate_result({:invalidated, prompt, gate}, _request),
+    do: {:handoff_blocked, prompt, protocol_gate_list(gate)}
 
   defp run_review_gate_for_request(request) do
     run_review_gate(
@@ -657,22 +694,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp defer_handoff_gate(request_context, gate) do
     context = request_context.context
-
-    request = %{
-      query: request_context.query,
-      variables: request_context.variables,
-      workspace: request_context.workspace,
-      issue: request_context.issue,
-      worker_host: request_context.worker_host,
-      target_state: request_context.target_state,
-      gate: gate,
-      before_handoff_command: context_value(context, :before_handoff_command),
-      before_handoff_timeout_ms: context_value(context, :before_handoff_timeout_ms),
-      before_handoff_stale_ms: context_value(context, :before_handoff_stale_ms),
-      review_workflow: context_value(context, :review_workflow),
-      review_opts: context_value(context, :review_opts) || [],
-      linear_client: request_context.linear_client
-    }
+    request = handoff_request(request_context, gate)
 
     case deferred_handoff_gate_callback(context) do
       callback when is_function(callback, 1) ->
@@ -690,6 +712,44 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         {:handoff_infrastructure_error, prompt, gate}
     end
   end
+
+  defp handoff_request(request_context, gate \\ nil) do
+    context = request_context.context
+
+    %{
+      query: request_context.query,
+      variables: request_context.variables,
+      workspace: request_context.workspace,
+      issue: request_context.issue,
+      worker_host: request_context.worker_host,
+      target_state: request_context.target_state,
+      before_handoff_command: context_value(context, :before_handoff_command),
+      before_handoff_timeout_ms: context_value(context, :before_handoff_timeout_ms),
+      before_handoff_stale_ms: context_value(context, :before_handoff_stale_ms),
+      review_workflow: context_value(context, :review_workflow),
+      review_opts: context_value(context, :review_opts) || [],
+      linear_client: request_context.linear_client
+    }
+    |> maybe_put_map_value(:gate, gate)
+  end
+
+  defp persist_starting_handoff_gate(context, request) do
+    invoke_handoff_state_callback(context, :handoff_gate_start_callback, request)
+  end
+
+  defp clear_starting_handoff_gate(context, request) do
+    invoke_handoff_state_callback(context, :handoff_gate_clear_callback, request)
+  end
+
+  defp invoke_handoff_state_callback(context, key, request) do
+    case context_value(context, key) do
+      callback when is_function(callback, 1) -> callback.(request)
+      _callback -> :ok
+    end
+  end
+
+  defp maybe_put_map_value(map, _key, nil), do: map
+  defp maybe_put_map_value(map, key, value), do: Map.put(map, key, value)
 
   defp context_value(context, key) when is_map(context) and is_atom(key),
     do: Map.get(context, key) || Map.get(context, Atom.to_string(key))
