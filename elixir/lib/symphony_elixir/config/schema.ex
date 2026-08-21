@@ -413,6 +413,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:session_start, :string)
       field(:before_run, :string)
       field(:before_handoff, :string)
+      field(:before_handoff_poll, :string)
       field(:after_run, :string)
       field(:before_remove, :string)
       field(:timeout_ms, :integer, default: 60_000)
@@ -427,6 +428,7 @@ defmodule SymphonyElixir.Config.Schema do
         :session_start,
         :before_run,
         :before_handoff,
+        :before_handoff_poll,
         :after_run,
         :before_remove,
         :timeout_ms,

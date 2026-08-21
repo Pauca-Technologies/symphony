@@ -174,6 +174,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
         timeout_ms = Keyword.get(opts, :turn_timeout_ms, Config.settings!().codex.turn_timeout_ms)
+        timeout_mode = Keyword.get(opts, :turn_timeout_mode, :absolute)
 
         case await_turn_completion(
                port,
@@ -181,7 +182,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                turn_id,
                tool_executor,
                auto_approve_requests,
-               timeout_ms
+               timeout_ms,
+               timeout_mode
              ) do
           {:ok, result} ->
             handle_turn_success(
@@ -639,15 +641,16 @@ defmodule SymphonyElixir.Codex.AppServer do
          turn_id,
          tool_executor,
          auto_approve_requests,
-         timeout_ms
+         timeout_ms,
+         timeout_mode
        ) do
-    deadline_ms = optional_deadline(timeout_ms)
+    timeout_state = turn_timeout_state(timeout_ms, timeout_mode)
 
     receive_loop(
       port,
       on_message,
       turn_id,
-      deadline_ms,
+      timeout_state,
       "",
       tool_executor,
       auto_approve_requests
@@ -720,9 +723,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   # *our* turn — see `handle_incoming/7` — so the first subagent to finish is
   # not mistaken for the parent turn completing.
   defp receive_loop(port, on_message, turn_id, deadline_ms, pending_line, tool_executor, auto_approve_requests) do
-    # A positive configured timeout remains an absolute monotonic deadline.
-    # Zero disables that optional hard cap; the orchestrator's independent
-    # stall watchdog still terminates turns that stop producing activity.
+    deadline_ms = refresh_idle_timeout(deadline_ms)
+    # Normal turns use an absolute monotonic deadline. Callers that explicitly
+    # select idle mode refresh it after every event. Zero disables the optional
+    # cap; the orchestrator still has its independent stall watchdog.
     remaining_ms = remaining_timeout(deadline_ms)
 
     receive do
@@ -745,18 +749,33 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:port_exit, status}}
     after
       remaining_ms ->
-        {:error, :turn_timeout}
+        {:error, timeout_reason(deadline_ms)}
     end
   end
+
+  defp turn_timeout_state(timeout_ms, mode)
+       when is_integer(timeout_ms) and timeout_ms > 0 and mode in [:absolute, :idle] do
+    {mode, timeout_ms, optional_deadline(timeout_ms)}
+  end
+
+  defp turn_timeout_state(_timeout_ms, _mode), do: {:disabled, 0, nil}
+
+  defp refresh_idle_timeout({:idle, timeout_ms, _deadline_ms}),
+    do: {:idle, timeout_ms, optional_deadline(timeout_ms)}
+
+  defp refresh_idle_timeout(timeout_state), do: timeout_state
+
+  defp timeout_reason({:idle, _timeout_ms, _deadline_ms}), do: :turn_stalled
+  defp timeout_reason(_timeout_state), do: :turn_timeout
 
   defp optional_deadline(timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0,
     do: System.monotonic_time(:millisecond) + timeout_ms
 
   defp optional_deadline(_timeout_ms), do: nil
 
-  defp remaining_timeout(nil), do: :infinity
+  defp remaining_timeout({_mode, _timeout_ms, nil}), do: :infinity
 
-  defp remaining_timeout(deadline_ms),
+  defp remaining_timeout({_mode, _timeout_ms, deadline_ms}),
     do: max(0, deadline_ms - System.monotonic_time(:millisecond))
 
   defp handle_incoming(port, on_message, turn_id, data, timeout_ms, tool_executor, auto_approve_requests) do

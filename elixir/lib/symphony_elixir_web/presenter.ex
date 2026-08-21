@@ -214,6 +214,15 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(retry), do: Map.get(retry, :attempt, 0) || 0
 
   defp issue_status(_running, _retry, %{}), do: "waiting"
+  defp issue_status(%{lifecycle_state: :handoff_pending_gate}, _retry, nil), do: "validating"
+  defp issue_status(%{lifecycle_state: :handoff_pending_review}, _retry, nil), do: "reviewing"
+
+  defp issue_status(%{review_state: review}, _retry, nil) when is_map(review) do
+    if review_value(review, :outcome) in [:request_changes, "request_changes"],
+      do: "changes requested",
+      else: "running"
+  end
+
   defp issue_status(_running, nil, nil), do: "running"
   defp issue_status(nil, _retry, nil), do: "retrying"
   defp issue_status(_running, _retry, nil), do: "running"
@@ -497,6 +506,7 @@ defmodule SymphonyElixirWeb.Presenter do
       session_id: running.session_id,
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
+      phase: lifecycle_phase(running),
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
@@ -546,6 +556,22 @@ defmodule SymphonyElixirWeb.Presenter do
       _gate -> payload
     end
   end
+
+  defp lifecycle_phase(%{lifecycle_state: :handoff_pending_gate}), do: "Validation running"
+
+  defp lifecycle_phase(%{lifecycle_state: :handoff_pending_review}),
+    do: "Landable; automated review running"
+
+  defp lifecycle_phase(%{review_state: review}) when is_map(review) do
+    if review_value(review, :outcome) in [:request_changes, "request_changes"],
+      do: "Reviewer requested changes",
+      else: "Implementation"
+  end
+
+  defp lifecycle_phase(_entry), do: "Implementation"
+
+  defp review_value(review, key) when is_map(review) and is_atom(key),
+    do: Map.get(review, key) || Map.get(review, Atom.to_string(key))
 
   # The actual backend + model/effort the run is using, captured from the running
   # session (not re-derived from the issue's labels). `backend` is the resolved

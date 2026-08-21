@@ -628,6 +628,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Enum.map(payload.handoff, & &1.issue_identifier) == ["UDPE-7016"]
     assert length(payload.running) == 2
 
+    assert {:ok, handoff_payload} =
+             SymphonyElixirWeb.Presenter.issue_payload("UDPE-7016", orchestrator_name, 50)
+
+    assert handoff_payload.status == "validating"
+    assert handoff_payload.running.phase == "Validation running"
+
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
     {:ok, _view, html} = live(build_conn(), "/")
 
@@ -826,6 +832,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "session_id" => "thread-http",
                "turn_count" => 7,
                "state" => "In Progress",
+               "phase" => "Implementation",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
                "last_message" => "rendered",

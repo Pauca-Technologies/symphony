@@ -263,6 +263,10 @@ defmodule SymphonyElixir.AgentRunner do
           |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
           |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
           |> maybe_put(
+            :per_repo_before_handoff_poll,
+            Map.get(repo_hook_opts, :before_handoff_poll)
+          )
+          |> maybe_put(
             :per_repo_before_handoff_timeout_ms,
             Map.get(repo_hook_opts, :before_handoff_timeout_ms)
           )
@@ -414,6 +418,7 @@ defmodule SymphonyElixir.AgentRunner do
       after_run: Map.get(hooks, "after_run"),
       session_start: Map.get(hooks, "session_start"),
       before_handoff: Map.get(hooks, "before_handoff"),
+      before_handoff_poll: Map.get(hooks, "before_handoff_poll"),
       before_handoff_timeout_ms: Map.get(hooks, "before_handoff_timeout_ms"),
       before_handoff_stale_ms: Map.get(hooks, "before_handoff_stale_ms"),
       after_create: Map.get(hooks, "after_create"),
@@ -1137,6 +1142,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp dynamic_tool_executor(issue, workspace, worker_host, lifecycle_recipient, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
     per_repo_before_handoff = Keyword.get(opts, :per_repo_before_handoff)
+    per_repo_before_handoff_poll = Keyword.get(opts, :per_repo_before_handoff_poll)
     per_repo_before_handoff_timeout_ms = Keyword.get(opts, :per_repo_before_handoff_timeout_ms)
     per_repo_before_handoff_stale_ms = Keyword.get(opts, :per_repo_before_handoff_stale_ms)
     per_repo_review_workflow = Keyword.get(opts, :per_repo_review_workflow)
@@ -1151,6 +1157,7 @@ defmodule SymphonyElixir.AgentRunner do
     handoff_context =
       %{issue: issue, workspace: workspace, worker_host: worker_host}
       |> maybe_put_map(:before_handoff_command, per_repo_before_handoff)
+      |> maybe_put_map(:before_handoff_poll_command, per_repo_before_handoff_poll)
       |> maybe_put_map(:before_handoff_timeout_ms, per_repo_before_handoff_timeout_ms)
       |> maybe_put_map(:before_handoff_stale_ms, per_repo_before_handoff_stale_ms)
       |> Map.put(:deferred_handoff_gate_callback, &store_deferred_handoff_gate/1)
@@ -1416,6 +1423,7 @@ defmodule SymphonyElixir.AgentRunner do
          target_state: target_state,
          gate: gate,
          before_handoff_command: Keyword.get(opts, :per_repo_before_handoff),
+         before_handoff_poll_command: Keyword.get(opts, :per_repo_before_handoff_poll),
          before_handoff_timeout_ms: Keyword.get(opts, :per_repo_before_handoff_timeout_ms),
          before_handoff_stale_ms: Keyword.get(opts, :per_repo_before_handoff_stale_ms),
          review_workflow: Keyword.get(opts, :per_repo_review_workflow),
@@ -1538,6 +1546,7 @@ defmodule SymphonyElixir.AgentRunner do
     poll_opts =
       [expected_candidate_hash: gate.candidate_hash]
       |> maybe_put(:hook_command, Map.get(request, :before_handoff_command))
+      |> maybe_put(:poll_command, Map.get(request, :before_handoff_poll_command))
       |> maybe_put(:timeout_ms, Map.get(request, :before_handoff_timeout_ms))
       |> maybe_put(:stale_ms, Map.get(request, :before_handoff_stale_ms))
 
@@ -1718,8 +1727,10 @@ defmodule SymphonyElixir.AgentRunner do
     worker_host = Map.get(request, :worker_host)
     review_workflow = Map.fetch!(request, :review_workflow)
     review_job_id = System.unique_integer([:positive, :monotonic])
-    review_opts = review_opts_with_progress(request, recipient, issue, review_job_id)
     review_timeout_ms = handoff_review_timeout_ms(AgentBackend.backend_name(backend))
+
+    review_opts =
+      review_opts_with_progress(request, recipient, issue, review_job_id, review_timeout_ms)
 
     Logger.info("review.gate deferred starting #{issue_context(issue)} workspace=#{workspace}")
 
@@ -1829,7 +1840,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp handoff_review_timeout_ms(backend_name),
     do: Config.backend_review_timeout_ms(backend_name)
 
-  defp review_opts_with_progress(request, recipient, issue, review_job_id) do
+  defp review_opts_with_progress(request, recipient, issue, review_job_id, review_timeout_ms) do
     review_opts =
       request
       |> Map.get(:review_opts, [])
@@ -1850,7 +1861,9 @@ defmodule SymphonyElixir.AgentRunner do
       )
     end
 
-    Keyword.put(review_opts, :on_message, on_message)
+    review_opts
+    |> Keyword.put(:on_message, on_message)
+    |> Keyword.put(:inactivity_timeout_ms, review_timeout_ms)
   end
 
   defp put_handoff_gate_attestations(review_opts, gate, worker_host) do

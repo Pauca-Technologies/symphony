@@ -490,6 +490,7 @@ defmodule SymphonyElixir.ReviewGate do
               settings.tool_output_max_bytes
             ),
           on_message: on_message,
+          inactivity_timeout_ms: Keyword.get(opts, :inactivity_timeout_ms, settings.turn_timeout_ms),
           review_settings: settings
         }
 
@@ -608,7 +609,7 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp handle_review_session_failure(%{issue: %Issue{} = issue, opts: opts} = review_context, attempt, reason) do
-    if attempt < @max_verdict_attempts do
+    if attempt < @max_verdict_attempts and retryable_review_session_failure?(reason) do
       Logger.warning("review.gate session failed #{issue_context(issue)} reason=#{inspect(reason)} attempt=#{attempt}; retrying")
 
       run_iteration(review_context, attempt + 1, {:review_session_failed, reason})
@@ -622,6 +623,13 @@ defmodule SymphonyElixir.ReviewGate do
       )
     end
   end
+
+  defp retryable_review_session_failure?(reason),
+    do: not review_timeout_or_stall?(reason)
+
+  defp review_timeout_or_stall?(reason) when reason in [:turn_timeout, :turn_stalled], do: true
+  defp review_timeout_or_stall?({reason, _details}) when reason in [:turn_timeout, :turn_stalled], do: true
+  defp review_timeout_or_stall?(_reason), do: false
 
   # On both verdicts we refresh the PR's human-review section from the reviewer's
   # review_effort tier + prose (effort is orthogonal to the verdict — a change
@@ -771,6 +779,7 @@ defmodule SymphonyElixir.ReviewGate do
          prompt: prompt,
          tool_executor: tool_executor,
          on_message: on_message,
+         inactivity_timeout_ms: inactivity_timeout_ms,
          review_settings: settings
        }) do
     opts =
@@ -779,7 +788,8 @@ defmodule SymphonyElixir.ReviewGate do
         tool_executor: tool_executor,
         ephemeral: true,
         overrides: review_overrides(settings),
-        turn_timeout_ms: settings.turn_timeout_ms
+        turn_timeout_ms: inactivity_timeout_ms,
+        turn_timeout_mode: :idle
       ]
       |> maybe_put_on_message(on_message)
 

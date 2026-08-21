@@ -610,6 +610,26 @@ defmodule SymphonyElixir.ReviewGateTest do
     end
   end
 
+  test "does not repeat a full reviewer turn after a timeout", %{workspace: workspace} do
+    test_pid = self()
+
+    runner = fn _ctx ->
+      send(test_pid, :review_timeout_attempt)
+      {:error, :turn_stalled}
+    end
+
+    assert {:infrastructure_unavailable, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner(),
+               comment_fn: fn _issue_id, _body -> :ok end
+             )
+
+    assert outcome.attempts == 1
+    assert_received :review_timeout_attempt
+    refute_received :review_timeout_attempt
+  end
+
   test "a later request_changes verdict replaces approval evidence", %{workspace: workspace} do
     runner = fn ctx ->
       verdict =

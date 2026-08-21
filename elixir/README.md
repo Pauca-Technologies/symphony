@@ -50,7 +50,9 @@ report for the original candidate can release the mutation. Failed and invalidat
 the implementor once with compact remediation. Stale-heartbeat, malformed-protocol, and other
 infrastructure outcomes fail the worker attempt and enter orchestrator backoff without consuming
 more model turns or changing the issue to `Blocked`. A restart reattaches to the persisted job
-rather than starting a duplicate gate.
+rather than starting a duplicate gate. Repositories may configure `hooks.before_handoff_poll` as a
+cheap job-status command. Poll-only invocations skip repeated GitHub credential preparation and
+issue-context refresh; repositories without that hook continue to reuse `before_handoff`.
 
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
@@ -218,6 +220,8 @@ hooks:
     scripts/hooks/session-start.sh
   before_handoff: |
     scripts/hooks/before-handoff.sh
+  before_handoff_poll: |
+    scripts/hooks/poll-before-handoff.sh
   before_handoff_timeout_ms: 60000
   before_handoff_stale_ms: 120000
 agent:
@@ -563,7 +567,9 @@ Notes:
   hook uses its configured hook timeout instead of the coding-agent stall timeout.
   Protocol-aware hooks receive `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. Exit `3` with a version 1
   `pending`/`running` JSON report to defer the mutation; subsequent lightweight polls receive
-  `SYMPHONY_HANDOFF_GATE_JOB_ID`. Configure the hook invocation deadline independently with
+  `SYMPHONY_HANDOFF_GATE_JOB_ID`. Configure `before_handoff_poll` to make those polls a dedicated
+  cheap job-status command that skips GitHub auth preparation and issue-context refresh. If it is
+  absent, Symphony polls with `before_handoff` for compatibility. Configure the invocation deadline with
   `before_handoff_timeout_ms` and the maximum accepted heartbeat age with
   `before_handoff_stale_ms`. The runtime APIs expose job/candidate identity, pending age,
   heartbeat age, progress stage, and next-poll delay while the issue is `handoff_pending_gate`.
@@ -578,14 +584,16 @@ Notes:
   The issue remains claimed in a distinct `handoff_pending_review` lifecycle while that reviewer
   runs, so the completed implementor is not mistaken for a stalled turn. Reviewer events emit a
   minimal, job-scoped heartbeat that refreshes worker activity without replacing implementor
-  session or token accounting; a silent reviewer is timed out with a review-specific log and retry.
+  session or token accounting. The reviewer deadline is an inactivity timeout refreshed by progress;
+  a silent reviewer is timed out with a review-specific log and is not immediately repeated for the
+  same full deadline.
   Symphony also pins the reviewed PR head and rechecks it before applying the transition, so a push
   during review requires a fresh handoff review.
   When a worker is stopped or exits, Symphony terminates its external descendant processes before
   discarding the worker, preventing hook and validation commands from being orphaned while
   preserving the worker BEAM's own runtime helpers until the VM exits normally.
-  Reviewer session/verdict failures receive one bounded retry and are then latched for that
-  candidate during the current orchestration run; budget exhaustion is likewise latched and never
+  Non-timeout reviewer session/verdict failures receive one bounded retry and are then latched for
+  that candidate during the current orchestration run; budget exhaustion is likewise latched and never
   spawns another reviewer in that run. To recover, repair reviewer tool/auth/runtime or verdict
   production, then start a fresh orchestration run (or attach/update the candidate head). For
   `budget_exhausted_with_findings`, a human must explicitly resolve or accept the recorded findings;

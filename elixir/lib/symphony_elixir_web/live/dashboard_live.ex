@@ -143,8 +143,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <p class="metric-value"><%= String.capitalize(@issue_payload.status) %></p>
               <p class="metric-detail">
                 <%= if @issue_payload.running do %>
-                  <span class={state_badge_class(@issue_payload.running.state)}>
-                    <%= @issue_payload.running.state %>
+                  <span class={state_badge_class(@issue_payload.status)}>
+                    <%= @issue_payload.running.phase %>
                   </span>
                 <% else %>
                   <%= if @issue_payload.waiting do %>

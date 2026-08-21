@@ -144,6 +144,75 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "idle turn timeout is refreshed while events keep streaming" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-idle-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1000-IDLE")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-idle"}}}' ;;
+          3)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-idle"}}}'
+            i=0
+            while [ "$i" -lt 4 ]; do
+              sleep 0.07
+              printf '%s\n' '{"method":"turn/progress","params":{"turn":{"id":"turn-idle"}}}'
+              i=$((i + 1))
+            done
+            printf '%s\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-idle-timeout",
+        identifier: "MT-1000-IDLE",
+        title: "Refresh a progressing turn",
+        state: "In Progress"
+      }
+
+      opts = [
+        turn_timeout_ms: 120,
+        turn_timeout_mode: :idle,
+        issue_context_file: Path.join(test_root, "issue-context.json")
+      ]
+
+      assert {:ok, session} = AppServer.start_session(workspace, opts)
+
+      try do
+        started = System.monotonic_time(:millisecond)
+        assert {:ok, _result} = AppServer.run_turn(session, "Keep streaming", issue, opts)
+        assert System.monotonic_time(:millisecond) - started >= 250
+      after
+        AppServer.stop_session(session)
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server applies model/effort overrides and passes explicit turn policies through unchanged" do
     test_root =
       Path.join(

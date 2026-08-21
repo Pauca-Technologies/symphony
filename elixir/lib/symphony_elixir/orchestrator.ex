@@ -477,16 +477,18 @@ defmodule SymphonyElixir.Orchestrator do
         do: Map.get(running_entry, :lifecycle_started_at, now),
         else: now
 
-    Logger.info(
-      "Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=handoff_pending_gate gate_job_id=#{gate_job_id} status=#{Map.get(gate, :status)}"
-    )
+    unless unchanged_handoff_gate_update?(running_entry, gate_job_id, gate) do
+      Logger.info(
+        "Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=handoff_pending_gate gate_job_id=#{gate_job_id} status=#{Map.get(gate, :status)}"
+      )
 
-    emit_agent_lifecycle(running_entry, previous_state, :handoff_pending_gate, %{
-      gate_job_id: gate_job_id,
-      gate_job_identity: Map.get(gate, :exact_hash),
-      gate_status: Map.get(gate, :status),
-      gate_stage: get_in(gate, [:progress, "stage"]) || get_in(gate, [:progress, :stage])
-    })
+      emit_agent_lifecycle(running_entry, previous_state, :handoff_pending_gate, %{
+        gate_job_id: gate_job_id,
+        gate_job_identity: Map.get(gate, :exact_hash),
+        gate_status: Map.get(gate, :status),
+        gate_stage: gate_progress_value(gate, "stage")
+      })
+    end
 
     running_entry
     |> Map.put(:lifecycle_state, :handoff_pending_gate)
@@ -615,6 +617,26 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp transition_agent_lifecycle(running_entry, _lifecycle_state, _metadata),
     do: running_entry
+
+  defp unchanged_handoff_gate_update?(running_entry, gate_job_id, gate) do
+    previous_gate = Map.get(running_entry, :handoff_gate_state, %{})
+
+    Map.get(running_entry, :lifecycle_state) == :handoff_pending_gate and
+      Map.get(running_entry, :handoff_gate_job_id) == gate_job_id and
+      Map.get(previous_gate, :status) == Map.get(gate, :status) and
+      gate_progress_value(previous_gate, "stage") == gate_progress_value(gate, "stage") and
+      gate_progress_value(previous_gate, "completed") == gate_progress_value(gate, "completed")
+  end
+
+  defp gate_progress_value(gate, "stage") when is_map(gate) do
+    progress = Map.get(gate, :progress) || Map.get(gate, "progress") || %{}
+    Map.get(progress, "stage") || Map.get(progress, :stage)
+  end
+
+  defp gate_progress_value(gate, "completed") when is_map(gate) do
+    progress = Map.get(gate, :progress) || Map.get(gate, "progress") || %{}
+    Map.get(progress, "completed") || Map.get(progress, :completed)
+  end
 
   defp emit_agent_lifecycle(running_entry, from, to, details) do
     issue = Map.get(running_entry, :issue, %{})

@@ -358,8 +358,7 @@ defmodule SymphonyElixir.Workspace do
     issue_context = issue_context(issue_or_identifier)
     command = resolve_hook_command(:before_handoff, Keyword.get(opts, :hook_command))
 
-    with {:ok, _issue_context_file} <-
-           prepare_issue_context(workspace, issue_or_identifier, worker_host) do
+    with :ok <- maybe_prepare_handoff_issue_context(workspace, issue_or_identifier, worker_host, opts) do
       case command do
         nil ->
           {:ok, ""}
@@ -368,9 +367,22 @@ defmodule SymphonyElixir.Workspace do
           run_hook(command, workspace, issue_context, "before_handoff", worker_host,
             capture_output: true,
             timeout_ms: Keyword.get(opts, :timeout_ms),
-            env: handoff_hook_env(opts)
+            env: handoff_hook_env(opts),
+            github_auth: Keyword.get(opts, :github_auth, true),
+            quiet: Keyword.get(opts, :quiet, false)
           )
       end
+    end
+  end
+
+  defp maybe_prepare_handoff_issue_context(workspace, issue_or_identifier, worker_host, opts) do
+    if Keyword.get(opts, :prepare_issue_context, true) do
+      case prepare_issue_context(workspace, issue_or_identifier, worker_host) do
+        {:ok, _path} -> :ok
+        {:error, _reason} = error -> error
+      end
+    else
+      :ok
     end
   end
 
@@ -540,7 +552,10 @@ defmodule SymphonyElixir.Workspace do
     timeout_ms = Keyword.get(opts, :timeout_ms) || Config.settings!().hooks.timeout_ms
     capture_output? = Keyword.get(opts, :capture_output, false)
 
-    Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
+    log_hook_start(
+      "Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local",
+      opts
+    )
 
     with {:ok, github_env} <- github_hook_env(workspace, nil, opts) do
       env = port_hook_env(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
@@ -565,7 +580,10 @@ defmodule SymphonyElixir.Workspace do
     timeout_ms = Keyword.get(opts, :timeout_ms) || Config.settings!().hooks.timeout_ms
     capture_output? = Keyword.get(opts, :capture_output, false)
 
-    Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
+    log_hook_start(
+      "Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}",
+      opts
+    )
 
     with {:ok, github_env} <- github_hook_env(workspace, worker_host, opts) do
       exports = remote_hook_exports(workspace, merge_env(github_env, Keyword.get(opts, :env, [])))
@@ -680,12 +698,21 @@ defmodule SymphonyElixir.Workspace do
     {:ok, IO.iodata_to_binary(output)}
   end
 
+  defp handle_hook_command_result({output, 3}, _workspace, _issue_context, "before_handoff", _capture_output?) do
+    Logger.debug("Workspace before_handoff hook reported an asynchronous pending/running result")
+    {:error, {:workspace_hook_failed, "before_handoff", 3, output}}
+  end
+
   defp handle_hook_command_result({output, status}, workspace, issue_context, hook_name, _capture_output?) do
     sanitized_output = sanitize_hook_output_for_log(output)
 
     Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}")
 
     {:error, {:workspace_hook_failed, hook_name, status, output}}
+  end
+
+  defp log_hook_start(message, opts) do
+    if Keyword.get(opts, :quiet, false), do: Logger.debug(message), else: Logger.info(message)
   end
 
   defp sanitize_hook_output_for_log(output, max_bytes \\ 2_048) do
