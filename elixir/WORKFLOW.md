@@ -70,12 +70,10 @@ hooks:
   # Repositories can use it to block handoff until repo-local gates pass, for example:
   # before_handoff: |
   #   scripts/hooks/before-handoff.sh
-  # Async protocol invocations receive SYMPHONY_HANDOFF_GATE_PROTOCOL=1. A repo
-  # can provide a cheap poll-only command; it also receives the durable job ID
-  # and runs without repeated GitHub auth or issue-context preparation. Without
-  # it, polls reuse before_handoff for compatibility.
-  # before_handoff_poll: |
-  #   scripts/hooks/poll-before-handoff.sh
+  # Async protocol invocations receive SYMPHONY_HANDOFF_GATE_PROTOCOL=1. Polls
+  # reuse before_handoff with SYMPHONY_HANDOFF_GATE_JOB_ID and skip repeated
+  # GitHub auth and issue-context preparation, so the command should branch to
+  # its cheap durable-job read before normal setup.
   # These limits are independent of other lifecycle hooks.
   before_handoff_timeout_ms: 60000
   before_handoff_stale_ms: 120000

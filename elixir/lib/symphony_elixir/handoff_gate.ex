@@ -81,29 +81,19 @@ defmodule SymphonyElixir.HandoffGate do
   @spec poll_before_handoff(Path.t(), Issue.t(), term(), String.t(), String.t(), keyword()) :: result()
   def poll_before_handoff(workspace, %Issue{} = issue, worker_host, target_state, job_id, opts \\ [])
       when is_binary(workspace) and is_binary(target_state) and is_binary(job_id) do
-    poll_command = Keyword.get(opts, :poll_command)
-
     run_hook(
       workspace,
       issue,
       worker_host,
       target_state,
       opts
-      |> maybe_use_poll_command(poll_command)
+      |> Keyword.put(:github_auth, false)
+      |> Keyword.put(:prepare_issue_context, false)
+      |> Keyword.put(:quiet, true)
       |> Keyword.put(:async, true)
       |> Keyword.put(:gate_job_id, job_id)
     )
   end
-
-  defp maybe_use_poll_command(opts, command) when is_binary(command) and command != "" do
-    opts
-    |> Keyword.put(:hook_command, command)
-    |> Keyword.put(:github_auth, false)
-    |> Keyword.put(:prepare_issue_context, false)
-    |> Keyword.put(:quiet, true)
-  end
-
-  defp maybe_use_poll_command(opts, _command), do: opts
 
   @doc false
   @spec parse_protocol_result(String.t(), non_neg_integer(), String.t() | nil, pos_integer()) ::

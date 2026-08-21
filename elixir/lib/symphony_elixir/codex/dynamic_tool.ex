@@ -423,14 +423,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     before_handoff_cmd =
       Map.get(context, :before_handoff_command) || Map.get(context, "before_handoff_command")
 
-    before_handoff_poll_cmd =
-      Map.get(context, :before_handoff_poll_command) ||
-        Map.get(context, "before_handoff_poll_command")
-
     handoff_opts =
       [async: true]
       |> maybe_put_keyword(:hook_command, before_handoff_cmd)
-      |> maybe_put_keyword(:poll_command, before_handoff_poll_cmd)
       |> maybe_put_keyword(
         :timeout_ms,
         Map.get(context, :before_handoff_timeout_ms) || Map.get(context, "before_handoff_timeout_ms")
@@ -672,7 +667,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       target_state: request_context.target_state,
       gate: gate,
       before_handoff_command: context_value(context, :before_handoff_command),
-      before_handoff_poll_command: context_value(context, :before_handoff_poll_command),
       before_handoff_timeout_ms: context_value(context, :before_handoff_timeout_ms),
       before_handoff_stale_ms: context_value(context, :before_handoff_stale_ms),
       review_workflow: context_value(context, :review_workflow),

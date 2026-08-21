@@ -1148,15 +1148,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "config reads a dedicated handoff poll hook" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      hook_before_handoff_poll: "scripts/hooks/poll-before-handoff.sh"
-    )
-
-    assert Config.settings!().hooks.before_handoff_poll ==
-             "scripts/hooks/poll-before-handoff.sh\n"
-  end
-
   test "config reads defaults for optional settings" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
@@ -1212,7 +1203,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
     assert config.hooks.before_handoff_timeout_ms == nil
-    assert config.hooks.before_handoff_poll == nil
     assert config.hooks.before_handoff_stale_ms == 120_000
 
     write_workflow_file!(Workflow.workflow_file_path(),

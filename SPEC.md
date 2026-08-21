@@ -417,11 +417,6 @@ Fields:
   - Runs before an agent-driven Linear status transition from `In Progress` to a review handoff
     state such as `In Review`.
   - Failure cancels the status transition and feeds hook remediation into the next agent turn.
-- `before_handoff_poll` (multiline shell script string, OPTIONAL)
-  - Polls a durable asynchronous handoff job by `SYMPHONY_HANDOFF_GATE_JOB_ID` after the initial
-    `before_handoff` invocation returns pending/running.
-  - Poll-only invocations skip repeated GitHub authentication and issue-context preparation. When
-    omitted, Symphony reuses `before_handoff` for compatibility.
 - `before_handoff_timeout_ms` (integer, OPTIONAL)
   - Overrides `hooks.timeout_ms` for each initial or polling invocation of `before_handoff`.
 - `before_handoff_stale_ms` (integer, OPTIONAL, default `120000`)
@@ -664,7 +659,6 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.session_start`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.before_handoff`: shell script or null
-- `hooks.before_handoff_poll`: shell script or null; falls back to `hooks.before_handoff`
 - `hooks.before_handoff_timeout_ms`: positive integer or null; falls back to `hooks.timeout_ms`
 - `hooks.before_handoff_stale_ms`: positive integer, default `120000`
 - `hooks.after_run`: shell script or null
@@ -1087,10 +1081,9 @@ Execution contract:
   written outside the agent-writable workspace, MUST NOT contain tracker credentials, and SHOULD
   be refreshed from the same normalized issue and comment activity used to assemble the first turn
   before session startup and before `hooks.before_handoff`.
-- A configured `hooks.before_handoff_poll` MUST replace `hooks.before_handoff` only for durable job
-  polls. It receives `SYMPHONY_HANDOFF_GATE_PROTOCOL=1` and `SYMPHONY_HANDOFF_GATE_JOB_ID`, and MUST
-  run without repeated GitHub credential preparation or issue-context refresh. If it is absent,
-  polls reuse `hooks.before_handoff`.
+- Durable job polls MUST reuse `hooks.before_handoff` with `SYMPHONY_HANDOFF_GATE_PROTOCOL=1` and
+  `SYMPHONY_HANDOFF_GATE_JOB_ID`, without repeated GitHub credential preparation or issue-context
+  refresh. Protocol-aware commands SHOULD branch to the durable-job read before normal hook setup.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. `before_handoff` may override each
   invocation with `hooks.before_handoff_timeout_ms`.
 - On timeout, worker stop, or worker exit, terminate the hook's external descendant processes before

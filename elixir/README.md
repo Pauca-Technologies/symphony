@@ -50,9 +50,9 @@ report for the original candidate can release the mutation. Failed and invalidat
 the implementor once with compact remediation. Stale-heartbeat, malformed-protocol, and other
 infrastructure outcomes fail the worker attempt and enter orchestrator backoff without consuming
 more model turns or changing the issue to `Blocked`. A restart reattaches to the persisted job
-rather than starting a duplicate gate. Repositories may configure `hooks.before_handoff_poll` as a
-cheap job-status command. Poll-only invocations skip repeated GitHub credential preparation and
-issue-context refresh; repositories without that hook continue to reuse `before_handoff`.
+rather than starting a duplicate gate. Poll-only invocations reuse `hooks.before_handoff` with the
+durable job ID while skipping repeated GitHub credential preparation and issue-context refresh; the
+repository command should branch to its cheap job-status read before normal handoff setup.
 
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
@@ -220,8 +220,6 @@ hooks:
     scripts/hooks/session-start.sh
   before_handoff: |
     scripts/hooks/before-handoff.sh
-  before_handoff_poll: |
-    scripts/hooks/poll-before-handoff.sh
   before_handoff_timeout_ms: 60000
   before_handoff_stale_ms: 120000
 agent:
@@ -566,10 +564,9 @@ Notes:
   the issue `handoff_pending_gate` before invoking even a legacy synchronous hook, so a long valid
   hook uses its configured hook timeout instead of the coding-agent stall timeout.
   Protocol-aware hooks receive `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. Exit `3` with a version 1
-  `pending`/`running` JSON report to defer the mutation; subsequent lightweight polls receive
-  `SYMPHONY_HANDOFF_GATE_JOB_ID`. Configure `before_handoff_poll` to make those polls a dedicated
-  cheap job-status command that skips GitHub auth preparation and issue-context refresh. If it is
-  absent, Symphony polls with `before_handoff` for compatibility. Configure the invocation deadline with
+  `pending`/`running` JSON report to defer the mutation; subsequent lightweight polls reuse
+  `before_handoff` with `SYMPHONY_HANDOFF_GATE_JOB_ID` and skip GitHub auth preparation and
+  issue-context refresh. The hook should read that job before normal setup. Configure the invocation deadline with
   `before_handoff_timeout_ms` and the maximum accepted heartbeat age with
   `before_handoff_stale_ms`. The runtime APIs expose job/candidate identity, pending age,
   heartbeat age, progress stage, and next-poll delay while the issue is `handoff_pending_gate`.

@@ -200,26 +200,6 @@ defmodule SymphonyElixir.HandoffGateTest do
              )
   end
 
-  test "poll uses a dedicated lightweight command when configured" do
-    workspace = temp_workspace!("handoff-dedicated-poll")
-    report = protocol_report("passed", %{"jobId" => "gate-poll-light-1"})
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: Path.dirname(workspace),
-      hook_before_handoff: "exit 99"
-    )
-
-    assert {:passed, %{job_id: "gate-poll-light-1"}} =
-             HandoffGate.poll_before_handoff(
-               workspace,
-               issue("MT-HANDOFF-LIGHT-POLL"),
-               nil,
-               "In Review",
-               "gate-poll-light-1",
-               poll_command: "printf '%s' '#{Jason.encode!(report)}'"
-             )
-  end
-
   test "poll default options preserve fail-closed protocol outcomes" do
     workspace = temp_workspace!("handoff-poll-defaults")
     passed = protocol_report("passed", %{"jobId" => "gate-default-1"})
