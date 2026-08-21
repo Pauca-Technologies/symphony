@@ -74,6 +74,128 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     assert Registry.list() == []
   end
 
+  test "a live completed worker is reattached so its terminal event can be acknowledged" do
+    issue = issue("completed-live-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, spec} = Registry.load_spec(manifest)
+    {:ok, server} = Server.start_link(spec, runner_fun: fn _recipient -> :ok end)
+    server_ref = Process.monitor(server)
+
+    assert_eventually(fn ->
+      match?([%{status: "completed"}], Registry.list())
+    end)
+
+    Application.put_env(
+      :symphony_elixir,
+      :persistent_worker_liveness_check,
+      fn candidate -> candidate.worker_id == manifest.worker_id and Process.alive?(server) end
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_liveness_check)
+    end)
+
+    {:ok, target} = RelayTarget.start_link(self())
+    assert [%{manifest: %{worker_id: worker_id}}] = PersistentWorker.attach_all(target)
+    assert worker_id == manifest.worker_id
+
+    assert_receive {:event, ^target, ^worker_id, 1, {:persistent_worker_completed, :normal}},
+                   5_000
+
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 5_000
+    assert Registry.list() == []
+  end
+
+  test "stopping records are terminated before their registry entry is removed" do
+    issue = issue("stopping-live-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, stopping} = Registry.update(manifest, %{status: "stopping", os_pid: 12_345})
+    {:ok, liveness_calls} = Agent.start_link(fn -> 0 end)
+    identity = %{pid: 12_345, ppid: 1, start_time: "100", name: "beam.smp"}
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :persistent_worker_liveness_check, fn candidate ->
+      if candidate.worker_id == stopping.worker_id do
+        Agent.get_and_update(liveness_calls, fn calls -> {calls == 0, calls + 1} end)
+      else
+        false
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_process_snapshotter, fn 12_345 ->
+      send(test_pid, :stopping_worker_snapshotted)
+      [identity]
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_identity_terminator, fn identities, _timeout ->
+      send(test_pid, {:stopping_worker_terminated, identities})
+      :ok
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_liveness_check)
+      Application.delete_env(:symphony_elixir, :persistent_worker_process_snapshotter)
+      Application.delete_env(:symphony_elixir, :persistent_worker_identity_terminator)
+    end)
+
+    assert PersistentWorker.attach_all(self()) == []
+    assert_receive :stopping_worker_snapshotted
+    assert_receive {:stopping_worker_terminated, [^identity]}
+    assert Registry.list() == []
+  end
+
+  test "a launched worker record is preserved when relay startup fails" do
+    issue = issue("relay-start-failure")
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :persistent_worker_launcher, fn manifest ->
+      send(test_pid, {:worker_launch_attempted, manifest.worker_id})
+      :ok
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_client_starter, fn _manifest, _orchestrator ->
+      {:error, :relay_unavailable}
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_launcher)
+      Application.delete_env(:symphony_elixir, :persistent_worker_client_starter)
+    end)
+
+    assert {:error, :relay_unavailable} = PersistentWorker.start(issue, 1, nil, self())
+    assert_receive {:worker_launch_attempted, worker_id}
+    assert [%{worker_id: ^worker_id}] = Registry.list()
+  end
+
+  test "startup reaps an unregistered worker only through its captured process identity" do
+    test_pid = self()
+    identity = %{pid: 23_456, ppid: 1, start_time: "200", name: "beam.smp"}
+
+    Application.put_env(:symphony_elixir, :persistent_worker_orphan_scanner, fn ->
+      [%{pid: 23_456, spec_path: "/tmp/workers/orphan/run.term"}]
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_process_snapshotter, fn 23_456 ->
+      send(test_pid, :unregistered_worker_snapshotted)
+      [identity]
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_identity_terminator, fn identities, _timeout ->
+      send(test_pid, {:unregistered_worker_terminated, identities})
+      :ok
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_orphan_scanner)
+      Application.delete_env(:symphony_elixir, :persistent_worker_process_snapshotter)
+      Application.delete_env(:symphony_elixir, :persistent_worker_identity_terminator)
+    end)
+
+    assert PersistentWorker.attach_all(self()) == []
+    assert_receive :unregistered_worker_snapshotted
+    assert_receive {:unregistered_worker_terminated, [^identity]}
+  end
+
   test "dead running records are reclaimed before adoption" do
     issue = issue("dead-record")
     assert {:ok, manifest} = Registry.prepare(issue, 1, nil)

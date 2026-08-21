@@ -48,6 +48,8 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
           run_dir: Path.t()
         }
 
+  @type orphan_worker :: %{pid: pos_integer(), spec_path: Path.t()}
+
   @doc "Return the persistent-worker registry root."
   @spec root() :: Path.t()
   def root do
@@ -90,6 +92,22 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
         entries
         |> Enum.sort()
         |> Enum.flat_map(&load_listed_manifest/1)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  @doc "Find persistent-worker processes whose registry manifest is missing."
+  @spec unregistered_workers() :: [orphan_worker()]
+  def unregistered_workers do
+    expanded_root = Path.expand(root())
+
+    case File.ls("/proc") do
+      {:ok, entries} ->
+        entries
+        |> Enum.flat_map(&load_unregistered_worker(&1, expanded_root))
+        |> Enum.sort_by(& &1.pid)
 
       {:error, _reason} ->
         []
@@ -244,13 +262,21 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
   defp prepare_from_existing(run_dir, issue, attempt, worker_host, runner_opts) do
     case existing_manifest(run_dir) do
       {:existing, %{status: "completed"} = manifest} ->
-        replace_terminal_manifest(manifest, issue, attempt, worker_host, runner_opts)
+        prepare_from_terminal(manifest, issue, attempt, worker_host, runner_opts)
 
       {:existing, %{status: "stopping"} = manifest} ->
         prepare_from_stopping(manifest, issue, attempt, worker_host, runner_opts)
 
       result ->
         result
+    end
+  end
+
+  defp prepare_from_terminal(manifest, issue, attempt, worker_host, runner_opts) do
+    if worker_alive?(manifest) do
+      {:existing, manifest}
+    else
+      replace_terminal_manifest(manifest, issue, attempt, worker_host, runner_opts)
     end
   end
 
@@ -275,6 +301,30 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
       {:ok, manifest} -> [manifest]
       {:error, _reason} -> []
     end
+  end
+
+  defp load_unregistered_worker(entry, expanded_root) do
+    with {pid, ""} when pid > 0 <- Integer.parse(entry),
+         {:ok, command_line} <- File.read("/proc/#{pid}/cmdline"),
+         arguments <- :binary.split(command_line, <<0>>, [:global, :trim_all]),
+         marker_index when is_integer(marker_index) <- Enum.find_index(arguments, &(&1 == "__persistent_worker__")),
+         spec_path when is_binary(spec_path) <- Enum.at(arguments, marker_index + 1),
+         expanded_spec <- Path.expand(spec_path),
+         true <- registered_spec_path?(expanded_spec, expanded_root),
+         false <- File.exists?(Path.join(Path.dirname(expanded_spec), @manifest_filename)) do
+      [%{pid: pid, spec_path: expanded_spec}]
+    else
+      _other -> []
+    end
+  rescue
+    _error -> []
+  end
+
+  defp registered_spec_path?(spec_path, expanded_root) do
+    relative = Path.relative_to(spec_path, expanded_root)
+
+    Path.basename(spec_path) == @spec_filename and relative != spec_path and
+      relative != @spec_filename and not String.starts_with?(relative, "..")
   end
 
   defp remove_registry_record(manifest_path, spec_path, run_dir) do

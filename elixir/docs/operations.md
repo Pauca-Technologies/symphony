@@ -45,6 +45,16 @@ The state response reports `mode.draining: true`. You may wait for all work to f
 while sessions are still active: detached workers keep owning their backend processes and the next
 orchestrator reconnects to them. Do not remove `~/.symphony/workers` or stop worker PIDs.
 
+Startup also reconciles terminal worker records conservatively. A completed live worker is
+reattached long enough to acknowledge its terminal event; a worker already marked stopping is
+identity-checked and terminated. Symphony removes either discovery record only after the recorded
+worker is no longer live. If relay startup itself fails after launch, the record is retained for a
+later reconnect instead of creating a manifestless process.
+On Linux, startup also scans the configured worker registry for a worker command whose exact
+`run.term` path is under that registry but whose manifest is missing. It snapshots the PID start
+identity and terminates only that captured process tree, making any legacy manifestless worker
+visible in logs and self-healing without process-name-wide kills.
+
 The first rollout that introduces persistent workers cannot adopt agents launched by an older
 Symphony version; drain those legacy runs fully once. Subsequent rollouts can reconnect.
 

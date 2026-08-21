@@ -36,15 +36,7 @@ defmodule SymphonyElixir.PersistentWorker do
       when is_pid(orchestrator) and is_list(runner_opts) do
     case Registry.prepare(issue, attempt, worker_host, runner_opts) do
       {:ok, manifest} ->
-        with :ok <- Launcher.launch(manifest),
-             {:ok, spec} <- Registry.load_spec(manifest),
-             {:ok, pid} <- start_client(manifest, orchestrator) do
-          {:ok, %{pid: pid, manifest: manifest, spec: spec, launched?: true}}
-        else
-          {:error, reason} ->
-            _ = Registry.cleanup(manifest, manifest.worker_id)
-            {:error, reason}
-        end
+        launch_prepared_worker(manifest, orchestrator)
 
       {:existing, manifest} ->
         attach_manifest(manifest, orchestrator, false)
@@ -58,6 +50,8 @@ defmodule SymphonyElixir.PersistentWorker do
   @spec attach_all(pid(), MapSet.t(String.t())) :: [attachment()]
   def attach_all(orchestrator, tracked_worker_ids \\ MapSet.new())
       when is_pid(orchestrator) do
+    reap_unregistered_workers()
+
     Registry.list()
     |> Enum.reject(&MapSet.member?(tracked_worker_ids, &1.worker_id))
     |> Enum.flat_map(&attach_discovered_manifest(&1, orchestrator))
@@ -99,16 +93,34 @@ defmodule SymphonyElixir.PersistentWorker do
     end
   end
 
-  defp attach_discovered_manifest(%{status: "completed"} = manifest, _orchestrator) do
-    _ = Registry.cleanup(manifest, manifest.worker_id)
-    []
+  defp launch_prepared_worker(manifest, orchestrator) do
+    case launch_worker(manifest) do
+      :ok ->
+        attach_launched_worker(manifest, orchestrator)
+
+      {:error, reason} ->
+        _ = Registry.cleanup(manifest, manifest.worker_id)
+        {:error, reason}
+    end
+  end
+
+  defp attach_launched_worker(manifest, orchestrator) do
+    case attach_manifest(manifest, orchestrator, true) do
+      {:ok, attachment} ->
+        {:ok, attachment}
+
+      {:error, reason} ->
+        Logger.warning(
+          "Persistent worker launched but its relay could not attach; preserving discovery record " <>
+            "worker_id=#{manifest.worker_id} issue_id=#{manifest.issue_id}: #{inspect(reason)}"
+        )
+
+        {:error, reason}
+    end
   end
 
   defp attach_discovered_manifest(%{status: "stopping"} = manifest, _orchestrator) do
-    unless registered_worker_alive?(manifest) do
-      _ = Registry.cleanup(manifest, manifest.worker_id)
-    end
-
+    retire_stopping_manifest(manifest)
     []
   end
 
@@ -137,10 +149,85 @@ defmodule SymphonyElixir.PersistentWorker do
     end
   end
 
+  defp reap_unregistered_workers do
+    orphaned =
+      case Application.get_env(:symphony_elixir, :persistent_worker_orphan_scanner) do
+        scanner when is_function(scanner, 0) -> scanner.()
+        _other -> Registry.unregistered_workers()
+      end
+
+    Enum.each(orphaned, &reap_unregistered_worker/1)
+  end
+
+  defp reap_unregistered_worker(%{pid: pid, spec_path: spec_path}) do
+    case snapshot_worker_tree(pid) do
+      [] ->
+        Logger.warning("Unable to snapshot unregistered persistent worker pid=#{pid} spec_path=#{spec_path}; leaving it untouched")
+
+      identities ->
+        log_unregistered_worker_termination(pid, spec_path, terminate_worker_identities(identities))
+    end
+  end
+
+  defp log_unregistered_worker_termination(pid, spec_path, :ok) do
+    Logger.info("Terminated unregistered persistent worker pid=#{pid} spec_path=#{spec_path}")
+  end
+
+  defp log_unregistered_worker_termination(pid, spec_path, {:error, reason}) do
+    Logger.warning("Unable to terminate unregistered persistent worker pid=#{pid} spec_path=#{spec_path}: #{inspect(reason)}")
+  end
+
+  defp retire_stopping_manifest(manifest) do
+    if registered_worker_alive?(manifest) do
+      identities = snapshot_worker_tree(manifest.os_pid)
+      result = terminate_worker_identities(identities)
+
+      if registered_worker_alive?(manifest) do
+        Logger.warning(
+          "Stopping persistent worker remains alive; preserving discovery record " <>
+            "worker_id=#{manifest.worker_id} issue_id=#{manifest.issue_id} result=#{inspect(result)}"
+        )
+      else
+        _ = Registry.cleanup(manifest, manifest.worker_id)
+      end
+    else
+      _ = Registry.cleanup(manifest, manifest.worker_id)
+    end
+  end
+
+  defp snapshot_worker_tree(pid) when is_integer(pid) and pid > 0 do
+    case Application.get_env(:symphony_elixir, :persistent_worker_process_snapshotter) do
+      snapshotter when is_function(snapshotter, 1) -> snapshotter.(pid)
+      _other -> OSProcess.snapshot_tree(pid)
+    end
+  end
+
+  defp snapshot_worker_tree(_pid), do: []
+
+  defp terminate_worker_identities(identities) do
+    case Application.get_env(:symphony_elixir, :persistent_worker_identity_terminator) do
+      terminator when is_function(terminator, 2) -> terminator.(identities, shutdown_force_timeout_ms())
+      _other -> OSProcess.terminate_identities(identities, shutdown_force_timeout_ms())
+    end
+  end
+
   defp start_client(manifest, orchestrator) do
-    Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-      Client.run(manifest, orchestrator)
-    end)
+    case Application.get_env(:symphony_elixir, :persistent_worker_client_starter) do
+      starter when is_function(starter, 2) ->
+        starter.(manifest, orchestrator)
+
+      _other ->
+        Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+          Client.run(manifest, orchestrator)
+        end)
+    end
+  end
+
+  defp launch_worker(manifest) do
+    case Application.get_env(:symphony_elixir, :persistent_worker_launcher) do
+      launcher when is_function(launcher, 1) -> launcher.(manifest)
+      _other -> Launcher.launch(manifest)
+    end
   end
 
   defp terminate_registered_worker(%{manifest: manifest, identities: identities}) do

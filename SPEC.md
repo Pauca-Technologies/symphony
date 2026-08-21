@@ -2136,6 +2136,13 @@ After restart:
   events. It MUST liveness-check records marked active before adoption. A dead record SHOULD be
   reclaimed without replacing an existing retry deadline; an unreachable worker record must not
   authorize duplicate concurrent work or indefinitely postpone recovery.
+- A reconnectable-worker implementation MUST NOT delete a discovery record while its exact worker
+  process is still live. A live completed worker SHOULD be reattached so its terminal event can be
+  acknowledged through the normal relay lifecycle. A live record already marked stopping SHOULD
+  have its identity-checked process tree terminated before the record is removed.
+- An implementation MAY reconcile a manifestless worker whose command names an immutable run spec
+  beneath the configured registry. It MUST capture and revalidate the OS process start identity
+  before terminating that process tree and MUST NOT use a broad process-name match.
 - Stopping a detached worker SHOULD terminate agent-owned external descendants while preserving the
   worker VM's runtime helpers long enough to record terminal state and exit normally.
 
