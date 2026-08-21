@@ -1147,6 +1147,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> maybe_put(:efficiency_decision, efficiency_decision)
       |> maybe_put(:requested_lenses, AgentEfficiency.review_lenses(efficiency_decision))
       |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
+      |> maybe_put(:hook_command, per_repo_before_handoff)
 
     handoff_context =
       %{issue: issue, workspace: workspace, worker_host: worker_host}
@@ -1467,6 +1468,7 @@ defmodule SymphonyElixir.AgentRunner do
     review_opts =
       []
       |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
+      |> maybe_put(:hook_command, Keyword.get(opts, :per_repo_before_handoff))
 
     %{
       query: Map.fetch!(durable, "query"),
@@ -1540,6 +1542,26 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_starting_handoff_gate(request, recipient, backend, issue_state_fetcher, opts) do
+    case revalidate_starting_handoff_base(request, opts) do
+      {:ok, decision} ->
+        request
+        |> put_request_base_drift_decision(decision)
+        |> start_recovered_handoff_gate(recipient, backend, issue_state_fetcher, opts)
+
+      {:defer, prompt, _decision} ->
+        resume_after_starting_handoff_gate(request, prompt)
+
+      {:error, reason} ->
+        prompt =
+          "Symphony could not revalidate origin/#{starting_handoff_base_ref(request)} before retrying the handoff gate " <>
+            "(#{inspect(reason)}). Keep the issue in progress, restore base visibility, and re-attempt the handoff. " <>
+            "No rebase was attempted."
+
+        resume_after_starting_handoff_gate(request, prompt)
+    end
+  end
+
+  defp start_recovered_handoff_gate(request, recipient, backend, issue_state_fetcher, opts) do
     starter = Keyword.get(opts, :handoff_gate_starter, &HandoffGate.run_before_handoff/5)
 
     start_opts =
@@ -1565,6 +1587,29 @@ defmodule SymphonyElixir.AgentRunner do
       issue_state_fetcher,
       opts
     )
+  end
+
+  defp revalidate_starting_handoff_base(request, opts) do
+    base_opts =
+      [worker_host: request.worker_host, hook_command: request.before_handoff_command]
+      |> maybe_put(:git_runner, Keyword.get(opts, :base_drift_git_runner))
+      |> maybe_put(:ssh_runner, Keyword.get(opts, :base_drift_ssh_runner))
+
+    BaseDrift.assess(
+      request.workspace,
+      request.issue,
+      starting_handoff_base_ref(request),
+      base_opts
+    )
+  end
+
+  defp starting_handoff_base_ref(request) do
+    Keyword.get(request.review_opts, :base_drift_ref)
+  end
+
+  defp put_request_base_drift_decision(request, decision) do
+    review_opts = Keyword.put(request.review_opts, :base_drift_decision, decision)
+    Map.put(request, :review_opts, review_opts)
   end
 
   defp handle_starting_handoff_result(

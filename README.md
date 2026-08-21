@@ -7,13 +7,15 @@ The reference scheduler is repository-aware: global and state limits are supplem
 per-repository ceilings and changed-path overlap risk. Disjoint work can use available capacity,
 while high-overlap work is deterministically ordered to avoid repeated rebases and invalidated
 validation. Before handoff it checks the current base and withholds expensive final gates only when
-newer base changes overlap the candidate; it never rewrites dirty work automatically.
+newer base changes overlap the candidate or the repository-owned handoff runtime; it never rewrites
+dirty work automatically.
 Long-running exact-head gates can return a durable pending job: Symphony pauses model work, polls
 that job without spending turns or tokens, and applies the deferred handoff only after the exact
 current candidate passes. Pending jobs survive orchestrator restarts and remain visible in runtime
 status instead of being misclassified as stalled agents. The attempted handoff is also persisted
 before initial gate startup, so a pre-job infrastructure retry reruns the hook without launching a
-replacement model session.
+replacement model session. Those retries revalidate the current base first, so a branch cannot loop
+on an obsolete repository hook after its workflow or hook script was fixed upstream.
 
 Automated handoff reviews use fresh, thin-context reviewer threads rather than copying an
 implementor's full history. A bounded, versioned packet pins every review to the exact base/head

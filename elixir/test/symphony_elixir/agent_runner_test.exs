@@ -1850,6 +1850,102 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
     end
 
+    test "revalidates handoff runtime drift before retrying a durable gate start" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-start-drift-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7370")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-start-drift",
+        identifier: "UDPE-7370",
+        title: "Refresh a stale handoff runtime",
+        state: "In Progress",
+        labels: []
+      }
+
+      assert :ok =
+               Workspace.persist_handoff_gate_state(workspace, %{
+                 "phase" => "starting",
+                 "query" => "mutation Move { issueUpdate(id: \"issue-gate-start-drift\", input: {stateId: \"review\"}) { success } }",
+                 "variables" => %{},
+                 "targetState" => "In Review"
+               })
+
+      Application.put_env(:symphony_elixir, :handoff_prompt_recipient_for_test, self())
+      test_pid = self()
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :handoff_prompt_recipient_for_test)
+        File.rm_rf(workspace_root)
+      end)
+
+      starter = fn _workspace, _issue, _worker_host, _target_state, _start_opts ->
+        send(test_pid, :stale_handoff_started)
+        :ok
+      end
+
+      git_runner = fn
+        ["rev-parse", "HEAD"], ^workspace ->
+          {"candidate-head\n", 0}
+
+        ["fetch", "--quiet", "origin", "develop"], ^workspace ->
+          {"", 0}
+
+        ["rev-parse", "refs/remotes/origin/develop"], ^workspace ->
+          {"current-base\n", 0}
+
+        ["merge-base", "candidate-head", "current-base"], ^workspace ->
+          {"candidate-base\n", 0}
+
+        ["diff", "--name-only", "candidate-base..HEAD"], ^workspace ->
+          {"app/widget.tsx\n", 0}
+
+        ["diff", "--name-only", "HEAD"], ^workspace ->
+          {"", 0}
+
+        ["diff", "--name-only", "--cached"], ^workspace ->
+          {"", 0}
+
+        ["ls-files", "--others", "--exclude-standard"], ^workspace ->
+          {"", 0}
+
+        ["diff", "--name-only", "candidate-base..current-base"], ^workspace ->
+          {"scripts/hooks/before-handoff.sh\n", 0}
+
+        ["status", "--porcelain", "--untracked-files=normal"], ^workspace ->
+          {"", 0}
+      end
+
+      state_fetcher = fn ["issue-gate-start-drift"] -> {:ok, [issue]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {HandoffPromptBackend, %{}},
+                   issue_context_file: Workspace.issue_context_path(workspace),
+                   issue_state_fetcher: state_fetcher,
+                   handoff_gate_starter: starter,
+                   base_drift_ref: "develop",
+                   base_drift_git_runner: git_runner,
+                   per_repo_before_handoff: "scripts/hooks/before-handoff.sh",
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received {:handoff_prompt, prompt, ^issue}
+      assert prompt =~ "paths required by the configured handoff runtime"
+      assert prompt =~ "scripts/hooks/before-handoff.sh"
+      refute_received :stale_handoff_started
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
     test "reattaches to a durable job and applies an exact-candidate pass without a model turn" do
       workspace_root =
         Path.join(System.tmp_dir!(), "symphony-gate-recovery-#{System.unique_integer([:positive])}")

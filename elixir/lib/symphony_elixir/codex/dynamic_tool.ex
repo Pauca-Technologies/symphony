@@ -821,7 +821,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     review_opts = Map.get(context, :review_opts, [])
     base_ref = Keyword.get(review_opts, :base_drift_ref)
 
-    case BaseDrift.assess(workspace, issue, base_ref, base_drift_opts(worker_host, review_opts)) do
+    case BaseDrift.assess(
+           workspace,
+           issue,
+           base_ref,
+           base_drift_opts(worker_host, review_opts, context)
+         ) do
       {:ok, decision} ->
         {:ok, decision}
 
@@ -837,8 +842,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp base_drift_opts(worker_host, review_opts) do
+  defp base_drift_opts(worker_host, review_opts, context) do
     [worker_host: worker_host]
+    |> maybe_put_keyword(
+      :hook_command,
+      Map.get(context, :before_handoff_command) || Map.get(context, "before_handoff_command")
+    )
     |> maybe_put_base_drift_runner(:git_runner, Keyword.get(review_opts, :base_drift_git_runner))
     |> maybe_put_base_drift_runner(:ssh_runner, Keyword.get(review_opts, :base_drift_ssh_runner))
   end

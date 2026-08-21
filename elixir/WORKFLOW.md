@@ -65,7 +65,8 @@ hooks:
     fi
   # before_handoff runs before a Linear issue moves from In Progress to In Review.
   # In multi-repo mode Symphony first fetches the configured base branch and
-  # skips this expensive hook when newer base changes overlap the candidate.
+  # skips this expensive hook when newer base changes overlap the candidate or
+  # change the workflow/hook files needed to run the gate safely.
   # It never rebases, resets, or stashes a dirty worktree automatically.
   # Repositories can use it to block handoff until repo-local gates pass, for example:
   # before_handoff: |
@@ -75,7 +76,8 @@ hooks:
   # GitHub auth and issue-context preparation, so the command should branch to
   # its cheap durable-job read before normal setup. Symphony persists the
   # attempted mutation before initial startup so infrastructure retries rerun
-  # this hook directly instead of opening another model session.
+  # this hook directly instead of opening another model session. A retry first
+  # revalidates the base and returns to the agent if the gate runtime changed.
   # These limits are independent of other lifecycle hooks.
   before_handoff_timeout_ms: 60000
   before_handoff_stale_ms: 120000

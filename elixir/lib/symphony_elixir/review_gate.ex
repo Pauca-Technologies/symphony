@@ -277,9 +277,13 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp base_drift_opts(context) do
     [worker_host: context.worker_host]
+    |> maybe_put_base_drift_option(:hook_command, Keyword.get(context.opts, :hook_command))
     |> maybe_put_base_drift_runner(:git_runner, Keyword.get(context.opts, :base_drift_git_runner))
     |> maybe_put_base_drift_runner(:ssh_runner, Keyword.get(context.opts, :base_drift_ssh_runner))
   end
+
+  defp maybe_put_base_drift_option(opts, _key, nil), do: opts
+  defp maybe_put_base_drift_option(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp maybe_put_base_drift_runner(opts, key, runner) when is_function(runner),
     do: Keyword.put(opts, key, runner)
@@ -293,7 +297,7 @@ defmodule SymphonyElixir.ReviewGate do
           severity: "blocking",
           file: path,
           line: nil,
-          body: "The configured base advanced on a path overlapping this candidate; refresh before final gates."
+          body: base_drift_finding_body(decision, path)
         }
       end)
 
@@ -302,7 +306,7 @@ defmodule SymphonyElixir.ReviewGate do
       iteration: context.iteration,
       max_iterations: context.settings.max_iterations,
       reviewed_sha: context.reviewed_sha,
-      summary: "Final gates deferred because the candidate overlaps newer base changes.",
+      summary: base_drift_summary(decision),
       failure_reason: :overlapping_base_drift,
       resume_condition: "Refresh against the current base without discarding dirty work, then re-attempt the handoff.",
       review_effort: :thorough,
@@ -311,6 +315,22 @@ defmodule SymphonyElixir.ReviewGate do
       inspected: decision.overlap_paths,
       severity_counts: %{"blocking" => length(findings)}
     }
+  end
+
+  defp base_drift_finding_body(decision, path) do
+    if path in decision.critical_overlap_paths do
+      "The configured base changed a handoff-runtime dependency; refresh before final gates."
+    else
+      "The configured base advanced on a path overlapping this candidate; refresh before final gates."
+    end
+  end
+
+  defp base_drift_summary(%{critical_overlap_paths: [_path | _paths]}) do
+    "Final gates deferred because the repository-owned handoff runtime changed on the newer base."
+  end
+
+  defp base_drift_summary(_decision) do
+    "Final gates deferred because the candidate overlaps newer base changes."
   end
 
   defp required_pr_outcome(%{issue: %Issue{} = issue} = context, reason) do

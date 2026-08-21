@@ -951,7 +951,11 @@ Part A: Stall detection
 - Persist the captured tracker mutation and pending gate identity outside the agent-writable
   workspace. Persist the mutation before the initial asynchronous hook invocation as a starting
   handoff intent. If that invocation ends with infrastructure failure before returning a job ID,
-  retry the hook from the durable intent before starting a coding-agent session. After process
+  revalidate the configured base before retrying the hook from the durable intent. Changes to the
+  repository workflow, reviewer workflow, or repository-relative scripts referenced by the configured
+  hook are handoff-runtime overlap even when product-code paths are disjoint; clear the starting intent
+  and return remediation to the coding agent so it can refresh the branch. Otherwise retry the hook
+  before starting a coding-agent session. After process
   restart, reattach to an existing job before starting a coding-agent session.
   Repeated requests for the same candidate MUST coalesce. A changed candidate cancels or
   supersedes the old request; a stale pass MUST NOT authorize the mutation.

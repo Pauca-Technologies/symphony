@@ -52,6 +52,48 @@ defmodule SymphonyElixir.BaseDriftTest do
     assert decision.upstream_paths == ["docs/readme.md"]
   end
 
+  test "a changed handoff runtime blocks a disjoint candidate until it refreshes", context do
+    commit_file!(context.workspace, "lib/candidate.ex", "candidate\n", "candidate")
+
+    commit_file!(
+      context.upstream,
+      "scripts/hooks/before-handoff.sh",
+      "#!/usr/bin/env bash\nexit 0\n",
+      "fix handoff hook"
+    )
+
+    git!(context.upstream, ["push", "origin", "main"])
+
+    assert {:defer, remediation, decision} =
+             BaseDrift.assess(context.workspace, issue(), "main", hook_command: "scripts/hooks/before-handoff.sh")
+
+    assert decision.candidate_paths == ["lib/candidate.ex"]
+
+    assert decision.critical_paths == [
+             "WORKFLOW.md",
+             "WORKFLOW_REVIEW.md",
+             "scripts/hooks/before-handoff.sh"
+           ]
+
+    assert decision.critical_overlap_paths == ["scripts/hooks/before-handoff.sh"]
+    assert decision.overlap_paths == ["scripts/hooks/before-handoff.sh"]
+    assert remediation =~ "paths required by the configured handoff runtime"
+  end
+
+  test "extracts only normalized repository paths from a handoff command" do
+    command = """
+    if [ -x ./scripts/hooks/before-handoff.sh ]; then
+      bash ./scripts/hooks/before-handoff.sh --base origin/develop
+    fi
+    """
+
+    assert BaseDrift.handoff_runtime_paths(command) == [
+             "WORKFLOW.md",
+             "WORKFLOW_REVIEW.md",
+             "scripts/hooks/before-handoff.sh"
+           ]
+  end
+
   test "overlapping base advance avoids stale gates and preserves dirty work", context do
     commit_file!(context.workspace, "lib/account.ex", "account = :candidate\n", "candidate account")
     commit_file!(context.upstream, "lib/account.ex", "account = :upstream\n", "upstream account")
