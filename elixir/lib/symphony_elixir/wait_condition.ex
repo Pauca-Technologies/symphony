@@ -126,15 +126,29 @@ defmodule SymphonyElixir.WaitCondition do
            ] do
     repo_arg = if condition["repository"], do: " --repo " <> shell_escape(condition["repository"]), else: ""
 
-    command =
+    checks_command =
       "gh pr checks #{condition["pr_number"]} --json name,state,bucket,workflow" <>
         repo_arg
 
-    with {:ok, output, _status} <- run_command(condition, command),
-         {:ok, checks} when is_list(checks) <- Jason.decode(output) do
-      {:ok, checks_observation(type, checks, condition)}
+    pr_command =
+      "gh pr view #{condition["pr_number"]} " <>
+        "--json state,isDraft,headRefOid,baseRefOid,mergeable,mergeStateStatus,reviewDecision" <>
+        repo_arg
+
+    with {:ok, checks_output, _status} <- run_command(condition, checks_command),
+         {:ok, checks} when is_list(checks) <- Jason.decode(checks_output),
+         {:ok, pr_output, 0} <- run_command(condition, pr_command),
+         {:ok, pull_request} when is_map(pull_request) <- Jason.decode(pr_output) do
+      {:ok, github_pr_observation(type, checks, condition, pull_request)}
     else
-      {:error, reason} -> {:error, reason}
+      {:ok, output, status} when is_integer(status) ->
+        {:error, {:github_pr_view_failed, status, String.trim(output)}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:github_pr_invalid_response, other}}
     end
   end
 
@@ -180,8 +194,10 @@ defmodule SymphonyElixir.WaitCondition do
   def changed?(%{condition: %{"type" => "github_actions_recovered"}}, observation),
     do: observation["recovery_signal"] != "waiting"
 
-  def changed?(%{condition: %{"type" => "github_pr_gate_settled"}}, observation),
-    do: observation["aggregate"] in ["pass", "fail"]
+  def changed?(%{condition: %{"type" => "github_pr_gate_settled"}} = request, observation) do
+    observation["aggregate"] in ["pass", "fail"] or
+      pull_request_changed?(request, observation)
+  end
 
   def changed?(%{condition: %{"type" => "time", "resume_at" => resume_at}}, _observation) do
     case DateTime.from_iso8601(resume_at) do
@@ -394,6 +410,30 @@ defmodule SymphonyElixir.WaitCondition do
       end
 
     %{"aggregate" => aggregate, "fingerprint" => digest(normalized), "checks" => normalized}
+  end
+
+  defp github_pr_observation(type, checks, condition, pull_request) do
+    pull_request_state =
+      Map.take(pull_request, [
+        "state",
+        "isDraft",
+        "headRefOid",
+        "baseRefOid",
+        "mergeable",
+        "mergeStateStatus",
+        "reviewDecision"
+      ])
+
+    type
+    |> checks_observation(checks, condition)
+    |> Map.put("pull_request", pull_request_state)
+  end
+
+  defp pull_request_changed?(request, observation) do
+    baseline = Map.get(request, :baseline) || get_in(request, [:condition, "observed"])
+
+    is_map(baseline) and
+      canonical(observation["pull_request"]) != canonical(baseline["pull_request"])
   end
 
   defp canonical(value) when is_map(value) or is_list(value), do: Jason.encode!(value)

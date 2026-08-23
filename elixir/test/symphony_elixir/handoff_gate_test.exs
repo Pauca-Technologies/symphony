@@ -177,6 +177,30 @@ defmodule SymphonyElixir.HandoffGateTest do
              HandoffGate.parse_protocol_result(Jason.encode!(passed), 0, "candidate-2", 2_000)
   end
 
+  test "protocol v1 adopts a live replacement job when the producer supersedes a candidate" do
+    replacement =
+      protocol_report("running", %{
+        "jobId" => "gate-replacement",
+        "identity" =>
+          protocol_report("running")["identity"]
+          |> Map.put("candidateHash", "candidate-2")
+          |> Map.put("exactHash", "exact-2")
+      })
+
+    assert {:ok,
+            %{
+              status: :running,
+              job_id: "gate-replacement",
+              candidate_hash: "candidate-2"
+            }} =
+             HandoffGate.parse_protocol_result(
+               Jason.encode!(replacement),
+               3,
+               "candidate-1",
+               2_000
+             )
+  end
+
   test "poll exports the protocol and durable job identity to the hook" do
     workspace = temp_workspace!("handoff-poll-env")
     report = protocol_report("passed", %{"jobId" => "gate-poll-1"})

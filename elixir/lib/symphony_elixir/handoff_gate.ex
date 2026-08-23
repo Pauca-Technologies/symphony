@@ -123,9 +123,20 @@ defmodule SymphonyElixir.HandoffGate do
   end
 
   defp apply_expected_candidate(gate, expected_candidate_hash) do
-    case validate_expected_candidate(gate, expected_candidate_hash) do
-      :ok -> {:ok, gate}
-      :candidate_changed -> {:candidate_changed, %{gate | status: :invalidated}}
+    case {gate.status, validate_expected_candidate(gate, expected_candidate_hash)} do
+      {_status, :ok} ->
+        {:ok, gate}
+
+      {status, :candidate_changed} when status in [:pending, :running] ->
+        Logger.info(
+          "gate.before_handoff reattaching to live replacement job job_id=#{gate.job_id} " <>
+            "expected_candidate_hash=#{expected_candidate_hash} actual_candidate_hash=#{gate.candidate_hash}"
+        )
+
+        {:ok, gate}
+
+      {_status, :candidate_changed} ->
+        {:candidate_changed, %{gate | status: :invalidated}}
     end
   end
 
@@ -556,7 +567,7 @@ defmodule SymphonyElixir.HandoffGate do
   defp validate_expected_candidate(%{candidate_hash: expected}, expected), do: :ok
 
   defp validate_expected_candidate(%{candidate_hash: actual}, expected) do
-    Logger.warning("gate.before_handoff candidate changed expected_candidate_hash=#{expected} actual_candidate_hash=#{actual}; withholding handoff")
+    Logger.warning("gate.before_handoff candidate changed expected_candidate_hash=#{expected} actual_candidate_hash=#{actual}")
 
     :candidate_changed
   end

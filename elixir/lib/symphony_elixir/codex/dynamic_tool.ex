@@ -121,7 +121,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   }
   @wait_for_description """
-  Park this issue without consuming an agent slot while an external GitHub, git, or Linear condition is unchanged. Never use this for local CPU or memory pressure, other validations, local process or port contention, elapsed-time backoffs, or a clock. After a successful call, end the turn; Symphony persists the workspace and resumes exactly once when the external condition changes or a human resumes it.
+  Park this issue without consuming an agent slot while an external GitHub, git, or Linear condition is unchanged. Never use this for local CPU or memory pressure, other validations, local process or port contention, elapsed-time backoffs, a clock, or a Symphony-owned handoff gate; Symphony persists and polls accepted handoff jobs itself. After a successful call, end the turn; Symphony persists the workspace and resumes exactly once when the external condition changes or a human resumes it.
   """
   @wait_for_input_schema %{
     "type" => "object",

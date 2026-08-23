@@ -958,7 +958,10 @@ Part A: Stall detection
   before starting a coding-agent session. After process
   restart, reattach to an existing job before starting a coding-agent session.
   Repeated requests for the same candidate MUST coalesce. A changed candidate cancels or
-  supersedes the old request; a stale pass MUST NOT authorize the mutation.
+  supersedes the old request; when an authenticated poll returns a live pending replacement job,
+  the orchestrator MUST durably adopt and continue polling that replacement before starting a
+  coding-agent turn. A stale pass MUST NOT authorize the mutation. Lifecycle completion MUST close
+  the job identity the orchestrator owns even when a terminal response reports a superseding job.
 - A pending review is keyed to the issue and reviewed PR head. Repeated requests while that job is
   pending coalesce into the existing review. Before applying the captured tracker transition,
   re-resolve the PR head; if it changed, clear pending state and require a fresh review.
@@ -1473,7 +1476,9 @@ Optional client-side tool extension:
   observation or baseline fields.
 - The watcher MUST compare later observations with the server-captured baseline and MUST NOT resume
   merely because it observed the same value again. A recovery or gate-settled condition that is
-  already satisfied MUST be rejected instead of parked.
+  already satisfied MUST be rejected instead of parked. GitHub PR-check observations SHOULD include
+  the PR head, base, open/draft state, mergeability, merge-state status, and review decision so a
+  material PR change wakes work even when the specifically watched check remains unchanged.
 - A successful tool call records the request in the worker lifecycle. The agent SHOULD end its turn;
   on normal worker exit, the orchestrator retains the workspace and claim, persists the wait, and
   releases the agent slot.

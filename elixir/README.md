@@ -329,9 +329,12 @@ Notes:
   active incident affecting Actions formally reaches the `monitoring`/`resolved` phase, allowing one
   controlled retry as soon as GitHub reports mitigation rather than waiting for the component badge.
   The tool rejects clock waits and must not be used for local resource pressure, another validation,
-  or local process/port contention; independently bounded validations are allowed to overlap.
+  local process/port contention, or a Symphony-owned handoff gate; Symphony persists and polls
+  accepted handoff jobs itself. Independently bounded validations are allowed to overlap.
   PR-check waits treat GitHub's terminal `SKIPPED` checks as neutral, so passed checks plus intentional
-  skips resolve to `pass` instead of remaining parked as `pending`.
+  skips resolve to `pass` instead of remaining parked as `pending`. They also wake when the PR's
+  head, base, open/draft state, mergeability, merge-state status, or review decision changes, because
+  any of those changes can make a previously watched check insufficient or require remediation.
 - Every Linear caller shares one process-wide rate-limit cooldown. A rate-limit response pauses
   polling, workpad/label writes, and agent tool requests together, honoring a longer `Retry-After`
   hint when Linear supplies one instead of letting concurrent callers immediately refill the limit.

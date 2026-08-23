@@ -452,6 +452,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
     assert_receive {:waiting_prompt, prompt}
     assert prompt =~ "call Symphony's `wait_for` tool once and end the turn"
     assert prompt =~ "Never call `wait_for` because of local CPU"
+    assert prompt =~ "Symphony-owned handoff job"
     assert prompt =~ "permits validations from multiple agents to overlap"
     assert_receive {:waiting_tool_result, %{"success" => true}}
 
@@ -2025,6 +2026,178 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert query =~ "issueUpdate"
       refute_received :turn_ran
       assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
+    test "adopts a live replacement gate and finishes its lifecycle without a model turn" do
+      workspace_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-gate-replacement-#{System.unique_integer([:positive])}"
+        )
+
+      workspace = Path.join(workspace_root, "UDPE-7372")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-replacement",
+        identifier: "UDPE-7372",
+        title: "Follow a replacement gate",
+        state: "In Progress",
+        labels: []
+      }
+
+      original_gate = async_gate(:pending)
+      replacement_gate = %{original_gate | job_id: "job-86814", candidate_hash: "candidate-86814"}
+
+      assert :ok =
+               Workspace.persist_handoff_gate_state(workspace, %{
+                 "query" => "mutation Move { issueUpdate(id: \"issue-gate-replacement\", input: {stateId: \"review\"}) { success } }",
+                 "variables" => %{},
+                 "targetState" => "In Review",
+                 "gate" => %{
+                   "jobId" => original_gate.job_id,
+                   "status" => "pending",
+                   "candidateHash" => original_gate.candidate_hash,
+                   "exactHash" => original_gate.exact_hash,
+                   "identity" => original_gate.identity,
+                   "heartbeatAt" => original_gate.heartbeat_at,
+                   "heartbeatAgeMs" => original_gate.heartbeat_age_ms,
+                   "nextPollMs" => original_gate.next_poll_ms,
+                   "progress" => original_gate.progress,
+                   "startedAt" => original_gate.started_at
+                 }
+               })
+
+      Application.put_env(:symphony_elixir, :turn_count_recipient_for_test, self())
+      test_pid = self()
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
+        File.rm_rf(workspace_root)
+      end)
+
+      poller = fn
+        ^workspace, ^issue, nil, "In Review", "job-7157", _poll_opts ->
+          send(test_pid, :replacement_gate_adopted)
+          {:pending, replacement_gate}
+
+        ^workspace, ^issue, nil, "In Review", "job-86814", _poll_opts ->
+          send(test_pid, :replacement_gate_polled)
+          {:passed, %{replacement_gate | status: :passed}}
+      end
+
+      linear_client = fn _query, %{}, [] ->
+        send(test_pid, :replacement_gate_handoff_applied)
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 self(),
+                 [
+                   agent_backend: {TurnCountingBackend, %{}},
+                   issue_context_file: Workspace.issue_context_path(workspace),
+                   issue_state_fetcher: fn ["issue-gate-replacement"] -> {:ok, [issue]} end,
+                   handoff_gate_poller: poller,
+                   handoff_gate_sleep: fn _milliseconds -> :ok end,
+                   linear_client: linear_client,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received :replacement_gate_adopted
+      assert_received :replacement_gate_polled
+      assert_received :replacement_gate_handoff_applied
+      assert_received {:agent_lifecycle, "issue-gate-replacement", :handoff_pending_gate, %{gate_job_id: "job-7157"}}
+
+      assert_received {:agent_lifecycle, "issue-gate-replacement", :handoff_pending_gate, %{gate_job_id: "job-86814"}}
+
+      assert_received {:agent_lifecycle, "issue-gate-replacement", :implementing, %{gate_job_id: "job-86814", gate_outcome: :passed}}
+
+      refute_received :turn_ran
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
+    test "finishes the owned lifecycle when a terminal replacement cannot be adopted" do
+      workspace_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-gate-terminal-replacement-#{System.unique_integer([:positive])}"
+        )
+
+      workspace = Path.join(workspace_root, "UDPE-7372")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-terminal-gate-replacement",
+        identifier: "UDPE-7372",
+        title: "Finish an invalidated replacement gate",
+        state: "In Progress",
+        labels: []
+      }
+
+      request = %{
+        query: "mutation Move { issueUpdate(id: \"issue-terminal-gate-replacement\", input: {stateId: \"review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        target_state: "In Review",
+        gate: async_gate(:pending),
+        linear_client: fn _query, _variables, _opts -> {:ok, %{}} end
+      }
+
+      Application.put_env(:symphony_elixir, :pending_gate_recipient_for_test, self())
+      Application.put_env(:symphony_elixir, :pending_gate_request_for_test, request)
+      {:ok, state_reads} = Agent.start_link(fn -> 0 end)
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :pending_gate_recipient_for_test)
+        Application.delete_env(:symphony_elixir, :pending_gate_request_for_test)
+        if Process.alive?(state_reads), do: Agent.stop(state_reads)
+        File.rm_rf(workspace_root)
+      end)
+
+      terminal_gate = %{
+        async_gate(:invalidated)
+        | job_id: "job-replacement",
+          candidate_hash: "candidate-replacement",
+          summary: "candidate changed"
+      }
+
+      poller = fn _workspace, _issue, nil, "In Review", "job-7157", _opts ->
+        {:invalidated, "candidate changed", terminal_gate}
+      end
+
+      state_fetcher = fn ["issue-terminal-gate-replacement"] ->
+        read = Agent.get_and_update(state_reads, fn count -> {count, count + 1} end)
+        state = if read == 0, do: "In Progress", else: "Done"
+        {:ok, [%{issue | state: state}]}
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 self(),
+                 [
+                   agent_backend: {PendingGateBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   handoff_gate_poller: poller,
+                   handoff_gate_sleep: fn _milliseconds -> :ok end,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received {:agent_lifecycle, "issue-terminal-gate-replacement", :handoff_pending_gate, %{gate_job_id: "job-7157"}}
+
+      assert_received {:agent_lifecycle, "issue-terminal-gate-replacement", :implementing, %{gate_job_id: "job-7157", gate_outcome: :invalidated}}
     end
 
     test "ends the worker attempt on handoff infrastructure failure without a remediation turn" do

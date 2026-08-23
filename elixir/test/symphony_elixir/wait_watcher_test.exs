@@ -178,6 +178,64 @@ defmodule SymphonyElixir.WaitWatcherTest do
     assert %{"aggregate" => "fail"} = WaitCondition.checks_observation_for_test(failing)
   end
 
+  test "PR-check waits wake when relevant pull-request state changes" do
+    pull_request = %{
+      "state" => "OPEN",
+      "isDraft" => false,
+      "headRefOid" => "head-1",
+      "baseRefOid" => "base-1",
+      "mergeable" => "MERGEABLE",
+      "mergeStateStatus" => "BLOCKED",
+      "reviewDecision" => "REVIEW_REQUIRED"
+    }
+
+    baseline = %{
+      "present" => true,
+      "name" => "CodeRabbit",
+      "state" => "PENDING",
+      "bucket" => "pending",
+      "workflow" => "",
+      "pull_request" => pull_request
+    }
+
+    request = %{
+      condition: %{"type" => "github_pr_check_changed"},
+      baseline: baseline
+    }
+
+    refute WaitCondition.changed?(request, baseline)
+
+    conflicted =
+      put_in(baseline, ["pull_request", "mergeStateStatus"], "DIRTY")
+
+    assert WaitCondition.changed?(request, conflicted)
+  end
+
+  test "PR gate waits wake on pull-request drift before checks settle" do
+    pull_request = %{
+      "state" => "OPEN",
+      "headRefOid" => "head-1",
+      "baseRefOid" => "base-1",
+      "mergeable" => "MERGEABLE"
+    }
+
+    baseline = %{
+      "aggregate" => "pending",
+      "fingerprint" => "checks-1",
+      "checks" => [],
+      "pull_request" => pull_request
+    }
+
+    request = %{
+      condition: %{"type" => "github_pr_gate_settled"},
+      baseline: baseline
+    }
+
+    refute WaitCondition.changed?(request, baseline)
+    assert WaitCondition.changed?(request, put_in(baseline, ["pull_request", "baseRefOid"], "base-2"))
+    assert WaitCondition.changed?(request, %{baseline | "aggregate" => "pass"})
+  end
+
   test "deduplicates identical probes and persists ready work", %{state_path: state_path} do
     test_pid = self()
 

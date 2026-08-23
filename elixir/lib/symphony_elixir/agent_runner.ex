@@ -1864,9 +1864,10 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp resume_after_terminal_gate(request, gate, prompt, recipient, outcome) do
+    owned_job_id = request.gate.job_id
     request = Map.put(request, :gate, gate)
 
-    case finish_pending_gate(request, recipient, outcome) do
+    case finish_pending_gate(request, recipient, outcome, owned_job_id) do
       :ok -> {:resume, prompt, request.issue}
       {:error, reason} -> {:error, reason}
     end
@@ -1898,12 +1899,13 @@ defmodule SymphonyElixir.AgentRunner do
       })
   end
 
-  defp finish_pending_gate(request, recipient, outcome) do
+  defp finish_pending_gate(request, recipient, outcome, owned_job_id \\ nil) do
     gate = request.gate
+    lifecycle_job_id = owned_job_id || gate.job_id
 
     with :ok <- Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
       transition_agent_lifecycle(recipient, request.issue, :implementing, %{
-        gate_job_id: gate.job_id,
+        gate_job_id: lifecycle_job_id,
         gate_outcome: outcome
       })
     end
@@ -2401,7 +2403,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     - If useful work cannot continue until an external GitHub, git, or Linear condition changes, call Symphony's `wait_for` tool once and end the turn.
     - Do not spend agent turns repeatedly polling an unchanged external condition. Symphony will persist the wait, free the agent slot, and resume this issue after the condition changes.
-    - Never call `wait_for` because of local CPU or memory pressure, another validation running, local process or port contention, or a desired time delay. Continue useful work and run repository validations with the configured per-run worker limit; Symphony intentionally permits validations from multiple agents to overlap.
+    - Never call `wait_for` because of local CPU or memory pressure, another validation running, local process or port contention, a desired time delay, or a Symphony-owned handoff job. Symphony polls accepted handoff jobs itself. Continue useful work and run repository validations with the configured per-run worker limit; Symphony intentionally permits validations from multiple agents to overlap.
     """
 
     handoff_guidance =
