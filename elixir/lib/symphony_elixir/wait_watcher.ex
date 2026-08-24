@@ -76,7 +76,7 @@ defmodule SymphonyElixir.WaitWatcher do
       _ = File.rm(WaitStore.path())
     end
 
-    state = %State{entries: WaitStore.load()}
+    state = %State{entries: due_restored_waits(WaitStore.load())}
     send(self(), :arm_all)
     send(self(), :notify_ready)
     {:ok, state}
@@ -360,6 +360,18 @@ defmodule SymphonyElixir.WaitWatcher do
   end
 
   defp first_probe_at(_entry, fallback), do: fallback
+
+  defp due_restored_waits(entries) when is_map(entries) do
+    now = DateTime.utc_now()
+
+    Map.new(entries, fn
+      {issue_id, %{status: :waiting} = entry} ->
+        {issue_id, Map.put(entry, :next_probe_at, now)}
+
+      persisted_entry ->
+        persisted_entry
+    end)
+  end
 
   defp observe(request) do
     case Application.get_env(:symphony_elixir, :wait_condition_probe) do

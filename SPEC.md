@@ -1478,12 +1478,16 @@ Optional client-side tool extension:
   merely because it observed the same value again. A recovery or gate-settled condition that is
   already satisfied MUST be rejected instead of parked. GitHub PR-check observations SHOULD include
   the PR head, base, open/draft state, mergeability, merge-state status, and review decision so a
-  material PR change wakes work even when the specifically watched check remains unchanged.
+  material PR change wakes work even when the specifically watched check remains unchanged. The
+  captured baseline MUST survive persistence and restart; implementations MAY recover a missing
+  legacy baseline from the last unchanged observation.
 - A successful tool call records the request in the worker lifecycle. The agent SHOULD end its turn;
   on normal worker exit, the orchestrator retains the workspace and claim, persists the wait, and
   releases the agent slot.
 - Probes MUST run outside coding-agent/model sessions. Identical condition keys SHOULD share one
-  probe, with bounded exponential backoff for unchanged or failed probes.
+  probe, with bounded exponential backoff for unchanged or failed probes. On watcher startup,
+  persisted waiting entries SHOULD become immediately due so a restart or deployment revalidates
+  their external state instead of preserving an obsolete pre-restart backoff deadline.
 - A changed condition MUST re-enter the normal priority, dependency, capacity, and concurrency
   scheduler exactly once with a compact prompt describing the state change. Durable ready state
   SHOULD remain until a replacement worker has actually started.

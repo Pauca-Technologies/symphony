@@ -79,6 +79,8 @@ defmodule SymphonyElixir.WaitStore do
   end
 
   defp decode_entry(entry) do
+    last_observation = entry["last_observation"]
+
     %{
       issue_id: entry["issue_id"],
       identifier: entry["identifier"],
@@ -90,21 +92,22 @@ defmodule SymphonyElixir.WaitStore do
       recent_codex_transcript_blocks: entry["recent_codex_transcript_blocks"] || [],
       priority: entry["priority"],
       created_at: parse_datetime(entry["created_at"]),
-      request: atomize_request(entry["request"] || %{}),
+      request: atomize_request(entry["request"] || %{}, last_observation),
       status: if(entry["status"] == "ready", do: :ready, else: :waiting),
       parked_at: parse_datetime(entry["parked_at"]) || DateTime.utc_now(),
       next_probe_at: parse_datetime(entry["next_probe_at"]) || DateTime.utc_now(),
       probe_attempt: entry["probe_attempt"] || 0,
-      last_observation: entry["last_observation"],
+      last_observation: last_observation,
       last_error: entry["last_error"],
       resume_prompt: entry["resume_prompt"]
     }
   end
 
-  defp atomize_request(request) do
+  defp atomize_request(request, last_observation) do
     %{
       condition: request["condition"] || %{},
       condition_key: request["condition_key"],
+      baseline: request["baseline"] || last_observation,
       reason: request["reason"],
       min_poll_ms: request["min_poll_ms"] || 60_000,
       max_poll_ms: request["max_poll_ms"] || 1_800_000

@@ -275,6 +275,61 @@ defmodule SymphonyElixir.WaitWatcherTest do
     assert WaitWatcher.issue_ids(name) == MapSet.new(["issue-2"])
   end
 
+  test "probes restored waits immediately instead of preserving an old backoff deadline" do
+    test_pid = self()
+    previous_reset = Application.get_env(:symphony_elixir, :wait_state_reset_on_start)
+    Application.put_env(:symphony_elixir, :wait_state_reset_on_start, false)
+
+    on_exit(fn -> restore_app_env(:wait_state_reset_on_start, previous_reset) end)
+
+    Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
+      send(test_pid, {:restored_probe_started, self()})
+
+      receive do
+        :release_restored_probe -> {:ok, %{"sha" => "same-sha"}}
+      end
+    end)
+
+    request = %{
+      condition: %{"type" => "git_ref_changed", "ref" => "refs/heads/main"},
+      condition_key: "restored-ref-condition",
+      baseline: %{"sha" => "same-sha"},
+      reason: "await main",
+      min_poll_ms: 15_000,
+      max_poll_ms: 1_800_000
+    }
+
+    future_probe_at = DateTime.add(DateTime.utc_now(), 2, :hour)
+
+    persisted_entry =
+      entry("issue-restored", "UDPE-RESTORED", request)
+      |> Map.merge(%{
+        status: :waiting,
+        parked_at: DateTime.utc_now(),
+        next_probe_at: future_probe_at,
+        probe_attempt: 10,
+        last_observation: %{"sha" => "same-sha"},
+        last_error: nil
+      })
+
+    :ok = WaitStore.save(%{"issue-restored" => persisted_entry})
+
+    name = :"wait-watcher-restored-#{System.unique_integer([:positive])}"
+    start_supervised!({WaitWatcher, name: name})
+
+    assert_receive {:restored_probe_started, probe_pid}, 1_000
+    [restored] = WaitWatcher.snapshot(name)
+    assert restored.request.baseline == %{"sha" => "same-sha"}
+    send(probe_pid, :release_restored_probe)
+
+    assert eventually(fn ->
+             [restored] = WaitWatcher.snapshot(name)
+
+             restored.probe_attempt == 11 and
+               DateTime.compare(restored.next_probe_at, future_probe_at) == :lt
+           end)
+  end
+
   test "manual resume produces a compact resume prompt" do
     Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
       {:unchanged, %{"status" => "degraded"}}

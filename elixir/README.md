@@ -320,7 +320,9 @@ Notes:
   the initial value itself; agent-supplied observations are rejected. The worker then exits cleanly
   and releases its concurrency slot while
   a non-LLM watcher persists the wait in `~/.symphony/waits.json`. Identical conditions share one
-  probe with bounded exponential backoff. When the condition changes, the issue re-enters the
+  probe with bounded exponential backoff. Restored waits retain their server-captured baseline (or
+  recover it from their last unchanged observation for legacy state) and receive one immediate probe
+  when Symphony starts instead of carrying a pre-restart backoff deadline forward. When the condition changes, the issue re-enters the
   normal priority/concurrency scheduler with a compact state-change prompt. The terminal dashboard
   exposes a dedicated Waiting count and row section; the web dashboard adds an above-the-fold
   Waiting badge linked to the detailed rows plus **Resume now** and **Cancel wait**. Cancelling the
