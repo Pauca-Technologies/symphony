@@ -146,6 +146,7 @@ Use `linear_issue` for the current workpad, labels, and workflow transitions. In
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.
+- Treat the Linear description as the original scope authority and later human-authored Linear comments as chronological amendments that may clarify or override earlier ticket text. The workpad and Symphony marker comments are runtime evidence, not scope amendments.
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
@@ -153,12 +154,13 @@ Use `linear_issue` for the current workpad, labels, and workflow transitions. In
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
+- Adjacent work belongs in the current candidate only when an explicit requested outcome or acceptance criterion cannot be satisfied correctly without it. Cleanup, consistency, abstraction, or likely future value is not enough.
 - When meaningful out-of-scope improvements are discovered during execution,
-  file a separate Linear issue instead of expanding scope. The follow-up issue
-  must include a clear title, description, and acceptance criteria, be placed in
-  `Backlog`, be assigned to the same project as the current issue, link the
-  current issue as `related`, and use `blockedBy` when the follow-up depends on
-  the current issue.
+  use the typed `linear_issue` `create_follow_up` operation as soon as the title,
+  description, acceptance criteria, and evidence are concrete. Do not implement
+  the follow-up in the current branch. Symphony creates or returns a deterministic
+  unassigned Backlog issue in the same project without automation labels and links
+  it as related, or as blocked by the current issue when `depends_on_current` is true.
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
@@ -351,11 +353,9 @@ Use this only when completion is blocked by missing required tools or missing au
 - Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.
 - If comment editing is unavailable in-session, use the update script. Only report blocked if both MCP editing and script-based editing are unavailable.
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
-- If out-of-scope improvements are found, create a separate Backlog issue rather
-  than expanding current scope, and include a clear
-  title/description/acceptance criteria, same-project assignment, a `related`
-  link to the current issue, and `blockedBy` when the follow-up depends on the
-  current issue.
+- If out-of-scope improvements are found, leave them out of this candidate and
+  create the separate issue through typed `linear_issue create_follow_up`; record
+  the returned identifier in the workpad.
 - Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
 - In `Human Review`, do not make changes; wait and poll.
 - If state is terminal (`Done`), do nothing and shut down.

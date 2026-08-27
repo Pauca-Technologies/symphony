@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ReviewPacketTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.{Config, Linear.Issue, ReviewOutcome, ReviewPacket}
+  alias SymphonyElixir.{Config, Linear.Comment, Linear.Issue, ReviewOutcome, ReviewPacket}
 
   setup do
     workspace = Path.join(System.tmp_dir!(), "review-packet-#{System.unique_integer([:positive])}")
@@ -63,6 +63,56 @@ defmodule SymphonyElixir.ReviewPacketTest do
 
     assert %{"validation_attestations" => [%{"command" => "mix test"}]} =
              result.evidence_path |> File.read!() |> Jason.decode!()
+  end
+
+  test "human comments become ordered scope amendments while workpad and Symphony notes stay out", context do
+    issue = %{
+      issue("Scope amendments")
+      | comments: [
+          %Comment{
+            id: "later",
+            author_name: "Raul",
+            body: "Override: use the shared route.",
+            created_at: ~U[2026-08-27 11:00:00Z]
+          },
+          %Comment{
+            id: "workpad",
+            author_name: "Agent",
+            body: "## Codex Workpad\n\nimplementation transcript",
+            created_at: ~U[2026-08-27 10:30:00Z]
+          },
+          %Comment{
+            id: "earlier",
+            author_name: "Raul",
+            body: "Clarification: preserve the endpoint.",
+            created_at: ~U[2026-08-27 10:00:00Z]
+          },
+          %Comment{
+            id: "runtime",
+            author_name: "Symphony",
+            body: "<!-- symphony:review-skipped --> runtime note",
+            created_at: ~U[2026-08-27 09:00:00Z]
+          }
+        ]
+    }
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue,
+               pr(context),
+               context.head_sha,
+               nil,
+               settings(),
+               attestations: [attestation(context.head_sha)]
+             )
+
+    assert Enum.map(result.packet.issue.scope_amendments, & &1.id) == ["earlier", "later"]
+
+    assert Enum.map(result.packet.issue.scope_amendments, & &1.body) == [
+             "Clarification: preserve the endpoint.",
+             "Override: use the shared route."
+           ]
   end
 
   test "passed handoff checks and private PR attachments become exact-head review evidence", context do

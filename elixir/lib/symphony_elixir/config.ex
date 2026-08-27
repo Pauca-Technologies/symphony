@@ -62,6 +62,8 @@ defmodule SymphonyElixir.Config do
           model: String.t() | nil,
           reasoning_effort: String.t() | nil,
           require_pr: boolean(),
+          scope_contract_required: boolean(),
+          draft_pr_lifecycle: boolean(),
           pr_section_enabled: boolean(),
           section_heading: String.t()
         }
@@ -95,6 +97,8 @@ defmodule SymphonyElixir.Config do
     model: nil,
     reasoning_effort: nil,
     require_pr: true,
+    scope_contract_required: false,
+    draft_pr_lifecycle: false,
     pr_section_enabled: true,
     section_heading: "## 🤖 How to review this PR"
   }
@@ -247,6 +251,8 @@ defmodule SymphonyElixir.Config do
     |> Map.put(:model, optional_non_blank(raw, "model"))
     |> Map.put(:reasoning_effort, optional_non_blank(raw, "reasoning_effort"))
     |> Map.put(:require_pr, boolean_value(raw, "require_pr", true))
+    |> Map.put(:scope_contract_required, boolean_value(raw, "scope_contract_required", false))
+    |> Map.put(:draft_pr_lifecycle, boolean_value(raw, "draft_pr_lifecycle", false))
     |> Map.put(:pr_section_enabled, boolean_value(raw, "pr_section_enabled", true))
     |> Map.put(
       :section_heading,

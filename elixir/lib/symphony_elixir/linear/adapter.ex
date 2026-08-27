@@ -5,7 +5,54 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.{Client, Comment}
+  alias SymphonyElixir.Linear.{Client, Comment, Issue}
+
+  @follow_up_context_query """
+  query SymphonyFollowUpContext($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      identifier
+      url
+      project { id }
+      team {
+        id
+        states(filter: {name: {eq: "Backlog"}}, first: 1) {
+          nodes { id }
+        }
+      }
+    }
+  }
+  """
+
+  @create_follow_up_mutation """
+  mutation SymphonyCreateFollowUp($input: IssueCreateInput!) {
+    issueCreate(input: $input) {
+      success
+      issue { id identifier title url }
+    }
+  }
+  """
+
+  @follow_up_lookup_query """
+  query SymphonyFollowUpById($issueId: String!) {
+    issue(id: $issueId) { id identifier title url }
+  }
+  """
+
+  @create_follow_up_relation_mutation """
+  mutation SymphonyCreateFollowUpRelation($input: IssueRelationCreateInput!) {
+    issueRelationCreate(input: $input) {
+      success
+      issueRelation { id }
+    }
+  }
+  """
+
+  @follow_up_relation_lookup_query """
+  query SymphonyFollowUpRelationById($relationId: String!) {
+    issueRelation(id: $relationId) { id }
+  }
+  """
 
   @create_comment_mutation """
   mutation SymphonyCreateComment($issueId: String!, $body: String!) {
@@ -116,6 +163,16 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  @spec create_follow_up(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  def create_follow_up(%Issue{id: issue_id} = source, attributes)
+      when is_binary(issue_id) and is_map(attributes) do
+    with {:ok, context} <- follow_up_context(issue_id),
+         {:ok, follow_up, deduplicated?} <- create_or_fetch_follow_up(source, context, attributes),
+         :ok <- ensure_follow_up_relation(source, follow_up, attributes) do
+      {:ok, Map.put(follow_up, :deduplicated, deduplicated?)}
+    end
+  end
+
   @spec update_workpad(String.t(), String.t()) :: :ok | {:error, term()}
   def update_workpad(issue_id, body) when is_binary(issue_id) and is_binary(body) do
     with {:ok, %{comments: comments}} <- fetch_issue_comments(issue_id) do
@@ -185,6 +242,143 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
+  end
+
+  defp follow_up_context(issue_id) do
+    with {:ok, response} <- client_module().graphql(@follow_up_context_query, %{issueId: issue_id}),
+         %{"id" => source_id, "team" => %{"id" => team_id}} = issue <-
+           get_in(response, ["data", "issue"]),
+         project_id when is_binary(project_id) <- get_in(issue, ["project", "id"]),
+         state_id when is_binary(state_id) <-
+           get_in(issue, ["team", "states", "nodes", Access.at(0), "id"]) do
+      {:ok,
+       %{
+         source_id: source_id,
+         source_identifier: issue["identifier"],
+         source_url: issue["url"],
+         team_id: team_id,
+         project_id: project_id,
+         state_id: state_id
+       }}
+    else
+      {:error, reason} -> {:error, reason}
+      nil -> {:error, :follow_up_context_missing}
+      _ -> {:error, :follow_up_context_missing}
+    end
+  end
+
+  defp create_or_fetch_follow_up(source, context, attributes) do
+    title = attribute(attributes, :title)
+    issue_id = deterministic_uuid("follow-up", context.source_id, title)
+
+    input = %{
+      id: issue_id,
+      teamId: context.team_id,
+      projectId: context.project_id,
+      stateId: context.state_id,
+      title: title,
+      description: follow_up_description(source, attributes)
+    }
+
+    case client_module().graphql(@create_follow_up_mutation, %{input: input}) do
+      {:ok, response} ->
+        case get_in(response, ["data", "issueCreate"]) do
+          %{"success" => true, "issue" => issue} -> {:ok, normalize_follow_up(issue), false}
+          _ -> fetch_follow_up(issue_id)
+        end
+
+      {:error, _reason} ->
+        fetch_follow_up(issue_id)
+    end
+  end
+
+  defp fetch_follow_up(issue_id) do
+    with {:ok, response} <- client_module().graphql(@follow_up_lookup_query, %{issueId: issue_id}),
+         %{"id" => _id} = issue <- get_in(response, ["data", "issue"]) do
+      {:ok, normalize_follow_up(issue), true}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :follow_up_create_failed}
+    end
+  end
+
+  defp ensure_follow_up_relation(%Issue{id: source_id}, %{id: follow_up_id}, attributes) do
+    relation_type = if truthy_attribute?(attributes, :depends_on_current), do: "blocks", else: "related"
+    relation_id = deterministic_uuid("follow-up-relation:#{relation_type}", source_id, follow_up_id)
+
+    input = %{
+      id: relation_id,
+      issueId: source_id,
+      relatedIssueId: follow_up_id,
+      type: relation_type
+    }
+
+    case client_module().graphql(@create_follow_up_relation_mutation, %{input: input}) do
+      {:ok, response} ->
+        if get_in(response, ["data", "issueRelationCreate", "success"]) == true,
+          do: :ok,
+          else: follow_up_relation_exists?(relation_id)
+
+      {:error, _reason} ->
+        follow_up_relation_exists?(relation_id)
+    end
+  end
+
+  defp follow_up_relation_exists?(relation_id) do
+    with {:ok, response} <-
+           client_module().graphql(@follow_up_relation_lookup_query, %{relationId: relation_id}),
+         relation when is_map(relation) <- get_in(response, ["data", "issueRelation"]) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :follow_up_relation_create_failed}
+    end
+  end
+
+  defp follow_up_description(source, attributes) do
+    acceptance_criteria = attribute(attributes, :acceptance_criteria)
+    evidence = attribute(attributes, :evidence)
+
+    """
+    #{attribute(attributes, :description)}
+
+    ## Acceptance criteria
+
+    #{acceptance_criteria}
+
+    ## Discovery evidence
+
+    #{evidence}
+
+    Discovered while working on [#{source.identifier}](#{source.url}). Kept separate to preserve the source ticket's scope.
+    """
+    |> String.trim()
+  end
+
+  defp normalize_follow_up(issue) do
+    %{
+      id: issue["id"],
+      identifier: issue["identifier"],
+      title: issue["title"],
+      url: issue["url"]
+    }
+  end
+
+  defp attribute(attributes, key) do
+    Map.get(attributes, key) || Map.get(attributes, Atom.to_string(key))
+  end
+
+  defp truthy_attribute?(attributes, key), do: attribute(attributes, key) == true
+
+  defp deterministic_uuid(namespace, source_id, discriminator) do
+    <<prefix::48, _version::4, middle::12, _variant::2, suffix::62, _rest::binary>> =
+      :crypto.hash(:sha256, Enum.join([namespace, source_id, discriminator], "\0"))
+
+    <<prefix::48, 4::4, middle::12, 2::2, suffix::62>>
+    |> Base.encode16(case: :lower)
+    |> then(fn <<a::binary-size(8), b::binary-size(4), c::binary-size(4), d::binary-size(4), e::binary>> ->
+      Enum.join([a, b, c, d, e], "-")
+    end)
   end
 
   defp update_comment(comment_id, body) do

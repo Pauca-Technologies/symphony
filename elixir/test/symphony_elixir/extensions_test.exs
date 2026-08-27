@@ -232,10 +232,23 @@ defmodule SymphonyElixir.ExtensionsTest do
              SymphonyElixir.Tracker.fetch_issue_comments("issue-1")
 
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+
+    follow_up_attributes = %{
+      title: "Separate improvement",
+      description: "Keep the improvement out of the current candidate.",
+      acceptance_criteria: "The improvement is independently verifiable.",
+      evidence: "The current issue exposed it.",
+      depends_on_current: false
+    }
+
+    assert {:ok, %{id: "follow-up-issue-1", title: "Separate improvement"} = follow_up} =
+             SymphonyElixir.Tracker.create_follow_up(issue, follow_up_attributes)
+
     assert :ok = SymphonyElixir.Tracker.update_workpad("issue-1", "## Codex Workpad\n\nUpdated")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert :ok = SymphonyElixir.Tracker.remove_label("issue-1", "needs-human-input")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_follow_up, ^issue, ^follow_up_attributes, ^follow_up}
     assert_receive {:memory_tracker_workpad, "issue-1", "## Codex Workpad\n\nUpdated"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
     assert_receive {:memory_tracker_remove_label, "issue-1", "needs-human-input"}
@@ -295,6 +308,80 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive {:graphql_called, create_query, %{issueId: "issue-1", body: "## Codex Workpad\n\nCreated"}}
 
     assert create_query =~ "commentCreate"
+  end
+
+  test "linear adapter creates an unlabelled same-project Backlog follow-up and relation" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "id" => "source-id",
+               "identifier" => "UDPE-1",
+               "url" => "https://linear.example/UDPE-1",
+               "project" => %{"id" => "project-id"},
+               "team" => %{
+                 "id" => "team-id",
+                 "states" => %{"nodes" => [%{"id" => "backlog-id"}]}
+               }
+             }
+           }
+         }},
+        {:ok,
+         %{
+           "data" => %{
+             "issueCreate" => %{
+               "success" => true,
+               "issue" => %{
+                 "id" => "follow-up-id",
+                 "identifier" => "UDPE-2",
+                 "title" => "Extract helper",
+                 "url" => "https://linear.example/UDPE-2"
+               }
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueRelationCreate" => %{"success" => true, "issueRelation" => %{"id" => "relation-id"}}}}}
+      ]
+    )
+
+    source = %Issue{
+      id: "source-id",
+      identifier: "UDPE-1",
+      title: "Current task",
+      url: "https://linear.example/UDPE-1"
+    }
+
+    assert {:ok, %{identifier: "UDPE-2", deduplicated: false}} =
+             Adapter.create_follow_up(source, %{
+               title: "Extract helper",
+               description: "Consolidate the shared behavior.",
+               acceptance_criteria: "Both callers use the shared helper.",
+               evidence: "a.ex and b.ex duplicate the behavior.",
+               depends_on_current: false
+             })
+
+    assert_receive {:graphql_called, context_query, %{issueId: "source-id"}}
+    assert context_query =~ "Backlog"
+
+    assert_receive {:graphql_called, create_query, %{input: input}}
+    assert create_query =~ "issueCreate"
+    assert input.teamId == "team-id"
+    assert input.projectId == "project-id"
+    assert input.stateId == "backlog-id"
+    refute Map.has_key?(input, :labelIds)
+    refute Map.has_key?(input, :assigneeId)
+    assert input.id =~ ~r/^[0-9a-f-]{36}$/
+
+    assert_receive {:graphql_called, relation_query, %{input: relation_input}}
+    assert relation_query =~ "issueRelationCreate"
+    assert relation_input.issueId == "source-id"
+    assert relation_input.relatedIssueId == "follow-up-id"
+    assert relation_input.type == "related"
   end
 
   test "linear adapter delegates reads and validates mutation responses" do

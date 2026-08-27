@@ -110,6 +110,8 @@ defmodule SymphonyElixir.ReviewGate do
           review_effort: review_effort(),
           human_review: String.t(),
           comments: [map()],
+          scope_assessment: map() | nil,
+          follow_ups: [map()],
           failure_reason: String.t() | nil,
           resume_condition: String.t() | nil
         }
@@ -234,6 +236,27 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp dispatch_review(%{settings: %{require_pr: true}} = context, {:skip, reason}) do
     required_pr_outcome(context, reason)
+  end
+
+  defp dispatch_review(%{settings: %{draft_pr_lifecycle: true}} = context, {:ok, pr}) do
+    case PrReviewSection.ensure_draft(context.workspace, pr, context.opts) do
+      {:ok, draft_pr} ->
+        context =
+          context
+          |> Map.put(:managed_draft_lifecycle, true)
+          |> put_in([:settings, :draft_pr_lifecycle], false)
+
+        dispatch_review(context, {:ok, draft_pr})
+
+      {:error, reason} ->
+        conclude_infrastructure_failure(
+          context.issue,
+          Map.merge(context, %{pr: pr, reviewed_sha: candidate_sha(context.workspace, pr)}),
+          1,
+          {:managed_pr_draft_failed, reason},
+          context.opts
+        )
+    end
   end
 
   defp dispatch_review(context, pr_result) do
@@ -692,7 +715,8 @@ defmodule SymphonyElixir.ReviewGate do
            staged_verdict_path,
            review_context.reviewed_sha,
            packet.packet_id,
-           packet.diff.mode
+           packet.diff.mode,
+           review_context.settings.scope_contract_required
          ) do
       {:ok, verdict} ->
         publish_valid_verdict(staged_verdict_path, verdict_path, verdict, review_context, attempt, telemetry_handle)
@@ -749,12 +773,39 @@ defmodule SymphonyElixir.ReviewGate do
          attempt,
          telemetry_handle
        ) do
-    ReviewTelemetry.finish(telemetry_handle, :approved, verdict)
-    outcome = approved_outcome(review_context, verdict, attempt)
-    clear_latest_outcome(issue.id)
-    maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
-    emit_outcome_telemetry(issue, outcome)
-    {:approved, outcome}
+    with :ok <- persist_follow_ups(issue, verdict.follow_ups, opts),
+         _section_result <-
+           maybe_write_section(
+             workspace,
+             pr,
+             verdict.review_effort,
+             verdict.human_review,
+             settings,
+             opts
+           ),
+         {:ok, ready_pr} <- maybe_mark_pr_ready(workspace, pr, review_context, opts),
+         true <- candidate_sha(workspace, ready_pr) == review_context.reviewed_sha do
+      ReviewTelemetry.finish(telemetry_handle, :approved, verdict)
+      outcome = approved_outcome(review_context, verdict, attempt)
+      clear_latest_outcome(issue.id)
+      emit_outcome_telemetry(issue, outcome)
+      {:approved, outcome}
+    else
+      false ->
+        ReviewTelemetry.finish(telemetry_handle, :infrastructure_unavailable, verdict)
+
+        conclude_infrastructure_failure(
+          issue,
+          review_context,
+          attempt,
+          :pr_head_changed_while_marking_ready,
+          opts
+        )
+
+      {:error, reason} ->
+        ReviewTelemetry.finish(telemetry_handle, :infrastructure_unavailable, verdict)
+        conclude_infrastructure_failure(issue, review_context, attempt, reason, opts)
+    end
   end
 
   defp conclude_published_verdict(
@@ -763,8 +814,22 @@ defmodule SymphonyElixir.ReviewGate do
          attempt,
          telemetry_handle
        ) do
-    ReviewTelemetry.finish(telemetry_handle, :request_changes, verdict)
-    conclude_request_changes(review_context, verdict, attempt)
+    case persist_follow_ups(review_context.issue, verdict.follow_ups, review_context.opts) do
+      :ok ->
+        ReviewTelemetry.finish(telemetry_handle, :request_changes, verdict)
+        conclude_request_changes(review_context, verdict, attempt)
+
+      {:error, reason} ->
+        ReviewTelemetry.finish(telemetry_handle, :infrastructure_unavailable, verdict)
+
+        conclude_infrastructure_failure(
+          review_context.issue,
+          review_context,
+          attempt,
+          reason,
+          review_context.opts
+        )
+    end
   end
 
   defp conclude_published_verdict(
@@ -839,6 +904,29 @@ defmodule SymphonyElixir.ReviewGate do
     else
       :ok
     end
+  end
+
+  defp maybe_mark_pr_ready(workspace, pr, context, opts) do
+    if Map.get(context, :managed_draft_lifecycle, false) or
+         context.settings.draft_pr_lifecycle do
+      PrReviewSection.mark_ready(workspace, pr, opts)
+    else
+      {:ok, pr}
+    end
+  end
+
+  defp persist_follow_ups(_issue, [], _opts), do: :ok
+
+  defp persist_follow_ups(%Issue{} = issue, follow_ups, opts) do
+    create_follow_up = Keyword.get(opts, :tracker_create_follow_up, &Tracker.create_follow_up/2)
+
+    Enum.reduce_while(follow_ups, :ok, fn follow_up, :ok ->
+      case create_follow_up.(issue, follow_up) do
+        {:ok, _created_or_existing} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:follow_up_persistence_failed, reason}}}
+        other -> {:halt, {:error, {:follow_up_persistence_failed, other}}}
+      end
+    end)
   end
 
   defp budget_human_review(iterations) do
@@ -1069,6 +1157,8 @@ defmodule SymphonyElixir.ReviewGate do
     High-risk `high_risk_final_full_diff` mode additionally requires `full_diff_inspected: true`
     after a final complete base-to-head diff pass following delta reconciliation.
 
+    #{scope_contract_instructions(settings)}
+
     The final `verdict` must be one of `approve`, `request_changes`, or
     `infrastructure_unavailable`. Use `request_changes` only for a candidate defect or evidence gap
     the implementor can fix. Every `request_changes` verdict must contain at least one comment with
@@ -1082,6 +1172,24 @@ defmodule SymphonyElixir.ReviewGate do
     used authoritative repository authentication; otherwise report `infrastructure_unavailable`.
     """
   end
+
+  defp scope_contract_instructions(%{scope_contract_required: true}) do
+    """
+    This repository requires a structured scope decision. Treat the issue description as the
+    original authority and the packet's chronologically ordered `issue.scope_amendments` as later
+    authoritative amendments; a later amendment may override earlier ticket text. Inspect the full
+    candidate, not only file names. Emit `scope_assessment` with conclusion `conforms`,
+    `necessary_dependencies_only`, or `out_of_scope_changes_present`. Every necessary dependency
+    needs a concrete ticket criterion and exact files. Every out-of-scope change must set
+    `required_action` to `remove_from_candidate`; never approve while any remain. Put legitimate
+    discoveries that do not belong in this candidate in `follow_ups` with a title, description,
+    acceptance criteria, evidence, and `depends_on_current`; Symphony creates those Linear issues
+    after validating this exact-head verdict.
+    """
+    |> String.trim()
+  end
+
+  defp scope_contract_instructions(_settings), do: "No additional structured scope contract is enabled."
 
   defp add_review_runtime_stability_guard(prompt) do
     """
@@ -1194,20 +1302,34 @@ defmodule SymphonyElixir.ReviewGate do
 
   # --- verdict parsing -----------------------------------------------------
 
-  defp read_verdict(verdict_path, expected_sha, expected_packet_id, review_mode) do
+  defp read_verdict(verdict_path, expected_sha, expected_packet_id, review_mode, scope_contract_required?) do
     with {:ok, raw} <- File.read(verdict_path),
          {:ok, decoded} <- Jason.decode(raw),
          :ok <- reject_interim_verdict(decoded),
          {:ok, verdict} <- normalize_verdict(decoded),
-         :ok <- validate_verdict_candidate(verdict, expected_sha, expected_packet_id, review_mode) do
+         :ok <-
+           validate_verdict_candidate(
+             verdict,
+             expected_sha,
+             expected_packet_id,
+             review_mode,
+             scope_contract_required?
+           ) do
       {:ok, verdict}
     end
   end
 
-  defp validate_verdict_candidate(verdict, expected_sha, expected_packet_id, review_mode) do
+  defp validate_verdict_candidate(
+         verdict,
+         expected_sha,
+         expected_packet_id,
+         review_mode,
+         scope_contract_required?
+       ) do
     with :ok <- validate_verdict_evidence_contract(verdict),
          :ok <- validate_infrastructure_verdict(verdict),
          :ok <- validate_request_changes_findings(verdict),
+         :ok <- validate_scope_contract(verdict, scope_contract_required?),
          :ok <- validate_verdict_identity_when_pinned(verdict, expected_sha, expected_packet_id) do
       validate_full_diff_verdict(verdict, review_mode)
     end
@@ -1264,6 +1386,72 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp validate_request_changes_findings(_verdict), do: :ok
+
+  defp validate_scope_contract(%{verdict: :infrastructure_unavailable}, _required?), do: :ok
+  defp validate_scope_contract(_verdict, false), do: :ok
+
+  defp validate_scope_contract(%{scope_assessment: nil}, true),
+    do: {:error, :verdict_missing_scope_assessment}
+
+  defp validate_scope_contract(verdict, true) do
+    assessment = verdict.scope_assessment
+
+    with true <- valid_scope_conclusion?(assessment.conclusion) or {:error, :invalid_scope_conclusion},
+         true <-
+           Enum.all?(assessment.necessary_dependencies, &valid_necessary_dependency?/1) or
+             {:error, :invalid_necessary_dependency},
+         true <-
+           Enum.all?(assessment.out_of_scope_changes, &valid_out_of_scope_change?/1) or
+             {:error, :invalid_out_of_scope_change},
+         true <- verdict.follow_up_contract? or {:error, :verdict_missing_follow_ups},
+         true <- Enum.all?(verdict.follow_ups, &valid_follow_up?/1) or {:error, :invalid_follow_up},
+         :ok <- validate_scope_conclusion_shape(assessment) do
+      validate_scope_verdict(assessment, verdict.verdict)
+    end
+  end
+
+  defp valid_scope_conclusion?(value),
+    do: value in ["conforms", "necessary_dependencies_only", "out_of_scope_changes_present"]
+
+  defp valid_necessary_dependency?(dependency) do
+    present_string?(dependency.description) and present_string?(dependency.criterion) and
+      dependency.files != []
+  end
+
+  defp valid_out_of_scope_change?(change) do
+    present_string?(change.description) and change.files != [] and
+      change.required_action == "remove_from_candidate"
+  end
+
+  defp valid_follow_up?(follow_up) do
+    Enum.all?(
+      [follow_up.title, follow_up.description, follow_up.acceptance_criteria, follow_up.evidence],
+      &present_string?/1
+    ) and is_boolean(follow_up.depends_on_current)
+  end
+
+  defp validate_scope_conclusion_shape(%{conclusion: "conforms"} = assessment) do
+    if assessment.necessary_dependencies == [] and assessment.out_of_scope_changes == [],
+      do: :ok,
+      else: {:error, :scope_conclusion_does_not_match_entries}
+  end
+
+  defp validate_scope_conclusion_shape(%{conclusion: "necessary_dependencies_only"} = assessment) do
+    if assessment.necessary_dependencies != [] and assessment.out_of_scope_changes == [],
+      do: :ok,
+      else: {:error, :scope_conclusion_does_not_match_entries}
+  end
+
+  defp validate_scope_conclusion_shape(%{conclusion: "out_of_scope_changes_present"} = assessment) do
+    if assessment.out_of_scope_changes != [],
+      do: :ok,
+      else: {:error, :scope_conclusion_does_not_match_entries}
+  end
+
+  defp validate_scope_verdict(%{out_of_scope_changes: [_ | _]}, :approve),
+    do: {:error, :approval_contains_out_of_scope_changes}
+
+  defp validate_scope_verdict(_assessment, _verdict), do: :ok
 
   defp concrete_blocking_finding?(comment) do
     blocking_severity?(comment.severity) and
@@ -1342,6 +1530,9 @@ defmodule SymphonyElixir.ReviewGate do
            review_effort: normalize_effort(Map.get(decoded, "review_effort") || Map.get(decoded, "risk")),
            human_review: string_or_default(Map.get(decoded, "human_review"), ""),
            comments: normalize_comments(Map.get(decoded, "comments")),
+           scope_assessment: normalize_scope_assessment(Map.get(decoded, "scope_assessment")),
+           follow_ups: normalize_follow_ups(Map.get(decoded, "follow_ups")),
+           follow_up_contract?: is_list(Map.get(decoded, "follow_ups")),
            packet_id: string_or_nil(Map.get(decoded, "packet_id")),
            reviewed_sha: string_or_nil(Map.get(decoded, "reviewed_sha")),
            inspected: normalize_string_list(Map.get(decoded, "inspected")),
@@ -1398,6 +1589,69 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp normalize_comments(_comments), do: []
+
+  defp normalize_scope_assessment(assessment) when is_map(assessment) do
+    dependencies = Map.get(assessment, "necessary_dependencies")
+    out_of_scope = Map.get(assessment, "out_of_scope_changes")
+
+    if is_list(dependencies) and is_list(out_of_scope) do
+      %{
+        conclusion: string_or_nil(Map.get(assessment, "conclusion")),
+        necessary_dependencies: normalize_scope_entries(dependencies, :dependency),
+        out_of_scope_changes: normalize_scope_entries(out_of_scope, :out_of_scope)
+      }
+    end
+  end
+
+  defp normalize_scope_assessment(_assessment), do: nil
+
+  defp normalize_scope_entries(entries, kind) when is_list(entries) do
+    Enum.map(entries, &normalize_scope_entry(&1, kind))
+  end
+
+  defp normalize_scope_entries(_entries, _kind), do: []
+
+  defp normalize_scope_entry(entry, :dependency) when is_map(entry) do
+    %{
+      description: string_or_nil(Map.get(entry, "description")),
+      criterion: string_or_nil(Map.get(entry, "criterion")),
+      files: normalize_string_list(Map.get(entry, "files"))
+    }
+  end
+
+  defp normalize_scope_entry(entry, :out_of_scope) when is_map(entry) do
+    %{
+      description: string_or_nil(Map.get(entry, "description")),
+      files: normalize_string_list(Map.get(entry, "files")),
+      required_action: string_or_nil(Map.get(entry, "required_action"))
+    }
+  end
+
+  defp normalize_scope_entry(_entry, :dependency),
+    do: %{description: nil, criterion: nil, files: []}
+
+  defp normalize_scope_entry(_entry, :out_of_scope),
+    do: %{description: nil, files: [], required_action: nil}
+
+  defp normalize_follow_ups(follow_ups) when is_list(follow_ups) do
+    Enum.map(follow_ups, fn follow_up ->
+      if is_map(follow_up) do
+        depends_on_current = Map.get(follow_up, "depends_on_current")
+
+        %{
+          title: string_or_nil(Map.get(follow_up, "title")),
+          description: string_or_nil(Map.get(follow_up, "description")),
+          acceptance_criteria: string_or_nil(Map.get(follow_up, "acceptance_criteria")),
+          evidence: string_or_nil(Map.get(follow_up, "evidence")),
+          depends_on_current: if(is_boolean(depends_on_current), do: depends_on_current)
+        }
+      else
+        %{title: nil, description: nil, acceptance_criteria: nil, evidence: nil, depends_on_current: false}
+      end
+    end)
+  end
+
+  defp normalize_follow_ups(_follow_ups), do: []
 
   defp normalize_string_list(values) when is_list(values) do
     values
@@ -1476,7 +1730,7 @@ defmodule SymphonyElixir.ReviewGate do
     Reviewer comments:
     #{format_comments(comments)}
 
-    Keep the issue in In Progress. Address the comments above — update code, tests, or docs, or post a justified pushback in the workpad — then re-attempt the handoff. The reviewer will run again on your next attempt. After #{max_iterations} request-change passes Symphony stops automated review and escalates the unresolved findings for an explicit human decision; it does not treat budget exhaustion as approval.
+    Keep the issue in In Progress. Address the comments above — update code, tests, or docs, or post a justified pushback in the workpad — then re-attempt the handoff. For a scope finding, remove the unrelated change from this candidate; do not implement the separately tracked follow-up in this branch. The reviewer will run again on your next attempt. After #{max_iterations} request-change passes Symphony stops automated review and escalates the unresolved findings for an explicit human decision; it does not treat budget exhaustion as approval.
     """
     |> String.trim()
   end
@@ -1514,6 +1768,8 @@ defmodule SymphonyElixir.ReviewGate do
       attempts: attempt,
       authoritative: present_sha?(reviewed_sha),
       findings: verdict.comments,
+      follow_ups: verdict.follow_ups,
+      scope_assessment: verdict.scope_assessment,
       inspected: verdict.inspected,
       attestation_report: verdict.attestations,
       severity_counts: severity_counts(verdict.comments),
@@ -1537,6 +1793,8 @@ defmodule SymphonyElixir.ReviewGate do
       review_effort: verdict.review_effort,
       attempts: attempt,
       findings: verdict.comments,
+      follow_ups: verdict.follow_ups,
+      scope_assessment: verdict.scope_assessment,
       inspected: verdict.inspected,
       attestation_report: verdict.attestations,
       severity_counts: severity_counts(verdict.comments),
@@ -1580,6 +1838,8 @@ defmodule SymphonyElixir.ReviewGate do
       failure_reason: :review_budget_exhausted,
       review_effort: :thorough,
       findings: latest.findings,
+      follow_ups: latest.follow_ups,
+      scope_assessment: latest.scope_assessment,
       inspected: latest.inspected,
       attestation_report: latest.attestation_report,
       severity_counts: latest.severity_counts,
@@ -1872,6 +2132,7 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp present_sha?(value), do: is_binary(value) and String.trim(value) != ""
+  defp present_string?(value), do: is_binary(value) and String.trim(value) != ""
   defp sha_label(value) when is_binary(value) and value != "", do: value
   defp sha_label(_value), do: "unavailable"
 

@@ -62,7 +62,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   }
   """
   @linear_issue_description """
-  Read or update the current Linear issue through typed operations. Use this for activity, the single `## Codex Workpad`, labels, and workflow transitions. Transitions to review states still run Symphony's before_handoff and automated review gates. Use `linear_graphql` only when no typed operation fits.
+  Read or update the current Linear issue through typed operations. Use this for activity, the single `## Codex Workpad`, labels, workflow transitions, and separate follow-up issues for valuable discoveries outside current scope. Follow-ups are created unassigned in Backlog, in the same project, without automation labels, and linked deterministically to the current issue. Transitions to review states still run Symphony's before_handoff and automated review gates. Use `linear_graphql` only when no typed operation fits.
   """
   @linear_issue_input_schema %{
     "type" => "object",
@@ -71,7 +71,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     "properties" => %{
       "operation" => %{
         "type" => "string",
-        "enum" => ["get", "update_workpad", "add_label", "remove_label", "transition"]
+        "enum" => ["get", "update_workpad", "add_label", "remove_label", "create_follow_up", "transition"]
       },
       "body" => %{
         "type" => ["string", "null"],
@@ -79,6 +79,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       },
       "label" => %{"type" => ["string", "null"]},
       "state" => %{"type" => ["string", "null"]},
+      "title" => %{"type" => ["string", "null"], "minLength" => 1},
+      "description" => %{"type" => ["string", "null"], "minLength" => 1},
+      "acceptance_criteria" => %{"type" => ["string", "null"], "minLength" => 1},
+      "evidence" => %{"type" => ["string", "null"], "minLength" => 1},
+      "depends_on_current" => %{
+        "type" => ["boolean", "null"],
+        "description" => "True only when the follow-up cannot start until the current issue is complete."
+      },
       "blocker" => %{
         "type" => ["object", "null"],
         "additionalProperties" => false,
@@ -203,7 +211,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     with {:ok, operation} <- typed_operation(arguments),
          {:ok, issue} <- current_issue(opts),
          {:ok, issue_id} <- current_issue_id(issue) do
-      execute_typed_issue_operation(operation, issue_id, arguments, opts)
+      execute_typed_issue_operation(operation, issue, issue_id, arguments, opts)
     else
       {:error, reason} -> failure_response(linear_issue_error(reason))
     end
@@ -212,7 +220,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp execute_linear_issue(_arguments, _opts),
     do: failure_response(linear_issue_error(:invalid_arguments))
 
-  defp execute_typed_issue_operation("get", issue_id, _arguments, opts) do
+  defp execute_typed_issue_operation("get", _issue, issue_id, _arguments, opts) do
     fetch_issue = Keyword.get(opts, :tracker_fetch_issue, &Tracker.fetch_issue_states_by_ids/1)
     fetch_comments = Keyword.get(opts, :tracker_fetch_comments, &Tracker.fetch_issue_comments/1)
 
@@ -232,7 +240,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp execute_typed_issue_operation("update_workpad", issue_id, arguments, opts) do
+  defp execute_typed_issue_operation("update_workpad", _issue, issue_id, arguments, opts) do
     update_workpad = Keyword.get(opts, :tracker_update_workpad, &Tracker.update_workpad/2)
 
     with {:ok, body} <- typed_workpad_body(arguments),
@@ -244,7 +252,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp execute_typed_issue_operation(operation, issue_id, arguments, opts)
+  defp execute_typed_issue_operation(operation, _issue, issue_id, arguments, opts)
        when operation in ["add_label", "remove_label"] do
     label_operation =
       case operation do
@@ -261,7 +269,39 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp execute_typed_issue_operation("transition", issue_id, arguments, opts) do
+  defp execute_typed_issue_operation("create_follow_up", issue, _issue_id, arguments, opts) do
+    create_follow_up = Keyword.get(opts, :tracker_create_follow_up, &Tracker.create_follow_up/2)
+
+    with {:ok, title} <- typed_non_blank(arguments, "title", :missing_follow_up_title),
+         {:ok, description} <-
+           typed_non_blank(arguments, "description", :missing_follow_up_description),
+         {:ok, acceptance_criteria} <-
+           typed_non_blank(
+             arguments,
+             "acceptance_criteria",
+             :missing_follow_up_acceptance_criteria
+           ),
+         {:ok, evidence} <- typed_non_blank(arguments, "evidence", :missing_follow_up_evidence),
+         {:ok, follow_up} <-
+           create_follow_up.(issue, %{
+             title: title,
+             description: description,
+             acceptance_criteria: acceptance_criteria,
+             evidence: evidence,
+             depends_on_current: typed_value(arguments, "depends_on_current") == true
+           }) do
+      success_response(%{
+        "status" => "created",
+        "operation" => "create_follow_up",
+        "issue" => follow_up
+      })
+    else
+      {:error, reason} -> failure_response(linear_issue_error(reason))
+      other -> failure_response(linear_issue_error({:follow_up_create_failed, other}))
+    end
+  end
+
+  defp execute_typed_issue_operation("transition", _issue, issue_id, arguments, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
 
     with {:ok, state_name} <- typed_non_blank(arguments, "state", :missing_state),
@@ -1348,7 +1388,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp typed_operation(arguments) do
     case typed_value(arguments, "operation") do
       operation
-      when operation in ["get", "update_workpad", "add_label", "remove_label", "transition"] ->
+      when operation in [
+             "get",
+             "update_workpad",
+             "add_label",
+             "remove_label",
+             "create_follow_up",
+             "transition"
+           ] ->
         {:ok, operation}
 
       _operation ->
@@ -1467,6 +1514,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           "update_workpad",
           "add_label",
           "remove_label",
+          "create_follow_up",
           "transition"
         ]
       }

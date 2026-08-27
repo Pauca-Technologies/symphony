@@ -29,6 +29,8 @@ defmodule SymphonyElixir.ReviewOutcome do
     :attempts,
     authoritative: false,
     findings: [],
+    follow_ups: [],
+    scope_assessment: nil,
     inspected: [],
     attestation_report: %{reused: [], rerun: []},
     severity_counts: %{}
@@ -47,6 +49,8 @@ defmodule SymphonyElixir.ReviewOutcome do
           attempts: pos_integer() | nil,
           authoritative: boolean(),
           findings: [map()],
+          follow_ups: [map()],
+          scope_assessment: map() | nil,
           inspected: [String.t()],
           attestation_report: %{reused: [String.t()], rerun: [String.t()]},
           severity_counts: %{optional(String.t()) => non_neg_integer()}
@@ -70,6 +74,8 @@ defmodule SymphonyElixir.ReviewOutcome do
       attempts: outcome.attempts,
       authoritative: outcome.authoritative,
       findings: outcome.findings,
+      follow_ups: outcome.follow_ups,
+      scope_assessment: outcome.scope_assessment,
       inspected: outcome.inspected,
       attestation_report: outcome.attestation_report,
       severity_counts: outcome.severity_counts

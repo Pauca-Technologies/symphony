@@ -68,6 +68,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
            "headRefOid" => "abc123",
            "baseRefOid" => "base123",
            "baseRefName" => "main",
+           "isDraft" => true,
            "changedFiles" => 4,
            "headRepository" => %{"nameWithOwner" => "org/repo"}
          }), 0}
@@ -82,6 +83,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
                 head_oid: "abc123",
                 base_oid: "base123",
                 base_ref: "main",
+                is_draft: true,
                 changed_files: 4,
                 repository: "org/repo"
               }} =
@@ -108,7 +110,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
                          "view",
                          "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
                          "--json",
-                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
+                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
                        ]}
     end
 
@@ -128,7 +130,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
                          "pr",
                          "view",
                          "--json",
-                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
+                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
                        ]}
     end
 
@@ -156,6 +158,59 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
       runner = fn _args, _cwd -> raise "executable not found" end
       assert {:skip, reason} = PrReviewSection.resolve_pr("/tmp", pr_runner: runner)
       assert reason =~ "executable not found"
+    end
+  end
+
+  describe "managed draft lifecycle" do
+    test "moves a ready PR to draft and verifies the exact head" do
+      test_pid = self()
+
+      runner = fn
+        ["pr", "ready", "7", "--undo"], _cwd ->
+          send(test_pid, :drafted)
+          {"", 0}
+
+        ["pr", "view", "7", "--json", _fields], _cwd ->
+          {Jason.encode!(%{
+             "id" => "PR_7",
+             "number" => 7,
+             "body" => "Body",
+             "headRefOid" => "head-7",
+             "isDraft" => true
+           }), 0}
+      end
+
+      assert {:ok, %{is_draft: true, head_oid: "head-7"}} =
+               PrReviewSection.ensure_draft(
+                 "/tmp",
+                 %{id: "PR_7", number: 7, body: "Body", head_oid: "head-7", is_draft: false},
+                 pr_runner: runner
+               )
+
+      assert_received :drafted
+    end
+
+    test "marks an approved draft ready and rejects a changed head" do
+      runner = fn
+        ["pr", "ready", "7"], _cwd ->
+          {"", 0}
+
+        ["pr", "view", "7", "--json", _fields], _cwd ->
+          {Jason.encode!(%{
+             "id" => "PR_7",
+             "number" => 7,
+             "body" => "Body",
+             "headRefOid" => "changed-head",
+             "isDraft" => false
+           }), 0}
+      end
+
+      assert {:error, {:pr_head_changed, "head-7", "changed-head"}} =
+               PrReviewSection.mark_ready(
+                 "/tmp",
+                 %{id: "PR_7", number: 7, body: "Body", head_oid: "head-7", is_draft: true},
+                 pr_runner: runner
+               )
     end
   end
 

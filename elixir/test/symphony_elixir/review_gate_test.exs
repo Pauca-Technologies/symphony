@@ -126,6 +126,112 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert outcome.reviewed_sha == "head-7"
   end
 
+  test "managed scope approval persists follow-ups and marks the exact draft head ready", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    pr_runner = fn
+      ["pr", "view" | _], _cwd ->
+        {Jason.encode!(%{
+           "id" => "PR_7",
+           "number" => 7,
+           "body" => "Existing PR body.",
+           "headRefOid" => "head-7",
+           "isDraft" => Process.get(:test_pr_ready, false) == false
+         }), 0}
+
+      ["api", "graphql" | _], _cwd ->
+        {"", 0}
+
+      ["pr", "ready", "7"], _cwd ->
+        Process.put(:test_pr_ready, true)
+        send(test_pid, :pr_marked_ready)
+        {"", 0}
+    end
+
+    runner =
+      verdict_runner(%{
+        "verdict" => "approve",
+        "summary" => "scope conforms",
+        "comments" => [],
+        "scope_assessment" => %{
+          "conclusion" => "necessary_dependencies_only",
+          "necessary_dependencies" => [
+            %{
+              "description" => "The route contract requires its parser.",
+              "criterion" => "Accept the new scoped route input.",
+              "files" => ["lib/parser.ex"]
+            }
+          ],
+          "out_of_scope_changes" => []
+        },
+        "follow_ups" => [
+          %{
+            "title" => "Consolidate parsers",
+            "description" => "Consolidate the remaining parser duplication separately.",
+            "acceptance_criteria" => "Both legacy callers use one parser.",
+            "evidence" => "The reviewed diff exposed a second legacy parser.",
+            "depends_on_current" => false
+          }
+        ]
+      })
+
+    assert {:approved, outcome} =
+             ReviewGate.run(
+               workspace,
+               issue(),
+               nil,
+               review_workflow(%{
+                 "scope_contract_required" => true,
+                 "draft_pr_lifecycle" => true
+               }),
+               session_runner: runner,
+               pr_runner: pr_runner,
+               tracker_create_follow_up: fn source, follow_up ->
+                 send(test_pid, {:persisted_follow_up, source, follow_up})
+                 {:ok, %{identifier: "UDPE-2"}}
+               end
+             )
+
+    assert outcome.scope_assessment.conclusion == "necessary_dependencies_only"
+    assert [%{title: "Consolidate parsers"}] = outcome.follow_ups
+    assert_received {:persisted_follow_up, %Issue{id: "issue-1"}, %{title: "Consolidate parsers"}}
+    assert_received :pr_marked_ready
+  end
+
+  test "managed scope cannot approve while out-of-scope changes remain", %{workspace: workspace} do
+    runner =
+      verdict_runner(%{
+        "verdict" => "approve",
+        "comments" => [],
+        "scope_assessment" => %{
+          "conclusion" => "out_of_scope_changes_present",
+          "necessary_dependencies" => [],
+          "out_of_scope_changes" => [
+            %{
+              "description" => "Unrelated cleanup",
+              "files" => ["lib/unrelated.ex"],
+              "required_action" => "remove_from_candidate"
+            }
+          ]
+        },
+        "follow_ups" => []
+      })
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(
+               workspace,
+               issue(),
+               nil,
+               review_workflow(%{"scope_contract_required" => true}),
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert {:verdict_unreadable, :approval_contains_out_of_scope_changes} = outcome.failure_reason
+  end
+
   test "publishes the authoritative verdict only after the reviewer session completes", %{
     workspace: workspace
   } do
@@ -319,7 +425,11 @@ defmodule SymphonyElixir.ReviewGateTest do
     workspace: workspace
   } do
     test_pid = self()
-    issue = %{issue() | comments: [%{body: "IMPLEMENTOR-TRANSCRIPT-MUST-NOT-LEAK"}]}
+
+    issue = %{
+      issue()
+      | comments: [%{body: "## Codex Workpad\n\nIMPLEMENTOR-TRANSCRIPT-MUST-NOT-LEAK"}]
+    }
 
     runner = fn ctx ->
       send(test_pid, {:review_context, ctx})
@@ -1306,7 +1416,7 @@ defmodule SymphonyElixir.ReviewGateTest do
         "view",
         "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
         "--json",
-        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
+        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
       ],
       _cwd ->
         {Jason.encode!(%{
@@ -1320,7 +1430,7 @@ defmodule SymphonyElixir.ReviewGateTest do
         "pr",
         "view",
         "--json",
-        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"
+        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
       ],
       _cwd ->
         flunk("must not rely on current branch PR detection when Linear has a PR attachment")

@@ -49,6 +49,7 @@ defmodule SymphonyElixir.Github.PrReviewSection do
           optional(:base_ref) => String.t() | nil,
           optional(:url) => String.t() | nil,
           optional(:repository) => String.t() | nil,
+          optional(:is_draft) => boolean(),
           optional(:changed_files) => non_neg_integer() | nil
         }
   # (gh args, cwd) -> {output, exit_status}; mirrors Github.ReviewerRequest.
@@ -71,13 +72,36 @@ defmodule SymphonyElixir.Github.PrReviewSection do
     args =
       ["pr", "view"] ++
         explicit_pr_ref_args(opts) ++
-        ["--json", "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository"]
+        ["--json", "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"]
 
     case safe_run(runner, args, workspace) do
       {output, 0} -> parse_pr(output)
       {:error, reason} -> {:skip, reason}
       {_output, _code} -> {:skip, :no_pr}
     end
+  end
+
+  @doc "Move an existing managed PR to draft and verify its exact head did not change."
+  @spec ensure_draft(Path.t(), pr() | nil, keyword()) ::
+          {:ok, pr()} | {:skip, :no_pr} | {:error, term()}
+  def ensure_draft(_workspace, nil, _opts), do: {:skip, :no_pr}
+
+  def ensure_draft(_workspace, %{is_draft: true} = pr, _opts), do: {:ok, pr}
+
+  def ensure_draft(workspace, %{number: number} = pr, opts)
+      when is_binary(workspace) and is_integer(number) do
+    change_draft_state(workspace, pr, true, opts)
+  end
+
+  @doc "Move an approved managed PR to ready-for-review and verify its exact head."
+  @spec mark_ready(Path.t(), pr() | nil, keyword()) :: {:ok, pr()} | {:error, term()}
+  def mark_ready(_workspace, nil, _opts), do: {:error, :no_pr}
+
+  def mark_ready(_workspace, %{is_draft: false} = pr, _opts), do: {:ok, pr}
+
+  def mark_ready(workspace, %{number: number} = pr, opts)
+      when is_binary(workspace) and is_integer(number) do
+    change_draft_state(workspace, pr, false, opts)
   end
 
   @doc """
@@ -177,6 +201,7 @@ defmodule SymphonyElixir.Github.PrReviewSection do
            base_ref: string_or_nil(Map.get(decoded, "baseRefName")),
            url: string_or_nil(Map.get(decoded, "url")),
            repository: repository_name(Map.get(decoded, "headRepository")),
+           is_draft: Map.get(decoded, "isDraft") == true,
            changed_files: integer_or_nil(Map.get(decoded, "changedFiles"))
          }}
 
@@ -216,6 +241,38 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   defp write_body(_workspace, %{number: number}, _new_body, _opts) do
     Logger.warning("PrReviewSection missing PR node id pr=##{number}; skipping review section update")
     :skipped
+  end
+
+  defp change_draft_state(workspace, %{number: number} = pr, draft?, opts) do
+    runner = Keyword.get(opts, :pr_runner, &default_runner/2)
+    args = ["pr", "ready", Integer.to_string(number)] ++ if(draft?, do: ["--undo"], else: [])
+
+    case safe_run(runner, args, workspace) do
+      {_output, 0} -> verify_draft_state(workspace, pr, draft?, opts)
+      {:error, reason} -> {:error, {:pr_draft_state_failed, reason}}
+      {output, code} -> {:error, {:pr_draft_state_failed, code, truncate(output)}}
+    end
+  end
+
+  defp verify_draft_state(workspace, %{number: number, head_oid: expected_head}, draft?, opts) do
+    refresh_opts =
+      opts
+      |> Keyword.delete(:pr_url)
+      |> Keyword.put(:pr_ref, Integer.to_string(number))
+
+    case resolve_pr(workspace, refresh_opts) do
+      {:ok, %{head_oid: ^expected_head, is_draft: ^draft?} = refreshed} ->
+        {:ok, refreshed}
+
+      {:ok, %{head_oid: actual_head}} when actual_head != expected_head ->
+        {:error, {:pr_head_changed, expected_head, actual_head}}
+
+      {:ok, %{is_draft: actual}} ->
+        {:error, {:pr_draft_state_not_applied, draft?, actual}}
+
+      {:skip, reason} ->
+        {:error, {:pr_refresh_failed, reason}}
+    end
   end
 
   defp update_pull_request_body_mutation do

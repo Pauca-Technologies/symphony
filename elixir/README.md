@@ -36,7 +36,8 @@ Consumer-repository scripts can therefore use current task context without recei
 credential. Later turns receive only comments added or updated since the previous turn. Equivalent
 repeated automated-review outcomes for the same candidate are collapsed, while human comments and
 the single workpad remain verbatim. The typed `linear_issue` tool handles current-issue reads,
-workpad updates, labels, and transitions; `linear_graphql` remains available for uncommon operations
+workpad updates, labels, transitions, and deterministic same-project Backlog follow-ups for
+out-of-scope discoveries; `linear_graphql` remains available for uncommon operations
 that have no typed form. Both transition paths preserve handoff gates. Symphony disables the native
 Linear MCP in managed Codex sessions because its writes cannot run `hooks.before_handoff` or the
 automated review gate.
@@ -76,6 +77,15 @@ findings with their reviewed SHA, PR-body attachment links, and a bounded follow
 compaction never removes the commands for reading the authoritative full diff or the applicable
 security/tenant/auth rule paths. High-risk follow-ups
 must finish with another complete base-to-head pass.
+
+Opted-in review workflows can require structured scope and a managed draft PR lifecycle. Scope starts
+with the Linear description and applies later human-authored comments as chronological amendments;
+workpad and Symphony marker comments are excluded. The reviewer identifies necessary dependencies,
+out-of-scope candidate changes, and separate follow-ups. Symphony validates and persists follow-ups
+before accepting the verdict, using deterministic Linear IDs so retries do not duplicate issues.
+Before every implementation or feedback turn Symphony keeps the PR draft. After exact-head
+approval it marks that same head ready and only then starts the repository's final CI/landability
+gate; any draft-state or head mismatch withholds handoff.
 
 The reviewer is fail-safe. It writes to an attempt-scoped staging path; Symphony publishes the
 canonical verdict with one atomic rename only after the reviewer session completes and the output

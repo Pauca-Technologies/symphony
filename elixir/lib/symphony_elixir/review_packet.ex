@@ -331,6 +331,7 @@ defmodule SymphonyElixir.ReviewPacket do
       |> Map.update!(:requested_outcome, &truncate(&1, 1_000))
       |> Map.update!(:acceptance_criteria, &truncate(&1, 1_500))
       |> Map.update!(:non_goals, &truncate(&1, 800))
+      |> Map.update!(:scope_amendments, &compact_scope_amendments(&1, 12, 800))
     end)
   end
 
@@ -363,7 +364,8 @@ defmodule SymphonyElixir.ReviewPacket do
           packet.issue
           | requested_outcome: truncate(packet.issue.requested_outcome, 500),
             acceptance_criteria: truncate(packet.issue.acceptance_criteria, 700),
-            non_goals: truncate(packet.issue.non_goals, 400)
+            non_goals: truncate(packet.issue.non_goals, 400),
+            scope_amendments: compact_scope_amendments(packet.issue.scope_amendments, 8, 500)
         },
         diff: %{
           packet.diff
@@ -424,7 +426,8 @@ defmodule SymphonyElixir.ReviewPacket do
           title: truncate(packet.issue.title, 240),
           requested_outcome: truncate(packet.issue.requested_outcome, 280),
           acceptance_criteria: truncate(packet.issue.acceptance_criteria, 360),
-          non_goals: truncate(packet.issue.non_goals, 200)
+          non_goals: truncate(packet.issue.non_goals, 200),
+          scope_amendments: compact_scope_amendments(packet.issue.scope_amendments, 5, 280)
         },
         diff: %{
           mode: packet.diff.mode,
@@ -741,9 +744,45 @@ defmodule SymphonyElixir.ReviewPacket do
       title: issue.title,
       requested_outcome: section_or_summary(description, ["required change", "requested outcome", "problem"]),
       acceptance_criteria: section_or_summary(description, ["acceptance criteria", "test plan", "testing"]),
-      non_goals: section_or_default(description, ["non-goals", "non goals"], "No explicit non-goals were provided; do not infer scope beyond the requested outcome and acceptance criteria.")
+      non_goals: section_or_default(description, ["non-goals", "non goals"], "No explicit non-goals were provided; do not infer scope beyond the requested outcome and acceptance criteria."),
+      scope_amendments: scope_amendments(issue.comments)
     }
   end
+
+  defp scope_amendments(comments) when is_list(comments) do
+    comments
+    |> Enum.reject(&non_authoritative_comment?/1)
+    |> Enum.sort_by(&comment_timestamp/1, DateTime)
+    |> Enum.map(fn comment ->
+      %{
+        id: Map.get(comment, :id),
+        author: Map.get(comment, :author_name),
+        created_at: iso8601_or_nil(Map.get(comment, :created_at)),
+        updated_at: iso8601_or_nil(Map.get(comment, :updated_at)),
+        body: truncate(Map.get(comment, :body) || "", @text_limit)
+      }
+    end)
+  end
+
+  defp scope_amendments(_comments), do: []
+
+  defp compact_scope_amendments(amendments, max_entries, max_body_bytes) do
+    amendments
+    |> Enum.take(-max_entries)
+    |> Enum.map(&Map.update!(&1, :body, fn body -> truncate(body, max_body_bytes) end))
+  end
+
+  defp non_authoritative_comment?(comment) do
+    body = comment |> Map.get(:body, "") |> String.trim_leading()
+    String.starts_with?(body, "## Codex Workpad") or String.starts_with?(body, "<!-- symphony:")
+  end
+
+  defp comment_timestamp(comment) do
+    Map.get(comment, :updated_at) || Map.get(comment, :created_at) || ~U[1970-01-01 00:00:00Z]
+  end
+
+  defp iso8601_or_nil(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp iso8601_or_nil(_value), do: nil
 
   defp section_or_summary(description, headings) do
     section_or_default(description, headings, truncate(description, @text_limit))

@@ -37,7 +37,8 @@ Important boundary:
 
 - Symphony is a scheduler/runner and tracker reader.
 - Ticket writes (state transitions, comments, PR links) are typically performed by the coding agent
-  using tools available in the workflow/runtime environment.
+  using tools available in the workflow/runtime environment. An opted-in exact-head review policy
+  MAY ask Symphony to persist deterministic follow-up issues emitted by a validated verdict.
 - A successful run can end at a workflow-defined handoff state (for example `Human Review`), not
   necessarily `Done`.
 
@@ -61,8 +62,9 @@ Important boundary:
 - Rich web UI or multi-tenant control plane.
 - Prescribing a specific dashboard or terminal UI implementation.
 - General-purpose workflow engine or distributed job scheduler.
-- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
-  workflow prompt and agent tooling.)
+- General built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in
+  the workflow prompt and agent tooling; narrowly scoped, repository-opted-in review lifecycle and
+  follow-up persistence are allowed.)
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
 - Mandating a single default approval, sandbox, or operator-confirmation posture for all
   implementations.
@@ -969,6 +971,10 @@ Part A: Stall detection
   not rerun an already completed review. Re-resolve the PR head after the gate passes and before
   applying the captured tracker transition; if it changed, clear pending state and require a fresh
   review.
+- A repository MAY opt into a managed draft PR lifecycle. In that mode, Symphony MUST return an
+  existing PR to draft before an implementation turn and MUST keep it draft during exact-head
+  review. Only a validated approval may move the same head to ready-for-review before the expensive
+  handoff gate; a head or state mismatch is an infrastructure failure and withholds handoff.
 - Each reviewer attempt MUST start a fresh thread that does not inherit the implementor transcript.
   Its only task context is a bounded, versioned packet for the exact candidate. The packet records
   project/repository and PR identity, resolved base/head SHAs and fingerprint, issue outcome and
@@ -995,6 +1001,12 @@ Part A: Stall detection
   or interim placeholder MUST leave no authoritative verdict. A `request_changes` verdict MUST
   contain at least one blocking-severity finding with a concrete failing state, violated criterion,
   or missing regression test; minor and advisory observations MAY accompany approval.
+- A repository MAY require a structured scope contract in candidate verdicts. When enabled, the
+  original issue description plus chronological non-runtime issue comments form the amended scope;
+  later comments may override earlier text. The verdict MUST classify necessary dependencies and
+  out-of-scope changes, MUST NOT approve while out-of-scope changes remain, and MAY emit fully
+  specified follow-up candidates. Symphony MAY persist those follow-ups only after exact-head
+  verdict validation and MUST make retries idempotent.
 - Parent reviewer and lens threads are attributed independently in telemetry, including packet/head,
   token usage, duration, model, reasoning effort, outcome, and finding count.
 - Reviewer request-changes or timeout clears pending state. Request-changes returns control to the
@@ -1424,9 +1436,14 @@ Optional client-side tool extension:
   coding agent to construct Linear GraphQL.
 - The tool MUST derive the issue identity from host-owned session context. It MUST NOT accept an
   arbitrary issue ID from the coding agent.
-- Standard operations are `get`, `update_workpad`, `add_label`, `remove_label`, and `transition`.
+- Standard operations are `get`, `update_workpad`, `add_label`, `remove_label`,
+  `create_follow_up`, and `transition`.
 - `update_workpad` MUST update the existing comment whose trimmed body starts with
   `## Codex Workpad`, or create it if absent.
+- `create_follow_up` MUST create or return an idempotent issue derived from the host-owned current
+  issue and typed title, description, acceptance criteria, evidence, and dependency input. The
+  repository policy determines project/state/assignment/label defaults; the operation MUST NOT let
+  the coding agent supply an arbitrary source issue ID.
 - Review-state transitions MUST pass through the same `before_handoff` and automated-review gates as
   raw GraphQL transitions.
 - A transition to `Blocked` MUST require the same structured human blocker as the raw extension.
@@ -1566,6 +1583,11 @@ An implementation MUST support these tracker adapter operations:
 4. `fetch_issue_comments(issue_id)`
    - Used once immediately before an outer agent dispatch to assemble required issue activity.
    - Returns normalized comments plus a truncation marker.
+
+5. `create_follow_up(source_issue, attributes)` when advertised by the runtime
+   - Create or return an idempotent typed follow-up using repository/runtime policy.
+   - Preserve source linkage without making the follow-up eligible for automation unless policy
+     explicitly requests that behavior.
 
 ### 11.2 Query Semantics (Linear)
 

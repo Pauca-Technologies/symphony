@@ -77,6 +77,20 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec create_follow_up(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  def create_follow_up(%Issue{} = issue, attributes) when is_map(attributes) do
+    result = %{
+      id: "follow-up-#{issue.id}",
+      identifier: "FOLLOW-1",
+      title: Map.get(attributes, :title) || Map.get(attributes, "title"),
+      url: "https://linear.example/FOLLOW-1",
+      deduplicated: false
+    }
+
+    send_event({:memory_tracker_follow_up, issue, attributes, result})
+    {:ok, result}
+  end
+
   @spec update_workpad(String.t(), String.t()) :: :ok | {:error, term()}
   def update_workpad(issue_id, body) do
     send_event({:memory_tracker_workpad, issue_id, body})

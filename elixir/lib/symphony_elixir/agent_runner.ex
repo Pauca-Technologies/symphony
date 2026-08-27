@@ -13,7 +13,9 @@ defmodule SymphonyElixir.AgentRunner do
     AgentFailure,
     AgentRouter,
     BaseDrift,
+    Cardinality,
     Config,
+    Github.PrReviewSection,
     GitHubAuth,
     HandoffGate,
     Linear.Client,
@@ -730,6 +732,34 @@ defmodule SymphonyElixir.AgentRunner do
          issue_state_fetcher,
          {turn_number, max_turns}
        ) do
+    case ensure_implementation_pr_draft(workspace, issue, opts) do
+      :ok ->
+        run_codex_turn(
+          backend,
+          app_session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          {turn_number, max_turns}
+        )
+
+      {:error, reason} ->
+        {:error, {:managed_pr_draft_failed, reason}}
+    end
+  end
+
+  defp run_codex_turn(
+         backend,
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         {turn_number, max_turns}
+       ) do
     budget_collector = Keyword.fetch!(opts, :budget_collector)
     strategy_prompt = AgentBudgetCollector.take_strategy_prompt(budget_collector)
     opts = maybe_put(opts, :efficiency_strategy_prompt, strategy_prompt)
@@ -860,6 +890,37 @@ defmodule SymphonyElixir.AgentRunner do
 
         Logger.warning("Agent turn ended abnormally for #{issue_context(issue)} turn=#{turn_number}/#{max_turns} reason=#{inspect(reason)}")
         error
+    end
+  end
+
+  defp ensure_implementation_pr_draft(workspace, issue, opts) do
+    opts
+    |> Keyword.get(:per_repo_review_workflow)
+    |> Config.review_settings()
+    |> maybe_ensure_implementation_pr_draft(workspace, issue, opts)
+  end
+
+  defp maybe_ensure_implementation_pr_draft(%{draft_pr_lifecycle: false}, _workspace, _issue, _opts),
+    do: :ok
+
+  defp maybe_ensure_implementation_pr_draft(_settings, workspace, issue, opts) do
+    pr_opts =
+      opts
+      |> Keyword.take([:pr_runner])
+      |> maybe_put(:pr_url, List.first(Cardinality.pr_urls(issue)))
+
+    workspace
+    |> PrReviewSection.resolve_pr(pr_opts)
+    |> ensure_resolved_pr_draft(workspace, pr_opts)
+  end
+
+  defp ensure_resolved_pr_draft({:skip, :no_pr}, _workspace, _opts), do: :ok
+  defp ensure_resolved_pr_draft({:skip, reason}, _workspace, _opts), do: {:error, reason}
+
+  defp ensure_resolved_pr_draft({:ok, pr}, workspace, opts) do
+    case PrReviewSection.ensure_draft(workspace, pr, opts) do
+      {:ok, _pr} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 

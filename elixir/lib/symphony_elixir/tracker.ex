@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Tracker do
   Adapter boundary for issue tracker reads and writes.
   """
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, Linear.Issue}
 
   @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Tracker do
               {:ok, %{comments: [term()], truncated: boolean()}} | {:error, term()}
   @callback recently_terminal_issues(pos_integer()) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback create_follow_up(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
   @callback update_workpad(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   @callback add_label(String.t(), String.t()) :: :ok | {:error, :label_missing} | {:error, term()}
@@ -52,6 +53,12 @@ defmodule SymphonyElixir.Tracker do
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     adapter().create_comment(issue_id, body)
+  end
+
+  @doc "Create or return a deterministic same-project follow-up for the current issue."
+  @spec create_follow_up(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
+  def create_follow_up(%Issue{} = issue, attributes) when is_map(attributes) do
+    adapter().create_follow_up(issue, attributes)
   end
 
   @spec update_workpad(String.t(), String.t()) :: :ok | {:error, term()}

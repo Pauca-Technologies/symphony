@@ -1507,7 +1507,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
           "tool_output_max_bytes" => 99,
           "model" => "gpt-review",
           "reasoning_effort" => "high",
-          "require_pr" => false
+          "require_pr" => false,
+          "scope_contract_required" => true,
+          "draft_pr_lifecycle" => true
         }
       },
       prompt: "review",
@@ -1526,6 +1528,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.model == "gpt-review"
     assert settings.reasoning_effort == "high"
     refute settings.require_pr
+    assert settings.scope_contract_required
+    assert settings.draft_pr_lifecycle
 
     minimum =
       Config.review_settings(%{

@@ -64,6 +64,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              "update_workpad",
              "add_label",
              "remove_label",
+             "create_follow_up",
              "transition"
            ]
 
@@ -143,6 +144,47 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert update_response["success"]
     assert_received {:updated_workpad, "issue-typed", "## Codex Workpad\n\nUpdated."}
+  end
+
+  test "linear_issue creates a bounded follow-up through the tracker boundary" do
+    issue = %SymphonyElixir.Linear.Issue{
+      id: "issue-source",
+      identifier: "UDPE-1",
+      title: "Keep scope bounded",
+      state: "In Progress"
+    }
+
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_issue",
+        %{
+          "operation" => "create_follow_up",
+          "title" => "Extract the shared helper",
+          "description" => "The duplicated helper should be consolidated separately.",
+          "acceptance_criteria" => "Both callers use one shared helper.",
+          "evidence" => "The current diff exposed matching helpers in a.ts and b.ts.",
+          "depends_on_current" => false
+        },
+        handoff_gate_context: %{issue: issue},
+        tracker_create_follow_up: fn source, attributes ->
+          send(test_pid, {:follow_up, source, attributes})
+          {:ok, %{identifier: "UDPE-2", url: "https://linear.example/UDPE-2"}}
+        end
+      )
+
+    assert response["success"]
+    assert Jason.decode!(response["output"])["issue"]["identifier"] == "UDPE-2"
+
+    assert_received {:follow_up, ^issue,
+                     %{
+                       title: "Extract the shared helper",
+                       description: "The duplicated helper should be consolidated separately.",
+                       acceptance_criteria: "Both callers use one shared helper.",
+                       evidence: "The current diff exposed matching helpers in a.ts and b.ts.",
+                       depends_on_current: false
+                     }}
   end
 
   test "linear_issue resolves typed state transitions before using the gated mutation path" do
