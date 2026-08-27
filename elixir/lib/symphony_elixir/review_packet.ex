@@ -745,6 +745,7 @@ defmodule SymphonyElixir.ReviewPacket do
       requested_outcome: section_or_summary(description, ["required change", "requested outcome", "problem"]),
       acceptance_criteria: section_or_summary(description, ["acceptance criteria", "test plan", "testing"]),
       non_goals: section_or_default(description, ["non-goals", "non goals"], "No explicit non-goals were provided; do not infer scope beyond the requested outcome and acceptance criteria."),
+      scope_amendments_truncated: issue.comments_truncated,
       scope_amendments: scope_amendments(issue.comments)
     }
   end
@@ -774,7 +775,9 @@ defmodule SymphonyElixir.ReviewPacket do
 
   defp non_authoritative_comment?(comment) do
     body = comment |> Map.get(:body, "") |> String.trim_leading()
-    String.starts_with?(body, "## Codex Workpad") or String.starts_with?(body, "<!-- symphony:")
+
+    is_nil(Map.get(comment, :author_id)) or String.starts_with?(body, "## Codex Workpad") or
+      String.starts_with?(body, "<!-- symphony:")
   end
 
   defp comment_timestamp(comment) do

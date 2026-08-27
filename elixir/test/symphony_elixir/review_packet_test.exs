@@ -68,30 +68,42 @@ defmodule SymphonyElixir.ReviewPacketTest do
   test "human comments become ordered scope amendments while workpad and Symphony notes stay out", context do
     issue = %{
       issue("Scope amendments")
-      | comments: [
+      | comments_truncated: true,
+        comments: [
           %Comment{
             id: "later",
+            author_id: "user-1",
             author_name: "Raul",
             body: "Override: use the shared route.",
             created_at: ~U[2026-08-27 11:00:00Z]
           },
           %Comment{
             id: "workpad",
+            author_id: "agent-1",
             author_name: "Agent",
             body: "## Codex Workpad\n\nimplementation transcript",
             created_at: ~U[2026-08-27 10:30:00Z]
           },
           %Comment{
             id: "earlier",
+            author_id: "user-1",
             author_name: "Raul",
             body: "Clarification: preserve the endpoint.",
             created_at: ~U[2026-08-27 10:00:00Z]
           },
           %Comment{
             id: "runtime",
+            author_id: "symphony-1",
             author_name: "Symphony",
             body: "<!-- symphony:review-skipped --> runtime note",
             created_at: ~U[2026-08-27 09:00:00Z]
+          },
+          %Comment{
+            id: "integration",
+            author_id: nil,
+            author_name: "Integration",
+            body: "Automated integration noise.",
+            created_at: ~U[2026-08-27 10:15:00Z]
           }
         ]
     }
@@ -108,6 +120,7 @@ defmodule SymphonyElixir.ReviewPacketTest do
              )
 
     assert Enum.map(result.packet.issue.scope_amendments, & &1.id) == ["earlier", "later"]
+    assert result.packet.issue.scope_amendments_truncated
 
     assert Enum.map(result.packet.issue.scope_amendments, & &1.body) == [
              "Clarification: preserve the endpoint.",

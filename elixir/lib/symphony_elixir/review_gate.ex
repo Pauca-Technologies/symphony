@@ -1178,7 +1178,10 @@ defmodule SymphonyElixir.ReviewGate do
     This repository requires a structured scope decision. Treat the issue description as the
     original authority and the packet's chronologically ordered `issue.scope_amendments` as later
     authoritative amendments; a later amendment may override earlier ticket text. Inspect the full
-    candidate, not only file names. Emit `scope_assessment` with conclusion `conforms`,
+    candidate, not only file names. If `issue.scope_amendments_truncated` is true, use the read-only
+    Linear tool to retrieve the omitted older activity before deciding; report
+    `infrastructure_unavailable` if authoritative retrieval is unavailable. Emit `scope_assessment`
+    with conclusion `conforms`,
     `necessary_dependencies_only`, or `out_of_scope_changes_present`. Every necessary dependency
     needs a concrete ticket criterion and exact files. Every out-of-scope change must set
     `required_action` to `remove_from_candidate`; never approve while any remain. Put legitimate

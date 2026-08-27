@@ -80,9 +80,11 @@ must finish with another complete base-to-head pass.
 
 Opted-in review workflows can require structured scope and a managed draft PR lifecycle. Scope starts
 with the Linear description and applies later human-authored comments as chronological amendments;
-workpad and Symphony marker comments are excluded. The reviewer identifies necessary dependencies,
-out-of-scope candidate changes, and separate follow-ups. Symphony validates and persists follow-ups
-before accepting the verdict, using deterministic Linear IDs so retries do not duplicate issues.
+workpad, integration-authored activity, and Symphony marker comments are excluded. If the bounded
+snapshot omits older comments, the reviewer retrieves that activity with its read-only Linear access
+before deciding. The reviewer identifies necessary dependencies, out-of-scope candidate changes, and
+separate follow-ups. Symphony validates and persists follow-ups before accepting the verdict, using
+deterministic Linear IDs so retries do not duplicate issues.
 Before every implementation or feedback turn Symphony keeps the PR draft. After exact-head
 approval it marks that same head ready and only then starts the repository's final CI/landability
 gate; any draft-state or head mismatch withholds handoff.

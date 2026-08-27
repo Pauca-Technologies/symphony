@@ -184,6 +184,8 @@ Fields:
   - Each record contains `id`, `body`, `author_id`, `author_name`, `created_at`, and `updated_at`.
 - `comments_truncated` (boolean)
   - True when older comments exist outside the captured activity window.
+  - A structured scope reviewer must retrieve the omitted activity before making an authoritative
+    decision; an unavailable retrieval is an infrastructure outcome, not an approval.
 
 #### 4.1.2 Workflow Definition
 
