@@ -1007,8 +1007,10 @@ Part A: Stall detection
   original issue description plus chronological non-runtime issue comments form the amended scope;
   later comments may override earlier text. The verdict MUST classify necessary dependencies and
   out-of-scope changes, MUST NOT approve while out-of-scope changes remain, and MAY emit fully
-  specified follow-up candidates. Symphony MAY persist those follow-ups only after exact-head
-  verdict validation and MUST make retries idempotent.
+  specified follow-up candidates. The packet MUST carry a stable digest of the complete amended
+  scope so a downstream gate can reject a verdict after that authority changes. Symphony MAY
+  persist those follow-ups only after exact-head verdict validation and MUST make retries
+  idempotent.
 - Parent reviewer and lens threads are attributed independently in telemetry, including packet/head,
   token usage, duration, model, reasoning effort, outcome, and finding count.
 - Reviewer request-changes or timeout clears pending state. Request-changes returns control to the

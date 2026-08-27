@@ -126,6 +126,69 @@ defmodule SymphonyElixir.ReviewPacketTest do
              "Clarification: preserve the endpoint.",
              "Override: use the shared route."
            ]
+
+    assert result.packet.issue.scope_digest =~ ~r/^sha256:[a-f0-9]{64}$/
+  end
+
+  test "scope digest changes with human authority but ignores integration activity", context do
+    original = %Issue{
+      id: "issue-6050",
+      identifier: "UDPE-6050",
+      title: "Scope amendments",
+      description: "Original scope.",
+      comments: [
+        %Comment{
+          id: "human",
+          author_id: "user-1",
+          author_name: "Raul",
+          body: "Preserve the endpoint.",
+          created_at: ~U[2026-08-27 10:00:00Z]
+        },
+        %Comment{
+          id: "integration",
+          author_id: nil,
+          author_name: "Integration",
+          body: "First runtime note.",
+          created_at: ~U[2026-08-27 10:05:00Z]
+        }
+      ]
+    }
+
+    human_amendment =
+      update_in(original.comments, fn comments ->
+        Enum.map(comments, fn
+          %Comment{id: "human"} = comment -> %{comment | body: "Remove the endpoint."}
+          comment -> comment
+        end)
+      end)
+
+    integration_update =
+      update_in(original.comments, fn comments ->
+        Enum.map(comments, fn
+          %Comment{id: "integration"} = comment -> %{comment | body: "Second runtime note."}
+          comment -> comment
+        end)
+      end)
+
+    build = fn candidate ->
+      {:ok, result} =
+        ReviewPacket.build(
+          context.workspace,
+          candidate,
+          pr(context),
+          context.head_sha,
+          nil,
+          settings(),
+          attestations: [attestation(context.head_sha)]
+        )
+
+      result.packet.issue.scope_digest
+    end
+
+    original_digest = build.(original)
+    assert original_digest == "sha256:bfa727453ab871092a2172005c19c04bf72fb504bcd94685208cc7ec9e5afe36"
+    assert build.(human_amendment) != original_digest
+    assert build.(integration_update) == original_digest
   end
 
   test "passed handoff checks and private PR attachments become exact-head review evidence", context do

@@ -742,6 +742,7 @@ defmodule SymphonyElixir.ReviewPacket do
       id: issue.id,
       identifier: issue.identifier,
       title: issue.title,
+      scope_digest: scope_digest(issue),
       requested_outcome: section_or_summary(description, ["required change", "requested outcome", "problem"]),
       acceptance_criteria: section_or_summary(description, ["acceptance criteria", "test plan", "testing"]),
       non_goals: section_or_default(description, ["non-goals", "non goals"], "No explicit non-goals were provided; do not infer scope beyond the requested outcome and acceptance criteria."),
@@ -786,6 +787,44 @@ defmodule SymphonyElixir.ReviewPacket do
 
   defp iso8601_or_nil(%DateTime{} = value), do: DateTime.to_iso8601(value)
   defp iso8601_or_nil(_value), do: nil
+
+  defp scope_digest(%Issue{} = issue) do
+    comment_parts =
+      issue.comments
+      |> List.wrap()
+      |> Enum.reject(&non_authoritative_comment?/1)
+      |> Enum.sort_by(&comment_timestamp/1, DateTime)
+      |> Enum.flat_map(fn comment ->
+        [
+          Map.get(comment, :id),
+          Map.get(comment, :author_id),
+          Map.get(comment, :author_name),
+          iso8601_or_nil(Map.get(comment, :created_at)),
+          iso8601_or_nil(Map.get(comment, :updated_at)),
+          Map.get(comment, :body)
+        ]
+      end)
+
+    payload =
+      [
+        "symphony-review-scope-v1",
+        issue.id,
+        issue.identifier,
+        issue.title,
+        issue.description,
+        to_string(issue.comments_truncated == true),
+        Integer.to_string(div(length(comment_parts), 6))
+        | comment_parts
+      ]
+      |> Enum.map_join(&length_prefixed/1)
+
+    "sha256:" <> sha256(payload)
+  end
+
+  defp length_prefixed(value) do
+    normalized = if is_binary(value), do: value, else: ""
+    "#{byte_size(normalized)}:#{normalized}"
+  end
 
   defp section_or_summary(description, headings) do
     section_or_default(description, headings, truncate(description, @text_limit))

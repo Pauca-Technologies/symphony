@@ -84,7 +84,8 @@ workpad, integration-authored activity, and Symphony marker comments are exclude
 snapshot omits older comments, the reviewer retrieves that activity with its read-only Linear access
 before deciding. The reviewer identifies necessary dependencies, out-of-scope candidate changes, and
 separate follow-ups. Symphony validates and persists follow-ups before accepting the verdict, using
-deterministic Linear IDs so retries do not duplicate issues.
+deterministic Linear IDs so retries do not duplicate issues. The packet carries a stable digest of
+the complete amended scope so downstream gates reject approval after the scope snapshot changes.
 Before every implementation or feedback turn Symphony keeps the PR draft. After exact-head
 approval it marks that same head ready and only then starts the repository's final CI/landability
 gate; any draft-state or head mismatch withholds handoff.
