@@ -963,17 +963,19 @@ Part A: Stall detection
   coding-agent turn. A stale pass MUST NOT authorize the mutation. Lifecycle completion MUST close
   the job identity the orchestrator owns even when a terminal response reports a superseding job.
 - A pending review is keyed to the issue and reviewed PR head. Repeated requests while that job is
-  pending coalesce into the existing review. Before applying the captured tracker transition,
-  re-resolve the PR head; if it changed, clear pending state and require a fresh review.
+  pending coalesce into the existing review. The reviewer MUST run before the expensive
+  `before_handoff` hook. Only exact-head approval may start that hook; request changes MUST NOT start
+  it. Persist the approval identity with subsequent asynchronous gate state so restart recovery does
+  not rerun an already completed review. Re-resolve the PR head after the gate passes and before
+  applying the captured tracker transition; if it changed, clear pending state and require a fresh
+  review.
 - Each reviewer attempt MUST start a fresh thread that does not inherit the implementor transcript.
   Its only task context is a bounded, versioned packet for the exact candidate. The packet records
   project/repository and PR identity, resolved base/head SHAs and fingerprint, issue outcome and
   acceptance/non-goals, changed-file/stat manifest, authoritative full-diff commands, applicable
   repository rules, risk/lens rationale, exact-head attestations, prior unresolved findings with
   their reviewed SHA, implementation risks/skipped proof/evidence, PR-body attachment links, and a
-  bounded follow-up delta. Exact-candidate attestations from a passed protocol-aware handoff gate,
-  including candidate/exact/mutable-PR-state identity, MUST be forwarded into this packet rather
-  than requiring the reviewer to rediscover already-accepted proof.
+  bounded follow-up delta.
 - Packet size and reviewer context/tool-output/timeout settings are repository-configurable with a
   deterministic hard bound and compaction order. Compaction MUST NOT remove access to the complete
   meaningful diff or applicable security/tenant/auth rules. Budget pressure is handled by explicit
@@ -987,6 +989,12 @@ Part A: Stall detection
 - Follow-up reviews receive prior open findings plus the prior-head-to-current-head delta. A
   high-risk follow-up MUST perform a final complete base-to-head diff pass. Verdict evidence records
   the packet id, exact reviewed head, inspected scope, and attestations reused versus rerun.
+- Each review attempt MUST write only to an attempt-scoped staging path. The orchestrator MUST read
+  and validate that staged output only after the reviewer session completes, then atomically publish
+  it to the configured canonical verdict path. A crash, timeout, partial write, malformed verdict,
+  or interim placeholder MUST leave no authoritative verdict. A `request_changes` verdict MUST
+  contain at least one blocking-severity finding with a concrete failing state, violated criterion,
+  or missing regression test; minor and advisory observations MAY accompany approval.
 - Parent reviewer and lens threads are attributed independently in telemetry, including packet/head,
   token usage, duration, model, reasoning effort, outcome, and finding count.
 - Reviewer request-changes or timeout clears pending state. Request-changes returns control to the

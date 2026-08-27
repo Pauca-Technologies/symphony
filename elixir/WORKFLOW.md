@@ -85,7 +85,8 @@ hooks:
     cd elixir && mise exec -- mix workspace.before_remove
 # Automated-review packet/context/turn budgets are repository-owned. Configure
 # them under `review:` in that target repository's WORKFLOW_REVIEW.md; Symphony
-# always starts a fresh one-turn reviewer and requires an exact-head verdict.
+# always starts a fresh one-turn reviewer before the expensive handoff hook,
+# atomically publishes its final verdict, and requires exact-head approval.
 agent:
   max_concurrent_agents: 10
   # Per-agent test process fan-out; this does not change max_concurrent_agents.

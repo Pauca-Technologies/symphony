@@ -1178,6 +1178,155 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "deferred review lifecycle" do
+    test "approves the exact head before starting and durably polling the handoff gate" do
+      workspace_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-review-before-gate-#{System.unique_integer([:positive])}"
+        )
+
+      workspace = Path.join(workspace_root, "UDPE-7431")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      {_, 0} = System.cmd("git", ["-C", workspace, "init", "--quiet"])
+      File.write!(Path.join(workspace, "README.md"), "review before gate\n")
+      {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          workspace,
+          "-c",
+          "user.name=Symphony Test",
+          "-c",
+          "user.email=symphony@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "review before gate"
+        ])
+
+      {head_sha, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+      head_sha = String.trim(head_sha)
+      test_pid = self()
+
+      issue = %Issue{
+        id: "issue-review-before-gate",
+        identifier: "UDPE-7431",
+        title: "Review before final validation",
+        state: "In Progress",
+        labels: []
+      }
+
+      review_workflow = %{
+        config: %{"review" => %{"require_pr" => false}},
+        prompt: "Review {{ issue.identifier }}",
+        prompt_template: "Review {{ issue.identifier }}"
+      }
+
+      no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
+
+      review_runner = fn ctx ->
+        send(test_pid, :review_started_before_gate)
+        refute_received :handoff_gate_started
+        write_review_verdict(ctx, %{"verdict" => "approve"})
+        {:ok, %{}}
+      end
+
+      linear_client = fn query, variables, _opts ->
+        send(test_pid, {:reviewed_handoff_applied, query, variables})
+        {:ok, %{"data" => %{}}}
+      end
+
+      review_opts = [
+        pr_runner: no_pr,
+        session_runner: review_runner,
+        comment_fn: fn _id, _body -> :ok end,
+        linear_client: linear_client
+      ]
+
+      handoff_request = %{
+        query: "mutation { issueUpdate(input: {stateId: \"in-review\"}) { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        target_state: "In Review",
+        before_handoff_command: nil,
+        before_handoff_timeout_ms: nil,
+        before_handoff_stale_ms: nil,
+        review_workflow: review_workflow,
+        review_opts: review_opts,
+        linear_client: linear_client
+      }
+
+      review_request = %{
+        query: handoff_request.query,
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: review_workflow,
+        review_opts: review_opts,
+        linear_client: linear_client,
+        handoff_after_review: handoff_request
+      }
+
+      Application.put_env(:symphony_elixir, :deferred_requests_for_test, [review_request])
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :deferred_requests_for_test)
+        File.rm_rf(workspace_root)
+      end)
+
+      starter = fn ^workspace, ^issue, nil, "In Review", start_opts ->
+        assert start_opts[:async] == true
+        send(test_pid, :handoff_gate_started)
+        {:pending, async_gate(:pending)}
+      end
+
+      poller = fn ^workspace, ^issue, nil, "In Review", "job-7157", _poll_opts ->
+        assert {:ok,
+                %{
+                  "phase" => "polling",
+                  "reviewApproval" => %{
+                    "kind" => "workspace",
+                    "issueId" => "issue-review-before-gate",
+                    "reviewedSha" => ^head_sha
+                  }
+                }} = Workspace.load_handoff_gate_state(workspace)
+
+        send(test_pid, :handoff_gate_polled)
+        {:passed, async_gate(:passed)}
+      end
+
+      state_fetcher = fn ["issue-review-before-gate"] -> {:ok, [issue]} end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {DeferredBackend, %{}},
+                   issue_state_fetcher: state_fetcher,
+                   handoff_gate_starter: starter,
+                   handoff_gate_poller: poller,
+                   handoff_gate_sleep: fn _milliseconds -> :ok end,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received :review_started_before_gate
+      assert_received :handoff_gate_started
+      assert_received :handoff_gate_polled
+      assert_received {:reviewed_handoff_applied, query, %{}}
+      assert query =~ "issueUpdate"
+      refute_received :review_started_before_gate
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
     test "ends the worker attempt when review infrastructure is unavailable" do
       workspace =
         Path.join(
@@ -1947,13 +2096,33 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
     end
 
-    test "reattaches to a durable job and applies an exact-candidate pass without a model turn" do
+    test "reattaches to a reviewed durable job and applies an exact-candidate pass without a model turn" do
       workspace_root =
         Path.join(System.tmp_dir!(), "symphony-gate-recovery-#{System.unique_integer([:positive])}")
 
       workspace = Path.join(workspace_root, "UDPE-7157")
       File.mkdir_p!(workspace)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      {_, 0} = System.cmd("git", ["-C", workspace, "init", "--quiet"])
+      File.write!(Path.join(workspace, "README.md"), "reviewed durable handoff\n")
+      {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          workspace,
+          "-c",
+          "user.name=Symphony Test",
+          "-c",
+          "user.email=symphony@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "reviewed durable handoff"
+        ])
+
+      {reviewed_sha, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+      reviewed_sha = String.trim(reviewed_sha)
 
       issue = %Issue{
         id: "issue-gate-recovery",
@@ -1970,6 +2139,11 @@ defmodule SymphonyElixir.AgentRunnerTest do
                  "query" => "mutation Move { issueUpdate(id: \"issue-gate-recovery\", input: {stateId: \"review\"}) { success } }",
                  "variables" => %{},
                  "targetState" => "In Review",
+                 "reviewApproval" => %{
+                   "kind" => "workspace",
+                   "issueId" => "issue-gate-recovery",
+                   "reviewedSha" => reviewed_sha
+                 },
                  "gate" => %{
                    "jobId" => pending_gate.job_id,
                    "status" => "pending",

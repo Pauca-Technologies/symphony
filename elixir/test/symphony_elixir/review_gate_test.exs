@@ -126,6 +126,77 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert outcome.reviewed_sha == "head-7"
   end
 
+  test "publishes the authoritative verdict only after the reviewer session completes", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+    canonical_path = Path.join(workspace, ".artifacts/symphony-review/verdict.json")
+    File.mkdir_p!(Path.dirname(canonical_path))
+    File.write!(canonical_path, "stale")
+
+    runner = fn ctx ->
+      refute ctx.verdict_path == canonical_path
+      refute File.exists?(canonical_path)
+      write_verdict(ctx, %{"verdict" => "approve"})
+      assert File.exists?(ctx.verdict_path)
+      refute File.exists?(canonical_path)
+      send(test_pid, {:staged_verdict_path, ctx.verdict_path})
+      {:ok, %{}}
+    end
+
+    assert {:approved, _outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:staged_verdict_path, staged_path}
+    refute File.exists?(staged_path)
+    assert {:ok, published} = File.read(canonical_path)
+    assert Jason.decode!(published)["verdict"] == "approve"
+  end
+
+  test "does not publish a verdict left by a failed reviewer session", %{workspace: workspace} do
+    test_pid = self()
+    canonical_path = Path.join(workspace, ".artifacts/symphony-review/verdict.json")
+
+    runner = fn ctx ->
+      write_verdict(ctx, %{"verdict" => "approve"})
+      send(test_pid, {:failed_staged_verdict_path, ctx.verdict_path})
+      {:error, :turn_timeout}
+    end
+
+    assert {:infrastructure_unavailable, _outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:failed_staged_verdict_path, staged_path}
+    refute File.exists?(staged_path)
+    refute File.exists?(canonical_path)
+  end
+
+  test "rejects request_changes without a concrete blocking finding", %{workspace: workspace} do
+    runner =
+      verdict_runner(%{
+        "verdict" => "request_changes",
+        "summary" => "minor observation",
+        "comments" => [%{"severity" => "minor", "body" => "Consider renaming this helper."}]
+      })
+
+    assert {:automation_inconclusive, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert outcome.failure_reason ==
+             {:verdict_unreadable, :request_changes_missing_concrete_blocking_finding}
+
+    refute File.exists?(Path.join(workspace, ".artifacts/symphony-review/verdict.json"))
+  end
+
   test "review packet builder can be injected without changing approval semantics", %{
     workspace: workspace
   } do
@@ -395,7 +466,13 @@ defmodule SymphonyElixir.ReviewGateTest do
         "verdict" => "request_changes",
         "summary" => "needs work",
         "comments" => [
-          %{"severity" => "blocker", "file" => "app/foo.ts", "line" => 12, "body" => "guard the nil case"}
+          %{
+            "severity" => "blocker",
+            "file" => "app/foo.ts",
+            "line" => 12,
+            "body" => "guard the nil case",
+            "failing_state" => "A nil value reaches the unguarded branch."
+          }
         ]
       })
 
@@ -425,7 +502,13 @@ defmodule SymphonyElixir.ReviewGateTest do
       verdict = %{
         "verdict" => "request_changes",
         "summary" => "still not there",
-        "comments" => [%{"severity" => "major", "body" => "fix it"}]
+        "comments" => [
+          %{
+            "severity" => "major",
+            "body" => "fix it",
+            "violated_criterion" => "The candidate must handle the documented edge case."
+          }
+        ]
       }
 
       File.mkdir_p!(Path.dirname(ctx.verdict_path))
@@ -448,7 +531,17 @@ defmodule SymphonyElixir.ReviewGateTest do
              ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)
 
     refute outcome.authoritative
-    assert outcome.findings == [%{severity: "major", file: nil, line: nil, body: "fix it"}]
+
+    assert [
+             %{
+               severity: "major",
+               file: nil,
+               line: nil,
+               body: "fix it",
+               violated_criterion: "The candidate must handle the documented edge case."
+             }
+           ] = outcome.findings
+
     assert outcome.severity_counts == %{"major" => 1}
     assert Process.get(:budget_review_runs) == 3
     assert_received {:review_comment, "issue-1", body}
@@ -641,7 +734,13 @@ defmodule SymphonyElixir.ReviewGateTest do
             %{
               "verdict" => "request_changes",
               "summary" => "new blocker",
-              "comments" => [%{"severity" => "blocker", "body" => "do not hand off"}]
+              "comments" => [
+                %{
+                  "severity" => "blocker",
+                  "body" => "do not hand off",
+                  "failing_state" => "The new candidate regresses the approved behavior."
+                }
+              ]
             }
         end
 
@@ -777,9 +876,9 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert first_prompt =~ "Do not run package-manager validation commands"
     assert first_prompt =~ "Symphony review tool-output guard"
     assert first_prompt =~ "Symphony verdict reliability guard"
-    assert first_prompt =~ "write a valid interim verdict"
-    assert first_prompt =~ ~s("symphony_interim": true)
-    assert first_prompt =~ "Before starting any long-running command or broad validation check"
+    assert first_prompt =~ "attempt-scoped staging path"
+    assert first_prompt =~ "Do not write a provisional"
+    assert first_prompt =~ "publishes it"
     assert first_prompt =~ "Do not run broad searches in `node_modules`"
     assert first_prompt =~ "--glob '!node_modules/**'"
     assert_received {:review_attempt, 2, retry_prompt}
@@ -885,7 +984,16 @@ defmodule SymphonyElixir.ReviewGateTest do
 
   test "max_iterations one escalates on the first request_changes verdict", %{workspace: workspace} do
     runner =
-      verdict_runner(%{"verdict" => "request_changes", "comments" => [%{"body" => "x"}]})
+      verdict_runner(%{
+        "verdict" => "request_changes",
+        "comments" => [
+          %{
+            "severity" => "blocking",
+            "body" => "x",
+            "missing_regression_test" => "No regression test covers the failing branch."
+          }
+        ]
+      })
 
     wf = review_workflow(%{"max_iterations" => 1})
     opts = [session_runner: runner, pr_runner: pr_runner()]
@@ -893,7 +1001,16 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert {:budget_exhausted_with_findings, outcome} =
              ReviewGate.run(workspace, issue(), nil, wf, opts)
 
-    assert outcome.findings == [%{severity: "comment", file: nil, line: nil, body: "x"}]
+    assert [
+             %{
+               severity: "blocking",
+               file: nil,
+               line: nil,
+               body: "x",
+               missing_regression_test: "No regression test covers the failing branch."
+             }
+           ] = outcome.findings
+
     assert outcome.iteration == 1
   end
 
@@ -1271,7 +1388,13 @@ defmodule SymphonyElixir.ReviewGateTest do
         "verdict" => "request_changes",
         "review_effort" => "focused",
         "human_review" => "needs another pass",
-        "comments" => [%{"body" => "fix"}]
+        "comments" => [
+          %{
+            "severity" => "blocking",
+            "body" => "fix",
+            "violated_criterion" => "The implementation does not satisfy the acceptance criterion."
+          }
+        ]
       })
 
     wf = review_workflow(%{"max_iterations" => 2})

@@ -125,9 +125,20 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
         File.write!(
           ctx.verdict_path,
           Jason.encode!(%{
+            "packet_id" => ctx.packet.packet_id,
+            "reviewed_sha" => ctx.reviewed_sha,
             "verdict" => "request_changes",
             "summary" => "missing test",
-            "comments" => [%{"severity" => "major", "file" => "app/x.ts", "body" => "add a test"}]
+            "inspected" => ["app/x.ts"],
+            "attestations" => %{"reused" => [], "rerun" => []},
+            "comments" => [
+              %{
+                "severity" => "major",
+                "file" => "app/x.ts",
+                "body" => "add a test",
+                "missing_regression_test" => "No test covers the changed failure branch."
+              }
+            ]
           })
         )
 

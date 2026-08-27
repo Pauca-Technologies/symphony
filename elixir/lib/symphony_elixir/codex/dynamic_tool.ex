@@ -9,7 +9,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     Linear.Client,
     ReviewGate,
     ReviewOutcome,
-    ReviewPacket,
     Tracker,
     WaitCondition
   }
@@ -475,9 +474,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp run_handoff_transition(request, handoff_opts) do
-    run_with_handoff_gate_lifecycle(request, fn ->
-      do_run_handoff_transition(request, handoff_opts)
-    end)
+    do_run_handoff_transition(request, handoff_opts)
   end
 
   defp do_run_handoff_transition(request, handoff_opts) do
@@ -492,14 +489,47 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:ok, base_drift_decision} ->
         context = put_base_drift_decision(request.context, base_drift_decision)
 
-        request
-        |> Map.merge(%{issue: gate_issue, context: context})
-        |> run_resolved_handoff_gate(handoff_opts)
+        request = Map.merge(request, %{issue: gate_issue, context: context})
+        run_review_before_handoff(request, handoff_opts)
 
       {:base_drift_blocked, _prompt, _decision} = blocked ->
         blocked
     end
   end
+
+  defp run_review_before_handoff(request, handoff_opts) do
+    case run_review_gate_for_request(request) do
+      :ok ->
+        run_resolved_handoff_gate(request, handoff_opts)
+
+      {:review_approved, approval} ->
+        result =
+          request
+          |> Map.put(:review_approval, approval)
+          |> run_resolved_handoff_gate(handoff_opts)
+
+        revalidate_inline_review_after_handoff(result, request, approval)
+
+      other ->
+        other
+    end
+  end
+
+  defp revalidate_inline_review_after_handoff(:ok, request, approval) do
+    if ReviewGate.authoritative_for_current_head?(
+         request.workspace,
+         request.issue,
+         approval.review_key,
+         approval.review_opts,
+         approval.review_outcome
+       ) do
+      :ok
+    else
+      block_stale_approval(approval.review_outcome)
+    end
+  end
+
+  defp revalidate_inline_review_after_handoff(result, _request, _approval), do: result
 
   defp run_with_handoff_gate_lifecycle(request, run) when is_function(run, 0) do
     gate_job_id = "inline-#{System.unique_integer([:positive, :monotonic])}"
@@ -594,6 +624,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     do: {:error, {:blocked_transition_requires_human_blocker, @human_blocker_kinds}}
 
   defp run_resolved_handoff_gate(request, handoff_opts) do
+    run_with_handoff_gate_lifecycle(request, fn ->
+      do_run_resolved_handoff_gate(request, handoff_opts)
+    end)
+  end
+
+  defp do_run_resolved_handoff_gate(request, handoff_opts) do
     durable_request = handoff_request(request)
 
     case persist_starting_handoff_gate(request.context, durable_request) do
@@ -649,13 +685,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp handle_terminal_handoff_gate_result(:ok, request), do: run_review_gate_for_request(request)
-
-  defp handle_terminal_handoff_gate_result({:passed, gate}, request) do
-    request
-    |> put_handoff_gate_attestations(gate)
-    |> run_review_gate_for_request()
-  end
+  defp handle_terminal_handoff_gate_result(:ok, _request), do: :ok
+  defp handle_terminal_handoff_gate_result({:passed, _gate}, _request), do: :ok
 
   defp handle_terminal_handoff_gate_result({:blocked, prompt, gates}, _request),
     do: {:handoff_blocked, prompt, gates}
@@ -674,22 +705,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       request.issue,
       request.worker_host,
       request.context,
-      request.linear_client
+      request.linear_client,
+      handoff_request(request)
     )
-  end
-
-  defp put_handoff_gate_attestations(request, gate) do
-    attestations = ReviewPacket.handoff_gate_attestations(gate, request.worker_host)
-    context = request.context
-    review_opts = Map.get(context, :review_opts) || Map.get(context, "review_opts") || []
-
-    review_opts =
-      case attestations do
-        [] -> review_opts
-        entries -> Keyword.update(review_opts, :handoff_gate_attestations, entries, &(&1 ++ entries))
-      end
-
-    %{request | context: Map.put(context, :review_opts, review_opts)}
   end
 
   defp defer_handoff_gate(request_context, gate) do
@@ -730,6 +748,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       review_opts: context_value(context, :review_opts) || [],
       linear_client: request_context.linear_client
     }
+    |> maybe_put_map_value(:review_approval, Map.get(request_context, :review_approval))
     |> maybe_put_map_value(:gate, gate)
   end
 
@@ -875,43 +894,47 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     ]
   end
 
-  # After the deterministic before_handoff shell hook passes, run the full
-  # reviewer agent when the consumer repo ships a WORKFLOW_REVIEW.md
+  # Before the expensive before_handoff shell hook, run the full reviewer
+  # agent when the consumer repo ships a WORKFLOW_REVIEW.md
   # (AgentRunner threads the loaded review workflow through the gate context).
   # A request-changes verdict blocks the handoff with the reviewer's comments
   # as remediation, reusing the same loop the shell hook uses.
-  defp run_review_gate(query, variables, workspace, issue, worker_host, context, linear_client) do
+  defp run_review_gate(
+         query,
+         variables,
+         workspace,
+         issue,
+         worker_host,
+         context,
+         linear_client,
+         handoff_after_review
+       ) do
     case Map.get(context, :review_workflow) || Map.get(context, "review_workflow") do
       review_workflow when is_map(review_workflow) ->
-        review_workflow
-        |> review_gate_request(query, variables, workspace, issue, worker_host, context, linear_client)
-        |> maybe_defer_or_run_review_gate()
+        # `:review_opts` is an optional passthrough (test/extensibility seam):
+        # the gate always pins `linear_client`; callers may add a custom
+        # session_runner / comment_fn.
+        review_opts =
+          context
+          |> Map.get(:review_opts, [])
+          |> Keyword.put(:linear_client, linear_client)
+
+        maybe_defer_or_run_review_gate(%{
+          query: query,
+          variables: variables,
+          workspace: workspace,
+          issue: issue,
+          worker_host: worker_host,
+          review_workflow: review_workflow,
+          review_opts: review_opts,
+          context: context,
+          linear_client: linear_client,
+          handoff_after_review: handoff_after_review
+        })
 
       _ ->
         :ok
     end
-  end
-
-  defp review_gate_request(review_workflow, query, variables, workspace, issue, worker_host, context, linear_client) do
-    # `:review_opts` is an optional passthrough (test/extensibility seam):
-    # the gate always pins `linear_client`; callers may add a custom
-    # session_runner / comment_fn.
-    review_opts =
-      context
-      |> Map.get(:review_opts, [])
-      |> Keyword.put(:linear_client, linear_client)
-
-    %{
-      query: query,
-      variables: variables,
-      workspace: workspace,
-      issue: issue,
-      worker_host: worker_host,
-      review_workflow: review_workflow,
-      review_opts: review_opts,
-      context: context,
-      linear_client: linear_client
-    }
   end
 
   defp maybe_defer_or_run_review_gate(
@@ -934,7 +957,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           worker_host: worker_host,
           review_workflow: review_workflow,
           review_opts: review_opts,
-          linear_client: request.linear_client
+          linear_client: request.linear_client,
+          handoff_after_review: request.handoff_after_review
         })
 
         {:review_deferred, deferred_review_result(issue)}
@@ -973,7 +997,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          pinned_opts,
          review_outcome
        ) do
-      :ok
+      {:review_approved,
+       %{
+         review_key: review_key,
+         reviewed_sha: review_outcome.reviewed_sha,
+         review_opts: pinned_opts,
+         review_outcome: review_outcome
+       }}
     else
       block_stale_approval(review_outcome)
     end

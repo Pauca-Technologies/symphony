@@ -59,24 +59,28 @@ repository command should branch to its cheap job-status read before normal hand
 
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
-mutation, the active implementor turn closes, and Symphony runs the reviewer before applying that
-mutation. An accepted deferred review returns a successful `deferred_review_started` tool result
-with explicit instructions to end the turn without retrying the mutation. If the Linear issue has
-an attached GitHub PR URL, the review gate uses that PR directly for the human-review section;
-otherwise it falls back to the current workspace branch's PR.
+mutation, the active implementor turn closes, and Symphony runs the reviewer before starting the
+expensive `before_handoff` hook. A request-changes verdict therefore avoids that final validation
+entirely. An accepted deferred review returns a successful `deferred_review_started` tool result
+with explicit instructions to end the turn without retrying the mutation. Exact-head approval is
+persisted with a subsequent asynchronous handoff job, survives restart, and is rechecked after the
+gate passes; a changed head requires a fresh review. If the Linear issue has an attached GitHub PR
+URL, the review gate uses that PR directly for the human-review section; otherwise it falls back to
+the current workspace branch's PR.
 
 Each pass starts a fresh, ephemeral reviewer thread with no implementor transcript or canonical
 issue-context file. Symphony gives it a versioned JSON packet pinned to the resolved base and head
 SHAs and a diff fingerprint. The packet carries the compact issue contract, changed-file manifest,
 area-specific repository rules, risk/lens rationale, exact-head validation attestations, prior open
-findings with their reviewed SHA, PR-body attachment links, and a bounded follow-up delta. A passed
-protocol-aware `before_handoff` result is forwarded as an exact-candidate attestation, including its
-candidate/exact/mutable-PR-state hashes, so the reviewer can reuse proof already accepted by the
-handoff gate. Packet compaction never removes the commands for reading the authoritative full diff,
-the passed-gate identity, or the applicable security/tenant/auth rule paths. High-risk follow-ups
+findings with their reviewed SHA, PR-body attachment links, and a bounded follow-up delta. Packet
+compaction never removes the commands for reading the authoritative full diff or the applicable
+security/tenant/auth rule paths. High-risk follow-ups
 must finish with another complete base-to-head pass.
 
-The reviewer is fail-safe. Its terminal outcomes are `approved`, `request_changes`,
+The reviewer is fail-safe. It writes to an attempt-scoped staging path; Symphony publishes the
+canonical verdict with one atomic rename only after the reviewer session completes and the output
+passes identity and evidence validation. A failed, timed-out, partial, or malformed attempt never
+publishes authoritative output. Its terminal outcomes are `approved`, `request_changes`,
 `automation_inconclusive`, `infrastructure_unavailable`, and
 `budget_exhausted_with_findings`. Only `approved` for the exact pinned candidate SHA may apply the
 captured Linear mutation. Missing or malformed verdicts, reviewer timeout/crash/tool/auth failures,
@@ -587,8 +591,10 @@ Notes:
   A terminal infrastructure/protocol verification result ends the worker attempt and uses
   orchestrator backoff rather than asking the implementor to repair platform infrastructure.
 - If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
-  implementor turn that requested the handoff has closed, and applies the captured Linear
-  transition only after an authoritative approval for the exact candidate SHA. Request changes,
+  implementor turn that requested the handoff has closed and before starting the expensive
+  `before_handoff` hook. It applies the captured Linear transition only after an authoritative
+  approval for the exact candidate SHA and a passing final hook. The approval identity is persisted
+  with asynchronous gate state and revalidated after the hook passes. Request changes,
   inconclusive automation and review-budget exhaustion withhold the transition and preserve the
   latest evidence for human resolution. Reviewer infrastructure and packet-generation failures
   end the worker attempt and use orchestrator backoff without consuming remediation turns.
@@ -598,8 +604,9 @@ Notes:
   session or token accounting. The reviewer deadline is an inactivity timeout refreshed by progress;
   a silent reviewer is timed out with a review-specific log and is not immediately repeated for the
   same full deadline.
-  Symphony also pins the reviewed PR head and rechecks it before applying the transition, so a push
-  during review requires a fresh handoff review.
+  Symphony also pins the reviewed PR head and rechecks it before starting final validation and again
+  before applying the transition, so a push during review or validation requires a fresh handoff
+  review.
   When a worker is stopped or exits, Symphony terminates its external descendant processes before
   discarding the worker, preventing hook and validation commands from being orphaned while
   preserving the worker BEAM's own runtime helpers until the VM exits normally.
@@ -639,7 +646,10 @@ Notes:
   The verdict must report the packet's exact `reviewed_sha`, a non-empty `inspected` list, and
   `attestations.reused` / `attestations.rerun`; missing or stale candidate evidence is
   `automation_inconclusive`. `request_changes` is reserved for candidate defects or proof gaps the
-  implementor can fix. Reviewer-side tool/auth/network/provider failures use
+  implementor can fix and must include a blocking-severity finding with a concrete `failing_state`,
+  `violated_criterion`, or `missing_regression_test`. Minor observations may accompany approval and
+  are not blockers. Reviewer output is staged per attempt and published atomically only after the
+  reviewer completes and Symphony validates it. Reviewer-side tool/auth/network/provider failures use
   `infrastructure_unavailable` with `failure_reason` and `resume_condition`, consume no substantive
   review iteration, and enter orchestrator backoff. Parent reviewer and delegated lens threads emit independent local
   telemetry with packet/head identity, tokens, duration, model, reasoning effort, and findings.

@@ -3,14 +3,17 @@ defmodule SymphonyElixir.ReviewGate do
   Runs a full reviewer agent at the `In Progress -> In Review` handoff.
 
   When a consumer repo ships a `WORKFLOW_REVIEW.md` (loaded by
-  `AgentRunner` alongside its `WORKFLOW.md`), the handoff tool call first
-  verifies that the deterministic `before_handoff` shell hook passes, then
-  records the requested Linear `issueUpdate` mutation and returns control to
-  the implementor turn. `AgentRunner` runs this review gate after that turn
-  closes and *before* applying the recorded mutation that would move the
-  issue out of `In Progress`. The gate spawns a fresh Codex session in the
-  implementor's own worktree, driven by the review prompt, and reads a JSON
-  verdict the reviewer writes to a known path.
+  `AgentRunner` alongside its `WORKFLOW.md`), the handoff tool records the
+  requested Linear `issueUpdate` mutation and returns control to the
+  implementor turn. `AgentRunner` runs this review gate after that turn
+  closes and before starting the expensive deterministic `before_handoff`
+  hook. Only exact-head approval starts that hook. The approval identity is
+  persisted with any asynchronous gate job and rechecked after the gate
+  passes, before Symphony applies the mutation. The gate spawns a fresh Codex
+  session in the implementor's own worktree, driven by the review prompt.
+  Reviewer output is written to an attempt-scoped staging path; Symphony
+  validates it after the session completes and atomically renames it to the
+  configured authoritative verdict path.
 
     * `approve` -> `{:approved, evidence}`. The caller may proceed only when
       that evidence is pinned to the exact current head.
@@ -484,9 +487,10 @@ defmodule SymphonyElixir.ReviewGate do
          previous_reason
        ) do
     verdict_path = Path.join(workspace, review_context.settings.verdict_path)
-    prepare_verdict_path(verdict_path)
+    staged_verdict_path = staged_verdict_path(verdict_path)
+    prepare_verdict_paths(verdict_path, staged_verdict_path)
 
-    case prepare_review_prompt(review_context, attempt, previous_reason) do
+    case prepare_review_prompt(review_context, attempt, previous_reason, staged_verdict_path) do
       {:ok, prompt, fitted_context} ->
         packet_result = Map.fetch!(fitted_context, :packet_result)
         settings = fitted_context.settings
@@ -503,7 +507,7 @@ defmodule SymphonyElixir.ReviewGate do
           packet: packet_result.packet,
           packet_path: packet_result.path,
           reviewed_sha: fitted_context.reviewed_sha,
-          verdict_path: verdict_path,
+          verdict_path: staged_verdict_path,
           tool_executor:
             review_tool_executor(
               Keyword.get(opts, :linear_client),
@@ -516,9 +520,17 @@ defmodule SymphonyElixir.ReviewGate do
 
         case run_review_session(ctx, opts) do
           {:ok, session} ->
-            evaluate_verdict(verdict_path, fitted_context, attempt, telemetry_handle, session)
+            evaluate_verdict(
+              staged_verdict_path,
+              verdict_path,
+              fitted_context,
+              attempt,
+              telemetry_handle,
+              session
+            )
 
           {:error, reason} ->
+            cleanup_staged_verdict(staged_verdict_path)
             ReviewTelemetry.finish(telemetry_handle, :session_failed)
             handle_review_session_failure(fitted_context, attempt, reason)
         end
@@ -543,13 +555,21 @@ defmodule SymphonyElixir.ReviewGate do
     end
   end
 
-  defp prepare_review_prompt(review_context, attempt, previous_reason) do
-    case render_review_prompt_for_context(review_context, attempt, previous_reason) do
+  defp prepare_review_prompt(review_context, attempt, previous_reason, verdict_path) do
+    case render_review_prompt_for_context(review_context, attempt, previous_reason, verdict_path) do
       {:ok, prompt} ->
         {:ok, prompt, review_context}
 
       {:error, {:review_context_budget_exceeded, actual_bytes, max_bytes} = reason} ->
-        refit_review_packet(review_context, attempt, previous_reason, actual_bytes, max_bytes, reason)
+        refit_review_packet(
+          review_context,
+          attempt,
+          previous_reason,
+          verdict_path,
+          actual_bytes,
+          max_bytes,
+          reason
+        )
 
       {:error, reason} ->
         {:error, reason}
@@ -560,6 +580,7 @@ defmodule SymphonyElixir.ReviewGate do
          review_context,
          attempt,
          previous_reason,
+         verdict_path,
          actual_bytes,
          max_bytes,
          original_reason
@@ -589,7 +610,8 @@ defmodule SymphonyElixir.ReviewGate do
             fitted_packet_result,
             settings,
             attempt,
-            previous_reason
+            previous_reason,
+            verdict_path
           )
 
         {:error, reason} ->
@@ -603,26 +625,27 @@ defmodule SymphonyElixir.ReviewGate do
          fitted_packet_result,
          settings,
          attempt,
-         previous_reason
+         previous_reason,
+         verdict_path
        ) do
     fitted_context =
       review_context
       |> Map.put(:packet_result, fitted_packet_result)
       |> Map.put(:settings, settings)
 
-    case render_review_prompt_for_context(fitted_context, attempt, previous_reason) do
+    case render_review_prompt_for_context(fitted_context, attempt, previous_reason, verdict_path) do
       {:ok, prompt} -> {:ok, prompt, fitted_context}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp render_review_prompt_for_context(review_context, attempt, previous_reason) do
+  defp render_review_prompt_for_context(review_context, attempt, previous_reason, verdict_path) do
     render_review_prompt(
       review_context.issue,
       review_context.review_workflow,
       attempt,
       previous_reason,
-      review_context.settings.verdict_path,
+      verdict_path,
       review_context.packet_result,
       review_context.settings
     )
@@ -656,8 +679,9 @@ defmodule SymphonyElixir.ReviewGate do
   # needing a thorough review can still approve). Keeping it fresh through the
   # request_changes loop means the final pass's assessment wins.
   defp evaluate_verdict(
+         staged_verdict_path,
          verdict_path,
-         %{workspace: workspace, issue: %Issue{} = issue, settings: settings, pr: pr, opts: opts} = review_context,
+         %{issue: %Issue{} = issue} = review_context,
          attempt,
          telemetry_handle,
          _session
@@ -665,28 +689,16 @@ defmodule SymphonyElixir.ReviewGate do
     packet = review_context.packet_result.packet
 
     case read_verdict(
-           verdict_path,
+           staged_verdict_path,
            review_context.reviewed_sha,
            packet.packet_id,
            packet.diff.mode
          ) do
-      {:ok, %{verdict: :approve} = verdict} ->
-        ReviewTelemetry.finish(telemetry_handle, :approved, verdict)
-        outcome = approved_outcome(review_context, verdict, attempt)
-        clear_latest_outcome(issue.id)
-        maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
-        emit_outcome_telemetry(issue, outcome)
-        {:approved, outcome}
-
-      {:ok, %{verdict: :request_changes} = verdict} ->
-        ReviewTelemetry.finish(telemetry_handle, :request_changes, verdict)
-        conclude_request_changes(review_context, verdict, attempt)
-
-      {:ok, %{verdict: :infrastructure_unavailable} = verdict} ->
-        ReviewTelemetry.finish(telemetry_handle, :infrastructure_unavailable, verdict)
-        conclude_reported_infrastructure(review_context, verdict, attempt)
+      {:ok, verdict} ->
+        publish_valid_verdict(staged_verdict_path, verdict_path, verdict, review_context, attempt, telemetry_handle)
 
       {:error, reason} ->
+        cleanup_staged_verdict(staged_verdict_path)
         ReviewTelemetry.finish(telemetry_handle, :automation_inconclusive)
 
         if attempt < @max_verdict_attempts do
@@ -703,6 +715,66 @@ defmodule SymphonyElixir.ReviewGate do
           )
         end
     end
+  end
+
+  defp publish_valid_verdict(
+         staged_verdict_path,
+         verdict_path,
+         verdict,
+         %{issue: %Issue{} = issue, opts: opts} = review_context,
+         attempt,
+         telemetry_handle
+       ) do
+    case File.rename(staged_verdict_path, verdict_path) do
+      :ok ->
+        conclude_published_verdict(verdict, review_context, attempt, telemetry_handle)
+
+      {:error, reason} ->
+        cleanup_staged_verdict(staged_verdict_path)
+        ReviewTelemetry.finish(telemetry_handle, :automation_inconclusive)
+
+        conclude_infrastructure_failure(
+          issue,
+          review_context,
+          attempt,
+          {:verdict_publish_failed, reason},
+          opts
+        )
+    end
+  end
+
+  defp conclude_published_verdict(
+         %{verdict: :approve} = verdict,
+         %{workspace: workspace, issue: %Issue{} = issue, settings: settings, pr: pr, opts: opts} = review_context,
+         attempt,
+         telemetry_handle
+       ) do
+    ReviewTelemetry.finish(telemetry_handle, :approved, verdict)
+    outcome = approved_outcome(review_context, verdict, attempt)
+    clear_latest_outcome(issue.id)
+    maybe_write_section(workspace, pr, verdict.review_effort, verdict.human_review, settings, opts)
+    emit_outcome_telemetry(issue, outcome)
+    {:approved, outcome}
+  end
+
+  defp conclude_published_verdict(
+         %{verdict: :request_changes} = verdict,
+         review_context,
+         attempt,
+         telemetry_handle
+       ) do
+    ReviewTelemetry.finish(telemetry_handle, :request_changes, verdict)
+    conclude_request_changes(review_context, verdict, attempt)
+  end
+
+  defp conclude_published_verdict(
+         %{verdict: :infrastructure_unavailable} = verdict,
+         review_context,
+         attempt,
+         telemetry_handle
+       ) do
+    ReviewTelemetry.finish(telemetry_handle, :infrastructure_unavailable, verdict)
+    conclude_reported_infrastructure(review_context, verdict, attempt)
   end
 
   defp conclude_request_changes(%{issue: %Issue{} = issue, iteration: iteration} = context, verdict, attempt) do
@@ -999,7 +1071,11 @@ defmodule SymphonyElixir.ReviewGate do
 
     The final `verdict` must be one of `approve`, `request_changes`, or
     `infrastructure_unavailable`. Use `request_changes` only for a candidate defect or evidence gap
-    the implementor can fix. Use `infrastructure_unavailable` only when reviewer-side tooling,
+    the implementor can fix. Every `request_changes` verdict must contain at least one comment with
+    a blocking severity (`blocker`, `blocking`, `critical`, `high`, or `major`) and a non-empty
+    `failing_state`, `violated_criterion`, or `missing_regression_test` field. Minor or advisory
+    observations may accompany an `approve` verdict and must not be inflated into blockers. Use
+    `infrastructure_unavailable` only when reviewer-side tooling,
     authentication, network, or provider availability prevents authoritative inspection, and include
     non-empty `failure_reason` and `resume_condition` strings. In particular, a 401, 403, or 404 for
     a private GitHub attachment is not evidence that the attachment is missing unless the request
@@ -1057,15 +1133,14 @@ defmodule SymphonyElixir.ReviewGate do
 
     ## Symphony verdict reliability guard
 
-    Before starting any long-running command or broad validation check, create the verdict directory
-    and write a valid interim verdict to `#{verdict_path}`. The interim verdict must include
-    `"symphony_interim": true`. If you do not yet have enough evidence to approve, that interim
-    verdict must be `"request_changes"` and explain the missing evidence or unresolved risk. Replace
-    it with your final verdict before your final message, and either omit `symphony_interim` or set
-    it to `false`.
+    `#{verdict_path}` is an attempt-scoped staging path. Write exactly one complete, final verdict
+    there after you finish the review and before your final message. Do not write a provisional,
+    placeholder, or `symphony_interim` verdict, and do not write to the configured canonical verdict
+    path. Symphony validates the staged file after the reviewer session completes and publishes it
+    atomically only when it is authoritative.
 
     Do not make a slow check the last thing standing between Symphony and the verdict file. If a
-    validation command is interrupted, times out, or returns partial evidence, keep or write the
+    validation command is interrupted, times out, or returns partial evidence, write the final
     verdict from the evidence already gathered. Use `"request_changes"` when candidate uncertainty
     meets the review severity bar. Use `"infrastructure_unavailable"` with `failure_reason` and
     `resume_condition` when reviewer-side tooling, authentication, network, or provider availability
@@ -1101,9 +1176,19 @@ defmodule SymphonyElixir.ReviewGate do
     """
   end
 
-  defp prepare_verdict_path(verdict_path) do
+  defp staged_verdict_path(verdict_path) do
+    verdict_path <> ".pending.#{System.unique_integer([:positive, :monotonic])}"
+  end
+
+  defp prepare_verdict_paths(verdict_path, staged_verdict_path) do
     _ = File.rm_rf(verdict_path)
+    _ = File.rm_rf(staged_verdict_path)
     _ = File.mkdir_p(Path.dirname(verdict_path))
+    :ok
+  end
+
+  defp cleanup_staged_verdict(staged_verdict_path) do
+    _ = File.rm_rf(staged_verdict_path)
     :ok
   end
 
@@ -1119,16 +1204,21 @@ defmodule SymphonyElixir.ReviewGate do
     end
   end
 
-  defp validate_verdict_candidate(verdict, expected_sha, expected_packet_id, review_mode)
-       when is_binary(expected_sha) and expected_sha != "" do
-    with :ok <- validate_verdict_identity(verdict, expected_sha, expected_packet_id),
-         :ok <- validate_verdict_evidence_contract(verdict),
-         :ok <- validate_infrastructure_verdict(verdict) do
+  defp validate_verdict_candidate(verdict, expected_sha, expected_packet_id, review_mode) do
+    with :ok <- validate_verdict_evidence_contract(verdict),
+         :ok <- validate_infrastructure_verdict(verdict),
+         :ok <- validate_request_changes_findings(verdict),
+         :ok <- validate_verdict_identity_when_pinned(verdict, expected_sha, expected_packet_id) do
       validate_full_diff_verdict(verdict, review_mode)
     end
   end
 
-  defp validate_verdict_candidate(_verdict, _expected_sha, _expected_packet_id, _review_mode),
+  defp validate_verdict_identity_when_pinned(verdict, expected_sha, expected_packet_id)
+       when is_binary(expected_sha) and expected_sha != "" do
+    validate_verdict_identity(verdict, expected_sha, expected_packet_id)
+  end
+
+  defp validate_verdict_identity_when_pinned(_verdict, _expected_sha, _expected_packet_id),
     do: :ok
 
   defp validate_verdict_identity(verdict, expected_sha, expected_packet_id) do
@@ -1164,6 +1254,34 @@ defmodule SymphonyElixir.ReviewGate do
     do: {:error, :infrastructure_verdict_missing_resume_condition}
 
   defp validate_infrastructure_verdict(_verdict), do: :ok
+
+  defp validate_request_changes_findings(%{verdict: :request_changes, comments: comments}) do
+    if Enum.any?(comments, &concrete_blocking_finding?/1) do
+      :ok
+    else
+      {:error, :request_changes_missing_concrete_blocking_finding}
+    end
+  end
+
+  defp validate_request_changes_findings(_verdict), do: :ok
+
+  defp concrete_blocking_finding?(comment) do
+    blocking_severity?(comment.severity) and
+      Enum.any?(
+        [
+          Map.get(comment, :failing_state),
+          Map.get(comment, :violated_criterion),
+          Map.get(comment, :missing_regression_test)
+        ],
+        &(is_binary(&1) and String.trim(&1) != "")
+      )
+  end
+
+  defp blocking_severity?(severity) when is_binary(severity) do
+    String.downcase(String.trim(severity)) in ["blocker", "blocking", "critical", "high", "major"]
+  end
+
+  defp blocking_severity?(_severity), do: false
 
   defp validate_full_diff_verdict(%{verdict: :infrastructure_unavailable}, _review_mode), do: :ok
 
@@ -1318,6 +1436,12 @@ defmodule SymphonyElixir.ReviewGate do
         line: Map.get(comment, "line"),
         body: body
       }
+      |> maybe_put_comment_field(:failing_state, Map.get(comment, "failing_state"))
+      |> maybe_put_comment_field(:violated_criterion, Map.get(comment, "violated_criterion"))
+      |> maybe_put_comment_field(
+        :missing_regression_test,
+        Map.get(comment, "missing_regression_test")
+      )
     end
   end
 
@@ -1330,6 +1454,13 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp normalize_comment(_comment), do: nil
+
+  defp maybe_put_comment_field(comment, key, value) do
+    case string_or_nil(value) do
+      nil -> comment
+      normalized -> Map.put(comment, key, normalized)
+    end
+  end
 
   # --- remediation / notes -------------------------------------------------
 

@@ -878,7 +878,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert get_in(output, ["error", "remediation"]) =~ "nested-input-state: nested stateId should run gates"
   end
 
-  test "linear_graphql runs the reviewer gate after before_handoff and blocks on request_changes" do
+  test "linear_graphql runs review before before_handoff and skips the expensive gate on request_changes" do
     workspace =
       Path.join(
         System.tmp_dir!(),
@@ -887,6 +887,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     File.mkdir_p!(workspace)
     on_exit(fn -> File.rm_rf(workspace) end)
+    gate_marker = Path.join(workspace, "before-handoff-started")
 
     review_workflow = %{
       config: %{"review" => %{"max_iterations" => 3}},
@@ -900,13 +901,21 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     session_runner = fn ctx ->
       send(test_pid, {:review_issue_state, ctx.issue.state})
+      refute File.exists?(gate_marker)
 
       write_review_verdict(
         ctx,
         %{
           "verdict" => "request_changes",
           "summary" => "missing test",
-          "comments" => [%{"severity" => "major", "file" => "app/x.ts", "body" => "add a test"}]
+          "comments" => [
+            %{
+              "severity" => "major",
+              "file" => "app/x.ts",
+              "body" => "add a test",
+              "missing_regression_test" => "No test covers the changed failure branch."
+            }
+          ]
         }
       )
 
@@ -926,6 +935,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           issue: issue,
           workspace: workspace,
           worker_host: nil,
+          before_handoff_command: "touch #{gate_marker}",
           review_workflow: review_workflow,
           review_opts: [session_runner: session_runner, pr_runner: stub_pr_runner()]
         },
@@ -950,6 +960,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
     assert_received {:review_issue_state, "In Progress"}
+    refute File.exists?(gate_marker)
 
     output = Jason.decode!(response["output"])
     assert get_in(output, ["error", "message"]) =~ "Automated review did not approve"
@@ -979,9 +990,11 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     }
 
     test_pid = self()
+    gate_marker = Path.join(workspace, "before-handoff-started")
 
     session_runner = fn ctx ->
       send(test_pid, {:inline_review_attestations, ctx.packet.validation_attestations})
+      refute File.exists?(gate_marker)
       write_review_verdict(ctx, %{"verdict" => "approve", "comments" => []})
       {:ok, %{}}
     end
@@ -1020,7 +1033,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           issue: issue,
           workspace: workspace,
           worker_host: nil,
-          before_handoff_command: "printf '%s' '#{Jason.encode!(gate_report)}'",
+          before_handoff_command: "touch #{gate_marker} && printf '%s' '#{Jason.encode!(gate_report)}'",
           review_workflow: review_workflow,
           review_opts: [session_runner: session_runner, pr_runner: stub_pr_runner()]
         },
@@ -1046,13 +1059,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       )
 
     assert response["success"] == true
-    assert_received {:inline_review_attestations, attestations}
-
-    assert Enum.any?(attestations, fn attestation ->
-             attestation.command == "before_handoff/check-evidence-fresh" and
-               attestation.exact_hash == "exact-inline" and
-               attestation.mutable_pr_state_hash == "mutable-inline"
-           end)
+    assert_received {:inline_review_attestations, []}
+    assert File.exists?(gate_marker)
 
     assert_received :mutation_sent
   end
@@ -1084,7 +1092,13 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         %{
           "verdict" => "request_changes",
           "summary" => "blocking finding remains",
-          "comments" => [%{"severity" => "blocker", "body" => "fix tenant isolation"}]
+          "comments" => [
+            %{
+              "severity" => "blocker",
+              "body" => "fix tenant isolation",
+              "failing_state" => "A user can read another tenant's record."
+            }
+          ]
         }
       )
 
@@ -1230,6 +1244,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert request.variables == variables
     assert request.issue.identifier == "UDPE-4"
     assert request.review_workflow == review_workflow
+    assert request.handoff_after_review.target_state == "In Review"
+    refute Map.has_key?(request.handoff_after_review, :gate)
   end
 
   test "linear_graphql accepts a raw GraphQL query string" do
