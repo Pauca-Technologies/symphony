@@ -185,8 +185,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, _captured_at, 0} = DateTime.from_iso8601(captured_at)
 
-      assert {:ok, ^context_file} =
-               Workspace.run_session_start_hook(workspace, issue, nil, hook_command: "printf '%s' \"$SYMPHONY_ISSUE_CONTEXT_FILE\"")
+      expected_shared_cache = Path.join(workspace_root, ".symphony-cache")
+      expected_hook_output = "#{context_file}:#{expected_shared_cache}"
+
+      assert {:ok, ^expected_hook_output} =
+               Workspace.run_session_start_hook(workspace, issue, nil, hook_command: "printf '%s:%s' \"$SYMPHONY_ISSUE_CONTEXT_FILE\" \"$SYMPHONY_SHARED_CACHE_DIR\"")
 
       updated_issue = %{issue | description: "Updated scope"}
 

@@ -21,7 +21,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During agent sessions, Symphony owns a canonical first-turn task context. It contains the issue's
-identifier, title, state, labels, URL, and description followed by a bounded, most-recently-updated
+identifier, title, state, labels, URL, attachment URLs, and description followed by a bounded, most-recently-updated
 Linear comment window fetched immediately before each outer dispatch. The current workpad and human
 unblock decisions are therefore deterministic task input. Any Markdown files produced by
 `hooks.session_start` appear next in an annotated startup-artifact section, followed by the rendered
@@ -33,7 +33,9 @@ Symphony writes the same issue and comment snapshot outside the agent-writable w
 its path as `SYMPHONY_ISSUE_CONTEXT_FILE` to lifecycle hooks and the agent process. Version 2 adds
 `issue.comments` and `issue.commentsTruncated`; the file never contains a Linear credential.
 Consumer-repository scripts can therefore use current task context without receiving that
-credential. Later turns receive only comments added or updated since the previous turn. Equivalent
+credential. Hook processes also receive `SYMPHONY_SHARED_CACHE_DIR`, a host-owned sibling of the
+issue workspaces for consumer caches whose keys and privacy contract are repository-defined. Later
+turns receive only comments added or updated since the previous turn. Equivalent
 repeated automated-review outcomes for the same candidate are collapsed, while human comments and
 the single workpad remain verbatim. The typed `linear_issue` tool handles current-issue reads,
 workpad updates, labels, transitions, and deterministic same-project Backlog follow-ups for
@@ -73,7 +75,8 @@ Each pass starts a fresh, ephemeral reviewer thread with no implementor transcri
 issue-context file. Symphony gives it a versioned JSON packet pinned to the resolved base and head
 SHAs and a diff fingerprint. The packet carries the compact issue contract, changed-file manifest,
 area-specific repository rules, risk/lens rationale, exact-head validation attestations, prior open
-findings with their reviewed SHA, PR-body attachment links, and a bounded follow-up delta. Packet
+findings with their reviewed SHA, prior approved inspection/attestation coverage, PR-body attachment
+links, and a bounded follow-up delta. Packet
 compaction never removes the commands for reading the authoritative full diff or the applicable
 security/tenant/auth rule paths. High-risk follow-ups
 must finish with another complete base-to-head pass.
@@ -498,7 +501,9 @@ Notes:
   bounded input metadata, reasons, and override provenance for efficiency routing.
 
   Soft fleet budgets live separately under repository-owned `agent.efficiency`. They default to
-  `shadow`, so proposed transitions are observable before prompts change. `enforce` applies each
+  `shadow`, so proposed transitions are observable before prompts change. A repository may allowlist
+  the three low-risk context/output-hygiene actions shown below while remaining in shadow mode;
+  review-depth and quality-sensitive transitions remain observational. `enforce` applies each
   threshold transition once at the next continuation boundary; `off` retains the decision record
   without transition enforcement. Defaults use distinct simple/standard/high-risk profiles seeded
   from recent fleet percentile bands, and every positive threshold is overrideable:
@@ -507,6 +512,10 @@ Notes:
   agent:
     efficiency:
       mode: shadow                 # off | shadow | enforce
+      enforced_actions:
+        - bound_future_tool_output
+        - fresh_thin_context_delegation_only
+        - prohibit_full_history_delegation
       capsule_max_bytes: 4000
       extreme_multiplier: 2.0
       task_profiles:

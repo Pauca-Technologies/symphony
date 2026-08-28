@@ -982,8 +982,8 @@ Part A: Stall detection
   project/repository and PR identity, resolved base/head SHAs and fingerprint, issue outcome and
   acceptance/non-goals, changed-file/stat manifest, authoritative full-diff commands, applicable
   repository rules, risk/lens rationale, exact-head attestations, prior unresolved findings with
-  their reviewed SHA, implementation risks/skipped proof/evidence, PR-body attachment links, and a
-  bounded follow-up delta.
+  their reviewed SHA, prior approved inspection and attestation coverage, implementation
+  risks/skipped proof/evidence, PR-body attachment links, and a bounded follow-up delta.
 - Packet size and reviewer context/tool-output/timeout settings are repository-configurable with a
   deterministic hard bound and compaction order. Compaction MUST NOT remove access to the complete
   meaningful diff or applicable security/tenant/auth rules. Budget pressure is handled by explicit
@@ -1115,6 +1115,9 @@ Execution contract:
   written outside the agent-writable workspace, MUST NOT contain tracker credentials, and SHOULD
   be refreshed from the same normalized issue and comment activity used to assemble the first turn
   before session startup and before `hooks.before_handoff`.
+- Expose `SYMPHONY_SHARED_CACHE_DIR` as a host-owned sibling of the issue workspaces. Consumer
+  repositories MAY use it only for privacy-bounded caches with explicit immutable identity keys;
+  one run MUST NOT inspect, stop, or reap another run through this directory.
 - Durable job polls MUST reuse `hooks.before_handoff` with `SYMPHONY_HANDOFF_GATE_PROTOCOL=1` and
   `SYMPHONY_HANDOFF_GATE_JOB_ID`, without repeated GitHub credential preparation or issue-context
   refresh. Protocol-aware commands SHOULD branch to the durable-job read before normal hook setup.
@@ -1850,8 +1853,9 @@ away by streaming chatter.
 ### 13.7 Telemetry-Driven Soft Budgets and Routing
 
 Repository workflows MAY configure `agent.efficiency` with `mode` (`off`, `shadow`, or `enforce`),
-a bounded resume-capsule size, an extreme-outlier multiplier, task-type-to-budget-profile mappings,
-and per-profile thresholds. Implementations SHOULD provide distinct simple, standard, and high-risk
+a bounded allowlist of low-risk actions enforced while otherwise in shadow mode, a bounded
+resume-capsule size, an extreme-outlier multiplier, task-type-to-budget-profile mappings, and
+per-profile thresholds. Implementations SHOULD provide distinct simple, standard, and high-risk
 defaults derived from recent fleet percentiles rather than one global ceiling. Required dimensions
 include issue/run total, parent/delegated and per-thread high waters, per-turn growth, uncached/cached
 input, prompt/review-packet/tool-output bytes, elapsed phase time, requested reviewer lenses, and
@@ -1872,8 +1876,10 @@ usage notifications MUST NOT produce repeated warning prompts or transitions. Ca
 SHOULD normalize and coalesce cumulative signals without retaining full protocol events in the
 runner mailbox, and a continuation-boundary snapshot MUST include callbacks begun before the turn
 returned. Tool-output bytes MUST come from terminal tool events rather than streaming deltas.
-`shadow` records the same proposed decisions/transitions without changing agent prompts. `enforce`
-applies a one-shot, bounded strategy capsule at a safe continuation boundary. Strategies MAY compact
+`shadow` records the same proposed decisions/transitions without changing agent prompts, except for
+explicitly allowlisted output bounding and thin-context/no-full-history delegation actions. Other
+actions, including review reductions, MUST remain observational in shadow mode. `enforce` applies a
+one-shot, bounded strategy capsule at a safe continuation boundary. Strategies MAY compact
 parent state, require fresh thin-context delegation/review, reuse exact-head gate evidence,
 constrain future tool output, select risk-relevant reviewer lenses/model/reasoning, synthesize open
 findings, or escalate an extreme outlier with a complete resume packet.

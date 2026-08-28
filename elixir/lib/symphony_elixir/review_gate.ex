@@ -787,7 +787,7 @@ defmodule SymphonyElixir.ReviewGate do
          true <- candidate_sha(workspace, ready_pr) == review_context.reviewed_sha do
       ReviewTelemetry.finish(telemetry_handle, :approved, verdict)
       outcome = approved_outcome(review_context, verdict, attempt)
-      clear_latest_outcome(issue.id)
+      put_latest_outcome(issue.id, outcome)
       emit_outcome_telemetry(issue, outcome)
       {:approved, outcome}
     else
@@ -2021,12 +2021,6 @@ defmodule SymphonyElixir.ReviewGate do
   defp put_latest_outcome(issue_id, %ReviewOutcome{} = outcome) do
     outcomes = Process.get(@latest_outcome_key, %{})
     Process.put(@latest_outcome_key, Map.put(outcomes, issue_id, outcome))
-    :ok
-  end
-
-  defp clear_latest_outcome(issue_id) do
-    outcomes = Process.get(@latest_outcome_key, %{})
-    Process.put(@latest_outcome_key, Map.delete(outcomes, issue_id))
     :ok
   end
 

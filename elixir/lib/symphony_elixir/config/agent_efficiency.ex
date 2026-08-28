@@ -2,6 +2,11 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
   @moduledoc false
 
   @modes ~w(off shadow enforce)
+  @enforceable_actions ~w(
+    bound_future_tool_output
+    fresh_thin_context_delegation_only
+    prohibit_full_history_delegation
+  )
   @reasoning_efforts ~w(none low medium high xhigh max)
   @task_types ~w(simple_direct ui security_tenant data_schema concurrency_liveness broad_architecture)
 
@@ -90,6 +95,7 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
 
   @type t :: %{
           mode: String.t(),
+          enforced_actions: [String.t()],
           capsule_max_bytes: pos_integer(),
           extreme_multiplier: float(),
           profiles: %{required(String.t()) => profile()},
@@ -113,6 +119,7 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
   defp defaults do
     %{
       mode: "shadow",
+      enforced_actions: [],
       capsule_max_bytes: 4_000,
       extreme_multiplier: 2.0,
       profiles: @default_profiles,
@@ -125,6 +132,7 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
     mode = value(raw, "mode") || defaults.mode
 
     with :ok <- validate_mode(mode),
+         {:ok, enforced_actions} <- enforced_actions(raw, defaults.enforced_actions),
          {:ok, profiles} <- parse_profiles(value(raw, "profiles"), defaults.profiles),
          {:ok, task_profiles} <- parse_task_profiles(value(raw, "task_profiles"), defaults.task_profiles, profiles),
          {:ok, capsule_max_bytes} <- capsule_max_bytes(raw, defaults.capsule_max_bytes),
@@ -132,6 +140,7 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
       {:ok,
        %{
          mode: mode,
+         enforced_actions: enforced_actions,
          capsule_max_bytes: capsule_max_bytes,
          extreme_multiplier: extreme_multiplier,
          profiles: profiles,
@@ -142,6 +151,28 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
 
   defp validate_mode(mode) when mode in @modes, do: :ok
   defp validate_mode(_mode), do: error("agent.efficiency.mode must be one of: #{Enum.join(@modes, ", ")}")
+
+  defp enforced_actions(map, default) do
+    case value(map, "enforced_actions") do
+      nil ->
+        {:ok, default}
+
+      actions when is_list(actions) ->
+        normalized = Enum.map(actions, &normalize_action/1)
+
+        if Enum.all?(normalized, &(&1 in @enforceable_actions)) do
+          {:ok, Enum.uniq(normalized)}
+        else
+          error("agent.efficiency.enforced_actions must contain only: #{Enum.join(@enforceable_actions, ", ")}")
+        end
+
+      _other ->
+        error("agent.efficiency.enforced_actions must be a list")
+    end
+  end
+
+  defp normalize_action(action) when is_binary(action), do: String.trim(action)
+  defp normalize_action(_action), do: nil
 
   defp parse_profiles(nil, defaults), do: {:ok, defaults}
 

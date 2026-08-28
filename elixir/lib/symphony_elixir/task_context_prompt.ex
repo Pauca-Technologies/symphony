@@ -129,6 +129,9 @@ defmodule SymphonyElixir.TaskContextPrompt do
     State: #{format_value(issue.state)}
     Labels: #{format_labels(issue.labels)}
     URL: #{format_value(issue.url)}
+    Attachments:
+    #{format_attachments(issue.attachment_urls)}
+    #{attachment_routing_guidance(issue.attachment_urls)}
     Issue updated at: #{format_datetime(issue.updated_at)}
     """
     |> String.trim()
@@ -325,6 +328,41 @@ defmodule SymphonyElixir.TaskContextPrompt do
 
   defp format_labels([]), do: "None"
   defp format_labels(labels) when is_list(labels), do: Enum.join(labels, ", ")
+
+  defp format_attachments(urls) when is_list(urls) do
+    urls
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.uniq()
+    |> case do
+      [] -> "None"
+      values -> Enum.map_join(values, "\n", &"- #{&1}")
+    end
+  end
+
+  defp format_attachments(_urls), do: "None"
+
+  defp attachment_routing_guidance(urls) when is_list(urls) do
+    if Enum.any?(urls, &sentry_attachment?/1) do
+      "Routing: a direct Sentry attachment is available. Call `get_sentry_resource` with that exact URL before organization/project discovery or issue search."
+    else
+      ""
+    end
+  end
+
+  defp attachment_routing_guidance(_urls), do: ""
+
+  defp sentry_attachment?(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) ->
+        host = String.downcase(host)
+        host == "sentry.io" or String.ends_with?(host, ".sentry.io")
+
+      _url ->
+        false
+    end
+  end
+
+  defp sentry_attachment?(_url), do: false
 
   defp format_description(value) when is_binary(value) do
     case String.trim(value) do

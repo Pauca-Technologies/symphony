@@ -39,6 +39,7 @@ defmodule SymphonyElixir.AgentEfficiency do
           override: map() | nil,
           capsule_max_bytes: pos_integer(),
           extreme_multiplier: float(),
+          enforced_actions: [String.t()],
           enforced: boolean()
         }
 
@@ -64,6 +65,7 @@ defmodule SymphonyElixir.AgentEfficiency do
         override: override,
         capsule_max_bytes: settings.capsule_max_bytes,
         extreme_multiplier: settings.extreme_multiplier,
+        enforced_actions: settings.enforced_actions,
         enforced: settings.mode == "enforce"
       }
 
@@ -203,6 +205,7 @@ defmodule SymphonyElixir.AgentEfficiency do
       budget_selection_reason: decision.selection_reason,
       budget_mode: decision.mode,
       enforced: decision.enforced,
+      enforced_actions: decision.enforced_actions,
       allow_overage: decision.budget.allow_overage,
       override: decision.override
     })

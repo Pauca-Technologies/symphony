@@ -452,15 +452,20 @@ defmodule SymphonyElixir.ReviewPacket do
   end
 
   defp compact_follow_up(follow_up) do
-    follow_up
-    |> Map.take([
-      :kind,
-      :prior_reviewed_sha,
-      :head_sha,
-      :command,
-      :candidate_base_sha
-    ])
-    |> Map.put(:stat, truncate(Map.get(follow_up, :stat), 180))
+    compacted =
+      follow_up
+      |> Map.take([
+        :kind,
+        :prior_reviewed_sha,
+        :prior_outcome,
+        :prior_review_effort,
+        :head_sha,
+        :command,
+        :candidate_base_sha
+      ])
+      |> Map.put(:stat, truncate(Map.get(follow_up, :stat), 180))
+
+    Map.put(compacted, :prior_inspected, compact_strings(Map.get(follow_up, :prior_inspected), 12, 240))
   end
 
   defp compact_strings(values, count, bytes) when is_list(values) do
@@ -570,22 +575,39 @@ defmodule SymphonyElixir.ReviewPacket do
 
   defp prior_review(%ReviewOutcome{} = prior, base_sha, head_sha, workspace, runner) do
     findings =
-      Enum.map(prior.findings, fn finding ->
+      Enum.map(unresolved_findings(prior), fn finding ->
         finding
         |> Map.new()
         |> Map.put(:originating_sha, prior.reviewed_sha)
       end)
 
+    delta =
+      prior.reviewed_sha
+      |> delta_context(head_sha, base_sha, workspace, runner)
+      |> Map.merge(%{
+        prior_attestations: prior.attestation_report,
+        prior_inspected: compact_strings(prior.inspected, 40, 500),
+        prior_outcome: Atom.to_string(prior.outcome),
+        prior_review_effort: if(is_atom(prior.review_effort), do: Atom.to_string(prior.review_effort)),
+        prior_summary: truncate(prior.summary, @compact_text_limit)
+      })
+
     %{
       reviewed_sha: prior.reviewed_sha,
       findings: findings,
-      delta: delta_context(prior.reviewed_sha, head_sha, base_sha, workspace, runner)
+      delta: delta
     }
   end
 
   defp prior_review(_prior, _base_sha, head_sha, _workspace, _runner) do
     %{reviewed_sha: nil, findings: [], delta: %{kind: "first_review", prior_reviewed_sha: nil, head_sha: head_sha, command: nil, stat: nil}}
   end
+
+  defp unresolved_findings(%ReviewOutcome{outcome: outcome, findings: findings})
+       when outcome in [:request_changes, :budget_exhausted_with_findings],
+       do: findings
+
+  defp unresolved_findings(%ReviewOutcome{}), do: []
 
   defp delta_context(prior_sha, head_sha, base_sha, workspace, runner) do
     cond do
@@ -988,9 +1010,19 @@ defmodule SymphonyElixir.ReviewPacket do
 
   defp security_paths?(paths) do
     Enum.any?(paths, fn path ->
-      down = String.downcase(path)
-      Enum.any?(@security_terms ++ ["migration", "orchestrator"], &String.contains?(down, &1))
+      if test_only_path?(path) do
+        false
+      else
+        down = String.downcase(path)
+        Enum.any?(@security_terms ++ ["migration", "orchestrator"], &String.contains?(down, &1))
+      end
     end)
+  end
+
+  defp test_only_path?(path) do
+    Regex.match?(~r{(^|/)__tests__(/|$)}, path) or
+      Regex.match?(~r{\.(test|spec)\.[cm]?[jt]sx?$}, path) or
+      String.starts_with?(path, "test/") or String.starts_with?(path, "tests/fixtures/")
   end
 
   defp repository_from_remote(nil), do: nil

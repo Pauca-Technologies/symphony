@@ -42,6 +42,7 @@ defmodule SymphonyElixir.AgentRunner do
   @prompt_built_telemetry_event [:symphony_elixir, :agent, :prompt_built]
   @handoff_gate_prompt_key {__MODULE__, :handoff_gate_prompt}
   @handoff_gate_infrastructure_failure_key {__MODULE__, :handoff_gate_infrastructure_failure}
+  @handoff_gate_lifecycle_key {__MODULE__, :handoff_gate_lifecycle}
   @deferred_handoff_gate_key {__MODULE__, :deferred_handoff_gate}
   @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
   @agent_wait_request_key {__MODULE__, :agent_wait_request}
@@ -1258,16 +1259,17 @@ defmodule SymphonyElixir.AgentRunner do
   defp handoff_gate_lifecycle_callback(recipient, issue) do
     fn
       :started, %{gate_job_id: gate_job_id, gate: gate} ->
-        transition_agent_lifecycle(recipient, issue, :handoff_pending_gate, %{
-          gate_job_id: gate_job_id,
-          gate: gate
-        })
+        transition_pending_gate(recipient, issue, Map.put(gate, :job_id, gate_job_id))
 
       :finished, %{gate_job_id: gate_job_id, outcome: outcome} ->
-        transition_agent_lifecycle(recipient, issue, :implementing, %{
-          gate_job_id: gate_job_id,
-          gate_outcome: outcome
-        })
+        result =
+          transition_agent_lifecycle(recipient, issue, :implementing, %{
+            gate_job_id: gate_job_id,
+            gate_outcome: outcome
+          })
+
+        clear_pending_gate_lifecycle(issue)
+        result
     end
   end
 
@@ -2077,11 +2079,20 @@ defmodule SymphonyElixir.AgentRunner do
   defp review_key_sha({:workspace, _issue_id, head_sha}), do: head_sha
 
   defp transition_pending_gate(recipient, issue, gate) do
-    :ok =
-      transition_agent_lifecycle(recipient, issue, :handoff_pending_gate, %{
-        gate_job_id: gate.job_id,
-        gate: handoff_gate_lifecycle_payload(gate)
-      })
+    signature = pending_gate_lifecycle_signature(gate)
+    lifecycles = Process.get(@handoff_gate_lifecycle_key, %{})
+
+    unless Map.get(lifecycles, issue.id) == signature do
+      :ok =
+        transition_agent_lifecycle(recipient, issue, :handoff_pending_gate, %{
+          gate_job_id: gate.job_id,
+          gate: handoff_gate_lifecycle_payload(gate)
+        })
+
+      Process.put(@handoff_gate_lifecycle_key, Map.put(lifecycles, issue.id, signature))
+    end
+
+    :ok
   end
 
   defp finish_pending_gate(request, recipient, outcome, owned_job_id \\ nil) do
@@ -2089,11 +2100,28 @@ defmodule SymphonyElixir.AgentRunner do
     lifecycle_job_id = owned_job_id || gate.job_id
 
     with :ok <- Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
-      transition_agent_lifecycle(recipient, request.issue, :implementing, %{
-        gate_job_id: lifecycle_job_id,
-        gate_outcome: outcome
-      })
+      result =
+        transition_agent_lifecycle(recipient, request.issue, :implementing, %{
+          gate_job_id: lifecycle_job_id,
+          gate_outcome: outcome
+        })
+
+      clear_pending_gate_lifecycle(request.issue)
+      result
     end
+  end
+
+  defp pending_gate_lifecycle_signature(gate) do
+    {
+      Map.get(gate, :job_id),
+      Map.get(gate, :status),
+      Map.get(gate, :progress)
+    }
+  end
+
+  defp clear_pending_gate_lifecycle(issue) do
+    lifecycles = Process.get(@handoff_gate_lifecycle_key, %{})
+    Process.put(@handoff_gate_lifecycle_key, Map.delete(lifecycles, issue.id))
   end
 
   defp handoff_gate_lifecycle_payload(gate) do

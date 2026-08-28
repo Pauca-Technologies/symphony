@@ -138,12 +138,14 @@ defmodule SymphonyElixir.AgentBudget do
   @spec take_strategy_prompt(t()) :: {String.t() | nil, t()}
   def take_strategy_prompt(%{pending: []} = state), do: {nil, state}
 
-  def take_strategy_prompt(%{decision: %{enforced: false}} = state),
-    do: {nil, %{state | pending: []}}
-
   def take_strategy_prompt(state) do
-    prompt = strategy_prompt(state)
-    {prompt, %{state | pending: []}}
+    applied = Enum.filter(state.pending, & &1.applied)
+    state = %{state | pending: []}
+
+    case applied do
+      [] -> {nil, state}
+      transitions -> {strategy_prompt(%{state | pending: transitions}), state}
+    end
   end
 
   @doc "Current inspectable metrics reconstructed from actual thread high waters."
@@ -208,11 +210,19 @@ defmodule SymphonyElixir.AgentBudget do
       threshold: threshold,
       action: action,
       proposed: true,
-      applied: state.decision.enforced,
+      applied: action_applied?(state.decision, action),
       allow_overage: state.decision.budget.allow_overage,
       quality_bar_unchanged: true
     }
   end
+
+  defp action_applied?(%{mode: "enforce"}, _action), do: true
+
+  defp action_applied?(%{mode: "shadow", enforced_actions: actions}, action)
+       when is_list(actions),
+       do: action in actions
+
+  defp action_applied?(_decision, _action), do: false
 
   defp emit_transition(state, transition) do
     Telemetry.emit(:budget_transition, %{

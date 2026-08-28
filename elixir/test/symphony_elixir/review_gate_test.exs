@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ReviewGateTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.ReviewGate
+  alias SymphonyElixir.{ReviewGate, ReviewOutcome}
 
   setup do
     workspace =
@@ -330,6 +330,53 @@ defmodule SymphonyElixir.ReviewGateTest do
              )
 
     assert_received {:review_packet_builder, "UDPE-1", "head-7"}
+  end
+
+  test "an approved head remains prior-review context when a later gate fix changes the candidate", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+    Process.put(:review_test_head, "head-7")
+
+    dynamic_pr_runner = fn
+      ["pr", "view" | _], _cwd ->
+        {Jason.encode!(%{
+           "id" => "PR_7",
+           "number" => 7,
+           "body" => "Existing PR body.",
+           "headRefOid" => Process.get(:review_test_head)
+         }), 0}
+
+      ["api", "graphql" | _], _cwd ->
+        {"", 0}
+    end
+
+    packet_builder = fn workspace, _issue, _pr, reviewed_sha, prior_outcome, _settings, _opts ->
+      send(test_pid, {:prior_review_context, reviewed_sha, prior_outcome})
+      {:ok, synthetic_packet_result(workspace, reviewed_sha, 1_000)}
+    end
+
+    assert {:approved, %{reviewed_sha: "head-7"}} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               review_packet_builder: packet_builder,
+               session_runner: verdict_runner(%{"verdict" => "approve", "summary" => "first head"}),
+               pr_runner: dynamic_pr_runner
+             )
+
+    assert_received {:prior_review_context, "head-7", nil}
+    Process.put(:review_test_head, "head-8")
+
+    assert {:approved, %{reviewed_sha: "head-8"}} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               review_packet_builder: packet_builder,
+               session_runner: verdict_runner(%{"verdict" => "approve", "summary" => "second head"}),
+               pr_runner: dynamic_pr_runner
+             )
+
+    assert_received {:prior_review_context, "head-8", %ReviewOutcome{} = prior}
+    assert prior.outcome == :approved
+    assert prior.reviewed_sha == "head-7"
+    assert prior.summary == "first head"
   end
 
   test "review packet builder failures are infrastructure unavailable", %{workspace: workspace} do

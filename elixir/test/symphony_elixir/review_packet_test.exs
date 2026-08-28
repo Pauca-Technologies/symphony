@@ -363,6 +363,8 @@ defmodule SymphonyElixir.ReviewPacketTest do
 
     assert result.packet.follow_up.kind == "changed_head_delta"
     assert result.packet.follow_up.prior_reviewed_sha == context.head_sha
+    assert result.packet.follow_up.prior_outcome == "request_changes"
+    assert result.packet.follow_up.prior_inspected == []
     assert result.packet.follow_up.command == "git diff --find-renames #{context.head_sha}..#{new_head}"
     assert byte_size(result.packet.follow_up.stat) <= 2_000
     assert result.packet.follow_up.stat =~ "[compacted]"
@@ -370,6 +372,67 @@ defmodule SymphonyElixir.ReviewPacketTest do
     assert originating_sha == context.head_sha
     assert result.packet.risk.level == "high"
     assert result.packet.diff.mode == "high_risk_final_full_diff"
+  end
+
+  test "approved prior review carries coverage without turning advisory comments into open findings", context do
+    prior = %ReviewOutcome{
+      outcome: :approved,
+      iteration: 1,
+      max_iterations: 3,
+      reviewed_sha: context.head_sha,
+      review_effort: :skim,
+      summary: "Reviewed the complete first candidate.",
+      findings: [%{severity: "minor", file: "lib.ex", body: "Optional rename."}],
+      inspected: ["complete base-to-head diff", "lib.ex"],
+      attestation_report: %{reused: ["mix test"], rerun: []},
+      resume_condition: "Keep the exact head"
+    }
+
+    File.write!(Path.join(context.workspace, "lib.ex"), "defmodule Example do\n  def value, do: :ok\nend\n")
+    git!(context.workspace, ["add", "."])
+    git!(context.workspace, ["commit", "--quiet", "-m", "post-gate fix"])
+    new_head = git!(context.workspace, ["rev-parse", "HEAD"])
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("Approved follow up"),
+               %{pr(context) | head_oid: new_head},
+               new_head,
+               prior,
+               settings(),
+               attestations: [attestation(new_head)]
+             )
+
+    assert result.packet.unresolved_findings == []
+    assert result.packet.follow_up.prior_outcome == "approved"
+    assert result.packet.follow_up.prior_review_effort == "skim"
+    assert result.packet.follow_up.prior_inspected == ["complete base-to-head diff", "lib.ex"]
+    assert result.packet.follow_up.prior_attestations == %{reused: ["mix test"], rerun: []}
+    assert result.packet.diff.mode == "delta_plus_full_candidate_confirmation"
+  end
+
+  test "test-only session fixtures do not force production security risk", context do
+    path = "scripts/session/digest-uncaught.test.ts"
+    File.mkdir_p!(Path.dirname(Path.join(context.workspace, path)))
+    File.write!(Path.join(context.workspace, path), "export const fixture = true\n")
+    git!(context.workspace, ["add", "."])
+    git!(context.workspace, ["commit", "--quiet", "-m", "test fixture"])
+    head = git!(context.workspace, ["rev-parse", "HEAD"])
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("Test fixture"),
+               %{pr(context) | head_oid: head},
+               head,
+               nil,
+               settings(),
+               attestations: [attestation(head)]
+             )
+
+    assert result.packet.risk.level == "normal"
+    refute Enum.any?(result.packet.requested_lenses, &(&1.name == "security_tenant_auth"))
   end
 
   test "missing diff and validation artifacts are explicit, not silently accepted", context do

@@ -11,6 +11,10 @@ defmodule SymphonyElixir.TaskContextPromptTest do
       state: "In Progress",
       labels: ["needs-human-input"],
       url: "https://linear.app/example/issue/UDPE-7011",
+      attachment_urls: [
+        "https://pauca.sentry.io/issues/123456/",
+        "https://example.com/design"
+      ],
       description: "Apply the product owner's decision.",
       comments: [
         %Comment{
@@ -49,6 +53,9 @@ defmodule SymphonyElixir.TaskContextPromptTest do
     assert prompt =~ "# Task context"
     assert prompt =~ "Issue: UDPE-7011"
     assert prompt =~ "## Current Linear activity"
+    assert prompt =~ "https://pauca.sentry.io/issues/123456/"
+    assert prompt =~ "https://example.com/design"
+    assert prompt =~ "Call `get_sentry_resource` with that exact URL"
     assert prompt =~ "Decision: use option B."
     assert prompt =~ "This issue is marked `needs-human-input`"
     assert prompt =~ "## Startup artifacts generated for this task"
@@ -69,6 +76,7 @@ defmodule SymphonyElixir.TaskContextPromptTest do
     prompt = TaskContextPrompt.render(%Issue{identifier: "UDPE-7062", comments: []})
 
     assert prompt =~ "No Linear comments were present at dispatch."
+    assert prompt =~ "Attachments:\nNone"
     refute prompt =~ "Startup artifacts"
   end
 

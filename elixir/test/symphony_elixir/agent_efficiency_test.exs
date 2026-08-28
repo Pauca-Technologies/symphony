@@ -24,6 +24,7 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
   test "defaults to shadow mode with task-specific percentile seed profiles" do
     assert {:ok, settings} = EfficiencyConfig.parse(%{})
     assert settings.mode == "shadow"
+    assert settings.enforced_actions == []
     assert settings.task_profiles["simple_direct"] == "simple"
     assert settings.task_profiles["security_tenant"] == "high_risk"
     assert settings.profiles["simple"].total_tokens < settings.profiles["high_risk"].total_tokens
@@ -35,6 +36,7 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
       "agent" => %{
         "efficiency" => %{
           "mode" => "enforce",
+          "enforced_actions" => ["bound_future_tool_output"],
           "capsule_max_bytes" => 700,
           "profiles" => %{
             "simple" => %{
@@ -49,6 +51,7 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
 
     assert {:ok, settings} = EfficiencyConfig.parse(config)
     assert settings.mode == "enforce"
+    assert settings.enforced_actions == ["bound_future_tool_output"]
     assert settings.capsule_max_bytes == 700
     assert settings.profiles["simple"].total_tokens == 10_000
 
@@ -59,6 +62,10 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
     too_small = put_in(config, ["agent", "efficiency", "capsule_max_bytes"], 100)
     assert {:error, {:invalid_agent_efficiency, capsule_message}} = EfficiencyConfig.parse(too_small)
     assert capsule_message =~ "between 512 and 65536"
+
+    unsupported = put_in(config, ["agent", "efficiency", "enforced_actions"], ["skip_validation"])
+    assert {:error, {:invalid_agent_efficiency, action_message}} = EfficiencyConfig.parse(unsupported)
+    assert action_message =~ "bound_future_tool_output"
   end
 
   test "records classifier provenance and honors an explicit budget override" do
@@ -216,6 +223,35 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
 
     assert MapSet.member?(state.crossed, "soft:total_tokens")
     assert {nil, cleared} = AgentBudget.take_strategy_prompt(state)
+    assert cleared.pending == []
+  end
+
+  test "shadow mode applies only explicitly allowlisted low-risk transitions" do
+    decision =
+      decision("shadow", 10)
+      |> Map.put(:enforced_actions, ["bound_future_tool_output"])
+      |> put_in([:budget, :tool_output_bytes], 5)
+
+    state =
+      decision
+      |> AgentBudget.new(issue())
+      |> AgentBudget.observe(usage("parent", 20, 15, 5))
+      |> AgentBudget.observe(
+        protocol_update("item/completed", %{
+          "item" => %{
+            "id" => "command",
+            "type" => "commandExecution",
+            "aggregatedOutput" => "bounded output"
+          }
+        })
+      )
+
+    assert Enum.any?(state.pending, &(&1.action == "bound_future_tool_output" and &1.applied))
+    assert Enum.any?(state.pending, &(&1.action == "compact_parent_resume_capsule" and not &1.applied))
+
+    assert {capsule, cleared} = AgentBudget.take_strategy_prompt(state)
+    assert capsule =~ "bound_future_tool_output"
+    refute capsule =~ "compact_parent_resume_capsule"
     assert cleared.pending == []
   end
 
@@ -406,6 +442,7 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
       override: nil,
       capsule_max_bytes: 1_000,
       extreme_multiplier: 3.0,
+      enforced_actions: [],
       enforced: mode == "enforce"
     }
   end

@@ -100,9 +100,15 @@ agent:
   max_retries: 10
   max_retry_backoff_ms: 300000
   # Soft budgets are policy/strategy signals, never completion or approval gates.
-  # Shadow mode records proposed routing and transitions without changing prompts.
+  # Shadow mode records proposed routing and transitions. The narrow action
+  # allowlist below applies only low-risk context/output hygiene; review depth
+  # and other quality-sensitive transitions remain shadow observations.
   efficiency:
     mode: shadow # off | shadow | enforce
+    enforced_actions:
+      - bound_future_tool_output
+      - fresh_thin_context_delegation_only
+      - prohibit_full_history_delegation
     capsule_max_bytes: 4000
     extreme_multiplier: 2.0
     # Defaults are seeded from recent fleet p50/p90 bands and differ for

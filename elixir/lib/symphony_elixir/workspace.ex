@@ -828,9 +828,12 @@ defmodule SymphonyElixir.Workspace do
   defp hook_env(workspace, extra_env) do
     [
       {"SYMPHONY_RUN", "1"},
-      {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)}
+      {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)},
+      {"SYMPHONY_SHARED_CACHE_DIR", shared_cache_path(workspace)}
     ] ++ extra_env
   end
+
+  defp shared_cache_path(workspace), do: Path.join(Path.dirname(workspace), ".symphony-cache")
 
   # SYMPHONY_RUN=1 marks this as a Symphony-spawned outer hook so consumer
   # repositories can distinguish it from an inner coding-agent process.
@@ -880,7 +883,8 @@ defmodule SymphonyElixir.Workspace do
   defp remote_hook_exports(workspace, extra_env) do
     ([
        {"SYMPHONY_RUN", "1"},
-       {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)}
+       {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)},
+       {"SYMPHONY_SHARED_CACHE_DIR", shared_cache_path(workspace)}
      ] ++ extra_env)
     |> Enum.map_join(" ", fn
       {name, false} -> "unset #{name} &&"
