@@ -602,7 +602,9 @@ Notes:
   `before_handoff` with `SYMPHONY_HANDOFF_GATE_JOB_ID` and skip GitHub auth preparation and
   issue-context refresh. The hook should read that job before normal setup. Symphony durably records
   the attempted mutation before the initial invocation too, so an infrastructure failure before job
-  creation retries the hook without starting another model session. Before a fresh invocation or a
+  creation retries the hook without starting another model session. Transient tracker refresh failures
+  while starting or polling a durable gate use capped internal backoff and preserve the gate, candidate,
+  and review approval; they do not return the issue to an implementor turn. Before a fresh invocation or a
   durable pre-job retry, base-drift validation treats `WORKFLOW.md`, `WORKFLOW_REVIEW.md`, and
   repository-relative scripts referenced by the configured hook as runtime dependencies. If the base
   changed one of them, Symphony clears the stale intent and asks the agent to refresh the branch instead

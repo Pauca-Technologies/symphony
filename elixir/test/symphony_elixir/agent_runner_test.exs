@@ -2202,6 +2202,102 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
     end
 
+    test "retries a transient issue refresh without clearing the durable gate or opening a model turn" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-refresh-retry-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7446")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-refresh-retry",
+        identifier: "UDPE-7446",
+        title: "Preserve a gate across tracker timeouts",
+        state: "In Progress",
+        labels: []
+      }
+
+      pending_gate = async_gate(:pending)
+      query = "mutation Move { issueUpdate(id: \"issue-gate-refresh-retry\", input: {stateId: \"review\"}) { success } }"
+
+      assert :ok =
+               Workspace.persist_handoff_gate_state(workspace, %{
+                 "query" => query,
+                 "variables" => %{},
+                 "targetState" => "In Review",
+                 "gate" => %{
+                   "jobId" => pending_gate.job_id,
+                   "status" => "pending",
+                   "candidateHash" => pending_gate.candidate_hash,
+                   "exactHash" => pending_gate.exact_hash,
+                   "identity" => pending_gate.identity,
+                   "heartbeatAt" => pending_gate.heartbeat_at,
+                   "heartbeatAgeMs" => pending_gate.heartbeat_age_ms,
+                   "nextPollMs" => pending_gate.next_poll_ms,
+                   "progress" => pending_gate.progress,
+                   "startedAt" => pending_gate.started_at
+                 }
+               })
+
+      Application.put_env(:symphony_elixir, :turn_count_recipient_for_test, self())
+      {:ok, state_reads} = Agent.start_link(fn -> 0 end)
+      test_pid = self()
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
+        if Process.alive?(state_reads), do: Agent.stop(state_reads)
+        File.rm_rf(workspace_root)
+      end)
+
+      state_fetcher = fn ["issue-gate-refresh-retry"] ->
+        case Agent.get_and_update(state_reads, fn count -> {count, count + 1} end) do
+          0 -> {:error, {:linear_api_request, %Req.TransportError{reason: :timeout}}}
+          1 -> {:ok, [issue]}
+        end
+      end
+
+      poller = fn ^workspace, ^issue, nil, "In Review", "job-7157", _poll_opts ->
+        send(test_pid, :durable_gate_polled_after_refresh)
+        {:passed, async_gate(:passed)}
+      end
+
+      linear_client = fn ^query, %{}, [] ->
+        send(test_pid, :durable_gate_handoff_applied_after_refresh)
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 self(),
+                 [
+                   agent_backend: {TurnCountingBackend, %{}},
+                   issue_context_file: Workspace.issue_context_path(workspace),
+                   issue_state_fetcher: state_fetcher,
+                   handoff_gate_poller: poller,
+                   handoff_issue_refresh_sleep: fn delay_ms ->
+                     send(test_pid, {
+                       :issue_refresh_retry_sleep,
+                       delay_ms,
+                       Workspace.load_handoff_gate_state(workspace)
+                     })
+                   end,
+                   linear_client: linear_client,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_received {:issue_refresh_retry_sleep, delay_ms, {:ok, %{"gate" => %{"jobId" => "job-7157"}}}}
+      assert delay_ms >= 1_000 and delay_ms <= 1_200
+      assert_received :durable_gate_polled_after_refresh
+      assert_received :durable_gate_handoff_applied_after_refresh
+      refute_received :turn_ran
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
     test "adopts a live replacement gate and finishes its lifecycle without a model turn" do
       workspace_root =
         Path.join(

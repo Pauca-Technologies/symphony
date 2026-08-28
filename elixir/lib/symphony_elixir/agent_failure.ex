@@ -88,18 +88,23 @@ defmodule SymphonyElixir.AgentFailure do
   def classify(reason, opts) do
     backend = Keyword.get(opts, :backend)
 
-    cond do
-      trusted_usage_limit?(reason, backend) ->
-        %__MODULE__{
-          class: :usage_quota_limit,
-          message: reason_message(reason),
-          backend: backend,
-          scope: :backend_account,
-          trusted: true,
-          reset_at: extract_reset_at(reason),
-          details: reason
-        }
+    if trusted_usage_limit?(reason, backend) do
+      %__MODULE__{
+        class: :usage_quota_limit,
+        message: reason_message(reason),
+        backend: backend,
+        scope: :backend_account,
+        trusted: true,
+        reset_at: extract_reset_at(reason),
+        details: reason
+      }
+    else
+      classify_non_usage_limit_failure(reason, backend)
+    end
+  end
 
+  defp classify_non_usage_limit_failure(reason, backend) do
+    cond do
       match?({:rate_limited, _}, reason) ->
         %__MODULE__{
           class: :rate_limited,
@@ -108,6 +113,9 @@ defmodule SymphonyElixir.AgentFailure do
           retry_after_ms: retry_after_ms(reason),
           details: reason
         }
+
+      transient_transport_failure?(reason) ->
+        failure(:transient_infrastructure, reason, backend)
 
       timeout_or_stall?(reason) ->
         failure(:response_timeout_or_stall, reason, backend)
@@ -189,6 +197,9 @@ defmodule SymphonyElixir.AgentFailure do
   defp contains_internal_marker?(list, marker) when is_list(list),
     do: Enum.any?(list, &contains_internal_marker?(&1, marker))
 
+  defp contains_internal_marker?(%_{} = struct, marker),
+    do: struct |> Map.from_struct() |> contains_internal_marker?(marker)
+
   defp contains_internal_marker?(map, marker) when is_map(map) do
     Enum.any?(map, fn {key, value} ->
       contains_internal_marker?(key, marker) or contains_internal_marker?(value, marker)
@@ -209,11 +220,39 @@ defmodule SymphonyElixir.AgentFailure do
 
   defp contains_atom?(list, atom) when is_list(list), do: Enum.any?(list, &contains_atom?(&1, atom))
 
+  defp contains_atom?(%_{} = struct, atom),
+    do: struct |> Map.from_struct() |> contains_atom?(atom)
+
   defp contains_atom?(map, atom) when is_map(map) do
     Enum.any?(map, fn {key, value} -> contains_atom?(key, atom) or contains_atom?(value, atom) end)
   end
 
   defp contains_atom?(_reason, _atom), do: false
+
+  defp transient_transport_failure?(%Req.TransportError{}), do: true
+  defp transient_transport_failure?(%Req.HTTPError{protocol: :http2, reason: :unprocessed}), do: true
+
+  defp transient_transport_failure?({:linear_api_status, status})
+       when is_integer(status) and status >= 500,
+       do: true
+
+  defp transient_transport_failure?(tuple) when is_tuple(tuple) do
+    tuple |> Tuple.to_list() |> Enum.any?(&transient_transport_failure?/1)
+  end
+
+  defp transient_transport_failure?(list) when is_list(list),
+    do: Enum.any?(list, &transient_transport_failure?/1)
+
+  defp transient_transport_failure?(%_{} = struct),
+    do: struct |> Map.from_struct() |> transient_transport_failure?()
+
+  defp transient_transport_failure?(map) when is_map(map) do
+    Enum.any?(map, fn {key, value} ->
+      transient_transport_failure?(key) or transient_transport_failure?(value)
+    end)
+  end
+
+  defp transient_transport_failure?(_reason), do: false
 
   defp extract_reset_at(reason) do
     reason
@@ -297,6 +336,8 @@ defmodule SymphonyElixir.AgentFailure do
   defp hour_24(12, meridiem) when meridiem in ["AM", "am"], do: 0
   defp hour_24(hour, meridiem) when meridiem in ["PM", "pm"] and hour < 12, do: hour + 12
   defp hour_24(hour, _meridiem), do: hour
+
+  defp deep_value(%_{} = struct, keys), do: struct |> Map.from_struct() |> deep_value(keys)
 
   defp deep_value(value, keys) when is_map(value) do
     Enum.find_value(keys, &Map.get(value, &1)) ||

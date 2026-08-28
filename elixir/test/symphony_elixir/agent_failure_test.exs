@@ -72,6 +72,19 @@ defmodule SymphonyElixir.AgentFailureTest do
              :agent_protocol_failure
   end
 
+  test "classifies nested Req transport structs without crashing" do
+    timeout = %Req.TransportError{reason: :timeout}
+
+    assert %AgentFailure{class: :transient_infrastructure, trusted: false} =
+             AgentFailure.classify(
+               {:issue_state_refresh_failed, {:linear_api_request, timeout}},
+               backend: "codex"
+             )
+
+    assert %AgentFailure{class: :transient_infrastructure, trusted: false} =
+             AgentFailure.classify({:linear_api_status, 503}, backend: "codex")
+  end
+
   test "requires positive rate-limit evidence before declaring recovery" do
     refute AgentFailure.recovered_rate_limits?(%{
              "credits" => %{"hasCredits" => false, "unlimited" => false},

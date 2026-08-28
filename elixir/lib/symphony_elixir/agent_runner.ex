@@ -46,6 +46,8 @@ defmodule SymphonyElixir.AgentRunner do
   @deferred_handoff_gate_key {__MODULE__, :deferred_handoff_gate}
   @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
   @agent_wait_request_key {__MODULE__, :agent_wait_request}
+  @handoff_issue_refresh_retry_base_ms 1_000
+  @handoff_issue_refresh_retry_max_ms 30_000
 
   # See T04 in /data/projects/coding-harness/implementation-plan.md and audit §5.1 O9.
   # Symphony silently giving up on terminal failure is a trust-killer; we mark the
@@ -1647,7 +1649,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp restore_gate_status(_status), do: :pending
 
   defp resume_starting_handoff_gate(request, recipient, backend, issue_state_fetcher, opts) do
-    case continue_with_issue?(request.issue, issue_state_fetcher, opts) do
+    case refresh_handoff_issue(request.issue, issue_state_fetcher, opts) do
       {:continue, refreshed_issue} ->
         request
         |> Map.put(:issue, refreshed_issue)
@@ -1889,7 +1891,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     if sleep_first?, do: handoff_gate_sleep(gate.next_poll_ms, opts)
 
-    case continue_with_issue?(issue, issue_state_fetcher, opts) do
+    case refresh_handoff_issue(issue, issue_state_fetcher, opts) do
       {:continue, refreshed_issue} ->
         request = Map.put(request, :issue, refreshed_issue)
         poll_current_handoff_gate(request, recipient, backend, issue_state_fetcher, opts)
@@ -1901,10 +1903,10 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
       {:error, reason} ->
-        case finish_pending_gate(request, recipient, :issue_refresh_failed) do
-          :ok -> {:error, reason}
-          {:error, clear_reason} -> {:error, {reason, clear_reason}}
-        end
+        # Tracker refresh is an operational precondition, not a gate verdict.
+        # Keep the durable job and its lifecycle intact so recovery can attach
+        # to the same exact candidate instead of starting an implementor turn.
+        {:error, {:handoff_issue_refresh_failed, reason}}
     end
   end
 
@@ -2142,6 +2144,56 @@ defmodule SymphonyElixir.AgentRunner do
   defp handoff_gate_sleep(next_poll_ms, opts) do
     sleep = Keyword.get(opts, :handoff_gate_sleep, &Process.sleep/1)
     sleep.(max(next_poll_ms || 1_000, 1))
+  end
+
+  defp refresh_handoff_issue(issue, issue_state_fetcher, opts, retry_attempt \\ 0) do
+    case continue_with_issue?(issue, issue_state_fetcher, opts) do
+      {:error, reason} = error ->
+        if transient_handoff_issue_refresh_failure?(reason) do
+          delay_ms = handoff_issue_refresh_retry_delay_ms(issue, retry_attempt)
+
+          Logger.warning(
+            "handoff.gate issue refresh failed; retrying #{issue_context(issue)} " <>
+              "attempt=#{retry_attempt + 1} delay_ms=#{delay_ms} reason=#{inspect(reason)}"
+          )
+
+          handoff_issue_refresh_sleep(delay_ms, opts)
+          refresh_handoff_issue(issue, issue_state_fetcher, opts, retry_attempt + 1)
+        else
+          error
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp transient_handoff_issue_refresh_failure?(reason) do
+    AgentFailure.classify(reason).class in [
+      :rate_limited,
+      :response_timeout_or_stall,
+      :transient_infrastructure
+    ]
+  end
+
+  defp handoff_issue_refresh_retry_delay_ms(issue, retry_attempt) do
+    exponent = min(max(retry_attempt, 0), 5)
+
+    base_delay_ms =
+      min(
+        @handoff_issue_refresh_retry_base_ms * Integer.pow(2, exponent),
+        @handoff_issue_refresh_retry_max_ms
+      )
+
+    jitter_room_ms = max(@handoff_issue_refresh_retry_max_ms - base_delay_ms, 0)
+    jitter_limit_ms = min(div(base_delay_ms, 5), jitter_room_ms)
+    jitter_ms = :erlang.phash2({issue.id, retry_attempt}, jitter_limit_ms + 1)
+    base_delay_ms + jitter_ms
+  end
+
+  defp handoff_issue_refresh_sleep(delay_ms, opts) do
+    sleep = Keyword.get(opts, :handoff_issue_refresh_sleep, &Process.sleep/1)
+    sleep.(delay_ms)
   end
 
   defp pending_gate_error_prompt(issue, reason) do

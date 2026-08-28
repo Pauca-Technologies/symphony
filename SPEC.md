@@ -1141,11 +1141,13 @@ Execution contract:
 - Before the initial protocol-aware invocation, durably record the original tracker mutation. On
   pre-job infrastructure failure, preserve that intent and retry the hook without a model turn. On
   pending/running, replace the intent with the durable job identity, end the active model turn, and
-  poll without a model turn. Apply the mutation only after a passed report is revalidated for the
-  exact current candidate. Failed or invalidated terminal results clear pending state and resume
-  the implementor once with bounded remediation. Infrastructure terminal results clear pending
-  state, fail the worker attempt with a typed infrastructure failure, and use orchestrator backoff
-  without consuming an implementor remediation turn.
+  poll without a model turn. Transient tracker refresh failures while starting or polling a durable
+  gate MUST preserve that intent and gate identity and SHOULD retry internally with capped backoff;
+  they MUST NOT return the issue to an implementor turn. Apply the mutation only after a passed
+  report is revalidated for the exact current candidate. Failed or invalidated terminal results
+  clear pending state and resume the implementor once with bounded remediation. Infrastructure
+  terminal results clear pending state, fail the worker attempt with a typed infrastructure failure,
+  and use orchestrator backoff without consuming an implementor remediation turn.
 - For a routed repository with a configured base branch, fetch and revalidate
   that base on the local or SSH worker host that owns the worktree immediately
   before `hooks.before_handoff`. Compute the
