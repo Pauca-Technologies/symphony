@@ -14,6 +14,7 @@ defmodule SymphonyElixir.WaitWatcher do
   alias SymphonyElixir.{WaitCondition, WaitStore}
 
   @ready_notify_interval_ms 1_000
+  @active_github_checks_max_poll_ms 60_000
 
   defmodule State do
     @moduledoc false
@@ -299,11 +300,13 @@ defmodule SymphonyElixir.WaitWatcher do
   defp backoff_entry(entry, observation, error) do
     attempt = entry.probe_attempt + 1
 
-    delay_ms =
+    exponential_delay_ms =
       min(
         entry.request.min_poll_ms * Integer.pow(2, min(attempt - 1, 10)),
         entry.request.max_poll_ms
       )
+
+    delay_ms = wait_poll_delay_ms(entry.request.condition, observation, error, exponential_delay_ms)
 
     entry
     |> Map.put(:probe_attempt, attempt)
@@ -311,6 +314,29 @@ defmodule SymphonyElixir.WaitWatcher do
     |> Map.put(:last_observation, observation || entry.last_observation)
     |> Map.put(:last_error, error)
   end
+
+  defp wait_poll_delay_ms(condition, observation, nil, exponential_delay_ms) do
+    if active_github_checks?(condition, observation) do
+      min(exponential_delay_ms, @active_github_checks_max_poll_ms)
+    else
+      exponential_delay_ms
+    end
+  end
+
+  defp wait_poll_delay_ms(_condition, _observation, _error, exponential_delay_ms),
+    do: exponential_delay_ms
+
+  defp active_github_checks?(%{"type" => type}, observation)
+       when type in ["github_pr_checks_changed", "github_pr_gate_settled"] and
+              is_map(observation),
+       do: observation["aggregate"] in ["none", "pending"]
+
+  defp active_github_checks?(%{"type" => "github_pr_check_changed"}, observation)
+       when is_map(observation) do
+    observation["present"] == false or observation["bucket"] == "pending"
+  end
+
+  defp active_github_checks?(_condition, _observation), do: false
 
   defp arm_condition(%State{} = state, condition_key) do
     if timer = Map.get(state.timers, condition_key), do: Process.cancel_timer(timer.ref)

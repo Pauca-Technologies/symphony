@@ -1521,7 +1521,10 @@ Optional client-side tool extension:
 - Probes MUST run outside coding-agent/model sessions. Identical condition keys SHOULD share one
   probe, with bounded exponential backoff for unchanged or failed probes. On watcher startup,
   persisted waiting entries SHOULD become immediately due so a restart or deployment revalidates
-  their external state instead of preserving an obsolete pre-restart backoff deadline.
+  their external state instead of preserving an obsolete pre-restart backoff deadline. After an
+  unchanged observation that identifies GitHub PR checks as pending, the next-probe delay SHOULD
+  not exceed one minute; failed probes SHOULD retain exponential backoff rather than using that
+  active-check interval.
 - A changed condition MUST re-enter the normal priority, dependency, capacity, and concurrency
   scheduler exactly once with a compact prompt describing the state change. Durable ready state
   SHOULD remain until a replacement worker has actually started.

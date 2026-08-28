@@ -357,6 +357,9 @@ Notes:
   skips resolve to `pass` instead of remaining parked as `pending`. They also wake when the PR's
   head, base, open/draft state, mergeability, merge-state status, or review decision changes, because
   any of those changes can make a previously watched check insufficient or require remediation.
+  While an unchanged PR observation still contains pending checks (or checks have not appeared yet),
+  watcher polling is capped at 60 seconds; probe failures retain exponential backoff so a GitHub
+  outage does not create a request loop.
 - Every Linear caller shares one process-wide rate-limit cooldown. A rate-limit response pauses
   polling, workpad/label writes, and agent tool requests together, honoring a longer `Retry-After`
   hint when Linear supplies one instead of letting concurrent callers immediately refill the limit.

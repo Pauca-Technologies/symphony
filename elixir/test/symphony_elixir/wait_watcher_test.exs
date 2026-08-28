@@ -330,6 +330,160 @@ defmodule SymphonyElixir.WaitWatcherTest do
            end)
   end
 
+  test "caps polling while known PR checks remain active", %{state_path: state_path} do
+    test_pid = self()
+    previous_reset = Application.get_env(:symphony_elixir, :wait_state_reset_on_start)
+    Application.put_env(:symphony_elixir, :wait_state_reset_on_start, false)
+
+    on_exit(fn -> restore_app_env(:wait_state_reset_on_start, previous_reset) end)
+
+    gate_observation = %{
+      "aggregate" => "pending",
+      "fingerprint" => "pending-checks",
+      "checks" => [%{"name" => "e2e", "bucket" => "pending", "state" => "IN_PROGRESS"}],
+      "pull_request" => %{"state" => "OPEN", "headRefOid" => "head-1"}
+    }
+
+    named_observation = %{
+      "present" => true,
+      "name" => "e2e",
+      "bucket" => "pending",
+      "state" => "QUEUED",
+      "pull_request" => %{"state" => "OPEN", "headRefOid" => "head-2"}
+    }
+
+    Application.put_env(:symphony_elixir, :wait_condition_probe, fn request ->
+      send(test_pid, {:active_checks_probed, request.condition_key})
+
+      case request.condition["type"] do
+        "github_pr_gate_settled" -> {:ok, gate_observation}
+        "github_pr_check_changed" -> {:ok, named_observation}
+      end
+    end)
+
+    gate_request = %{
+      condition: %{"type" => "github_pr_gate_settled", "pr_number" => 42},
+      condition_key: "active-pr-gate",
+      baseline: gate_observation,
+      reason: "await active CI",
+      min_poll_ms: 60_000,
+      max_poll_ms: 1_800_000
+    }
+
+    named_request = %{
+      condition: %{
+        "type" => "github_pr_check_changed",
+        "pr_number" => 43,
+        "check_name" => "e2e"
+      },
+      condition_key: "active-named-check",
+      baseline: named_observation,
+      reason: "await queued E2E",
+      min_poll_ms: 60_000,
+      max_poll_ms: 1_800_000
+    }
+
+    persisted_gate =
+      entry("issue-active-ci", "UDPE-ACTIVE-CI", gate_request)
+      |> Map.merge(%{
+        status: :waiting,
+        parked_at: DateTime.utc_now(),
+        next_probe_at: DateTime.add(DateTime.utc_now(), 30, :minute),
+        probe_attempt: 8,
+        last_observation: gate_observation,
+        last_error: nil
+      })
+
+    persisted_named =
+      entry("issue-active-named", "UDPE-ACTIVE-NAMED", named_request)
+      |> Map.merge(%{
+        status: :waiting,
+        parked_at: DateTime.utc_now(),
+        next_probe_at: DateTime.add(DateTime.utc_now(), 30, :minute),
+        probe_attempt: 8,
+        last_observation: named_observation,
+        last_error: nil
+      })
+
+    :ok =
+      WaitStore.save(%{
+        "issue-active-ci" => persisted_gate,
+        "issue-active-named" => persisted_named
+      })
+
+    name = :"wait-watcher-active-ci-#{System.unique_integer([:positive])}"
+    start_supervised!({WaitWatcher, name: name})
+
+    assert_receive {:active_checks_probed, "active-pr-gate"}, 1_000
+    assert_receive {:active_checks_probed, "active-named-check"}, 1_000
+
+    assert eventually(fn ->
+             updated = WaitWatcher.snapshot(name)
+
+             length(updated) == 2 and
+               Enum.all?(updated, fn entry ->
+                 delay_ms = DateTime.diff(entry.next_probe_at, DateTime.utc_now(), :millisecond)
+                 entry.probe_attempt == 9 and delay_ms > 0 and delay_ms <= 60_000
+               end)
+           end)
+
+    assert %{
+             "issue-active-ci" => %{request: %{baseline: ^gate_observation}},
+             "issue-active-named" => %{request: %{baseline: ^named_observation}}
+           } = WaitStore.load()
+
+    assert File.exists?(state_path)
+  end
+
+  test "keeps exponential backoff for failed PR-check probes" do
+    test_pid = self()
+    previous_reset = Application.get_env(:symphony_elixir, :wait_state_reset_on_start)
+    Application.put_env(:symphony_elixir, :wait_state_reset_on_start, false)
+
+    on_exit(fn -> restore_app_env(:wait_state_reset_on_start, previous_reset) end)
+
+    Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
+      send(test_pid, :failed_checks_probe)
+      {:error, :github_unavailable}
+    end)
+
+    observation = %{"aggregate" => "pending", "checks" => [], "pull_request" => %{}}
+
+    request = %{
+      condition: %{"type" => "github_pr_gate_settled", "pr_number" => 43},
+      condition_key: "failed-pr-gate",
+      baseline: observation,
+      reason: "await active CI",
+      min_poll_ms: 60_000,
+      max_poll_ms: 1_800_000
+    }
+
+    persisted_entry =
+      entry("issue-failed-ci-probe", "UDPE-FAILED-CI-PROBE", request)
+      |> Map.merge(%{
+        status: :waiting,
+        parked_at: DateTime.utc_now(),
+        next_probe_at: DateTime.utc_now(),
+        probe_attempt: 4,
+        last_observation: observation,
+        last_error: nil
+      })
+
+    :ok = WaitStore.save(%{"issue-failed-ci-probe" => persisted_entry})
+
+    name = :"wait-watcher-failed-ci-#{System.unique_integer([:positive])}"
+    start_supervised!({WaitWatcher, name: name})
+
+    assert_receive :failed_checks_probe, 1_000
+
+    assert eventually(fn ->
+             [updated] = WaitWatcher.snapshot(name)
+             delay_ms = DateTime.diff(updated.next_probe_at, DateTime.utc_now(), :millisecond)
+
+             updated.probe_attempt == 5 and delay_ms > 900_000
+           end)
+  end
+
   test "manual resume produces a compact resume prompt" do
     Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
       {:unchanged, %{"status" => "degraded"}}
