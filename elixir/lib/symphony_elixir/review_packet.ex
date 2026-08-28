@@ -424,9 +424,11 @@ defmodule SymphonyElixir.ReviewPacket do
           id: truncate(packet.issue.id, 160),
           identifier: truncate(packet.issue.identifier, 80),
           title: truncate(packet.issue.title, 240),
+          scope_digest: packet.issue.scope_digest,
           requested_outcome: truncate(packet.issue.requested_outcome, 280),
           acceptance_criteria: truncate(packet.issue.acceptance_criteria, 360),
           non_goals: truncate(packet.issue.non_goals, 200),
+          scope_amendments_truncated: packet.issue.scope_amendments_truncated,
           scope_amendments: compact_scope_amendments(packet.issue.scope_amendments, 5, 280)
         },
         diff: %{

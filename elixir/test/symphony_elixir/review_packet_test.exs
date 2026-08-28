@@ -272,7 +272,8 @@ defmodule SymphonyElixir.ReviewPacketTest do
   test "final packet identity and incident metadata still fit the configured bound", context do
     issue = %{
       issue(String.duplicate("incident acceptance detail ", 2_000))
-      | title: String.duplicate("Incident-sized title ", 1_000)
+      | title: String.duplicate("Incident-sized title ", 1_000),
+        comments_truncated: true
     }
 
     settings = settings(%{"packet_max_bytes" => 8_192, "context_budget_tokens" => 2_048})
@@ -296,6 +297,8 @@ defmodule SymphonyElixir.ReviewPacketTest do
     assert result.packet.diff.authoritative_full_diff.local_command =~ context.head_sha
     assert result.packet.evidence_status.raw_evidence_artifact
     assert result.packet.packet_id =~ "review-packet-v1-"
+    assert result.packet.issue.scope_digest =~ ~r/^sha256:[a-f0-9]{64}$/
+    assert result.packet.issue.scope_amendments_truncated
   end
 
   test "nested changed files include applicable repository rules without crashing", context do

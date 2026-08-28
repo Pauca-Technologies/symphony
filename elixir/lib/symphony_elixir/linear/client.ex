@@ -555,7 +555,7 @@ defmodule SymphonyElixir.Linear.Client do
   # after dispatch. Over-fetch is harmless; missing a worktree would
   # leak disk.
   @query_terminal_by_team_since """
-  query SymphonyLinearTerminalByTeamSince($teamId: ID!, $stateNames: [String!]!, $since: DateTimeOrDuration!, $first: Int!, $relationFirst: Int!, $after: String) {
+  query SymphonyLinearTerminalByTeamSince($teamId: ID!, $stateNames: [String!]!, $since: DateTimeOrDuration!, $first: Int!, $after: String) {
     issues(filter: {team: {id: {eq: $teamId}}, state: {name: {in: $stateNames}}, updatedAt: {gte: $since}}, first: $first, after: $after) {
       nodes {
         id
@@ -587,7 +587,7 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   @query_terminal_by_team_key_since """
-  query SymphonyLinearTerminalByTeamKeySince($teamKey: String!, $stateNames: [String!]!, $since: DateTimeOrDuration!, $first: Int!, $relationFirst: Int!, $after: String) {
+  query SymphonyLinearTerminalByTeamKeySince($teamKey: String!, $stateNames: [String!]!, $since: DateTimeOrDuration!, $first: Int!, $after: String) {
     issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}, updatedAt: {gte: $since}}, first: $first, after: $after) {
       nodes {
         id
@@ -1105,7 +1105,6 @@ defmodule SymphonyElixir.Linear.Client do
              stateNames: state_names,
              since: since,
              first: @issue_page_size,
-             relationFirst: @issue_page_size,
              after: after_cursor
            }),
          {:ok, issues, page_info} <- decode_linear_page_response(body, nil) do
@@ -1135,7 +1134,6 @@ defmodule SymphonyElixir.Linear.Client do
              stateNames: state_names,
              since: since,
              first: @issue_page_size,
-             relationFirst: @issue_page_size,
              after: after_cursor
            }),
          {:ok, issues, page_info} <- decode_linear_page_response(body, nil) do
