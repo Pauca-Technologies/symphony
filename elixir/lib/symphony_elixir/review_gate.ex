@@ -388,8 +388,7 @@ defmodule SymphonyElixir.ReviewGate do
     {:automation_inconclusive, outcome}
   end
 
-  defp run_unlatched_review(%{iteration: iteration, settings: settings} = context)
-       when iteration >= settings.max_iterations do
+  defp conclude_exhausted_review(%{iteration: iteration, settings: settings} = context) do
     outcome =
       budget_outcome(
         settings,
@@ -433,8 +432,13 @@ defmodule SymphonyElixir.ReviewGate do
           |> Map.put(:packet_result, packet_result)
           |> Map.put(:packet_builder, packet_builder)
           |> Map.put(:prior_outcome, prior_outcome)
+          |> apply_packet_review_route(packet_result)
 
-        run_iteration(review_context, 1, nil)
+        if review_context.iteration >= review_context.settings.max_iterations do
+          conclude_exhausted_review(review_context)
+        else
+          run_iteration(review_context, 1, nil)
+        end
 
       {:error, reason} ->
         conclude_infrastructure_failure(
@@ -444,6 +448,38 @@ defmodule SymphonyElixir.ReviewGate do
           {:review_packet_unavailable, reason},
           context.opts
         )
+    end
+  end
+
+  defp apply_packet_review_route(context, packet_result) do
+    case Map.get(packet_result, :review_decision) do
+      %{review_refinement: %{} = refinement} = decision ->
+        settings = Map.get(packet_result, :review_settings, context.settings)
+        candidate = Map.get(packet_result, :candidate_classification, %{})
+
+        Logger.info(
+          "review.routing refined #{issue_context(context.issue)} " <>
+            "original_budget=#{refinement.original_budget_profile} " <>
+            "effective_budget=#{decision.budget_profile} " <>
+            "review_class=#{Map.get(candidate, :review_class, "unknown")}"
+        )
+
+        Telemetry.emit(:review_routing_decision, %{
+          issue_id: context.issue.id,
+          issue_identifier: context.issue.identifier,
+          original_budget_profile: refinement.original_budget_profile,
+          effective_budget_profile: decision.budget_profile,
+          selection_reason: decision.selection_reason,
+          review_class: Map.get(candidate, :review_class),
+          changed_files: Map.get(candidate, :changed_files),
+          changed_lines: Map.get(candidate, :changed_lines),
+          rationale: Map.get(candidate, :rationale)
+        })
+
+        %{context | settings: settings}
+
+      _unchanged ->
+        context
     end
   end
 

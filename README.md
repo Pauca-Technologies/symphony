@@ -21,6 +21,9 @@ Automated handoff reviews use fresh, thin-context reviewer threads rather than c
 implementor's full history. A bounded, versioned packet pins every review to the exact base/head
 candidate while keeping the complete diff and security rules independently accessible; follow-up
 passes receive open findings plus a delta, and high-risk changes receive a final full-diff pass.
+When enforcement is enabled, a fully inspectable bounded documentation/test-only candidate may
+refine a standard reviewer route to the repository's simple profile; explicit overrides,
+quality fallbacks, control files, production paths, and high-risk work retain their original depth.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
 

@@ -91,7 +91,7 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
     assert decision.budget_profile == "high_risk"
     assert decision.override == %{source: "issue_label", label: "budget:high_risk"}
 
-    [event] = telemetry_events()
+    [event] = Enum.filter(telemetry_events(), &(&1["event"] == "routing_decision"))
     assert event["event"] == "routing_decision"
     assert event["classifier_result"]["task_type"] == "ui"
     assert event["override"]["label"] == "budget:high_risk"
@@ -407,6 +407,85 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
     assert "test_evidence" in lenses
     assert "security_tenant_auth" in lenses
     assert "structure" in lenses
+  end
+
+  test "an exact mechanical candidate can refine a standard UI review to the simple profile" do
+    workflow = %{config: %{"agent" => %{"efficiency" => %{"mode" => "enforce"}}}}
+
+    assert {:ok, decision} =
+             AgentEfficiency.decide(
+               issue(),
+               classified_route("ui"),
+               workflow
+             )
+
+    assert decision.budget_profile == "standard"
+
+    candidate = %{
+      review_class: "mechanical",
+      risk_level: "normal",
+      rationale: "bounded test-only candidate",
+      changed_files: 2,
+      changed_lines: 40
+    }
+
+    refined = AgentEfficiency.refine_review_decision(decision, candidate)
+
+    assert refined.initial_budget_profile == "standard"
+    assert refined.budget_profile == "simple"
+    assert refined.selection_reason == "exact_candidate_mechanical"
+    assert refined.review_refinement.original_budget_profile == "standard"
+    assert AgentEfficiency.review_lenses(refined) == ["correctness", "test_evidence"]
+
+    routed =
+      AgentEfficiency.review_settings(
+        %{model: nil, reasoning_effort: "high", max_iterations: 5, packet_max_bytes: 64_000},
+        refined
+      )
+
+    assert routed.reasoning_effort == "medium"
+    assert routed.max_iterations == 2
+    assert routed.packet_max_bytes == 32_000
+  end
+
+  test "exact-diff refinement preserves explicit overrides and high-risk task types" do
+    workflow = %{config: %{"agent" => %{"efficiency" => %{"mode" => "enforce"}}}}
+
+    candidate = %{
+      review_class: "mechanical",
+      risk_level: "normal",
+      rationale: "bounded test-only candidate",
+      changed_files: 1,
+      changed_lines: 8
+    }
+
+    assert {:ok, explicit} =
+             AgentEfficiency.decide(
+               issue(["budget:standard"]),
+               classified_route("ui"),
+               workflow
+             )
+
+    assert AgentEfficiency.refine_review_decision(explicit, candidate) == explicit
+
+    assert {:ok, uncertain} =
+             AgentEfficiency.decide(
+               issue(),
+               classified_route("ui", ambiguity: "high"),
+               workflow
+             )
+
+    assert uncertain.budget_profile == "high_risk"
+    assert AgentEfficiency.refine_review_decision(uncertain, candidate) == uncertain
+
+    assert {:ok, protected} =
+             AgentEfficiency.decide(
+               issue(),
+               classified_route("security_tenant"),
+               workflow
+             )
+
+    assert AgentEfficiency.refine_review_decision(protected, candidate) == protected
   end
 
   defp decision(mode, total_threshold) do

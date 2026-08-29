@@ -561,6 +561,17 @@ Notes:
   their budgets explicitly while preserving or strengthening reviewer effort, lens coverage, packet
   capacity, and iteration count.
 
+  In `enforce` mode, review routing gets one conservative exact-candidate refinement after the
+  handoff packet reads the real diff. A standard review uses the repository's simple reviewer
+  profile only when the complete local manifest contains at most 12 files and 600 changed lines,
+  every path is documentation or a test, and no repository-control path such as `AGENTS.md`,
+  `WORKFLOW.md`, `WORKFLOW_REVIEW.md`, `.github/`, or `.codex/` changed. Explicit budget labels,
+  quality fallbacks, high-risk task classes, production changes, broad candidates, binary changes,
+  and missing/incomplete local manifests never take this route. The refinement changes reviewer
+  model/reasoning, packet bound, iteration bound, and optional lenses only; it does not alter the
+  implementor's run budget or waive exact-head approval and required correctness/test-evidence
+  lenses. A `review_routing_decision` telemetry event records each applied refinement.
+
   The observability dashboard surfaces the **actual** backend, model, reasoning effort, and selected
   profile each run is using. Its "Agent" column in the running-issues list and "Agent" card on the
   issue detail page take values from the resolved backend module and the model handed to (or
@@ -743,11 +754,11 @@ codex:
   views without parsing transcripts. Percentiles use the conventional nearest-rank definition.
   Token totals use each actual thread's greatest cumulative
   snapshot; cached input and reasoning remain distinct and repeated absolute snapshots are not
-  summed. Routing views include classifier inputs/result/confidence, budget profile/mode and
-  overrides; efficiency views distinguish proposed/applied transitions and compare tokens, time,
-  review findings, CI/human outcomes, and extreme outliers over the requested rolling window (use
-  the prior 30 days for the rollout comparison). Unversioned telemetry JSONL remains readable as
-  schema version 0.
+  summed. Routing views include classifier inputs/result/confidence, budget profile/mode, overrides,
+  and exact-candidate review refinements; efficiency views distinguish proposed/applied transitions
+  and compare tokens, time, review findings, CI/human outcomes, and extreme outliers over the
+  requested rolling window (use the prior 30 days for the rollout comparison). Unversioned telemetry
+  JSONL remains readable as schema version 0.
 - Benign protocol notifications and stdout chunks do not produce one debug-log line each by
   default. `observability.benign_notification_debug: true` is the short-lived log-level escape
   hatch; selective gzip raw traces are normally the more complete incident artifact.

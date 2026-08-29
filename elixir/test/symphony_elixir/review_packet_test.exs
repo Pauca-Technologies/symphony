@@ -2,6 +2,7 @@ defmodule SymphonyElixir.ReviewPacketTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.{Config, Linear.Comment, Linear.Issue, ReviewOutcome, ReviewPacket}
+  alias SymphonyElixir.Config.AgentEfficiency, as: EfficiencyConfig
 
   setup do
     workspace = Path.join(System.tmp_dir!(), "review-packet-#{System.unique_integer([:positive])}")
@@ -539,6 +540,88 @@ defmodule SymphonyElixir.ReviewPacketTest do
     assert "security_tenant_auth" in names
     assert "regression" in names
     assert "structure" in names
+  end
+
+  test "bounded documentation and test-only diffs use exact-candidate simple review routing", context do
+    base_sha = context.head_sha
+    File.mkdir_p!(Path.join(context.workspace, "docs"))
+    File.mkdir_p!(Path.join(context.workspace, "test"))
+    File.write!(Path.join(context.workspace, "docs/usage.md"), "# Usage\n\nUpdated example.\n")
+    File.write!(Path.join(context.workspace, "test/example_test.exs"), "defmodule ExampleTest do\nend\n")
+    git!(context.workspace, ["add", "."])
+    git!(context.workspace, ["commit", "--quiet", "-m", "docs and tests"])
+    head_sha = git!(context.workspace, ["rev-parse", "HEAD"])
+
+    decision = efficiency_decision()
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("mechanical"),
+               %{pr(context) | base_oid: base_sha, head_oid: head_sha},
+               head_sha,
+               nil,
+               settings(),
+               efficiency_decision: decision,
+               attestations: [attestation(head_sha)]
+             )
+
+    assert result.candidate_classification.review_class == "mechanical"
+    assert result.review_decision.budget_profile == "simple"
+    assert result.review_settings.max_iterations == 2
+    assert result.review_settings.packet_max_bytes == 32_000
+    assert result.packet.risk.review_class == "mechanical"
+    assert Enum.map(result.packet.requested_lenses, & &1.name) == ["correctness", "test_evidence"]
+  end
+
+  test "repository-control markdown is not classified as mechanical", context do
+    base_sha = context.head_sha
+    File.write!(Path.join(context.workspace, "WORKFLOW_REVIEW.md"), "Review every candidate.\n")
+    git!(context.workspace, ["add", "."])
+    git!(context.workspace, ["commit", "--quiet", "-m", "review policy"])
+    head_sha = git!(context.workspace, ["rev-parse", "HEAD"])
+
+    decision = efficiency_decision()
+
+    assert {:ok, result} =
+             ReviewPacket.build(
+               context.workspace,
+               issue("control file"),
+               %{pr(context) | base_oid: base_sha, head_oid: head_sha},
+               head_sha,
+               nil,
+               settings(),
+               efficiency_decision: decision,
+               attestations: [attestation(head_sha)]
+             )
+
+    assert result.candidate_classification.review_class == "behavioral_or_unverified"
+    assert result.review_decision.budget_profile == "standard"
+
+    assert Enum.map(result.packet.requested_lenses, & &1.name) == [
+             "correctness",
+             "regression",
+             "test_evidence",
+             "structure"
+           ]
+  end
+
+  defp efficiency_decision do
+    {:ok, efficiency} =
+      EfficiencyConfig.parse(%{
+        "agent" => %{"efficiency" => %{"mode" => "enforce"}}
+      })
+
+    %{
+      enforced: true,
+      override: nil,
+      task_type: "ui",
+      budget_profile: "standard",
+      selection_reason: "task_profile",
+      budget: efficiency.profiles["standard"],
+      simple_review_budget: efficiency.profiles["simple"],
+      review_refinement: nil
+    }
   end
 
   defp settings(overrides \\ %{}) do

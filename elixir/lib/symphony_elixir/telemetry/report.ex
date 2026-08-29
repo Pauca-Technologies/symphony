@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Telemetry.Report do
     gates = Map.get(grouped, "gate", []) ++ Map.get(grouped, "review", [])
     retries = Map.get(grouped, "retry_policy", [])
     routing_decisions = Map.get(grouped, "routing_decision", [])
+    review_routing_decisions = Map.get(grouped, "review_routing_decision", [])
     budget_transitions = Map.get(grouped, "budget_transition", [])
     prompt_events = Map.get(grouped, "prompt_built", [])
     scheduling = Map.get(grouped, "scheduling", [])
@@ -77,7 +78,10 @@ defmodule SymphonyElixir.Telemetry.Report do
         task_types: tally(routing_decisions, "task_type"),
         budget_profiles: tally(routing_decisions, "budget_profile"),
         modes: tally(routing_decisions, "budget_mode"),
-        overrides: Enum.count(routing_decisions, &is_map(&1["override"]))
+        overrides: Enum.count(routing_decisions, &is_map(&1["override"])),
+        review_refinements: length(review_routing_decisions),
+        review_profiles: tally(review_routing_decisions, "effective_budget_profile"),
+        review_classes: tally(review_routing_decisions, "review_class")
       },
       efficiency: efficiency_view(budget_transitions, grouped, totals, durations, review_events),
       prompts: prompt_view(prompt_events),

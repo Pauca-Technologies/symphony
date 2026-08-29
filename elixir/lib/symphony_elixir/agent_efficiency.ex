@@ -34,8 +34,11 @@ defmodule SymphonyElixir.AgentEfficiency do
           confidence: float(),
           classification: classification(),
           budget_profile: String.t(),
+          initial_budget_profile: String.t(),
           selection_reason: String.t(),
           budget: map(),
+          simple_review_budget: map(),
+          review_refinement: map() | nil,
           override: map() | nil,
           capsule_max_bytes: pos_integer(),
           extreme_multiplier: float(),
@@ -60,8 +63,11 @@ defmodule SymphonyElixir.AgentEfficiency do
         confidence: classification.confidence,
         classification: classification,
         budget_profile: budget_profile,
+        initial_budget_profile: budget_profile,
         selection_reason: selection_reason,
         budget: budget,
+        simple_review_budget: Map.fetch!(settings.profiles, "simple"),
+        review_refinement: nil,
         override: override,
         capsule_max_bytes: settings.capsule_max_bytes,
         extreme_multiplier: settings.extreme_multiplier,
@@ -103,6 +109,44 @@ defmodule SymphonyElixir.AgentEfficiency do
   end
 
   def review_settings(settings, _decision), do: settings
+
+  @doc "Refine reviewer-only routing from an exact candidate diff without changing the run budget."
+  @spec refine_review_decision(decision() | nil, map() | nil) :: decision() | nil
+  def refine_review_decision(
+        %{
+          enforced: true,
+          override: nil,
+          task_type: task_type,
+          budget_profile: budget_profile,
+          simple_review_budget: simple_budget
+        } = decision,
+        %{
+          review_class: "mechanical",
+          risk_level: "normal",
+          rationale: rationale,
+          changed_files: changed_files,
+          changed_lines: changed_lines
+        }
+      )
+      when task_type not in @high_risk_types and budget_profile == "standard" and
+             is_map(simple_budget) do
+    %{
+      decision
+      | budget_profile: "simple",
+        budget: simple_budget,
+        selection_reason: "exact_candidate_mechanical",
+        review_refinement: %{
+          source: "exact_candidate_diff",
+          original_budget_profile: budget_profile,
+          effective_budget_profile: "simple",
+          rationale: rationale,
+          changed_files: changed_files,
+          changed_lines: changed_lines
+        }
+    }
+  end
+
+  def refine_review_decision(decision, _candidate), do: decision
 
   @doc "Requested lens names for the decision; packet construction adds mandatory risk lenses."
   @spec review_lenses(decision() | nil) :: [String.t()] | nil

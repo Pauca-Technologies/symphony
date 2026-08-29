@@ -103,6 +103,9 @@ agent:
   # Shadow mode records proposed routing and transitions. The narrow action
   # allowlist below applies only low-risk context/output hygiene; review depth
   # and other quality-sensitive transitions remain shadow observations.
+  # In enforce mode, a complete bounded docs/test-only handoff diff may refine
+  # a standard reviewer to the simple profile. Explicit/high-risk/fallback routes
+  # and production or repository-control changes are never reduced.
   efficiency:
     mode: shadow # off | shadow | enforce
     enforced_actions:

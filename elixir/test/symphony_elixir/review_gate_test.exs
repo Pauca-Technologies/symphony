@@ -332,6 +332,49 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert_received {:review_packet_builder, "UDPE-1", "head-7"}
   end
 
+  test "the reviewer session uses an exact-candidate refined packet route", %{workspace: workspace} do
+    test_pid = self()
+
+    packet_builder = fn workspace, _issue, _pr, reviewed_sha, _prior_outcome, settings, _opts ->
+      refined_settings = %{settings | max_iterations: 2, packet_max_bytes: 32_000, reasoning_effort: "medium"}
+
+      {:ok,
+       synthetic_packet_result(workspace, reviewed_sha, 1_000)
+       |> Map.put(:review_settings, refined_settings)
+       |> Map.put(:candidate_classification, %{
+         review_class: "mechanical",
+         changed_files: 2,
+         changed_lines: 20,
+         rationale: "bounded test-only candidate"
+       })
+       |> Map.put(:review_decision, %{
+         budget_profile: "simple",
+         selection_reason: "exact_candidate_mechanical",
+         review_refinement: %{
+           original_budget_profile: "standard"
+         }
+       })}
+    end
+
+    runner = fn ctx ->
+      send(test_pid, {:refined_review_settings, ctx.review_settings})
+      write_verdict(ctx, %{"verdict" => "approve"})
+      {:ok, %{}}
+    end
+
+    assert {:approved, _outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               review_packet_builder: packet_builder,
+               session_runner: runner,
+               pr_runner: pr_runner()
+             )
+
+    assert_received {:refined_review_settings, settings}
+    assert settings.max_iterations == 2
+    assert settings.packet_max_bytes == 32_000
+    assert settings.reasoning_effort == "medium"
+  end
+
   test "an approved head remains prior-review context when a later gate fix changes the candidate", %{
     workspace: workspace
   } do

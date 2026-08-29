@@ -8,7 +8,7 @@ defmodule SymphonyElixir.ReviewPacket do
   references, requested lenses, and the review budgets are never removed.
   """
 
-  alias SymphonyElixir.{Linear.Issue, PathSafety, ReviewOutcome}
+  alias SymphonyElixir.{AgentEfficiency, Linear.Issue, PathSafety, ReviewOutcome}
 
   @schema_version 1
   @archive_dir ".artifacts/symphony-review/packets"
@@ -17,6 +17,8 @@ defmodule SymphonyElixir.ReviewPacket do
   @context_bytes_per_token 3
   @review_prompt_reserve_bytes 10_000
   @delta_stat_limit 2_000
+  @mechanical_max_files 12
+  @mechanical_max_changed_lines 600
   @security_terms ~w(auth authorization authz tenant security permission access secret injection)
   @github_user_attachment_regex ~r{https://github\.com/user-attachments/assets/[A-Za-z0-9-]+}
 
@@ -25,7 +27,10 @@ defmodule SymphonyElixir.ReviewPacket do
           packet: packet(),
           encoded: String.t(),
           path: Path.t(),
-          archive_path: Path.t()
+          archive_path: Path.t(),
+          review_decision: AgentEfficiency.decision() | nil,
+          review_settings: map(),
+          candidate_classification: map()
         }
 
   @doc "Build and persist an exact-candidate review packet."
@@ -42,6 +47,21 @@ defmodule SymphonyElixir.ReviewPacket do
     changed_files = diff.changed_files
     rules = relevant_rules(workspace, changed_files)
     risk = risk_classification(changed_files, prior_outcome, opts)
+    candidate_classification = candidate_classification(diff.manifest, risk)
+
+    review_decision =
+      opts
+      |> Keyword.get(:efficiency_decision)
+      |> AgentEfficiency.refine_review_decision(candidate_classification)
+
+    settings = AgentEfficiency.review_settings(settings, review_decision)
+    requested_lenses = effective_requested_lenses(review_decision, opts)
+
+    risk =
+      Map.merge(risk, %{
+        review_class: candidate_classification.review_class,
+        review_class_rationale: candidate_classification.rationale
+      })
 
     packet = %{
       schema_version: @schema_version,
@@ -64,7 +84,7 @@ defmodule SymphonyElixir.ReviewPacket do
       },
       repository_rules: rules,
       risk: risk,
-      requested_lenses: requested_lenses(risk, changed_files, opts),
+      requested_lenses: requested_lenses(risk, changed_files, Keyword.put(opts, :requested_lenses, requested_lenses)),
       validation_attestations: attestations.entries,
       unresolved_findings: prior.findings,
       follow_up: prior.delta,
@@ -128,8 +148,18 @@ defmodule SymphonyElixir.ReviewPacket do
         evidence_encoded
       )
       |> case do
-        {:ok, paths} -> {:ok, Map.merge(paths, %{packet: packet, encoded: encoded})}
-        {:error, reason} -> {:error, reason}
+        {:ok, paths} ->
+          {:ok,
+           Map.merge(paths, %{
+             packet: packet,
+             encoded: encoded,
+             review_decision: review_decision,
+             review_settings: settings,
+             candidate_classification: candidate_classification
+           })}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     else
       {:error, {:packet_bound_unachievable, byte_size(encoded), max_bytes}}
@@ -716,6 +746,92 @@ defmodule SymphonyElixir.ReviewPacket do
     end
   end
 
+  defp candidate_classification(%{entries: entries, omitted_files: 0}, %{level: "normal"})
+       when is_list(entries) and entries != [] do
+    changed_files = length(entries)
+    changed_lines = changed_lines(entries)
+
+    if changed_files <= @mechanical_max_files and
+         changed_lines <= @mechanical_max_changed_lines and
+         Enum.all?(entries, &documentation_or_test_entry?/1) do
+      mechanical_candidate(
+        "The exact candidate is a bounded documentation/test-only change with no runtime or repository-control paths.",
+        changed_files,
+        changed_lines
+      )
+    else
+      behavioral_candidate(
+        "The exact candidate includes behavioral, repository-control, broad, or unbounded changes.",
+        changed_files,
+        changed_lines
+      )
+    end
+  end
+
+  defp candidate_classification(%{entries: entries}, risk) do
+    behavioral_candidate(
+      "The exact candidate is unavailable, empty, incomplete, or risk-classified #{risk.level}; reviewer depth was not reduced.",
+      length(entries),
+      changed_lines(entries)
+    )
+  end
+
+  defp mechanical_candidate(rationale, changed_files, changed_lines) do
+    %{
+      review_class: "mechanical",
+      risk_level: "normal",
+      rationale: rationale,
+      changed_files: changed_files,
+      changed_lines: changed_lines
+    }
+  end
+
+  defp behavioral_candidate(rationale, changed_files, changed_lines) do
+    %{
+      review_class: "behavioral_or_unverified",
+      risk_level: "normal",
+      rationale: rationale,
+      changed_files: changed_files,
+      changed_lines: changed_lines
+    }
+  end
+
+  defp effective_requested_lenses(nil, opts), do: Keyword.get(opts, :requested_lenses)
+
+  defp effective_requested_lenses(review_decision, opts) do
+    AgentEfficiency.review_lenses(review_decision) || Keyword.get(opts, :requested_lenses)
+  end
+
+  defp documentation_or_test_entry?(entry) do
+    path = Map.get(entry, :path, "")
+
+    bounded_text_entry?(entry) and not repository_control_path?(path) and
+      (documentation_path?(path) or test_only_path?(path))
+  end
+
+  defp bounded_text_entry?(entry) do
+    is_integer(Map.get(entry, :additions)) and is_integer(Map.get(entry, :deletions))
+  end
+
+  defp changed_lines(entries) do
+    Enum.reduce(entries, 0, fn entry, total ->
+      additions = if is_integer(Map.get(entry, :additions)), do: entry.additions, else: @mechanical_max_changed_lines + 1
+      deletions = if is_integer(Map.get(entry, :deletions)), do: entry.deletions, else: @mechanical_max_changed_lines + 1
+      total + additions + deletions
+    end)
+  end
+
+  defp documentation_path?(path) do
+    String.downcase(Path.extname(path)) in ~w(.md .mdx .rst .adoc)
+  end
+
+  defp repository_control_path?(path) do
+    basename = Path.basename(path)
+
+    basename in ["AGENTS.md", "WORKFLOW.md", "WORKFLOW_REVIEW.md"] or
+      String.starts_with?(path, ".github/") or String.starts_with?(path, ".codex/")
+  end
+
   defp requested_lenses(risk, changed_files, opts) do
     base = [
       %{name: "correctness", rationale: "Exercise boundary, failure, concurrency, and ordering cases in changed behavior."},
@@ -1023,8 +1139,11 @@ defmodule SymphonyElixir.ReviewPacket do
 
   defp test_only_path?(path) do
     Regex.match?(~r{(^|/)__tests__(/|$)}, path) or
+      Regex.match?(~r{(^|/)__snapshots__(/|$)}, path) or
       Regex.match?(~r{\.(test|spec)\.[cm]?[jt]sx?$}, path) or
-      String.starts_with?(path, "test/") or String.starts_with?(path, "tests/fixtures/")
+      Regex.match?(~r{_test\.exs$}, path) or Regex.match?(~r{(^|/)test_[^/]+\.py$}, path) or
+      Regex.match?(~r{_test\.py$}, path) or String.starts_with?(path, "test/") or
+      String.starts_with?(path, "tests/")
   end
 
   defp repository_from_remote(nil), do: nil

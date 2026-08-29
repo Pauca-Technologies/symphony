@@ -1896,6 +1896,15 @@ strengthening reviewer effort, packet capacity, lens coverage, and iteration cou
 SHOULD compare rolling tokens, time, review findings, CI/human outcomes, and extreme outliers, and
 expose classifier/budget decisions and applied versus shadow transitions.
 
+In `enforce` mode, an implementation MAY refine a standard reviewer route to the configured simple
+profile after constructing a complete exact-candidate diff manifest. Such refinement MUST be
+conservative and deterministic: it MUST NOT apply to explicit budget overrides, quality-fallback or
+high-risk profiles, high-risk task classes, missing/incomplete manifests, repository-control paths,
+production paths, binary changes, or candidates beyond the implementation's documented file/line
+bounds. It MUST retain exact-head approval plus mandatory correctness and test-evidence lenses, MUST
+affect reviewer routing only rather than the implementor's run budget, and SHOULD emit inspectable
+telemetry containing the original/effective profiles and candidate classification.
+
 ### 13.8 Humanized Agent Event Summaries (OPTIONAL)
 
 Humanized summaries of raw agent protocol events are OPTIONAL.

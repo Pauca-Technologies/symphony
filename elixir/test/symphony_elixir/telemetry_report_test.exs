@@ -131,6 +131,12 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
       %{"event" => "routing_decision", "task_type" => "simple_direct", "budget_profile" => "simple", "budget_mode" => "shadow"},
       %{"event" => "routing_decision", "task_type" => "security_tenant", "budget_profile" => "high_risk", "budget_mode" => "enforce", "override" => %{"source" => "issue_label"}},
       %{
+        "event" => "review_routing_decision",
+        "original_budget_profile" => "standard",
+        "effective_budget_profile" => "simple",
+        "review_class" => "mechanical"
+      },
+      %{
         "event" => "budget_transition",
         "transition" => %{
           "dimension" => "total_tokens",
@@ -159,6 +165,9 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
 
     assert report.routing.task_types == %{"security_tenant" => 1, "simple_direct" => 1}
     assert report.routing.overrides == 1
+    assert report.routing.review_refinements == 1
+    assert report.routing.review_profiles == %{"simple" => 1}
+    assert report.routing.review_classes == %{"mechanical" => 1}
     assert report.efficiency.proposed_transitions == 2
     assert report.efficiency.applied_transitions == 1
     assert report.efficiency.outliers == 1
