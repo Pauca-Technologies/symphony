@@ -51,7 +51,8 @@ shutdown policy lets operators choose whether Ctrl+C preserves those workers for
 terminates their complete process trees.
 Agents can also park work on typed external conditions; durable non-model watchers release the
 agent slot, deduplicate probes, and resume the issue through the normal priority scheduler when the
-condition changes.
+condition changes. Linear waits watch only the current ticket; actual cross-ticket prerequisites use
+Linear dependency relations so an unowned tracking artifact cannot strand a deliverable issue.
 
 The reference implementation also maintains a compact, versioned fleet analytics layer. It
 reconciles cumulative usage by actual parent and delegated threads, retains rolling lifecycle and

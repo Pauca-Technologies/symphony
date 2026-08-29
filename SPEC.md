@@ -1503,8 +1503,10 @@ Optional client-side tool extension:
   another validation, local process/port contention, or an elapsed-time backoff; independently
   bounded validations may overlap across agents.
 - Standard condition types include GitHub Actions recovery, all PR-check changes, one named
-  PR-check change, a PR gate settling to pass/fail, git-ref SHA changes, and Linear issue/comment
-  changes.
+  PR-check change, a PR gate settling to pass/fail, git-ref SHA changes, and current-issue Linear
+  state/comment changes. Cross-issue prerequisites MUST use tracker dependency relations rather
+  than a parked wait. Implementations MUST reject new cross-issue Linear waits and SHOULD resume
+  persisted legacy cross-issue waits once during upgrade.
 - The coding agent MUST identify only the typed target and desired event. The implementation MUST
   capture the initial external observation before accepting the wait and MUST reject agent-supplied
   observation or baseline fields.

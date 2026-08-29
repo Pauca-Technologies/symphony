@@ -228,9 +228,14 @@ defmodule SymphonyElixir.WaitCondition do
     do: checks_observation("github_pr_checks_changed", checks, %{})
 
   @doc "Return a compact prompt describing why a parked issue was resumed."
-  @spec resume_prompt(request(), map(), :condition_changed | :manual) :: String.t()
+  @spec resume_prompt(request(), map(), :condition_changed | :manual | :policy_changed) :: String.t()
   def resume_prompt(request, observation, trigger) do
-    trigger_text = if trigger == :manual, do: "A human requested an immediate resume", else: "The watched condition changed"
+    trigger_text =
+      case trigger do
+        :manual -> "A human requested an immediate resume"
+        :policy_changed -> "Symphony retired an unsafe cross-issue wait"
+        :condition_changed -> "The watched condition changed"
+      end
 
     """
     Symphony resumed this issue from a parked wait. #{trigger_text}.
@@ -327,9 +332,12 @@ defmodule SymphonyElixir.WaitCondition do
   end
 
   defp do_normalize_condition("linear_issue_changed", condition, context) do
-    issue_id = value(condition, "issue_id") || get_in(context, [:issue, :id])
+    current_issue_id = get_in(context, [:issue, :id])
+    issue_id = value(condition, "issue_id") || current_issue_id
 
-    with {:ok, issue_id} <- non_blank(issue_id, :missing_issue_id) do
+    with {:ok, current_issue_id} <- non_blank(current_issue_id, :missing_current_issue_id),
+         {:ok, issue_id} <- non_blank(issue_id, :missing_issue_id),
+         true <- issue_id == current_issue_id or {:error, :cross_issue_linear_wait_not_allowed} do
       {:ok, %{"type" => "linear_issue_changed", "issue_id" => issue_id}}
     end
   end

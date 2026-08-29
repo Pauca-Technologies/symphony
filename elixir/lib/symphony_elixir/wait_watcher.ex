@@ -15,6 +15,10 @@ defmodule SymphonyElixir.WaitWatcher do
 
   @ready_notify_interval_ms 1_000
   @active_github_checks_max_poll_ms 60_000
+  @retired_cross_issue_wait_observation %{
+    "policy" => "cross_issue_linear_wait_retired",
+    "remediation" => "Continue the current issue. Use a Linear blocks relation for a true prerequisite; a tracking follow-up does not block delivery."
+  }
 
   defmodule State do
     @moduledoc false
@@ -392,12 +396,25 @@ defmodule SymphonyElixir.WaitWatcher do
 
     Map.new(entries, fn
       {issue_id, %{status: :waiting} = entry} ->
-        {issue_id, Map.put(entry, :next_probe_at, now)}
+        if retired_cross_issue_wait?(entry) do
+          {issue_id, ready_entry(entry, @retired_cross_issue_wait_observation, :policy_changed)}
+        else
+          {issue_id, Map.put(entry, :next_probe_at, now)}
+        end
 
       persisted_entry ->
         persisted_entry
     end)
   end
+
+  defp retired_cross_issue_wait?(%{
+         issue_id: issue_id,
+         request: %{condition: %{"type" => "linear_issue_changed", "issue_id" => watched_issue_id}}
+       })
+       when is_binary(issue_id) and is_binary(watched_issue_id),
+       do: issue_id != watched_issue_id
+
+  defp retired_cross_issue_wait?(_entry), do: false
 
   defp observe(request) do
     case Application.get_env(:symphony_elixir, :wait_condition_probe) do

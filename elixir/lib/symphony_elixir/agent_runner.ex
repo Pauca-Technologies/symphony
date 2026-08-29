@@ -2701,6 +2701,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     - If useful work cannot continue until an external GitHub, git, or Linear condition changes, call Symphony's `wait_for` tool once and end the turn.
     - Do not spend agent turns repeatedly polling an unchanged external condition. Symphony will persist the wait, free the agent slot, and resume this issue after the condition changes.
+    - A Linear wait may watch only this current ticket's comments or state. Do not park on a follow-up/tracking ticket you created; represent a true prerequisite with Linear's `blocks` relation, while operational reviewer/handoff failures remain active for orchestrator retry.
     - Never call `wait_for` because of local CPU or memory pressure, another validation running, local process or port contention, a desired time delay, or a Symphony-owned handoff job. Symphony polls accepted handoff jobs itself. Continue useful work and run repository validations with the configured per-run worker limit; Symphony intentionally permits validations from multiple agents to overlap.
     """
 

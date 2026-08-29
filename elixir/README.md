@@ -338,7 +338,7 @@ Notes:
   ends only that worker session; it does not change the Linear state or add `needs-human-input`.
 - Agents can call Symphony's typed `wait_for` tool when useful work is blocked only on an external
   state change: GitHub Actions recovery, all PR-check changes, one named PR-check change, a PR gate
-  settling to pass/fail, a git ref advancing, or Linear issue/comment activity. Symphony observes
+  settling to pass/fail, a git ref advancing, or the current Linear issue's state/comment activity. Symphony observes
   the initial value itself; agent-supplied observations are rejected. The worker then exits cleanly
   and releases its concurrency slot while
   a non-LLM watcher persists the wait in `~/.symphony/waits.json`. Identical conditions share one
@@ -355,6 +355,9 @@ Notes:
   The tool rejects clock waits and must not be used for local resource pressure, another validation,
   local process/port contention, or a Symphony-owned handoff gate; Symphony persists and polls
   accepted handoff jobs itself. Independently bounded validations are allowed to overlap.
+  Cross-issue prerequisites use Linear's `blocks` relation instead of a parked wait. New cross-issue
+  waits are rejected, and restored legacy cross-issue waits are resumed once during upgrade so an
+  unowned tracking follow-up cannot strand otherwise deliverable work.
   PR-check waits treat GitHub's terminal `SKIPPED` checks as neutral, so passed checks plus intentional
   skips resolve to `pass` instead of remaining parked as `pending`. They also wake when the PR's
   head, base, open/draft state, mergeability, merge-state status, or review decision changes, because

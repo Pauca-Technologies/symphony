@@ -114,6 +114,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert wait_description =~ "without consuming an agent slot"
     assert wait_description =~ "Never use this for local CPU"
     assert wait_description =~ "Symphony-owned handoff gate"
+    assert wait_description =~ "current issue's comments/state"
+    assert wait_description =~ "never park on a tracking follow-up"
     assert "condition" in wait_schema["required"]
     refute "time" in wait_schema["properties"]["condition"]["properties"]["type"]["enum"]
     refute Map.has_key?(wait_schema["properties"]["condition"]["properties"], "resume_at")

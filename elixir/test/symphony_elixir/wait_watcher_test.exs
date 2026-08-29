@@ -48,6 +48,18 @@ defmodule SymphonyElixir.WaitWatcherTest do
 
     assert linear.condition["issue_id"] == "issue-1"
 
+    assert {:error, :cross_issue_linear_wait_not_allowed} =
+             WaitCondition.normalize(
+               %{
+                 "reason" => "await a tracking follow-up",
+                 "condition" => %{
+                   "type" => "linear_issue_changed",
+                   "issue_id" => "issue-2"
+                 }
+               },
+               context
+             )
+
     assert {:ok, named_check} =
              WaitCondition.normalize(
                %{
@@ -328,6 +340,54 @@ defmodule SymphonyElixir.WaitWatcherTest do
              restored.probe_attempt == 11 and
                DateTime.compare(restored.next_probe_at, future_probe_at) == :lt
            end)
+  end
+
+  test "releases restored cross-issue Linear waits without probing the tracking issue" do
+    test_pid = self()
+    previous_reset = Application.get_env(:symphony_elixir, :wait_state_reset_on_start)
+    Application.put_env(:symphony_elixir, :wait_state_reset_on_start, false)
+
+    on_exit(fn -> restore_app_env(:wait_state_reset_on_start, previous_reset) end)
+
+    Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
+      send(test_pid, :unexpected_cross_issue_probe)
+      {:unchanged, %{}}
+    end)
+
+    request = %{
+      condition: %{
+        "type" => "linear_issue_changed",
+        "issue_id" => "tracking-issue"
+      },
+      condition_key: "legacy-cross-issue-wait",
+      baseline: %{"state" => "Backlog"},
+      reason: "await tracking follow-up",
+      min_poll_ms: 60_000,
+      max_poll_ms: 1_800_000
+    }
+
+    persisted_entry =
+      entry("delivery-issue", "UDPE-DELIVERY", request)
+      |> Map.merge(%{
+        status: :waiting,
+        parked_at: DateTime.utc_now(),
+        next_probe_at: DateTime.add(DateTime.utc_now(), 1, :hour),
+        probe_attempt: 4,
+        last_observation: %{"state" => "Backlog"},
+        last_error: nil
+      })
+
+    :ok = WaitStore.save(%{"delivery-issue" => persisted_entry})
+
+    name = :"wait-watcher-cross-issue-#{System.unique_integer([:positive])}"
+    start_supervised!({WaitWatcher, name: name})
+
+    assert [restored] = WaitWatcher.snapshot(name)
+    assert restored.status == :ready
+    assert restored.last_observation["policy"] == "cross_issue_linear_wait_retired"
+    assert restored.resume_prompt =~ "retired an unsafe cross-issue wait"
+    assert restored.resume_prompt =~ "Use a Linear blocks relation"
+    refute_receive :unexpected_cross_issue_probe, 100
   end
 
   test "caps polling while known PR checks remain active", %{state_path: state_path} do

@@ -453,6 +453,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
     assert prompt =~ "call Symphony's `wait_for` tool once and end the turn"
     assert prompt =~ "Never call `wait_for` because of local CPU"
     assert prompt =~ "Symphony-owned handoff job"
+    assert prompt =~ "only this current ticket's comments or state"
+    assert prompt =~ "Do not park on a follow-up/tracking ticket"
     assert prompt =~ "permits validations from multiple agents to overlap"
     assert_receive {:waiting_tool_result, %{"success" => true}}
 
