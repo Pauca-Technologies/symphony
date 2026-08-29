@@ -62,7 +62,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   }
   """
   @linear_issue_description """
-  Read or update the current Linear issue through typed operations. Use this for activity, the single `## Codex Workpad`, labels, workflow transitions, and separate follow-up issues for valuable discoveries outside current scope. Follow-ups are created unassigned in Backlog, in the same project, without automation labels, and linked deterministically to the current issue. Transitions to review states still run Symphony's before_handoff and automated review gates. Use `linear_graphql` only when no typed operation fits.
+  Read or update the current Linear issue through typed operations. Use this for activity, the single `## Codex Workpad`, labels, every workflow transition, and separate follow-up issues for valuable discoveries outside current scope. Follow-ups are created unassigned in Backlog, in the same project, without automation labels, and linked deterministically to the current issue. Transitions to review states still run Symphony's before_handoff and automated review gates. Use `linear_graphql` only when no typed operation fits; raw current-issue workflow transitions are rejected.
   """
   @linear_issue_input_schema %{
     "type" => "object",
@@ -99,7 +99,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   }
   @linear_graphql_description """
-  Execute a raw GraphQL query or mutation against Linear. In Progress to review-state issueUpdate mutations invoke Symphony's before_handoff and automated review gates. Moving the active issue to Blocked requires a top-level blocker object with a human-actionable kind and summary; Symphony, reviewer, and handoff infrastructure failures are not human blockers.
+  Execute a raw GraphQL query or mutation against Linear only when no `linear_issue` operation fits. Raw workflow transitions are rejected inside a Symphony issue session; use `linear_issue` with `operation: "transition"` so current-issue state changes retain Symphony's handoff and blocker policies.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -114,16 +114,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "type" => ["object", "null"],
         "description" => "Optional GraphQL variables object.",
         "additionalProperties" => true
-      },
-      "blocker" => %{
-        "type" => ["object", "null"],
-        "description" => "Required only for a Blocked transition. Operational Symphony/reviewer/gate failures do not qualify.",
-        "additionalProperties" => false,
-        "required" => ["kind", "summary"],
-        "properties" => %{
-          "kind" => %{"type" => "string", "enum" => @human_blocker_kinds},
-          "summary" => %{"type" => "string", "minLength" => 1}
-        }
       }
     }
   }
@@ -332,7 +322,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           _blocker -> transition_arguments
         end
 
-      execute_linear_graphql(transition_arguments, opts)
+      execute_linear_graphql(transition_arguments, opts, :typed_transition)
     else
       nil -> failure_response(linear_issue_error({:state_not_found, typed_value(arguments, "state")}))
       {:error, reason} -> failure_response(linear_issue_error(reason))
@@ -373,10 +363,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp execute_linear_graphql(arguments, opts) do
+  defp execute_linear_graphql(arguments, opts),
+    do: execute_linear_graphql(arguments, opts, :raw)
+
+  defp execute_linear_graphql(arguments, opts, source) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
+         :ok <- require_typed_current_issue_transition(source, query, variables, opts),
          :ok <- maybe_run_before_handoff_gate(query, variables, arguments, opts, linear_client),
          {:ok, response} <- linear_client.(query, variables, []) do
       graphql_response(response)
@@ -429,6 +423,24 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
     end
+  end
+
+  defp require_typed_current_issue_transition(:typed_transition, _query, _variables, _opts),
+    do: :ok
+
+  defp require_typed_current_issue_transition(:raw, query, variables, opts) do
+    with {:ok, _issue} <- current_issue(opts),
+         true <- issue_update_mutation?(query),
+         true <- workflow_transition?(query, variables) do
+      {:error, :typed_transition_required}
+    else
+      _not_current_issue_transition -> :ok
+    end
+  end
+
+  defp workflow_transition?(query, variables) do
+    is_binary(explicit_target_state(query, variables)) or
+      is_binary(transition_state_id(query, variables))
   end
 
   defp maybe_run_before_handoff_gate(query, variables, arguments, opts, linear_client) do
@@ -1324,6 +1336,18 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload(:typed_transition_required) do
+    %{
+      "error" => %{
+        "message" => "Raw Linear workflow transitions are not supported for the current Symphony issue. Use the typed `linear_issue` transition operation.",
+        "requiredCall" => %{
+          "tool" => "linear_issue",
+          "arguments" => %{"operation" => "transition", "state" => "<target state>"}
+        }
+      }
+    }
+  end
+
   defp tool_error_payload({:blocked_transition_requires_human_blocker, allowed_kinds}) do
     %{
       "error" => %{
@@ -1539,7 +1563,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "error" => %{
         "message" => "The typed Linear issue operation failed.",
         "reason" => inspect(reason),
-        "hint" => "Use `linear_graphql` only if the required operation is not available through `linear_issue`."
+        "hint" => "Correct the typed operation arguments. Use `linear_graphql` only for operations that have no `linear_issue` equivalent."
       }
     }
 

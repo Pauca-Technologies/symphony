@@ -2488,7 +2488,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     Reason: `#{inspect(reason)}`
 
-    Keep the issue in In Progress, inspect the Linear status transition, and re-attempt the handoff with Symphony's `linear_graphql` tool.
+    Keep the issue in In Progress, inspect the Linear status transition, and re-attempt the handoff with Symphony's `linear_issue` tool using `operation: "transition"`.
     """
     |> String.trim()
   end
@@ -2709,9 +2709,9 @@ defmodule SymphonyElixir.AgentRunner do
         """
         Symphony handoff requirement:
 
-        - To move this issue from In Progress to In Review or Human Review, use Symphony's `linear_graphql` tool for the Linear `issueUpdate` mutation.
+        - To move this issue from In Progress to In Review or Human Review, use Symphony's `linear_issue` tool with `operation: "transition"` and the target `state`.
         - If that tool returns gate remediation, keep the issue In Progress and address the reported gate failures.
-        - Do not use the native Linear MCP `save_issue` tool for that handoff; it cannot run Symphony's before_handoff and automated review gates.
+        - Do not construct a raw `linear_graphql` `issueUpdate` mutation or use the native Linear MCP `save_issue` tool for that handoff; neither is the supported typed transition boundary.
         """
       else
         ""
@@ -2814,7 +2814,7 @@ defmodule SymphonyElixir.AgentRunner do
       true ->
         # The issue left the active states mid-run. This is the sanctioned
         # "blocked" channel: an agent that knows it is stuck transitions the
-        # issue to Blocked (via the gated linear_graphql tool), and that
+        # issue to Blocked (via the typed linear_issue transition), and that
         # transition ends the run here — the current turn finishes and we do
         # NOT dispatch another. Any non-active terminal (Done/Cancelled/…)
         # ends it the same way.

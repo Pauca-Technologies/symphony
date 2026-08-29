@@ -120,13 +120,13 @@ defmodule SymphonyElixir.AgentRunnerTest.HandoffToolBackend do
   def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
 
   @impl true
-  def run_turn(_session, _prompt, issue, opts) do
+  def run_turn(_session, _prompt, _issue, opts) do
     result =
       Keyword.fetch!(opts, :tool_executor).(
-        "linear_graphql",
+        "linear_issue",
         %{
-          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
+          "operation" => "transition",
+          "state" => "In Review"
         }
       )
 
@@ -488,6 +488,17 @@ defmodule SymphonyElixir.AgentRunnerTest do
     issue_id = issue.id
 
     linear_client = fn
+      query, %{"issueId" => issue_id, "stateName" => "In Review"}, []
+      when issue_id == issue.id ->
+        assert query =~ "SymphonyResolveTypedState"
+
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{"team" => %{"states" => %{"nodes" => [%{"id" => "state-review"}]}}}
+           }
+         }}
+
       query, %{"issueId" => issue_id}, [] when issue_id == issue.id ->
         if String.contains?(query, "SymphonyResolveIssueTransition") do
           {:ok,
@@ -788,7 +799,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "handoff prompt guidance" do
-    test "routes review handoffs through the gated GraphQL tool" do
+    test "routes review handoffs through the typed transition tool" do
       workspace =
         Path.join(System.tmp_dir!(), "symphony-handoff-prompt-#{System.unique_integer([:positive])}")
 
@@ -825,8 +836,9 @@ defmodule SymphonyElixir.AgentRunnerTest do
                )
 
       assert_receive {:handoff_prompt, prompt, ^issue}
-      assert prompt =~ "use Symphony's `linear_graphql` tool"
-      assert prompt =~ "before_handoff and automated review gates"
+      assert prompt =~ "use Symphony's `linear_issue` tool"
+      assert prompt =~ ~s(operation: "transition")
+      assert prompt =~ "Do not construct a raw `linear_graphql` `issueUpdate` mutation"
       refute prompt =~ "LINEAR_API_KEY"
       refute prompt =~ "Symphony Linear access:"
 

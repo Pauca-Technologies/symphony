@@ -40,9 +40,10 @@ repeated automated-review outcomes for the same candidate are collapsed, while h
 the single workpad remain verbatim. The typed `linear_issue` tool handles current-issue reads,
 workpad updates, labels, transitions, and deterministic same-project Backlog follow-ups for
 out-of-scope discoveries; `linear_graphql` remains available for uncommon operations
-that have no typed form. Both transition paths preserve handoff gates. Symphony disables the native
-Linear MCP in managed Codex sessions because its writes cannot run `hooks.before_handoff` or the
-automated review gate.
+that have no typed form, but rejects raw workflow transitions while a Symphony issue is active.
+All current-issue transitions therefore pass through the typed policy and handoff gates. Symphony
+disables the native Linear MCP in managed Codex sessions because its writes cannot run
+`hooks.before_handoff` or the automated review gate.
 
 `hooks.before_handoff` may implement the version 1 asynchronous gate protocol. Symphony sets
 `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`; a `pending` or `running` report exits `3` and supplies a durable
@@ -120,7 +121,8 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
    - The `linear` skill should prefer `linear_issue` for the current workpad, labels, activity, and
-     state. It can use `linear_graphql` for uncommon operations such as uploads.
+     state; all workflow transitions must use its typed `transition` operation. It can use
+     `linear_graphql` for uncommon operations such as uploads.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.

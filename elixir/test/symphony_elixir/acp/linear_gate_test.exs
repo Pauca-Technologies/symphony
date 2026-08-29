@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Acp.LinearGateTest do
   @moduledoc """
   In-VM MCP gate endpoint + ACP handoff-gate parity (`docs/acp-support-plan.md`
-  §5.5). Proves that a `linear_graphql` call hitting the HTTP endpoint is
+  §5.5). Proves that a typed `linear_issue` transition hitting the HTTP endpoint is
   dispatched into the owning session process and runs the same before_handoff +
   reviewer gates the Codex path does — blocking an In Progress -> In Review
   handoff with the same remediation.
@@ -11,8 +11,6 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
 
   alias SymphonyElixir.Acp.LinearGate
   alias SymphonyElixir.Codex.DynamicTool
-
-  @handoff_mutation "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }"
 
   describe "MCP handshake" do
     test "initialize and tools/list expose the server-authenticated Linear tools" do
@@ -273,30 +271,48 @@ defmodule SymphonyElixir.Acp.LinearGateTest do
   defp handoff_executor(issue, workspace, opts) do
     linear_client = Keyword.fetch!(opts, :linear_client)
 
+    typed_linear_client = fn query, variables, request_opts ->
+      if String.contains?(query, "SymphonyResolveTypedState") do
+        assert variables == %{"issueId" => issue.id, "stateName" => "In Review"}
+
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{"team" => %{"states" => %{"nodes" => [%{"id" => "state-review"}]}}}
+           }
+         }}
+      else
+        linear_client.(query, variables, request_opts)
+      end
+    end
+
     context =
       %{issue: issue, workspace: workspace, worker_host: nil}
       |> maybe_put(:review_workflow, Keyword.get(opts, :review_workflow))
       |> maybe_put(:review_opts, Keyword.get(opts, :review_opts))
       |> maybe_put(:deferred_review_callback, Keyword.get(opts, :deferred_review_callback))
 
-    fn "linear_graphql", args ->
-      DynamicTool.execute("linear_graphql", args, linear_client: linear_client, handoff_gate_context: context)
+    fn "linear_issue", args ->
+      DynamicTool.execute("linear_issue", args,
+        linear_client: typed_linear_client,
+        handoff_gate_context: context
+      )
     end
   end
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  defp tools_call(url, issue_id) do
+  defp tools_call(url, _issue_id) do
     mcp(url, %{
       "jsonrpc" => "2.0",
       "id" => 4,
       "method" => "tools/call",
       "params" => %{
-        "name" => "linear_graphql",
+        "name" => "linear_issue",
         "arguments" => %{
-          "query" => @handoff_mutation,
-          "variables" => %{"issueId" => issue_id, "stateId" => "state-review"}
+          "operation" => "transition",
+          "state" => "In Review"
         }
       }
     })

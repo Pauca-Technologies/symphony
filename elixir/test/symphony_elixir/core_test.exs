@@ -2361,7 +2361,7 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-gate-1"}}}'
-            printf '%s\\n' '{"method":"item/tool/call","id":"tool-gate","params":{"tool":"linear_graphql","arguments":{"query":"mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }","variables":{"issueId":"issue-gate-next","stateId":"state-review"}}}}'
+            printf '%s\\n' '{"method":"item/tool/call","id":"tool-gate","params":{"tool":"linear_issue","arguments":{"operation":"transition","state":"In Review"}}}'
             ;;
           5)
             printf '%s\\n' '{"method":"turn/completed"}'
@@ -2415,6 +2415,16 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       linear_client = fn
+        query, %{"issueId" => "issue-gate-next", "stateName" => "In Review"}, [] ->
+          assert query =~ "SymphonyResolveTypedState"
+
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{"team" => %{"states" => %{"nodes" => [%{"id" => "state-review"}]}}}
+             }
+           }}
+
         query, %{"issueId" => "issue-gate-next"}, [] ->
           assert query =~ "SymphonyResolveIssueTransition"
 

@@ -1453,9 +1453,8 @@ Optional client-side tool extension:
   issue and typed title, description, acceptance criteria, evidence, and dependency input. The
   repository policy determines project/state/assignment/label defaults; the operation MUST NOT let
   the coding agent supply an arbitrary source issue ID.
-- Review-state transitions MUST pass through the same `before_handoff` and automated-review gates as
-  raw GraphQL transitions.
-- A transition to `Blocked` MUST require the same structured human blocker as the raw extension.
+- Review-state transitions MUST pass through the `before_handoff` and automated-review gates.
+- A transition to `Blocked` MUST require a structured human blocker.
 - Implementations MAY expose `linear_graphql` for operations with no typed form.
 
 `linear_graphql` extension contract:
@@ -1479,6 +1478,9 @@ Optional client-side tool extension:
 - `variables` is OPTIONAL and, when present, MUST be a JSON object.
 - Implementations MAY additionally accept a raw GraphQL query string as shorthand input.
 - Execute one GraphQL operation per tool call.
+- When host-owned current-issue context is present, the tool MUST reject raw `issueUpdate`
+  workflow-state transitions and direct the coding agent to the typed `linear_issue` `transition`
+  operation. The raw extension remains available only for operations without a typed equivalent.
 - If the provided document contains multiple operations, reject the tool call as invalid input.
 - `operationName` selection is intentionally out of scope for this extension.
 - Reuse the configured Linear endpoint and auth from the active Symphony workflow/runtime config; do
@@ -1487,8 +1489,6 @@ Optional client-side tool extension:
   - transport success + no top-level GraphQL `errors` -> `success=true`
   - top-level GraphQL `errors` present -> `success=false`, but preserve the GraphQL response body
     for debugging
-  - an accepted deferred handoff review -> `success=true` with a distinct status and explicit
-    instructions to end the turn without retrying the mutation
   - invalid input, missing auth, or transport failure -> `success=false` with an error payload
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
@@ -2666,7 +2666,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - the tool is advertised to the session
   - valid `query` / `variables` inputs execute against configured Linear auth
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
-  - accepted deferred handoff reviews produce `success=true` with structured end-turn instructions
+  - raw current-issue workflow transitions fail with typed-transition remediation
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
   - session observability records retain normalized tool result details so deferred handoffs and
@@ -2675,7 +2675,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - the tool is advertised to the session
   - it is scoped to the host-owned current issue
   - typed workpad, label, activity, and transition operations return structured results
-  - review and blocked-state transitions preserve the same gates as `linear_graphql`
+  - review and blocked-state transitions preserve the required handoff and blocker gates
+  - accepted deferred handoff reviews produce `success=true` with structured end-turn instructions
 ### 17.6 Observability
 
 - Validation failures are operator-visible

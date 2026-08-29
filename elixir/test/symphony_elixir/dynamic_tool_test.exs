@@ -45,6 +45,34 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     File.write!(ctx.verdict_path, Jason.encode!(exact))
   end
 
+  defp execute_transition(issue, state, state_id, opts, extra_arguments \\ %{}) do
+    linear_client = Keyword.fetch!(opts, :linear_client)
+
+    typed_linear_client = fn query, variables, request_opts ->
+      if String.contains?(query, "SymphonyResolveTypedState") do
+        assert variables == %{"issueId" => issue.id, "stateName" => state}
+
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{"team" => %{"states" => %{"nodes" => [%{"id" => state_id}]}}}
+           }
+         }}
+      else
+        linear_client.(query, variables, request_opts)
+      end
+    end
+
+    arguments =
+      Map.merge(%{"operation" => "transition", "state" => state}, extra_arguments)
+
+    DynamicTool.execute(
+      "linear_issue",
+      arguments,
+      Keyword.put(opts, :linear_client, typed_linear_client)
+    )
+  end
+
   test "tool_specs advertises the server-authenticated Linear tool contracts" do
     specs = DynamicTool.tool_specs()
 
@@ -71,18 +99,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert %{
              "description" => graphql_description,
              "inputSchema" => %{
-               "properties" => %{
-                 "blocker" => _,
-                 "query" => _,
-                 "variables" => _
-               },
+               "properties" => %{"query" => _, "variables" => _},
                "required" => ["query"],
                "type" => "object"
              },
              "name" => "linear_graphql"
            } = Enum.find(specs, &(&1["name"] == "linear_graphql"))
 
-    assert graphql_description =~ "before_handoff"
+    assert graphql_description =~ "Raw workflow transitions are rejected"
 
     assert %{"description" => wait_description, "inputSchema" => wait_schema, "name" => "wait_for"} =
              Enum.find(specs, &(&1["name"] == "wait_for"))
@@ -284,7 +308,59 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert is_binary(request.condition_key)
   end
 
-  test "linear_graphql requires structured human evidence for Blocked transitions" do
+  test "linear_graphql rejects raw workflow transitions in a current issue session" do
+    issue = %Issue{id: "issue-raw-transition", identifier: "UDPE-7200", state: "In Progress"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
+          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
+        },
+        handoff_gate_context: %{issue: issue},
+        linear_client: fn _query, _variables, _opts ->
+          flunk("raw workflow transition must not reach Linear")
+        end
+      )
+
+    refute response["success"]
+
+    assert %{
+             "error" => %{
+               "message" => message,
+               "requiredCall" => %{
+                 "tool" => "linear_issue",
+                 "arguments" => %{"operation" => "transition", "state" => "<target state>"}
+               }
+             }
+           } = Jason.decode!(response["output"])
+
+    assert message =~ "Raw Linear workflow transitions are not supported"
+  end
+
+  test "linear_graphql preserves issueUpdate operations without a workflow transition" do
+    issue = %Issue{id: "issue-raw-update", identifier: "UDPE-7200B", state: "In Progress"}
+
+    query =
+      "mutation Rename($issueId: String!, $input: IssueUpdateInput!) { issueUpdate(id: $issueId, input: $input) { success } }"
+
+    variables = %{"issueId" => issue.id, "input" => %{"title" => "Clarified title"}}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => query, "variables" => variables},
+        handoff_gate_context: %{issue: issue},
+        linear_client: fn ^query, ^variables, [] ->
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        end
+      )
+
+    assert response["success"]
+  end
+
+  test "linear_issue requires structured human evidence for Blocked transitions" do
     issue = %Issue{
       id: "issue-blocked-policy",
       identifier: "UDPE-7201",
@@ -315,15 +391,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     end
 
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{
-          "query" => "mutation Block($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{
-            "issueId" => "issue-blocked-policy",
-            "stateId" => "state-blocked"
-          }
-        },
+      execute_transition(
+        issue,
+        "Blocked",
+        "state-blocked",
         handoff_gate_context: %{issue: issue, workspace: System.tmp_dir!(), worker_host: nil},
         linear_client: linear_client
       )
@@ -334,7 +405,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert "product_decision" in get_in(output, ["error", "requiredArgument", "blocker", "kind"])
   end
 
-  test "linear_graphql allows classified human Blocked transitions" do
+  test "linear_issue allows classified human Blocked transitions" do
     test_pid = self()
 
     issue = %Issue{
@@ -344,44 +415,43 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       state: "In Progress"
     }
 
-    query =
-      "mutation Block($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }"
-
-    variables = %{"issueId" => issue.id, "stateId" => "state-blocked"}
-
     response =
-      DynamicTool.execute(
-        "linear_graphql",
+      execute_transition(
+        issue,
+        "Blocked",
+        "state-blocked",
+        [
+          handoff_gate_context: %{issue: issue, workspace: System.tmp_dir!(), worker_host: nil},
+          linear_client: fn
+            transition_query, %{"issueId" => "issue-human-blocker"} = variables, []
+            when map_size(variables) == 1 ->
+              assert transition_query =~ "SymphonyResolveIssueTransition"
+
+              {:ok,
+               %{
+                 "data" => %{
+                   "issue" => %{
+                     "state" => %{"name" => "In Progress"},
+                     "team" => %{
+                       "states" => %{
+                         "nodes" => [%{"id" => "state-blocked", "name" => "Blocked"}]
+                       }
+                     }
+                   }
+                 }
+               }}
+
+            _mutation, %{"issueId" => "issue-human-blocker", "stateId" => "state-blocked"}, [] ->
+              send(test_pid, :blocked_mutation_applied)
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+          end
+        ],
         %{
-          "query" => query,
-          "variables" => variables,
           "blocker" => %{
             "kind" => "product_decision",
             "summary" => "Choose the required compatibility behavior."
           }
-        },
-        handoff_gate_context: %{issue: issue, workspace: System.tmp_dir!(), worker_host: nil},
-        linear_client: fn
-          transition_query, %{"issueId" => "issue-human-blocker"}, []
-          when transition_query != query ->
-            {:ok,
-             %{
-               "data" => %{
-                 "issue" => %{
-                   "state" => %{"name" => "In Progress"},
-                   "team" => %{
-                     "states" => %{
-                       "nodes" => [%{"id" => "state-blocked", "name" => "Blocked"}]
-                     }
-                   }
-                 }
-               }
-             }}
-
-          ^query, ^variables, [] ->
-            send(test_pid, :blocked_mutation_applied)
-            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
-        end
+        }
       )
 
     assert response["success"]
@@ -431,7 +501,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
   end
 
-  test "linear_graphql blocks In Progress to In Review issueUpdate when before_handoff hook fails" do
+  test "linear_issue blocks In Progress to In Review when before_handoff hook fails" do
     workspace =
       Path.join(
         System.tmp_dir!(),
@@ -474,12 +544,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     test_pid = self()
 
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{
-          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{"issueId" => "issue-gate", "stateId" => "state-review"}
-        },
+      execute_transition(
+        issue,
+        "In Review",
+        "state-review",
         handoff_gate_context: %{
           issue: issue,
           workspace: workspace,
@@ -532,7 +600,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert_receive {:handoff_gate_lifecycle, :finished, %{gate_job_id: ^gate_job_id, outcome: :blocked}}
   end
 
-  test "linear_graphql defers a protocol-v1 pending handoff without applying the mutation" do
+  test "linear_issue defers a protocol-v1 pending handoff without applying the mutation" do
     workspace =
       Path.join(
         System.tmp_dir!(),
@@ -576,12 +644,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     test_pid = self()
 
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{
-          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
-        },
+      execute_transition(
+        issue,
+        "In Review",
+        "state-review",
         handoff_gate_context: %{
           issue: issue,
           workspace: workspace,
@@ -631,7 +697,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     refute_receive :starting_handoff_cleared
   end
 
-  test "linear_graphql reports protocol infrastructure failures to the runner" do
+  test "linear_issue reports protocol infrastructure failures to the runner" do
     workspace =
       Path.join(
         System.tmp_dir!(),
@@ -673,12 +739,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     test_pid = self()
 
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{
-          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
-        },
+      execute_transition(
+        issue,
+        "In Review",
+        "state-review",
         handoff_gate_context: %{
           issue: issue,
           workspace: workspace,
@@ -726,25 +790,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert_receive :starting_handoff_cleared
   end
 
-  test "linear_graphql runs handoff gates when issueUpdate uses the issue identifier" do
-    workspace =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-identifier-handoff-tool-#{System.unique_integer([:positive])}"
-      )
-
-    File.mkdir_p!(workspace)
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: Path.dirname(workspace),
-      hook_before_handoff: """
-      printf '%s' '{"checks":[{"name":"review-required","status":"failed","detail":"review gate should run"}]}'
-      exit 2
-      """
-    )
-
-    on_exit(fn -> File.rm_rf(workspace) end)
-
+  test "linear_graphql rejects raw transitions that address the issue by identifier" do
     issue = %Issue{
       id: "ecd8bdb3-fa08-4a5f-b4b9-3026ab8be294",
       identifier: "UDPE-6085",
@@ -759,33 +805,16 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           "query" => "mutation UpdateIssueState($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }",
           "variables" => %{"id" => "UDPE-6085", "stateId" => "state-review"}
         },
-        handoff_gate_context: %{issue: issue, workspace: workspace, worker_host: nil},
-        linear_client: fn
-          query, %{"issueId" => "UDPE-6085"}, [] ->
-            assert query =~ "SymphonyResolveIssueTransition"
-
-            {:ok,
-             %{
-               "data" => %{
-                 "issue" => %{
-                   "state" => %{"name" => "In Progress"},
-                   "team" => %{
-                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
-                   }
-                 }
-               }
-             }}
-
-          _query, _variables, [] ->
-            flunk("blocked identifier handoff mutation should not be sent to Linear")
+        handoff_gate_context: %{issue: issue},
+        linear_client: fn _query, _variables, [] ->
+          flunk("raw identifier transition should not be sent to Linear")
         end
       )
 
     assert response["success"] == false
 
     output = Jason.decode!(response["output"])
-    assert get_in(output, ["error", "message"]) =~ "before_handoff hook blocked"
-    assert get_in(output, ["error", "remediation"]) =~ "review-required: review gate should run"
+    assert get_in(output, ["error", "requiredCall", "tool"]) == "linear_issue"
   end
 
   test "remote handoff revalidates base drift on its worker instead of bypassing the check" do
@@ -808,12 +837,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     end
 
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{
-          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{"issueId" => issue.id, "stateId" => "state-review"}
-        },
+      execute_transition(
+        issue,
+        "In Review",
+        "state-review",
         handoff_gate_context: %{
           issue: issue,
           workspace: workspace,
@@ -849,25 +876,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert command =~ "cd '/srv/remote worktree' && git"
   end
 
-  test "linear_graphql runs handoff gates when IssueUpdateInput carries stateId" do
-    workspace =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-input-state-handoff-tool-#{System.unique_integer([:positive])}"
-      )
-
-    File.mkdir_p!(workspace)
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: Path.dirname(workspace),
-      hook_before_handoff: """
-      printf '%s' '{"checks":[{"name":"nested-input-state","status":"failed","detail":"nested stateId should run gates"}]}'
-      exit 2
-      """
-    )
-
-    on_exit(fn -> File.rm_rf(workspace) end)
-
+  test "linear_graphql rejects raw transitions whose IssueUpdateInput carries stateId" do
     issue = %Issue{
       id: "30d1224d-9343-4f8f-a60c-e7ff285d13dd",
       identifier: "UDPE-6112",
@@ -891,36 +900,19 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             "input" => %{"stateId" => "state-review"}
           }
         },
-        handoff_gate_context: %{issue: issue, workspace: workspace, worker_host: nil},
-        linear_client: fn
-          query, %{"issueId" => "UDPE-6112"}, [] ->
-            assert query =~ "SymphonyResolveIssueTransition"
-
-            {:ok,
-             %{
-               "data" => %{
-                 "issue" => %{
-                   "state" => %{"name" => "In Progress"},
-                   "team" => %{
-                     "states" => %{"nodes" => [%{"id" => "state-review", "name" => "In Review"}]}
-                   }
-                 }
-               }
-             }}
-
-          _query, _variables, [] ->
-            flunk("blocked nested-input handoff mutation should not be sent to Linear")
+        handoff_gate_context: %{issue: issue},
+        linear_client: fn _query, _variables, [] ->
+          flunk("raw nested-input transition should not be sent to Linear")
         end
       )
 
     assert response["success"] == false
 
     output = Jason.decode!(response["output"])
-    assert get_in(output, ["error", "message"]) =~ "before_handoff hook blocked"
-    assert get_in(output, ["error", "remediation"]) =~ "nested-input-state: nested stateId should run gates"
+    assert get_in(output, ["error", "requiredCall", "tool"]) == "linear_issue"
   end
 
-  test "linear_graphql runs review before before_handoff and skips the expensive gate on request_changes" do
+  test "linear_issue runs review before before_handoff and skips the expensive gate on request_changes" do
     workspace =
       Path.join(
         System.tmp_dir!(),
@@ -967,12 +959,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     issue = %Issue{id: "issue-review", identifier: "UDPE-2", title: "Review me", state: "Todo"}
 
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{
-          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{"issueId" => "issue-review", "stateId" => "state-review"}
-        },
+      execute_transition(
+        issue,
+        "In Review",
+        "state-review",
         handoff_gate_context: %{
           issue: issue,
           workspace: workspace,
@@ -1014,7 +1004,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert get_in(output, ["error", "review", "severity_counts"]) == %{"major" => 1}
   end
 
-  test "linear_graphql lets the transition through when the reviewer approves" do
+  test "linear_issue lets the transition through when the reviewer approves" do
     workspace =
       Path.join(
         System.tmp_dir!(),
@@ -1065,12 +1055,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     }
 
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{
-          "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-          "variables" => %{"issueId" => "issue-ok", "stateId" => "state-review"}
-        },
+      execute_transition(
+        issue,
+        "In Review",
+        "state-review",
         handoff_gate_context: %{
           issue: issue,
           workspace: workspace,
@@ -1169,11 +1157,6 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         end
     end
 
-    arguments = %{
-      "query" => "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }",
-      "variables" => %{"issueId" => "issue-budget", "stateId" => "state-review"}
-    }
-
     opts = [
       handoff_gate_context: %{
         issue: issue,
@@ -1191,7 +1174,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     [first, second, third] =
       Enum.map(1..3, fn _attempt ->
-        DynamicTool.execute("linear_graphql", arguments, opts)
+        execute_transition(issue, "In Review", "state-review", opts)
       end)
 
     assert first["success"] == false
@@ -1210,7 +1193,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     refute_received :unexpected_budget_handoff_mutation
   end
 
-  test "linear_graphql defers the reviewer gate when a deferred callback is provided" do
+  test "linear_issue defers the reviewer gate when a deferred callback is provided" do
     workspace =
       Path.join(
         System.tmp_dir!(),
@@ -1229,15 +1212,11 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     issue = %Issue{id: "issue-defer", identifier: "UDPE-4", title: "Defer review", state: "In Progress"}
     test_pid = self()
 
-    query =
-      "mutation Move($issueId: String!, $stateId: String!) { issueUpdate(id: $issueId, input: {stateId: $stateId}) { success } }"
-
-    variables = %{"issueId" => "issue-defer", "stateId" => "state-review"}
-
     response =
-      DynamicTool.execute(
-        "linear_graphql",
-        %{"query" => query, "variables" => variables},
+      execute_transition(
+        issue,
+        "In Review",
+        "state-review",
         handoff_gate_context: %{
           issue: issue,
           workspace: workspace,
@@ -1282,8 +1261,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
 
     assert_received {:deferred_review, request}
-    assert request.query == query
-    assert request.variables == variables
+    assert request.query =~ "SymphonyTypedIssueTransition"
+    assert request.variables == %{"issueId" => "issue-defer", "stateId" => "state-review"}
     assert request.issue.identifier == "UDPE-4"
     assert request.review_workflow == review_workflow
     assert request.handoff_after_review.target_state == "In Review"
