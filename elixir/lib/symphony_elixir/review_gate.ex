@@ -267,7 +267,7 @@ defmodule SymphonyElixir.ReviewGate do
     base_drift_result =
       case Keyword.get(context.opts, :base_drift_decision) do
         %{action: action} = decision
-        when action in ["disabled", "allow_fresh_base", "allow_irrelevant_drift"] ->
+        when action in ["disabled", "allow_fresh_base"] ->
           {:ok, decision}
 
         _missing_or_non_allowing_decision ->
@@ -333,7 +333,7 @@ defmodule SymphonyElixir.ReviewGate do
       max_iterations: context.settings.max_iterations,
       reviewed_sha: context.reviewed_sha,
       summary: base_drift_summary(decision),
-      failure_reason: :overlapping_base_drift,
+      failure_reason: base_drift_failure_reason(decision),
       resume_condition: "Refresh against the current base without discarding dirty work, then re-attempt the handoff.",
       review_effort: :thorough,
       authoritative: false,
@@ -355,9 +355,16 @@ defmodule SymphonyElixir.ReviewGate do
     "Final gates deferred because the repository-owned handoff runtime changed on the newer base."
   end
 
+  defp base_drift_summary(%{overlap_paths: []}) do
+    "Final gates deferred because the candidate does not contain the current base."
+  end
+
   defp base_drift_summary(_decision) do
     "Final gates deferred because the candidate overlaps newer base changes."
   end
+
+  defp base_drift_failure_reason(%{overlap_paths: []}), do: :stale_base
+  defp base_drift_failure_reason(_decision), do: :overlapping_base_drift
 
   defp required_pr_outcome(%{issue: %Issue{} = issue} = context, reason) do
     case terminal_outcome(issue.id, nil) do

@@ -37,19 +37,22 @@ defmodule SymphonyElixir.BaseDriftTest do
     {:ok, workspace: workspace, upstream: upstream}
   end
 
-  test "irrelevant base advance does not block final gates", context do
+  test "a disjoint base advance blocks review until the candidate is current", context do
     commit_file!(context.workspace, "lib/candidate.ex", "candidate\n", "candidate")
     commit_file!(context.upstream, "docs/readme.md", "upstream docs\n", "docs advance")
     git!(context.upstream, ["push", "origin", "main"])
 
     issue = issue()
 
-    assert {:ok, decision} = BaseDrift.assess(context.workspace, issue, "main")
-    assert decision.action == "allow_irrelevant_drift"
+    assert {:defer, remediation, decision} = BaseDrift.assess(context.workspace, issue, "main")
+    assert decision.action == "defer_stale_base"
     assert decision.base_advanced
     assert decision.overlap_paths == []
     assert decision.candidate_paths == ["lib/candidate.ex"]
     assert decision.upstream_paths == ["docs/readme.md"]
+    assert decision.gates_avoided == 1
+    assert remediation =~ "does not contain the current origin/main base"
+    assert remediation =~ "upstream paths do not directly overlap"
   end
 
   test "a changed handoff runtime blocks a disjoint candidate until it refreshes", context do

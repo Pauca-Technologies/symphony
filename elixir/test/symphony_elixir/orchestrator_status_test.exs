@@ -2311,12 +2311,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       identifier: issue.identifier,
       issue: issue,
       session_id: "thread-review-heartbeat",
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
       lifecycle_state: :handoff_pending_review,
       lifecycle_started_at: stale_activity_at,
       handoff_review_job_id: 19,
       handoff_review_key: {:pull_request, issue_id, "PR_19", "head-19"},
       handoff_review_timeout_ms: 30_000,
       last_codex_timestamp: stale_activity_at,
+      last_codex_message: "Implementor turn completed",
+      last_codex_event: :turn_completed,
       started_at: stale_activity_at
     }
 
@@ -2335,6 +2341,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     Process.sleep(20)
     assert :sys.get_state(pid).running[issue_id].last_codex_timestamp == stale_activity_at
+    refute Map.has_key?(:sys.get_state(pid).running[issue_id], :handoff_review_last_event_at)
 
     send(
       pid,
@@ -2342,7 +2349,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     )
 
     Process.sleep(20)
-    assert :sys.get_state(pid).running[issue_id].last_codex_timestamp == now
+    assert :sys.get_state(pid).running[issue_id].last_codex_timestamp == stale_activity_at
+    assert :sys.get_state(pid).running[issue_id].handoff_review_last_event_at == now
 
     send(pid, :tick)
     Process.sleep(100)
@@ -2351,6 +2359,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Process.alive?(worker_pid)
     assert Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
+    [running] = Enum.filter(snapshot.running, &(&1.issue_id == issue_id))
+    assert running.handoff_review.status == :running
+    assert running.handoff_review.job_id == 19
+    assert running.handoff_review.heartbeat_at == now
+    assert is_integer(running.handoff_review.heartbeat_age_ms)
+    assert is_integer(running.handoff_review.pending_age_seconds)
 
     send(worker_pid, :done)
   end

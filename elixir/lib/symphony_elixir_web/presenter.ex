@@ -238,6 +238,10 @@ defmodule SymphonyElixirWeb.Presenter do
       agent: agent_payload(entry),
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
+      phase: lifecycle_phase(entry),
+      phase_started_at: iso8601(Map.get(entry, :lifecycle_started_at)),
+      phase_age_seconds: Map.get(entry, :lifecycle_age_seconds),
+      activity: activity_payload(entry),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
@@ -253,6 +257,7 @@ defmodule SymphonyElixirWeb.Presenter do
     |> maybe_put_persistent_worker(entry)
     |> maybe_put_scheduling(entry)
     |> maybe_put_handoff_gate(entry)
+    |> maybe_put_handoff_review(entry)
     |> maybe_put_review(entry)
   end
 
@@ -507,6 +512,9 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
       phase: lifecycle_phase(running),
+      phase_started_at: iso8601(Map.get(running, :lifecycle_started_at)),
+      phase_age_seconds: Map.get(running, :lifecycle_age_seconds),
+      activity: activity_payload(running),
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
@@ -522,6 +530,7 @@ defmodule SymphonyElixirWeb.Presenter do
     |> maybe_put_persistent_worker(running)
     |> maybe_put_scheduling(running)
     |> maybe_put_handoff_gate(running)
+    |> maybe_put_handoff_review(running)
     |> maybe_put_review(running)
   end
 
@@ -556,6 +565,70 @@ defmodule SymphonyElixirWeb.Presenter do
       _gate -> payload
     end
   end
+
+  defp maybe_put_handoff_review(payload, entry) do
+    case Map.get(entry, :handoff_review) do
+      review when is_map(review) ->
+        Map.put(payload, :handoff_review, %{
+          status: stringify_atom(review_value(review, :status)),
+          job_id: review_value(review, :job_id),
+          review_key: review_value(review, :review_key),
+          timeout_ms: review_value(review, :timeout_ms),
+          started_at: activity_timestamp(review_value(review, :started_at)),
+          heartbeat_at: activity_timestamp(review_value(review, :heartbeat_at)),
+          heartbeat_age_ms: review_value(review, :heartbeat_age_ms),
+          pending_age_seconds: review_value(review, :pending_age_seconds)
+        })
+
+      _review ->
+        payload
+    end
+  end
+
+  defp activity_payload(%{lifecycle_state: :handoff_pending_review} = entry) do
+    review = Map.get(entry, :handoff_review) || %{}
+
+    %{
+      kind: "review",
+      event: "reviewer_heartbeat",
+      message: "Automated review running",
+      at:
+        activity_timestamp(review_value(review, :heartbeat_at)) ||
+          iso8601(Map.get(entry, :lifecycle_started_at))
+    }
+  end
+
+  defp activity_payload(%{lifecycle_state: :handoff_pending_gate} = entry) do
+    gate = Map.get(entry, :handoff_gate) || %{}
+    progress = review_value(gate, :progress) || %{}
+    stage = review_value(progress, :stage)
+    status = stringify_atom(review_value(gate, :status)) || "running"
+
+    %{
+      kind: "handoff_gate",
+      event: stage || status,
+      message: review_value(progress, :message) || handoff_gate_activity_message(stage, status),
+      at:
+        activity_timestamp(review_value(gate, :heartbeat_at)) ||
+          iso8601(Map.get(entry, :lifecycle_started_at))
+    }
+  end
+
+  defp activity_payload(entry) do
+    %{
+      kind: "agent",
+      event: stringify_atom(Map.get(entry, :last_codex_event)),
+      message: summarize_message(Map.get(entry, :last_codex_message)),
+      at: iso8601(Map.get(entry, :last_codex_timestamp))
+    }
+  end
+
+  defp handoff_gate_activity_message(nil, status), do: "Handoff validation #{status}"
+  defp handoff_gate_activity_message(stage, _status), do: "Handoff validation: #{stage}"
+
+  defp activity_timestamp(%DateTime{} = timestamp), do: iso8601(timestamp)
+  defp activity_timestamp(timestamp) when is_binary(timestamp), do: timestamp
+  defp activity_timestamp(_timestamp), do: nil
 
   defp lifecycle_phase(%{lifecycle_state: :handoff_pending_gate}), do: "Validation running"
 

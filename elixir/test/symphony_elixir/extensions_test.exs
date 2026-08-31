@@ -702,6 +702,14 @@ defmodule SymphonyElixir.ExtensionsTest do
         identifier: "UDPE-7016",
         title: "Validate the exact candidate",
         lifecycle_state: :handoff_pending_gate,
+        lifecycle_started_at: DateTime.utc_now(),
+        lifecycle_age_seconds: 12,
+        handoff_gate: %{
+          job_id: "gate-7016",
+          status: :running,
+          heartbeat_at: "2026-08-31T12:00:00Z",
+          progress: %{"stage" => "tests", "message" => "Running changed-scope tests"}
+        },
         last_codex_event: "turn_completed"
       })
 
@@ -714,6 +722,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Enum.map(payload.implementing, & &1.issue_identifier) == ["MT-HTTP"]
     assert Enum.map(payload.handoff, & &1.issue_identifier) == ["UDPE-7016"]
     assert length(payload.running) == 2
+    [handoff_entry] = payload.handoff
+    assert handoff_entry.phase == "Validation running"
+    assert handoff_entry.activity.kind == "handoff_gate"
+    assert handoff_entry.activity.event == "tests"
+    assert handoff_entry.activity.message == "Running changed-scope tests"
+    assert handoff_entry.activity.at == "2026-08-31T12:00:00Z"
 
     assert {:ok, handoff_payload} =
              SymphonyElixirWeb.Presenter.issue_payload("UDPE-7016", orchestrator_name, 50)
@@ -728,6 +742,55 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Handoff validation / review"
     assert html =~ "1 implementing · 1 in handoff"
     assert html =~ "Post-turn exact-candidate gates"
+    assert html =~ "Running changed-scope tests"
+  end
+
+  test "presenter keeps reviewer progress separate from the implementor event" do
+    orchestrator_name = Module.concat(__MODULE__, :ReviewActivityOrchestrator)
+    started_at = DateTime.add(DateTime.utc_now(), -20, :second)
+    heartbeat_at = DateTime.add(DateTime.utc_now(), -2, :second)
+
+    review =
+      static_snapshot().running
+      |> List.first()
+      |> Map.merge(%{
+        issue_id: "issue-review",
+        identifier: "UDPE-7017",
+        title: "Review the exact candidate",
+        lifecycle_state: :handoff_pending_review,
+        lifecycle_started_at: started_at,
+        lifecycle_age_seconds: 20,
+        last_codex_message: "Implementor turn completed",
+        last_codex_timestamp: DateTime.add(started_at, -1, :second),
+        handoff_review: %{
+          status: :running,
+          job_id: 17,
+          review_key: "{:pull_request, \"PR_17\"}",
+          timeout_ms: 300_000,
+          started_at: started_at,
+          heartbeat_at: heartbeat_at,
+          heartbeat_age_ms: 2_000,
+          pending_age_seconds: 20
+        }
+      })
+
+    snapshot = %{static_snapshot() | running: [review]}
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 50)
+    [entry] = payload.handoff
+    assert entry.phase == "Landable; automated review running"
+    assert entry.last_message == "Implementor turn completed"
+
+    assert entry.activity == %{
+             kind: "review",
+             event: "reviewer_heartbeat",
+             message: "Automated review running",
+             at: DateTime.to_iso8601(DateTime.truncate(heartbeat_at, :second))
+           }
+
+    assert entry.handoff_review.job_id == 17
+    assert entry.handoff_review.heartbeat_age_ms == 2_000
   end
 
   test "web dashboard promotes parked waits and lists them after running sessions" do
@@ -825,6 +888,15 @@ defmodule SymphonyElixir.ExtensionsTest do
                  },
                  "session_id" => "thread-http",
                  "turn_count" => 7,
+                 "phase" => "Implementation",
+                 "phase_started_at" => nil,
+                 "phase_age_seconds" => nil,
+                 "activity" => %{
+                   "kind" => "agent",
+                   "event" => "notification",
+                   "message" => "rendered",
+                   "at" => nil
+                 },
                  "last_event" => "notification",
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
@@ -920,6 +992,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                "turn_count" => 7,
                "state" => "In Progress",
                "phase" => "Implementation",
+               "phase_started_at" => nil,
+               "phase_age_seconds" => nil,
+               "activity" => %{
+                 "kind" => "agent",
+                 "event" => "notification",
+                 "message" => "rendered",
+                 "at" => nil
+               },
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
                "last_message" => "rendered",

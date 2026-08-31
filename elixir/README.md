@@ -303,9 +303,10 @@ Notes:
   stale lease.
 - For a routed worktree, Symphony fetches and compares the configured base on
   the local or SSH worker that owns it immediately before `before_handoff`. An
-  irrelevant base advance proceeds. An
-  overlapping advance blocks before final validation or automated review and
-  returns compact remediation. The check never rebases, resets, or stashes; a
+  advance blocks before final validation or automated review, even when its
+  changed paths do not overlap the candidate, so exact-head review and later
+  gates always use a candidate that contains the same current base. Symphony
+  returns compact remediation and never rebases, resets, or stashes; a
   dirty worktree is preserved for deliberate agent judgment. The exact passing
   decision is handed to the immediately following review gate so it is not
   fetched twice, while every later handoff attempt performs a new fetch.
@@ -584,7 +585,7 @@ Notes:
   Repository scheduling waits are exposed separately with queue reason, bounded overlap paths,
   queue time, base age, bounded suggested order plus its omitted count, policy, and override state. Running entries expose their
   repository, path source/manifest, candidate/current base SHAs, base age, and dirty flag. Fleet
-  telemetry reports overlap decisions, queue time, rebase/conflict rate, irrelevant versus
+  telemetry reports overlap decisions, queue time, rebase/conflict rate, stale versus
   overlapping base drift, and expensive gates avoided.
 - **Label groups.** A Linear label nested in a label *group* (e.g. the leaf `opencode:kimi2.7` under
   group `agent`) is flattened to `<group>:<leaf>` (`agent:opencode:kimi2.7`) before matching — Symphony
@@ -644,7 +645,9 @@ Notes:
   The issue remains claimed in a distinct `handoff_pending_review` lifecycle while that reviewer
   runs, so the completed implementor is not mistaken for a stalled turn. Reviewer events emit a
   minimal, job-scoped heartbeat that refreshes worker activity without replacing implementor
-  session or token accounting. The reviewer deadline is an inactivity timeout refreshed by progress;
+  session, last-agent event, or token accounting. Snapshots and the observability UI expose the
+  separate reviewer job, phase age, heartbeat time, and heartbeat age instead of making an old
+  implementor message look current. The reviewer deadline is an inactivity timeout refreshed by progress;
   a silent reviewer is timed out with a review-specific log and is not immediately repeated for the
   same full deadline.
   Symphony also pins the reviewed PR head and rechecks it before starting final validation and again
@@ -789,6 +792,10 @@ The observability UI now runs on a minimal Phoenix stack:
   Code's named subscription windows are normalized into 5-hour/weekly percentage-used and reset
   fields when their streams report them. Backends whose agent protocol does not expose subscription
   limits remain visible as unavailable rather than being reported as zero.
+- Running rows show the orchestrator phase and the latest activity from the component that currently
+  owns progress: implementor events during implementation, reviewer heartbeats during automated
+  review, and gate progress during final validation. Issue detail pages expose the corresponding
+  handoff job identity and age.
 
 ## Project Layout
 

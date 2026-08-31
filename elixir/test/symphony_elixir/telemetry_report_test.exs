@@ -290,7 +290,7 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
       %{"event" => "scheduling", "action" => "dispatch", "reason" => "disjoint_or_unknown", "queue_time_ms" => 200},
       %{"event" => "scheduling", "action" => "dispatch", "reason" => "disjoint_or_unknown", "queue_time_ms" => 900},
       %{"event" => "base_drift", "action" => "defer_overlapping_drift", "gates_avoided" => 1},
-      %{"event" => "base_drift", "action" => "allow_irrelevant_drift", "gates_avoided" => 0},
+      %{"event" => "base_drift", "action" => "defer_stale_base", "gates_avoided" => 1},
       %{"event" => "tool", "action" => "end", "vcs_operation" => "rebase", "outcome" => "failed"},
       %{"event" => "tool", "action" => "end", "vcs_operation" => "rebase", "outcome" => "ok"}
     ]
@@ -306,8 +306,9 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
     assert scheduling.overlap_decisions == 1
     assert scheduling.base_drift_checks == 2
     assert scheduling.overlapping_base_drift == 1
-    assert scheduling.irrelevant_base_drift == 1
-    assert scheduling.gates_avoided == 1
+    assert scheduling.stale_base_drift == 1
+    assert scheduling.irrelevant_base_drift == 0
+    assert scheduling.gates_avoided == 2
     assert scheduling.rebases == 2
     assert scheduling.rebase_conflicts == 1
     assert scheduling.rebase_conflict_rate == 0.5

@@ -97,6 +97,7 @@ defmodule SymphonyElixir.Telemetry.Report do
         overlap_decisions: Enum.count(scheduling, &((&1["overlap_score"] || 0) > 0)),
         base_drift_checks: length(base_drift),
         overlapping_base_drift: Enum.count(base_drift, &(&1["action"] == "defer_overlapping_drift")),
+        stale_base_drift: Enum.count(base_drift, &(&1["action"] == "defer_stale_base")),
         irrelevant_base_drift: Enum.count(base_drift, &(&1["action"] == "allow_irrelevant_drift")),
         gates_avoided: Enum.reduce(base_drift, 0, &((&1["gates_avoided"] || 0) + &2)),
         rebases: length(completed_rebases),

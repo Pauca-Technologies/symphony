@@ -26,7 +26,7 @@ defmodule SymphonyElixir.BaseDrift do
   @workflow_runtime_paths ["WORKFLOW.md", "WORKFLOW_REVIEW.md"]
   @command_path_regex ~r{(?:^|[\s`'"(])((?:\.?/?[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)}m
 
-  @doc "Assess base freshness, returning compact remediation for overlapping drift."
+  @doc "Assess base freshness, returning compact remediation for a stale candidate base."
   @spec assess(Path.t(), Issue.t(), String.t() | nil, keyword()) ::
           {:ok, decision()} | {:defer, String.t(), decision()} | {:error, term()}
   def assess(workspace, issue, base_ref, opts \\ [])
@@ -99,10 +99,17 @@ defmodule SymphonyElixir.BaseDrift do
       overlap_paths = Enum.uniq(candidate_overlap.paths ++ critical_overlap.paths) |> Enum.sort()
       overlap_omitted = max(length(overlap_paths) - 20, 0)
       advanced? = candidate_base_sha != current_base_sha
-      defer? = advanced? and overlap_paths != []
+      defer? = advanced?
+
+      action =
+        cond do
+          not advanced? -> "allow_fresh_base"
+          overlap_paths == [] -> "defer_stale_base"
+          true -> "defer_overlapping_drift"
+        end
 
       decision = %{
-        action: if(defer?, do: "defer_overlapping_drift", else: if(advanced?, do: "allow_irrelevant_drift", else: "allow_fresh_base")),
+        action: action,
         base_ref: base_ref,
         candidate_base_sha: candidate_base_sha,
         current_base_sha: current_base_sha,
@@ -228,7 +235,7 @@ defmodule SymphonyElixir.BaseDrift do
     """
     System message:
 
-    Symphony deferred final validation and automated review because origin/#{decision.base_ref} advanced on #{overlap_description(decision)}: #{format_overlap(decision)}.
+    Symphony deferred final validation and automated review because #{drift_description(decision)}.
 
     #{dirty_guidance}
 
@@ -282,8 +289,19 @@ defmodule SymphonyElixir.BaseDrift do
   end
 
   defp compact(value), do: value |> to_string() |> String.replace(~r/\s+/, " ") |> String.trim() |> String.slice(0, 500)
-  defp overlap_description(%{critical_overlap_paths: [_path | _paths]}), do: "paths required by the configured handoff runtime"
-  defp overlap_description(_decision), do: "paths that overlap this candidate"
+
+  defp drift_description(%{critical_overlap_paths: [_path | _paths]} = decision) do
+    "origin/#{decision.base_ref} advanced on paths required by the configured handoff runtime: #{format_overlap(decision)}"
+  end
+
+  defp drift_description(%{overlap_paths: [_path | _paths]} = decision) do
+    "origin/#{decision.base_ref} advanced on paths that overlap this candidate: #{format_overlap(decision)}"
+  end
+
+  defp drift_description(decision) do
+    "the candidate does not contain the current origin/#{decision.base_ref} base, even though the upstream paths do not directly overlap its changes"
+  end
+
   defp format_overlap(%{overlap_paths: paths, overlap_paths_omitted: 0}), do: Enum.join(paths, ", ")
   defp format_overlap(%{overlap_paths: paths, overlap_paths_omitted: omitted}), do: Enum.join(paths, ", ") <> " (+#{omitted} omitted)"
 

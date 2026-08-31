@@ -1915,7 +1915,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       assert Process.alive?(worker_pid)
       assert state.running[issue.id].lifecycle_state == :handoff_pending_review
-      assert state.running[issue.id].last_codex_timestamp == review_event_at
+      assert state.running[issue.id].last_codex_timestamp == stale_at
+      assert state.running[issue.id].handoff_review_last_event_at == review_event_at
       assert MapSet.member?(state.claimed, issue.id)
       refute Map.has_key?(state.retry_attempts, issue.id)
 

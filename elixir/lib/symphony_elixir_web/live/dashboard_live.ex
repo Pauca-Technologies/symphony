@@ -239,6 +239,35 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           </section>
 
+          <section
+            :if={@issue_payload.running && @issue_payload.running.activity.kind != "agent"}
+            class="section-card"
+          >
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Handoff activity</h2>
+                <p class="section-copy"><%= @issue_payload.running.activity.message %></p>
+              </div>
+              <span class={state_badge_class(@issue_payload.status)}>
+                <%= @issue_payload.running.phase %>
+              </span>
+            </div>
+            <div class="field-list">
+              <div>
+                <span class="field-label">Latest progress</span>
+                <pre class="code-panel"><%= @issue_payload.running.activity.event %> · <%= full_time(@issue_payload.running.activity.at) %></pre>
+              </div>
+              <div :if={@issue_payload.running[:handoff_review]}>
+                <span class="field-label">Reviewer job / heartbeat age</span>
+                <pre class="code-panel"><%= @issue_payload.running.handoff_review.job_id %> · <%= format_milliseconds(@issue_payload.running.handoff_review.heartbeat_age_ms) %></pre>
+              </div>
+              <div :if={@issue_payload.running[:handoff_gate]}>
+                <span class="field-label">Validation job / pending age</span>
+                <pre class="code-panel"><%= @issue_payload.running.handoff_gate[:job_id] || "n/a" %> · <%= format_runtime_seconds(@issue_payload.running.handoff_gate[:pending_age_seconds] || 0) %></pre>
+              </div>
+            </div>
+          </section>
+
           <%= if review = issue_review(@issue_payload) do %>
             <section class="section-card">
               <div class="section-header">
@@ -604,8 +633,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </td>
                       <td>
                         <span class={state_badge_class(entry.state)}>
-                          <%= entry.state %>
+                          <%= entry.phase %>
                         </span>
+                        <span class="muted"><%= entry.state %></span>
                         <span :if={entry[:review]} class="muted">
                           review: <%= review_value(entry[:review], :outcome) || "unknown" %>
                           · <%= review_iteration_label(entry[:review]) %>
@@ -644,12 +674,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <div class="detail-stack">
                           <span
                             class="event-text"
-                            title={entry.last_message || to_string(entry.last_event || "n/a")}
-                          ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
+                            title={entry.activity.message || to_string(entry.activity.event || "n/a")}
+                          ><%= entry.activity.message || to_string(entry.activity.event || "n/a") %></span>
                           <span class="muted event-meta">
-                            <%= entry.last_event || "n/a" %>
-                            <%= if entry.last_event_at do %>
-                              · <time class="event-time-stamp" datetime={entry.last_event_at} title={full_time(entry.last_event_at)}><%= full_time(entry.last_event_at) %></time>
+                            <%= entry.activity.event || "n/a" %>
+                            <%= if entry.activity.at do %>
+                              · <time class="event-time-stamp" datetime={entry.activity.at} title={full_time(entry.activity.at)}><%= full_time(entry.activity.at) %></time>
                             <% end %>
                           </span>
                         </div>
@@ -1019,6 +1049,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
     secs = rem(whole_seconds, 60)
     "#{mins}m #{secs}s"
   end
+
+  defp format_milliseconds(milliseconds) when is_number(milliseconds),
+    do: format_runtime_seconds(milliseconds / 1_000)
+
+  defp format_milliseconds(_milliseconds), do: "n/a"
 
   defp runtime_seconds_from_started_at(%DateTime{} = started_at, %DateTime{} = now) do
     DateTime.diff(now, started_at, :second)

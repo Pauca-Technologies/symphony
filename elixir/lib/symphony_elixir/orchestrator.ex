@@ -421,7 +421,8 @@ defmodule SymphonyElixir.Orchestrator do
         lifecycle_state: :handoff_pending_review,
         handoff_review_job_id: ^review_job_id
       } = running_entry ->
-        updated_running_entry = Map.put(running_entry, :last_codex_timestamp, timestamp)
+        updated_running_entry = Map.put(running_entry, :handoff_review_last_event_at, timestamp)
+        notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
 
       _ ->
@@ -536,6 +537,16 @@ defmodule SymphonyElixir.Orchestrator do
     previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
     session_id = running_entry_session_id(running_entry)
 
+    continuing_review? =
+      previous_state == :handoff_pending_review and
+        Map.get(running_entry, :handoff_review_job_id) == review_job_id
+
+    lifecycle_started_at =
+      if continuing_review?, do: Map.get(running_entry, :lifecycle_started_at, now), else: now
+
+    last_event_at =
+      if continuing_review?, do: Map.get(running_entry, :handoff_review_last_event_at, now), else: now
+
     Logger.info(
       "Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=handoff_pending_review review_job_id=#{review_job_id} review_key=#{inspect(review_key)} timeout_ms=#{timeout_ms}"
     )
@@ -548,10 +559,11 @@ defmodule SymphonyElixir.Orchestrator do
 
     running_entry
     |> Map.put(:lifecycle_state, :handoff_pending_review)
-    |> Map.put(:lifecycle_started_at, now)
+    |> Map.put(:lifecycle_started_at, lifecycle_started_at)
     |> Map.put(:handoff_review_job_id, review_job_id)
     |> Map.put(:handoff_review_key, review_key)
     |> Map.put(:handoff_review_timeout_ms, timeout_ms)
+    |> Map.put(:handoff_review_last_event_at, last_event_at)
   end
 
   defp transition_agent_lifecycle(
@@ -605,7 +617,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> Map.drop([
         :handoff_review_job_id,
         :handoff_review_key,
-        :handoff_review_timeout_ms
+        :handoff_review_timeout_ms,
+        :handoff_review_last_event_at
       ])
       |> Map.put(:lifecycle_state, :implementing)
       |> Map.put(:lifecycle_started_at, now)
@@ -1088,7 +1101,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handoff_review_activity_timestamp(running_entry) when is_map(running_entry) do
-    last_activity_timestamp(running_entry)
+    [
+      Map.get(running_entry, :handoff_review_last_event_at),
+      Map.get(running_entry, :lifecycle_started_at)
+    ]
+    |> Enum.filter(&match?(%DateTime{}, &1))
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
   end
 
   defp terminate_task(pid) when is_pid(pid) do
@@ -3114,7 +3132,9 @@ defmodule SymphonyElixir.Orchestrator do
           turn_count: Map.get(metadata, :turn_count, 0),
           lifecycle_state: Map.get(metadata, :lifecycle_state, :implementing),
           lifecycle_started_at: Map.get(metadata, :lifecycle_started_at),
+          lifecycle_age_seconds: running_seconds(Map.get(metadata, :lifecycle_started_at), now),
           handoff_gate: handoff_gate_snapshot(metadata, now),
+          handoff_review: handoff_review_snapshot(metadata, now),
           review_state: Map.get(metadata, :review_state),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -5580,6 +5600,31 @@ defmodule SymphonyElixir.Orchestrator do
         nil
     end
   end
+
+  defp handoff_review_snapshot(
+         %{lifecycle_state: :handoff_pending_review} = metadata,
+         now
+       ) do
+    heartbeat_at = Map.get(metadata, :handoff_review_last_event_at)
+
+    %{
+      status: :running,
+      job_id: Map.get(metadata, :handoff_review_job_id),
+      review_key: inspect(Map.get(metadata, :handoff_review_key)),
+      timeout_ms: Map.get(metadata, :handoff_review_timeout_ms),
+      started_at: Map.get(metadata, :lifecycle_started_at),
+      heartbeat_at: heartbeat_at,
+      heartbeat_age_ms: datetime_age_ms(heartbeat_at, now),
+      pending_age_seconds: running_seconds(Map.get(metadata, :lifecycle_started_at), now)
+    }
+  end
+
+  defp handoff_review_snapshot(_metadata, _now), do: nil
+
+  defp datetime_age_ms(%DateTime{} = timestamp, %DateTime{} = now),
+    do: max(0, DateTime.diff(now, timestamp, :millisecond))
+
+  defp datetime_age_ms(_timestamp, _now), do: nil
 
   defp integer_like(value) when is_integer(value) and value >= 0, do: value
 
