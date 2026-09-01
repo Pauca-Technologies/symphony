@@ -100,7 +100,7 @@ defmodule SymphonyElixir.Config do
     scope_contract_required: false,
     draft_pr_lifecycle: false,
     pr_section_enabled: true,
-    section_heading: "## 🤖 How to review this PR"
+    section_heading: "## Review this PR"
   }
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}

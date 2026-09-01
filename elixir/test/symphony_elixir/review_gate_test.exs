@@ -97,7 +97,8 @@ defmodule SymphonyElixir.ReviewGateTest do
            "id" => "PR_7",
            "number" => 7,
            "body" => "Existing PR body.",
-           "headRefOid" => "head-7"
+           "headRefOid" => "head-7",
+           "headRepository" => %{"nameWithOwner" => "org/repo"}
          }), 0}
 
       ["api", "graphql" | _] = args, _cwd ->
@@ -1461,14 +1462,29 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert packet.diff.authoritative_full_diff.pull_request_command == "gh pr diff 7"
   end
 
-  test "writes the human-review section to the PR on approve", %{workspace: workspace} do
+  test "writes bounded structured review direction to the PR on approve", %{workspace: workspace} do
     test_pid = self()
 
     runner =
       verdict_runner(%{
         "verdict" => "approve",
         "review_effort" => "skim",
-        "human_review" => "Mostly skimmable; focus on `lib/foo.ex`.",
+        "review_direction" => %{
+          "targets" => [
+            %{
+              "path" => "lib/foo.ex",
+              "line_start" => 12,
+              "question" => "Does the handoff preserve exact-head ownership?"
+            }
+          ],
+          "verification" => [
+            %{
+              "label" => "Reviewer walkthrough video",
+              "url" => "https://github.com/user-attachments/assets/video-id",
+              "expectation" => "Confirm the complete handoff path."
+            }
+          ]
+        },
         "comments" => []
       })
 
@@ -1482,9 +1498,11 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     assert_received {:pr_edit, body}
     assert body =~ "<!-- symphony:review:start -->"
-    assert body =~ "## 🤖 How to review this PR"
-    assert body =~ "🔵 **Skim**"
-    assert body =~ "Mostly skimmable; focus on `lib/foo.ex`."
+    assert body =~ "## Review this PR"
+    assert body =~ "[lib/foo.ex:12](https://github.com/org/repo/blob/head-7/lib/foo.ex#L12)"
+    assert body =~ "Does the handoff preserve exact-head ownership?"
+    assert body =~ "[Reviewer walkthrough video](https://github.com/user-attachments/assets/video-id)"
+    refute body =~ "Skim"
   end
 
   test "resolves the PR from the Linear attachment before requiring branch inference", %{workspace: workspace} do
@@ -1600,21 +1618,21 @@ defmodule SymphonyElixir.ReviewGateTest do
     wf = review_workflow(%{"max_iterations" => 2})
     opts = [session_runner: runner, pr_runner: pr_runner(test_pid), comment_fn: capture_comments(test_pid)]
 
-    # Pass 1: request_changes -> section reflects the reviewer's medium tier.
+    # Pass 1: request_changes -> section reflects the reviewer's bounded guidance.
     assert {:request_changes, _, _} = ReviewGate.run(workspace, issue(), nil, wf, opts)
     assert_received {:pr_edit, first_body}
-    assert first_body =~ "🟠 **Focused**"
+    assert first_body =~ "needs another pass"
+    refute first_body =~ "Focused"
 
-    # Pass 2 consumes the budget -> section is overwritten immediately to high / did-not-converge.
+    # Pass 2 consumes the budget -> section is overwritten with a concise non-approval warning.
     assert {:budget_exhausted_with_findings, outcome} =
              ReviewGate.run(workspace, issue(), nil, wf, opts)
 
     assert outcome.outcome == :budget_exhausted_with_findings
     assert_received {:pr_edit, second_body}
-    assert second_body =~ "🔴 **Thorough**"
-    assert second_body =~ "without converging"
-    assert second_body =~ "handoff was **withheld"
-    assert second_body =~ "remains unapproved by automation"
+    refute second_body =~ "Thorough"
+    assert second_body =~ "did not converge"
+    assert second_body =~ "handoff remains unapproved"
     refute second_body =~ "allowed through"
   end
 

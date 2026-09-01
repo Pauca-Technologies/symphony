@@ -4,25 +4,53 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
   alias SymphonyElixir.Github.PrReviewSection
 
   describe "render/3" do
-    test "wraps heading, badge, and prose in stable markers" do
+    test "wraps bounded legacy guidance in stable markers without displaying the effort tier" do
       block = PrReviewSection.render(:none, "Look at `lib/foo.ex`.")
 
       assert block =~ "<!-- symphony:review:start -->"
       assert block =~ "<!-- symphony:review:end -->"
-      assert block =~ "## 🤖 How to review this PR"
-      assert block =~ "🟢 **None**"
-      assert block =~ "Look at `lib/foo.ex`."
+      assert block =~ "## Review this PR"
+      assert block =~ "Look at lib/foo.ex."
+      refute block =~ "`lib/foo.ex`"
+      refute block =~ "None"
     end
 
-    test "renders the badge from the review_effort enum" do
-      assert PrReviewSection.render(:skim, "") =~ "🔵 **Skim**"
-      assert PrReviewSection.render(:focused, "") =~ "🟠 **Focused**"
-      assert PrReviewSection.render(:thorough, "") =~ "🔴 **Thorough**"
-    end
+    test "renders structured exact-head targets and prominent video evidence" do
+      block =
+        PrReviewSection.render(
+          :focused,
+          %{
+            "targets" => [
+              %{
+                "path" => "app/routes/example.tsx",
+                "line_start" => 20,
+                "line_end" => 24,
+                "question" => "Does the write remain tenant scoped?"
+              }
+            ],
+            "verification" => [
+              %{
+                "label" => "UI walkthrough video",
+                "url" => "https://github.com/user-attachments/assets/video-id",
+                "expectation" => "Confirm the compact and wide layouts."
+              }
+            ]
+          },
+          repository: "org/repo",
+          head_oid: "abc123"
+        )
 
-    test "falls back when the reviewer gave no prose" do
-      assert PrReviewSection.render(:none, "") =~ "did not provide written guidance"
-      assert PrReviewSection.render(:none, "   ") =~ "did not provide written guidance"
+      assert block =~ "**Review these**"
+
+      assert block =~
+               "[app/routes/example.tsx:20-24](https://github.com/org/repo/blob/abc123/app/routes/example.tsx#L20-L24)"
+
+      assert block =~ "**Evidence / verification**"
+
+      assert block =~
+               "[UI walkthrough video](https://github.com/user-attachments/assets/video-id)"
+
+      refute block =~ "Focused"
     end
 
     test "honors a custom heading" do
@@ -45,8 +73,8 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
       second = PrReviewSection.render(:thorough, "b")
       {:changed, body2} = PrReviewSection.apply_to_body(body, second)
 
-      refute body2 =~ "🟢 **None**"
-      assert body2 =~ "🔴 **Thorough**"
+      refute body2 =~ "\n\na\n"
+      assert body2 =~ "\n\nb\n"
       assert length(Regex.scan(~r/symphony:review:start/, body2)) == 1
     end
 
@@ -54,6 +82,55 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
       block = PrReviewSection.render(:focused, "unchanged")
       {:changed, body} = PrReviewSection.apply_to_body("Top.", block)
       assert :unchanged = PrReviewSection.apply_to_body(body, block)
+    end
+
+    test "inserts new guidance immediately after the summary section" do
+      body = "## What changed\n\n- concise change\n\n## Evidence\n\n- video"
+      block = PrReviewSection.render(:focused, "Inspect the changed boundary.")
+
+      assert {:changed, updated} = PrReviewSection.apply_to_body(body, block)
+      assert updated =~ "- concise change\n\n#{block}\n\n## Evidence"
+    end
+
+    test "removes a stale managed section when no direction remains" do
+      block = PrReviewSection.render(:focused, "Inspect this.")
+      body = "## Summary\n\nChange.\n\n#{block}\n\n## Evidence\n\nVideo."
+
+      assert {:changed, updated} = PrReviewSection.remove_from_body(body)
+      refute updated =~ "symphony:review:start"
+      assert updated =~ "## Evidence"
+      assert :unchanged = PrReviewSection.remove_from_body(updated)
+    end
+  end
+
+  describe "normalize_direction/1" do
+    test "rejects unbounded or unsafe structured output" do
+      assert {:error, {:too_many_review_targets, 4, 3}} =
+               PrReviewSection.normalize_direction(%{
+                 targets:
+                   Enum.map(1..4, fn line ->
+                     %{path: "app/example.ts", line_start: line, question: "Check this boundary."}
+                   end)
+               })
+
+      assert {:error, :invalid_review_target_path} =
+               PrReviewSection.normalize_direction(%{
+                 targets: [%{path: "../secret", line_start: 1, question: "Check this boundary."}]
+               })
+
+      assert {:error, {:question, :too_long}} =
+               PrReviewSection.normalize_direction(%{
+                 targets: [
+                   %{path: "app/example.ts", line_start: 1, question: String.duplicate("x", 241)}
+                 ]
+               })
+    end
+
+    test "flattens and caps legacy markdown during rollout" do
+      legacy = "**Review policy**\n" <> String.duplicate("long guidance ", 40)
+      assert {:ok, %{summary: summary}} = PrReviewSection.normalize_direction(legacy)
+      refute summary =~ "\n"
+      assert String.length(summary) == 280
     end
   end
 
@@ -230,8 +307,8 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
       assert_received {:edited, body, args}
       assert "pullRequestId=PR_7" in args
       assert body =~ "Body."
-      assert body =~ "🔴 **Thorough**"
       assert body =~ "watch out"
+      refute body =~ "Thorough"
     end
 
     test "does not write when the section is unchanged" do
@@ -241,6 +318,29 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
 
       assert :unchanged =
                PrReviewSection.upsert("/tmp", %{number: 7, body: body}, :none, "hi", pr_runner: runner)
+    end
+
+    test "removes an existing section when structured direction is empty" do
+      block = PrReviewSection.render(:focused, "old guidance")
+      body = "Top.\n\n#{block}\n"
+      test_pid = self()
+
+      runner = fn ["api", "graphql" | _] = args, _cwd ->
+        send(test_pid, {:edited, graphql_body_arg(args)})
+        {"", 0}
+      end
+
+      assert :written =
+               PrReviewSection.upsert(
+                 "/tmp",
+                 %{id: "PR_7", number: 7, body: body},
+                 :none,
+                 %{targets: [], verification: []},
+                 pr_runner: runner
+               )
+
+      assert_received {:edited, updated}
+      refute updated =~ "symphony:review:start"
     end
 
     test "skips when there is no PR" do

@@ -43,13 +43,13 @@ defmodule SymphonyElixir.ReviewGate do
 
   Beyond the gate verdict, the reviewer also sets a `review_effort` tier
   (`review_effort: "none" | "skim" | "focused" | "thorough"` in the verdict
-  JSON — how hard a human should review the change) and writes `human_review`
-  markdown. `Github.PrReviewSection` upserts that, as a deterministic
-  marker-delimited section with an enum-rendered badge, onto the GitHub PR body
-  — overwriting it in place on every pass. `review_effort` is orthogonal to the
-  verdict: a change needing a `thorough` review can still `approve`. On budget
-  exhaustion the section is refreshed to `thorough` / "did not converge ->
-  elevated risk" so the riskiest case never ships stale guidance.
+  JSON) for telemetry and writes a bounded structured `review_direction` for
+  humans. `Github.PrReviewSection` renders at most three exact-head code targets
+  and two evidence/verification items into a marker-delimited PR section.
+  Legacy `human_review` strings remain accepted during rollout, but are
+  flattened and capped instead of copied as Markdown. `review_effort` remains
+  orthogonal to the verdict: a change needing a `thorough` review can still
+  `approve`.
 
   ## Configuration (the consumer repo's `WORKFLOW_REVIEW.md` front matter)
 
@@ -66,7 +66,7 @@ defmodule SymphonyElixir.ReviewGate do
         reasoning_effort: high             # optional reviewer override
         require_pr: true                   # no PR at handoff -> automation_inconclusive
         pr_section_enabled: true           # write the human-review PR section
-        section_heading: "## 🤖 How to review this PR"
+        section_heading: "## Review this PR"
   """
 
   require Logger
@@ -108,7 +108,7 @@ defmodule SymphonyElixir.ReviewGate do
           verdict: :approve | :request_changes | :infrastructure_unavailable,
           summary: String.t(),
           review_effort: review_effort(),
-          human_review: String.t(),
+          review_direction: PrReviewSection.direction(),
           comments: [map()],
           scope_assessment: map() | nil,
           follow_ups: [map()],
@@ -410,7 +410,7 @@ defmodule SymphonyElixir.ReviewGate do
       context.workspace,
       context.pr,
       :thorough,
-      budget_human_review(iteration),
+      budget_review_direction(iteration),
       settings,
       context.opts
     )
@@ -740,10 +740,9 @@ defmodule SymphonyElixir.ReviewGate do
   defp review_timeout_or_stall?({reason, _details}) when reason in [:turn_timeout, :turn_stalled], do: true
   defp review_timeout_or_stall?(_reason), do: false
 
-  # On both verdicts we refresh the PR's human-review section from the reviewer's
-  # review_effort tier + prose (effort is orthogonal to the verdict — a change
-  # needing a thorough review can still approve). Keeping it fresh through the
-  # request_changes loop means the final pass's assessment wins.
+  # On both verdicts we refresh the PR's managed review section from the reviewer's
+  # structured direction. Keeping it fresh through the request_changes loop
+  # means the final pass's assessment wins.
   defp evaluate_verdict(
          staged_verdict_path,
          verdict_path,
@@ -822,7 +821,7 @@ defmodule SymphonyElixir.ReviewGate do
              workspace,
              pr,
              verdict.review_effort,
-             verdict.human_review,
+             verdict.review_direction,
              settings,
              opts
            ),
@@ -909,7 +908,7 @@ defmodule SymphonyElixir.ReviewGate do
       context.workspace,
       context.pr,
       :thorough,
-      budget_human_review(outcome.iteration),
+      budget_review_direction(outcome.iteration),
       context.settings,
       context.opts
     )
@@ -924,7 +923,7 @@ defmodule SymphonyElixir.ReviewGate do
       context.workspace,
       context.pr,
       verdict.review_effort,
-      verdict.human_review,
+      verdict.review_direction,
       context.settings,
       context.opts
     )
@@ -934,14 +933,14 @@ defmodule SymphonyElixir.ReviewGate do
     {:request_changes, remediation_prompt(verdict, outcome.iteration, outcome.max_iterations), outcome}
   end
 
-  # --- PR human-review section ---------------------------------------------
+  # --- PR managed review section -------------------------------------------
 
-  defp maybe_write_section(_workspace, nil, _effort, _human_review, _settings, _opts), do: :ok
+  defp maybe_write_section(_workspace, nil, _effort, _review_direction, _settings, _opts), do: :ok
 
-  defp maybe_write_section(workspace, pr, effort, human_review, settings, opts) do
+  defp maybe_write_section(workspace, pr, effort, review_direction, settings, opts) do
     if settings.pr_section_enabled do
       write_opts = Keyword.put(opts, :section_heading, settings.section_heading)
-      outcome = PrReviewSection.upsert(workspace, pr, effort, human_review, write_opts)
+      outcome = PrReviewSection.upsert(workspace, pr, effort, review_direction, write_opts)
       Logger.info("review.gate pr-section pr=##{pr.number} review_effort=#{effort} outcome=#{outcome}")
       outcome
     else
@@ -972,11 +971,13 @@ defmodule SymphonyElixir.ReviewGate do
     end)
   end
 
-  defp budget_human_review(iterations) do
-    """
-    Automated review ran #{iterations} change-request #{pluralize(iterations, "pass", "passes")} without converging. The handoff was **withheld and remains unapproved by automation**. A human must resolve or explicitly accept the latest findings before a fresh orchestration run may review the resulting candidate. Treat this PR as elevated risk and review carefully end-to-end. The unresolved findings are preserved in the run transcript and the linked issue escalation note.
-    """
-    |> String.trim()
+  defp budget_review_direction(iterations) do
+    %{
+      summary:
+        "Automated review did not converge after #{iterations} change-request #{pluralize(iterations, "pass", "passes")}; handoff remains unapproved. Resolve the linked findings before review.",
+      targets: [],
+      verification: []
+    }
   end
 
   defp pluralize(1, singular, _plural), do: singular
@@ -1540,13 +1541,13 @@ defmodule SymphonyElixir.ReviewGate do
     text =
       [
         Map.get(decoded, "summary"),
-        Map.get(decoded, "human_review"),
+        Map.get(decoded, "review_direction") || Map.get(decoded, "human_review"),
         decoded
         |> Map.get("comments")
         |> interim_comment_text()
       ]
       |> Enum.reject(&is_nil/1)
-      |> Enum.join("\n")
+      |> Enum.map_join("\n", &interim_text/1)
       |> String.downcase()
 
     String.contains?(text, "interim") and
@@ -1566,39 +1567,48 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp interim_comment_text(_comments), do: nil
 
-  defp normalize_verdict(decoded) when is_map(decoded) do
-    case normalize_verdict_value(Map.get(decoded, "verdict")) do
-      {:ok, verdict_atom} ->
-        {:ok,
-         %{
-           verdict: verdict_atom,
-           summary: string_or_default(Map.get(decoded, "summary"), ""),
-           review_effort: normalize_effort(Map.get(decoded, "review_effort") || Map.get(decoded, "risk")),
-           human_review: string_or_default(Map.get(decoded, "human_review"), ""),
-           comments: normalize_comments(Map.get(decoded, "comments")),
-           scope_assessment: normalize_scope_assessment(Map.get(decoded, "scope_assessment")),
-           follow_ups: normalize_follow_ups(Map.get(decoded, "follow_ups")),
-           follow_up_contract?: is_list(Map.get(decoded, "follow_ups")),
-           packet_id: string_or_nil(Map.get(decoded, "packet_id")),
-           reviewed_sha: string_or_nil(Map.get(decoded, "reviewed_sha")),
-           inspected: normalize_string_list(Map.get(decoded, "inspected")),
-           attestations: normalize_attestation_report(Map.get(decoded, "attestations")),
-           attestation_contract?: valid_attestation_report?(Map.get(decoded, "attestations")),
-           full_diff_inspected: Map.get(decoded, "full_diff_inspected") == true,
-           failure_reason: string_or_nil(Map.get(decoded, "failure_reason")),
-           resume_condition: string_or_nil(Map.get(decoded, "resume_condition"))
-         }}
+  defp interim_text(value) when is_binary(value), do: value
+  defp interim_text(value) when is_map(value) or is_list(value), do: Jason.encode!(value)
+  defp interim_text(value), do: to_string(value)
 
+  defp normalize_verdict(decoded) when is_map(decoded) do
+    with {:ok, verdict_atom} <- normalize_verdict_value(Map.get(decoded, "verdict")),
+         {:ok, review_direction} <-
+           PrReviewSection.normalize_direction(Map.get(decoded, "review_direction") || Map.get(decoded, "human_review")) do
+      {:ok,
+       %{
+         verdict: verdict_atom,
+         summary: string_or_default(Map.get(decoded, "summary"), ""),
+         review_effort: normalize_effort(Map.get(decoded, "review_effort") || Map.get(decoded, "risk")),
+         review_direction: review_direction,
+         comments: normalize_comments(Map.get(decoded, "comments")),
+         scope_assessment: normalize_scope_assessment(Map.get(decoded, "scope_assessment")),
+         follow_ups: normalize_follow_ups(Map.get(decoded, "follow_ups")),
+         follow_up_contract?: is_list(Map.get(decoded, "follow_ups")),
+         packet_id: string_or_nil(Map.get(decoded, "packet_id")),
+         reviewed_sha: string_or_nil(Map.get(decoded, "reviewed_sha")),
+         inspected: normalize_string_list(Map.get(decoded, "inspected")),
+         attestations: normalize_attestation_report(Map.get(decoded, "attestations")),
+         attestation_contract?: valid_attestation_report?(Map.get(decoded, "attestations")),
+         full_diff_inspected: Map.get(decoded, "full_diff_inspected") == true,
+         failure_reason: string_or_nil(Map.get(decoded, "failure_reason")),
+         resume_condition: string_or_nil(Map.get(decoded, "resume_condition"))
+       }}
+    else
       :error ->
         {:error, {:unknown_verdict, Map.get(decoded, "verdict")}}
+
+      {:error, reason} ->
+        {:error, {:invalid_review_direction, reason}}
     end
   end
 
   defp normalize_verdict(_decoded), do: {:error, :verdict_not_a_map}
 
-  # `review_effort` is human-facing and never blocks: absent -> :focused
-  # silently; present but unknown -> :focused with a log. Never downgrade to
-  # :none by accident. Legacy "safe/medium/high" values are still accepted.
+  # `review_effort` is telemetry/routing metadata and never blocks: absent ->
+  # :focused silently; present but unknown -> :focused with a log. Never
+  # downgrade to :none by accident. Legacy "safe/medium/high" values are still
+  # accepted.
   defp normalize_effort(value) when is_binary(value) do
     case value |> String.trim() |> String.downcase() do
       v when v in ["none", "safe", "no_review", "no-review"] -> :none

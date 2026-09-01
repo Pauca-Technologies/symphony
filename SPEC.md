@@ -1003,6 +1003,12 @@ Part A: Stall detection
   or interim placeholder MUST leave no authoritative verdict. A `request_changes` verdict MUST
   contain at least one blocking-severity finding with a concrete failing state, violated criterion,
   or missing regression test; minor and advisory observations MAY accompany approval.
+- A repository MAY provide bounded structured human review direction in the verdict. Symphony MUST
+  validate its shape and render no more than three repository-relative file/line questions and two
+  URL- or command-backed verification items into one managed PR-body section. When PR identity is
+  available, file targets SHOULD link to the exact reviewed head. Effort tiers and lens policy are
+  machine metadata and SHOULD NOT expand the human-facing section. Legacy string guidance MAY be
+  accepted during migration only when flattened and deterministically bounded.
 - A repository MAY require a structured scope contract in candidate verdicts. When enabled, the
   original issue description plus chronological non-runtime issue comments form the amended scope;
   later comments may override earlier text. The verdict MUST classify necessary dependencies and

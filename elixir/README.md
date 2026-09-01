@@ -69,8 +69,12 @@ entirely. An accepted deferred review returns a successful `deferred_review_star
 with explicit instructions to end the turn without retrying the mutation. Exact-head approval is
 persisted with a subsequent asynchronous handoff job, survives restart, and is rechecked after the
 gate passes; a changed head requires a fresh review. If the Linear issue has an attached GitHub PR
-URL, the review gate uses that PR directly for the human-review section; otherwise it falls back to
-the current workspace branch's PR.
+URL, the review gate uses that PR directly for the managed review section; otherwise it falls back to
+the current workspace branch's PR. Repositories may return a structured `review_direction` with up
+to three file/line questions and two evidence or verification items. Symphony renders those as
+exact-head links in one compact managed PR section; reviewer effort and lens policy remain in
+telemetry and verdict artifacts. Legacy string guidance is accepted during rollout but flattened
+and capped instead of copied as arbitrary Markdown.
 
 Each pass starts a fresh, ephemeral reviewer thread with no implementor transcript or canonical
 issue-context file. Symphony gives it a versioned JSON packet pinned to the resolved base and head
