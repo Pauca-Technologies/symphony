@@ -21,6 +21,10 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
           issue_id: String.t(),
           issue_identifier: String.t(),
           attempt: pos_integer(),
+          run_id: String.t() | nil,
+          parent_run_id: String.t() | nil,
+          retry_id: String.t() | nil,
+          retry_attempt: non_neg_integer() | nil,
           worker_host: String.t() | nil,
           auth_token: String.t(),
           port: non_neg_integer() | nil,
@@ -213,6 +217,10 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
       issue_id: issue.id,
       issue_identifier: issue.identifier,
       attempt: attempt,
+      run_id: Keyword.get(runner_opts, :run_id),
+      parent_run_id: Keyword.get(runner_opts, :parent_run_id),
+      retry_id: Keyword.get(runner_opts, :retry_id),
+      retry_attempt: Keyword.get(runner_opts, :retry_attempt),
       worker_host: worker_host,
       auth_token: auth_token,
       port: nil,
@@ -362,6 +370,10 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
         :issue_id,
         :issue_identifier,
         :attempt,
+        :run_id,
+        :parent_run_id,
+        :retry_id,
+        :retry_attempt,
         :worker_host,
         :auth_token,
         :port,
@@ -420,6 +432,10 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
        issue_id: issue_id,
        issue_identifier: identifier,
        attempt: attempt,
+       run_id: Map.get(decoded, "run_id"),
+       parent_run_id: Map.get(decoded, "parent_run_id"),
+       retry_id: Map.get(decoded, "retry_id"),
+       retry_attempt: Map.get(decoded, "retry_attempt"),
        worker_host: Map.get(decoded, "worker_host"),
        auth_token: auth_token,
        port: Map.get(decoded, "port"),
@@ -453,7 +469,13 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
   defp normalize_attempt(_attempt), do: 1
 
   defp safe_runner_opts(opts) do
-    Keyword.take(opts, [:wait_resume_prompt])
+    Keyword.take(opts, [
+      :wait_resume_prompt,
+      :run_id,
+      :parent_run_id,
+      :retry_id,
+      :retry_attempt
+    ])
   end
 
   defp process_exists_fallback?(pid) do

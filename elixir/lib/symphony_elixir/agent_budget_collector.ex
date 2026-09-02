@@ -28,7 +28,14 @@ defmodule SymphonyElixir.AgentBudgetCollector do
 
   @spec start_link(map(), map()) :: GenServer.on_start()
   def start_link(decision, issue) when is_map(decision) and is_map(issue) do
-    GenServer.start_link(__MODULE__, {decision, issue})
+    start_link(decision, issue, %{})
+  end
+
+  @doc "Start a collector with immutable event-correlation context."
+  @spec start_link(map(), map(), map()) :: GenServer.on_start()
+  def start_link(decision, issue, event_context)
+      when is_map(decision) and is_map(issue) and is_map(event_context) do
+    GenServer.start_link(__MODULE__, {decision, issue, event_context})
   end
 
   @doc "Return the callback reference without exposing collector internals to callers."
@@ -80,14 +87,14 @@ defmodule SymphonyElixir.AgentBudgetCollector do
   end
 
   @impl true
-  def init({decision, issue}) do
+  def init({decision, issue, event_context}) do
     table = :ets.new(__MODULE__, [:set, :public, read_concurrency: true, write_concurrency: true])
     :ets.insert(table, {:tool_output_bytes, 0})
     counters = :atomics.new(@counter_slots, signed: false)
 
     {:ok,
      %{
-       budget: AgentBudget.new(decision, issue),
+       budget: AgentBudget.new(decision, issue, event_context),
        table: table,
        counters: counters,
        waiting: []

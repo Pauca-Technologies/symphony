@@ -19,10 +19,12 @@ defmodule SymphonyElixir.Telemetry do
   @schema_version 1
   @max_string_bytes 8_192
   @benign_debug_cache_key {__MODULE__, :benign_notification_debug}
+  @context_key {__MODULE__, :event_context}
 
   @type event_kind ::
           :run_start
           | :run_end
+          | :run_manifest
           | :prompt_built
           | :lifecycle
           | :token_high_water
@@ -78,6 +80,25 @@ defmodule SymphonyElixir.Telemetry do
   end
 
   def emit(_kind, _attrs, _policy), do: :ok
+
+  @doc "Run a function with additive fleet-event context scoped to the current process."
+  @spec with_context(map(), (-> result)) :: result when result: term()
+  def with_context(context, fun) when is_map(context) and is_function(fun, 0) do
+    previous = Process.get(@context_key)
+    Process.put(@context_key, Map.merge(previous || %{}, context))
+
+    try do
+      fun.()
+    after
+      if is_map(previous),
+        do: Process.put(@context_key, previous),
+        else: Process.delete(@context_key)
+    end
+  end
+
+  @doc "Return the fleet-event context scoped to the current process."
+  @spec current_context() :: map()
+  def current_context, do: Process.get(@context_key, %{})
 
   @doc "Build the exact versioned/redacted document written by `emit/2`."
   @spec build_event(event_kind(), map(), DateTime.t()) :: map()
@@ -167,7 +188,7 @@ defmodule SymphonyElixir.Telemetry do
   end
 
   defp do_emit(kind, attrs, fields) do
-    payload = build_event(kind, attrs, DateTime.utc_now(), fields)
+    payload = build_event(kind, Map.merge(current_context(), attrs), DateTime.utc_now(), fields)
 
     with {:ok, encoded} <- Jason.encode(payload),
          path <- today_path(),

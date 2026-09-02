@@ -23,6 +23,10 @@ defmodule SymphonyElixir.FleetEventTest do
     entry = %{
       issue: %{id: "issue-1", identifier: "UDPE-7165", parent_id: nil, labels: ["repo:symphony"]},
       identifier: "UDPE-7165",
+      run_id: "run-fleet",
+      parent_run_id: "run-parent",
+      retry_id: "retry-fleet",
+      retry_attempt: 2,
       backend: "codex",
       session_id: "thread-1",
       observability_policy: %{redact_fields: ["authorization"]}
@@ -63,6 +67,12 @@ defmodule SymphonyElixir.FleetEventTest do
     assert tools |> Enum.filter(&(&1["action"] == "end")) |> Enum.all?(&(&1["output_bytes"] > 0))
     assert Enum.map(tools, & &1["tool_id"]) |> Enum.uniq() |> Enum.sort() == ["acp-1", "claude-1", "claude-rebase", "cmd-1", "dynamic-1"]
     refute Enum.any?(tools, &(&1["tool_id"] in ["msg-1", "reason-1"]))
+
+    assert Enum.all?(tools, fn event ->
+             event["run_id"] == "run-fleet" and event["parent_run_id"] == "run-parent" and
+               event["retry_id"] == "retry-fleet" and event["retry_attempt"] == 2 and
+               event["session_id"] == "thread-1" and event["turn_id"] == "turn-1"
+           end)
 
     assert %{"vcs_operation" => "rebase", "outcome" => "completed"} =
              Enum.find(tools, &(&1["tool_id"] == "claude-rebase" and &1["action"] == "end"))

@@ -227,6 +227,10 @@ Fields (logical):
 
 - `issue_id`
 - `issue_identifier`
+- `run_id` (opaque identifier unique to this worker execution attempt)
+- `parent_run_id` (prior attempt's `run_id`, or null when there is no retry lineage)
+- `retry_id` (the retry scheduling decision that launched this attempt, or null)
+- `retry_attempt` (integer, `0` for an initial attempt and `>=1` for retries/continuations)
 - `attempt` (integer or null, `null` for first run, `>=1` for retries/continuation)
 - `workspace_path`
 - `started_at`
@@ -264,6 +268,9 @@ Fields:
 - `issue_id`
 - `identifier` (best-effort human ID for status surfaces/logs)
 - `attempt` (integer, 1-based for retry queue)
+- `retry_id` (opaque identifier unique to this scheduling decision)
+- `previous_retry_id` (the replaced/rescheduled decision, or null)
+- `parent_run_id` (the worker attempt whose outcome caused the retry)
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
@@ -894,7 +901,11 @@ Repository-aware extension:
 Retry entry creation:
 
 - Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, and new timer handle.
+- Create a fresh `retry_id`; retain the replaced decision as `previous_retry_id` and the source
+  worker as `parent_run_id`.
+- Store `attempt`, `identifier`, `error`, lineage, `due_at_ms`, and new timer handle.
+- A dispatched retry MUST create a fresh `run_id` distinct from `parent_run_id` and carry the
+  triggering `retry_id` into its run events.
 
 Backoff formula:
 
@@ -1838,6 +1849,24 @@ size and injected-section hashes, token high waters and accepted deltas, phase t
 boundaries/outcomes/output size/artifact references, typed failure/retry/circuit decisions,
 gate/attestation/review identity and reuse, lease lifecycle, base-drift/overlap decisions, and
 available handoff/CI/reopen/blocking-finding/merge/revert quality outcomes.
+
+Every worker execution attempt SHOULD have a unique opaque `run_id`. Lifecycle, fleet, budget,
+review, wait, retry, and failure events for that attempt SHOULD preserve it alongside the existing
+issue/session/thread/turn dimensions and numeric retry attempt. Retry attempts SHOULD also expose
+`parent_run_id`, the triggering `retry_id`, and, when a scheduling decision is replaced,
+`previous_retry_id`.
+
+After backend/model routing is resolved and before the first coding-agent turn, the worker SHOULD
+emit exactly one versioned `run_manifest`. The manifest SHOULD include, where available, the
+non-secret Symphony version and source SHA, repository/base/candidate SHAs and dirty state,
+workflow and prompt-template provenance hashes, resolved backend/model/reasoning/profile, task and
+risk classification, budget policy, sandbox/approval policy, and review policy. It MUST NOT include
+raw prompts, hook commands, environment variables, credentials, or tokens. A `config_digest` SHOULD
+hash a canonical serialization of the manifest's non-secret effective configuration, including the
+workflow and prompt-template identities so a template change produces a different digest. Dynamic
+per-turn section hashes are emitted by the prompt event after composition and SHOULD be referenced
+from the pre-turn manifest rather than guessed early. Readers MUST continue accepting older
+telemetry and persisted worker/wait/circuit records without these fields.
 
 Compact reporting SHOULD provide fleet, repository, issue, parent/delegated-thread, phase,
 failure-class, tool, review, and percentile views. At minimum it SHOULD include p50/p90 token and

@@ -281,7 +281,9 @@ defmodule SymphonyElixir.WaitWatcherTest do
 
     assert eventually(fn -> Enum.all?(WaitWatcher.snapshot(name), &(&1.status == :ready)) end)
     assert File.exists?(state_path)
-    assert MapSet.new(Map.keys(WaitStore.load())) == MapSet.new(["issue-1", "issue-2"])
+    restored = WaitStore.load()
+    assert MapSet.new(Map.keys(restored)) == MapSet.new(["issue-1", "issue-2"])
+    assert Enum.all?(restored, fn {_issue_id, entry} -> entry.run_id == nil end)
 
     :ok = WaitWatcher.acknowledge(name, "issue-1")
     assert WaitWatcher.issue_ids(name) == MapSet.new(["issue-2"])

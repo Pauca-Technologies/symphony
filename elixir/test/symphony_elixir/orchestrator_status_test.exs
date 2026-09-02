@@ -1870,7 +1870,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: nil,
+      tracker_kind: "memory",
       codex_stall_timeout_ms: 1_000
     )
 
@@ -1899,6 +1899,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       ref: make_ref(),
       identifier: "MT-STALL",
       issue: %Issue{id: issue_id, identifier: "MT-STALL", state: "In Progress"},
+      run_id: "run-stalled-worker",
+      parent_run_id: nil,
+      retry_id: nil,
+      retry_attempt: 0,
       session_id: "thread-stall-turn-stall",
       last_codex_message: nil,
       last_codex_timestamp: stale_activity_at,
@@ -1921,15 +1925,109 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              attempt: 1,
+             retry_id: first_retry_id,
+             previous_retry_id: nil,
+             parent_run_id: "run-stalled-worker",
+             retry_token: first_retry_token,
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
              error: "stalled for " <> _
            } = state.retry_attempts[issue_id]
 
+    assert {:ok, ^first_retry_id} = Ecto.UUID.cast(first_retry_id)
+
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     assert remaining_ms >= 9_500
     assert remaining_ms <= 10_500
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_candidate_issues_result,
+      {:error, :tracker_offline}
+    )
+
+    send(pid, {:retry_issue, issue_id, first_retry_token})
+
+    second_retry =
+      wait_for_state(pid, fn state ->
+        case state.retry_attempts[issue_id] do
+          %{attempt: 2} = retry -> {:ok, retry}
+          _pending -> :retry
+        end
+      end)
+
+    second_retry_id = second_retry.retry_id
+    assert {:ok, ^second_retry_id} = Ecto.UUID.cast(second_retry_id)
+    refute second_retry.retry_id == first_retry_id
+    assert second_retry.previous_retry_id == first_retry_id
+    assert second_retry.parent_run_id == "run-stalled-worker"
+
+    retried_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-STALL",
+      title: "Retry with lineage",
+      state: "In Progress",
+      labels: []
+    }
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_candidate_issues_result,
+      {:ok, [retried_issue]}
+    )
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_states_by_ids_result,
+      {:ok, [retried_issue]}
+    )
+
+    Application.put_env(:symphony_elixir, :persistent_workers_enabled, true)
+    Application.put_env(:symphony_elixir, :persistent_worker_launcher, fn _manifest -> :ok end)
+    test_pid = self()
+
+    Application.put_env(
+      :symphony_elixir,
+      :persistent_worker_client_starter,
+      fn manifest, _orchestrator ->
+        client =
+          spawn(fn ->
+            receive do
+              :stop -> :ok
+            end
+          end)
+
+        send(test_pid, {:retry_client_started, client, manifest})
+        {:ok, client}
+      end
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :memory_tracker_states_by_ids_result)
+      Application.delete_env(:symphony_elixir, :persistent_worker_launcher)
+      Application.delete_env(:symphony_elixir, :persistent_worker_client_starter)
+      Application.put_env(:symphony_elixir, :persistent_workers_enabled, false)
+    end)
+
+    send(pid, {:retry_issue, issue_id, second_retry.retry_token})
+    assert_receive {:retry_client_started, client, manifest}, 1_000
+
+    retried_run =
+      wait_for_state(pid, fn state ->
+        case state.running[issue_id] do
+          %{retry_attempt: 2} = running -> {:ok, running}
+          _pending -> :retry
+        end
+      end)
+
+    assert retried_run.parent_run_id == "run-stalled-worker"
+    refute retried_run.run_id == retried_run.parent_run_id
+    assert retried_run.retry_id == second_retry.retry_id
+    assert manifest.run_id == retried_run.run_id
+    assert manifest.parent_run_id == retried_run.parent_run_id
+    assert manifest.retry_id == retried_run.retry_id
+    send(client, :stop)
   end
 
   test "pending handoff review suppresses implementor stall restart" do
@@ -3145,6 +3243,28 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         Process.sleep(5)
         do_wait_for_snapshot(pid, predicate, deadline_ms)
       end
+    end
+  end
+
+  defp wait_for_state(pid, matcher, timeout_ms \\ 500) when is_function(matcher, 1) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for_state(pid, matcher, deadline_ms)
+  end
+
+  defp do_wait_for_state(pid, matcher, deadline_ms) do
+    state = :sys.get_state(pid)
+
+    case matcher.(state) do
+      {:ok, value} ->
+        value
+
+      :retry ->
+        if System.monotonic_time(:millisecond) < deadline_ms do
+          Process.sleep(5)
+          do_wait_for_state(pid, matcher, deadline_ms)
+        else
+          flunk("timed out waiting for orchestrator state: #{inspect(state.retry_attempts)}")
+        end
     end
   end
 

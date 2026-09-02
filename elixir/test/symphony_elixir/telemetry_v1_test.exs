@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TelemetryV1Test do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Telemetry
+  alias SymphonyElixir.{RunManifest, Telemetry}
 
   test "versioned events recursively redact configured secret fields" do
     event =
@@ -83,5 +83,63 @@ defmodule SymphonyElixir.TelemetryV1Test do
 
     assert [%{"event" => "run_start", "schema_version" => 0}] =
              Telemetry.read_events(~D[2026-08-01], ~D[2026-08-01])
+  end
+
+  test "scopes run correlation to lifecycle events without leaking it to a reused process" do
+    root = Path.join(System.tmp_dir!(), "telemetry-context-#{System.unique_integer([:positive])}")
+    previous_dir = Application.get_env(:symphony_elixir, :telemetry_dir)
+    previous_enabled = Application.get_env(:symphony_elixir, :telemetry_enabled)
+    Application.put_env(:symphony_elixir, :telemetry_dir, root)
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    on_exit(fn ->
+      File.rm_rf!(root)
+
+      if previous_dir,
+        do: Application.put_env(:symphony_elixir, :telemetry_dir, previous_dir),
+        else: Application.delete_env(:symphony_elixir, :telemetry_dir)
+
+      if is_nil(previous_enabled),
+        do: Application.delete_env(:symphony_elixir, :telemetry_enabled),
+        else: Application.put_env(:symphony_elixir, :telemetry_enabled, previous_enabled)
+    end)
+
+    context = %{
+      run_id: "run-context",
+      parent_run_id: "parent-context",
+      retry_id: "retry-context",
+      retry_attempt: 4,
+      attempt: 4
+    }
+
+    Telemetry.with_context(context, fn ->
+      Telemetry.emit(:budget_transition, %{issue_id: "issue-context"})
+      Telemetry.emit(:review, %{issue_id: "issue-context", thread_id: "review-thread"})
+      Telemetry.emit(:lifecycle, %{issue_id: "issue-context", phase: "waiting"})
+      Telemetry.emit(:failure, %{issue_id: "issue-context", failure_class: "transient"})
+    end)
+
+    assert Telemetry.current_context() == %{}
+    Telemetry.emit(:failure, %{issue_id: "unrelated-issue"})
+
+    events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+    correlated = Enum.filter(events, &(&1["issue_id"] == "issue-context"))
+    assert Enum.map(correlated, & &1["event"]) == ~w(budget_transition review lifecycle failure)
+
+    assert Enum.all?(correlated, fn event ->
+             event["run_id"] == "run-context" and event["parent_run_id"] == "parent-context" and
+               event["retry_id"] == "retry-context" and event["retry_attempt"] == 4 and
+               event["attempt"] == 4
+           end)
+
+    unrelated = Enum.find(events, &(&1["issue_id"] == "unrelated-issue"))
+    refute Map.has_key?(unrelated, "run_id")
+  end
+
+  test "configuration digests use canonical map ordering" do
+    left = %{sandbox: %{mode: "workspace-write", paths: ["a", "b"]}, model: "gpt-test"}
+    right = %{"model" => "gpt-test", "sandbox" => %{"paths" => ["a", "b"], "mode" => "workspace-write"}}
+
+    assert RunManifest.config_digest(left) == RunManifest.config_digest(right)
   end
 end

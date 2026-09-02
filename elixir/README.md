@@ -759,6 +759,16 @@ codex:
   per dispatched run, so a workflow reload applies to
   subsequent runs without reparsing configuration for every notification.
 - Compact fleet events live in `~/.symphony/telemetry/<YYYY-MM-DD>.jsonl` for at least 30 days.
+  Every worker attempt has a fresh `run_id`; retries retain `parent_run_id`, a distinct scheduling
+  `retry_id`, and the numeric retry attempt without replacing issue/session/thread/turn dimensions.
+  After routing and before the first backend turn, Symphony emits exactly one versioned
+  `run_manifest` containing non-secret repository/workflow/prompt hashes and resolved
+  backend/model/effort/task/risk/budget/sandbox/approval/review policy. Its `config_digest` hashes a
+  canonical non-secret configuration including the workflow/reviewer-template identities, so a
+  prompt-template change changes the digest. The manifest points to the per-turn `prompt_built`
+  event for dynamic injected-section hashes that only exist after prompt composition. Raw prompts,
+  commands, environment values, and credentials are excluded. Older unversioned events and
+  persisted records remain readable.
   `mix telemetry.report --from YYYY-MM-DD --to YYYY-MM-DD --json` reports fleet, repository,
   issue, parent/delegated-thread, phase, failure, gate, review, tool-output, percentile, and quality
   views without parsing transcripts. Percentiles use the conventional nearest-rank definition.

@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.AgentEfficiencyTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.{AgentBudget, AgentBudgetCollector, AgentEfficiency, FleetEvent}
+  alias SymphonyElixir.{AgentBudget, AgentBudgetCollector, AgentEfficiency, FleetEvent, Telemetry}
   alias SymphonyElixir.Config.AgentEfficiency, as: EfficiencyConfig
   alias SymphonyElixir.Linear.Issue
 
@@ -210,6 +210,37 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
 
       assert runtime.metrics.parent_tokens == 80
       assert runtime.metrics.delegated_tokens == 40
+    after
+      AgentBudgetCollector.stop(collector)
+    end
+  end
+
+  test "budget collector preserves run correlation in its separate process" do
+    context = %{
+      run_id: "run-budget",
+      parent_run_id: "run-parent",
+      retry_id: "retry-budget",
+      retry_attempt: 2,
+      attempt: 2
+    }
+
+    {:ok, collector} =
+      AgentBudgetCollector.start_link(decision("enforce", 10), issue(), context)
+
+    try do
+      ref = AgentBudgetCollector.ref(collector)
+      :ok = AgentBudgetCollector.observe(ref, usage("parent", 20, 15, 5))
+      _snapshot = AgentBudgetCollector.snapshot(collector)
+
+      [event | _rest] =
+        Telemetry.read_events(Date.utc_today(), Date.utc_today())
+        |> Enum.filter(&(&1["event"] == "budget_transition"))
+
+      assert event["run_id"] == "run-budget"
+      assert event["parent_run_id"] == "run-parent"
+      assert event["retry_id"] == "retry-budget"
+      assert event["retry_attempt"] == 2
+      assert event["attempt"] == 2
     after
       AgentBudgetCollector.stop(collector)
     end

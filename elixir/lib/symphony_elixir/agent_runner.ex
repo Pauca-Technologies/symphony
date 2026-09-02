@@ -30,6 +30,7 @@ defmodule SymphonyElixir.AgentRunner do
     ReviewOutcome,
     ReviewPacket,
     Router,
+    RunManifest,
     SessionStartHook,
     TaskContextPrompt,
     Telemetry,
@@ -61,6 +62,15 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    identity = RunManifest.execution_identity(Keyword.get(opts, :attempt), opts)
+    opts = Keyword.merge(opts, Map.to_list(Map.delete(identity, :attempt)))
+
+    Telemetry.with_context(identity, fn ->
+      do_run(issue, codex_update_recipient, opts)
+    end)
+  end
+
+  defp do_run(issue, codex_update_recipient, opts) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
@@ -181,6 +191,8 @@ defmodule SymphonyElixir.AgentRunner do
           opts
           |> Keyword.put_new(:issue_comments_fetcher, &Tracker.fetch_issue_comments/1)
           |> maybe_put(:repository_id, routed_repo && routed_repo.id)
+          |> Keyword.put(:workflow_source, workflow_source(routed_repo))
+          |> maybe_put(:review_workflow_source, review_workflow_source(routed_repo, review_workflow))
           |> maybe_put(:automation_opt_in_label, automation_opt_in_label)
           |> maybe_put(:base_drift_ref, routed_repo && routed_repo.base_branch)
 
@@ -244,13 +256,16 @@ defmodule SymphonyElixir.AgentRunner do
        }) do
     send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
+    repository_manifest = collect_repository_manifest(workspace, worker_host, opts)
+
     send_scheduling_runtime_info(
       codex_update_recipient,
       issue,
-      worker_host,
-      workspace,
+      repository_manifest,
       opts
     )
+
+    opts = Keyword.put(opts, :repository_manifest, repository_manifest)
 
     case prepare_github_auth(workspace, issue, worker_host) do
       {:ok, _github_auth} ->
@@ -409,6 +424,14 @@ defmodule SymphonyElixir.AgentRunner do
   defp review_workflow_path(%{review_workflow_path: path}) when is_binary(path) and path != "", do: path
   defp review_workflow_path(_routed_repo), do: "WORKFLOW_REVIEW.md"
 
+  defp workflow_source(%{workflow_path: path}) when is_binary(path), do: "repository:#{path}"
+  defp workflow_source(_routed_repo), do: "repository:#{SymphonyElixir.Workflow.workflow_file_path()}"
+
+  defp review_workflow_source(_routed_repo, nil), do: nil
+
+  defp review_workflow_source(routed_repo, _workflow),
+    do: "repository:#{review_workflow_path(routed_repo)}"
+
   defp repo_workflow_hook_opts(nil), do: %{}
 
   defp repo_workflow_hook_opts(%{config: config}) when is_map(config) do
@@ -457,11 +480,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  defp send_scheduling_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, opts)
-       when is_pid(recipient) and is_binary(issue_id) and is_binary(workspace) do
-    manifest =
-      BaseDrift.manifest(workspace, Keyword.get(opts, :base_drift_ref), worker_host: worker_host)
-
+  defp send_scheduling_runtime_info(recipient, %Issue{id: issue_id}, manifest, opts)
+       when is_pid(recipient) and is_binary(issue_id) and is_map(manifest) do
     scheduling_info =
       %{
         repository_id: Keyword.get(opts, :repository_id),
@@ -480,7 +500,20 @@ defmodule SymphonyElixir.AgentRunner do
     :ok
   end
 
-  defp send_scheduling_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts), do: :ok
+  defp send_scheduling_runtime_info(_recipient, _issue, _manifest, _opts), do: :ok
+
+  defp collect_repository_manifest(workspace, worker_host, opts) do
+    BaseDrift.manifest(workspace, Keyword.get(opts, :base_drift_ref), worker_host: worker_host)
+  end
+
+  defp refresh_scheduling_runtime_info(recipient, issue, worker_host, workspace, opts)
+       when is_pid(recipient) do
+    manifest = collect_repository_manifest(workspace, worker_host, opts)
+    send_scheduling_runtime_info(recipient, issue, manifest, opts)
+  end
+
+  defp refresh_scheduling_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts),
+    do: :ok
 
   defp maybe_put_actual_manifest(info, []), do: info
 
@@ -569,7 +602,12 @@ defmodule SymphonyElixir.AgentRunner do
   @spec run_codex_turns_for_test(Path.t(), Issue.t(), pid() | nil, keyword(), worker_host()) ::
           :ok | {:error, term()}
   def run_codex_turns_for_test(workspace, issue, recipient, opts, worker_host) do
-    run_codex_turns(workspace, issue, recipient, opts, worker_host)
+    identity = RunManifest.execution_identity(Keyword.get(opts, :attempt), opts)
+    opts = Keyword.merge(opts, Map.to_list(Map.delete(identity, :attempt)))
+
+    Telemetry.with_context(identity, fn ->
+      run_codex_turns(workspace, issue, recipient, opts, worker_host)
+    end)
   end
 
   @doc false
@@ -583,6 +621,8 @@ defmodule SymphonyElixir.AgentRunner do
     with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
          {:ok, efficiency} <-
            AgentEfficiency.decide(issue, route, Keyword.get(opts, :per_repo_workflow)) do
+      emit_run_manifest(workspace, issue, route, efficiency, opts)
+
       recovery =
         recover_pending_handoff_gate(
           workspace,
@@ -647,6 +687,25 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp emit_run_manifest(workspace, issue, route, efficiency, opts) do
+    context = %{
+      identity: Telemetry.current_context(),
+      issue: issue,
+      route: route,
+      efficiency: efficiency,
+      settings: Config.settings!(),
+      workspace: workspace,
+      repository_id: Keyword.get(opts, :repository_id),
+      repository_manifest: Keyword.get(opts, :repository_manifest, %{}),
+      repo_workflow: Keyword.get(opts, :per_repo_workflow),
+      review_workflow: Keyword.get(opts, :per_repo_review_workflow),
+      workflow_source: Keyword.get(opts, :workflow_source),
+      review_workflow_source: Keyword.get(opts, :review_workflow_source)
+    }
+
+    Telemetry.emit(:run_manifest, RunManifest.build(context))
+  end
+
   defp reject_recovered_handoff_infrastructure({:resume, _prompt, _issue} = recovery) do
     case pop_handoff_infrastructure_failure() do
       nil -> recovery
@@ -662,7 +721,8 @@ defmodule SymphonyElixir.AgentRunner do
     codex_update_recipient = context.recipient
     opts = context.opts
 
-    with {:ok, budget_collector} <- AgentBudgetCollector.start_link(efficiency, issue) do
+    with {:ok, budget_collector} <-
+           AgentBudgetCollector.start_link(efficiency, issue, Telemetry.current_context()) do
       opts =
         opts
         |> Keyword.put(:efficiency_decision, efficiency)
@@ -810,7 +870,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     send_budget_runtime_info(codex_update_recipient, issue, budget_runtime)
 
-    send_scheduling_runtime_info(
+    refresh_scheduling_runtime_info(
       codex_update_recipient,
       issue,
       app_session.worker_host,
@@ -1168,23 +1228,24 @@ defmodule SymphonyElixir.AgentRunner do
       suppressed_prompt_bytes: prompt_metadata.suppressed_bytes
     }
 
-    metadata = %{
-      event: "agent.prompt_built",
-      issue_id: issue.id,
-      issue_identifier: issue.identifier,
-      workspace: workspace,
-      worker_host: worker_host,
-      attempt: Keyword.get(opts, :attempt),
-      turn_number: turn_number,
-      max_turns: max_turns,
-      prompt_kind: prompt_kind,
-      included_sections: included_sections,
-      injected_section_hashes: prompt_metadata.section_hashes,
-      prompt_sections: prompt_metadata.sections,
-      prompt_section_decisions: prompt_metadata.decisions,
-      prompt_section_diagnostics: prompt_metadata.diagnostics,
-      prompt_sha256: :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
-    }
+    metadata =
+      Map.merge(Telemetry.current_context(), %{
+        event: "agent.prompt_built",
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        workspace: workspace,
+        worker_host: worker_host,
+        attempt: Keyword.get(opts, :attempt),
+        turn_number: turn_number,
+        max_turns: max_turns,
+        prompt_kind: prompt_kind,
+        included_sections: included_sections,
+        injected_section_hashes: prompt_metadata.section_hashes,
+        prompt_sections: prompt_metadata.sections,
+        prompt_section_decisions: prompt_metadata.decisions,
+        prompt_section_diagnostics: prompt_metadata.diagnostics,
+        prompt_sha256: :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
+      })
 
     :telemetry.execute(@prompt_built_telemetry_event, measurements, metadata)
     Telemetry.emit(:prompt_built, Map.merge(metadata, measurements))

@@ -68,6 +68,12 @@ defmodule SymphonyElixir.BaseDrift do
   def manifest(workspace, base_ref, opts \\ []) when is_binary(workspace) do
     runner = git_runner(opts)
 
+    head_sha =
+      case value(runner, workspace, ["rev-parse", "HEAD"]) do
+        {:ok, sha} -> sha
+        _missing -> nil
+      end
+
     current_base =
       case base_ref && value(runner, workspace, ["rev-parse", "refs/remotes/origin/#{base_ref}"]) do
         {:ok, sha} -> sha
@@ -81,6 +87,7 @@ defmodule SymphonyElixir.BaseDrift do
       end
 
     %{
+      head_sha: head_sha,
       base_sha: current_base,
       base_age_seconds: commit_age_seconds(runner, workspace, current_base),
       candidate_base_sha: candidate_base,

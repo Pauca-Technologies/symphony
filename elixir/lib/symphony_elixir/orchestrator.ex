@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Orchestrator do
     RepoConfig,
     RepositoryScheduler,
     Router,
+    RunManifest,
     SessionTranscript,
     ShutdownPolicyStore,
     StatusDashboard,
@@ -295,6 +296,9 @@ defmodule SymphonyElixir.Orchestrator do
               metadata = %{
                 identifier: running_entry.identifier,
                 issue: Map.get(running_entry, :issue),
+                run_id: Map.get(running_entry, :run_id),
+                parent_run_id: Map.get(running_entry, :parent_run_id),
+                retry_id: Map.get(running_entry, :retry_id),
                 error: failure_error(reason, running_entry, failure),
                 backend: failure.backend || Map.get(running_entry, :backend),
                 failure: failure,
@@ -358,6 +362,10 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: Map.get(issue, :id),
           issue_identifier: Map.get(issue, :identifier),
           parent_issue_id: Map.get(issue, :parent_id),
+          run_id: Map.get(updated_running_entry, :run_id),
+          parent_run_id: Map.get(updated_running_entry, :parent_run_id),
+          retry_id: Map.get(updated_running_entry, :retry_id),
+          retry_attempt: Map.get(updated_running_entry, :retry_attempt, 0),
           backend: Map.get(updated_running_entry, :backend),
           model: Map.get(updated_running_entry, :model),
           reasoning_effort: Map.get(updated_running_entry, :reasoning_effort),
@@ -659,6 +667,10 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id: Map.get(issue, :id),
       issue_identifier: Map.get(issue, :identifier),
       parent_issue_id: Map.get(issue, :parent_id),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
+      retry_attempt: Map.get(running_entry, :retry_attempt, 0),
       session_id: Map.get(running_entry, :session_id),
       backend: Map.get(running_entry, :backend),
       from_state: from,
@@ -674,7 +686,16 @@ defmodule SymphonyElixir.Orchestrator do
         _ -> "implementation"
       end
 
-    Telemetry.emit(:phase, %{issue_identifier: Map.get(issue, :identifier), session_id: Map.get(running_entry, :session_id), phase: phase, action: "transition"})
+    Telemetry.emit(:phase, %{
+      issue_identifier: Map.get(issue, :identifier),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
+      retry_attempt: Map.get(running_entry, :retry_attempt, 0),
+      session_id: Map.get(running_entry, :session_id),
+      phase: phase,
+      action: "transition"
+    })
   end
 
   defp maybe_dispatch(%State{draining: true} = state) do
@@ -1032,6 +1053,9 @@ defmodule SymphonyElixir.Orchestrator do
       |> schedule_failure_retry(issue_id, next_attempt, %{
         identifier: identifier,
         issue: Map.get(running_entry, :issue),
+        run_id: Map.get(running_entry, :run_id),
+        parent_run_id: Map.get(running_entry, :parent_run_id),
+        retry_id: Map.get(running_entry, :retry_id),
         error: "handoff review timed out after #{elapsed_ms}ms without reviewer activity",
         backend: Map.get(running_entry, :backend),
         failure:
@@ -1060,6 +1084,9 @@ defmodule SymphonyElixir.Orchestrator do
       |> schedule_failure_retry(issue_id, next_attempt, %{
         identifier: identifier,
         issue: Map.get(running_entry, :issue),
+        run_id: Map.get(running_entry, :run_id),
+        parent_run_id: Map.get(running_entry, :parent_run_id),
+        retry_id: Map.get(running_entry, :retry_id),
         error: "stalled for #{elapsed_ms}ms without codex activity",
         backend: Map.get(running_entry, :backend),
         failure: AgentFailure.classify(:stalled, backend: Map.get(running_entry, :backend))
@@ -1674,7 +1701,7 @@ defmodule SymphonyElixir.Orchestrator do
   # skip/error there would strand the claim in `state.claimed` until the next
   # restart (every poll is gated on `!MapSet.member?(claimed, issue.id)`), so it
   # must release the claim or reschedule. See `dispatch_active_retry/4`.
-  defp dispatch_issue_outcome(%State{} = state, issue, attempt, preferred_worker_host, agent_opts \\ []) do
+  defp dispatch_issue_outcome(%State{} = state, issue, attempt, preferred_worker_host, agent_opts) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
         {:dispatched, do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, agent_opts)}
@@ -1712,8 +1739,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, agent_opts) do
-    case start_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
-      {:ok, pid, persistent_worker_id} ->
+    proposed_identity = RunManifest.execution_identity(attempt, agent_opts)
+    runner_opts = Keyword.merge(agent_opts, Map.to_list(Map.delete(proposed_identity, :attempt)))
+
+    case start_issue_worker(issue, attempt, recipient, worker_host, runner_opts) do
+      {:ok, pid, persistent_worker_id, identity} ->
         ref = Process.monitor(pid)
         if Keyword.has_key?(agent_opts, :wait_resume_prompt), do: wait_watcher_acknowledge(issue.id)
 
@@ -1728,12 +1758,14 @@ defmodule SymphonyElixir.Orchestrator do
             new_running_entry(
               state,
               issue,
-              attempt,
               worker_host,
-              pid,
-              ref,
-              persistent_worker_id,
-              DateTime.utc_now()
+              %{
+                pid: pid,
+                ref: ref,
+                persistent_worker_id: persistent_worker_id,
+                started_at: DateTime.utc_now(),
+                identity: identity
+              }
             )
           )
 
@@ -1751,6 +1783,9 @@ defmodule SymphonyElixir.Orchestrator do
         schedule_failure_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
           issue: issue,
+          run_id: proposed_identity.run_id,
+          parent_run_id: proposed_identity.parent_run_id,
+          retry_id: proposed_identity.retry_id,
           error: "failed to spawn agent: #{inspect(reason)}",
           backend: predicted_backend(issue),
           failure: AgentFailure.classify({:spawn_failed, reason}, backend: predicted_backend(issue)),
@@ -1769,8 +1804,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp start_persistent_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
     case PersistentWorker.start(issue, attempt, worker_host, recipient, agent_opts) do
-      {:ok, %{pid: pid, manifest: manifest}} -> {:ok, pid, manifest.worker_id}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{pid: pid, manifest: manifest, spec: spec}} ->
+        identity = persistent_worker_identity(manifest, spec)
+
+        {:ok, pid, manifest.worker_id, identity}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1782,8 +1822,11 @@ defmodule SymphonyElixir.Orchestrator do
              Keyword.merge([attempt: attempt, worker_host: worker_host], agent_opts)
            )
          end) do
-      {:ok, pid} -> {:ok, pid, nil}
-      {:error, reason} -> {:error, reason}
+      {:ok, pid} ->
+        {:ok, pid, nil, RunManifest.execution_identity(attempt, agent_opts)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1812,7 +1855,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp adopt_persistent_worker(
-         %{pid: pid, manifest: manifest, spec: %{issue: %Issue{} = issue}},
+         %{pid: pid, manifest: manifest, spec: %{issue: %Issue{} = issue} = spec},
          %State{} = state
        ) do
     if Map.has_key?(state.running, issue.id) do
@@ -1827,12 +1870,14 @@ defmodule SymphonyElixir.Orchestrator do
         new_running_entry(
           state,
           issue,
-          manifest.attempt,
           manifest.worker_host,
-          pid,
-          ref,
-          manifest.worker_id,
-          started_at
+          %{
+            pid: pid,
+            ref: ref,
+            persistent_worker_id: manifest.worker_id,
+            started_at: started_at,
+            identity: persistent_worker_identity(manifest, spec)
+          }
         )
 
       Logger.info("Reconnected persistent worker worker_id=#{manifest.worker_id} #{issue_context(issue)} pid=#{inspect(pid)}")
@@ -1855,20 +1900,32 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp parse_worker_started_at(_value), do: DateTime.utc_now()
 
-  defp new_running_entry(
-         state,
-         issue,
-         attempt,
-         worker_host,
-         pid,
-         ref,
-         persistent_worker_id,
-         started_at
-       ) do
+  defp persistent_worker_identity(manifest, spec) do
+    opts = Map.get(spec, :runner_opts, [])
+
+    opts =
+      opts
+      |> Keyword.put(:run_id, manifest.run_id || Keyword.get(opts, :run_id) || "legacy-worker-#{manifest.worker_id}")
+      |> Keyword.put(:parent_run_id, manifest.parent_run_id || Keyword.get(opts, :parent_run_id))
+      |> Keyword.put(:retry_id, manifest.retry_id || Keyword.get(opts, :retry_id))
+      |> Keyword.put(
+        :retry_attempt,
+        manifest.retry_attempt || Keyword.get(opts, :retry_attempt)
+      )
+
+    RunManifest.execution_identity(manifest.attempt, opts)
+  end
+
+  defp new_running_entry(state, issue, worker_host, worker) do
+    identity = worker.identity
+
     %{
-      pid: pid,
-      ref: ref,
-      persistent_worker_id: persistent_worker_id,
+      pid: worker.pid,
+      ref: worker.ref,
+      persistent_worker_id: worker.persistent_worker_id,
+      run_id: identity.run_id,
+      parent_run_id: identity.parent_run_id,
+      retry_id: identity.retry_id,
       identifier: issue.identifier,
       issue: issue,
       worker_host: worker_host,
@@ -1909,7 +1966,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_context_tokens: 0,
       codex_context_window: nil,
       turn_count: 0,
-      retry_attempt: normalize_retry_attempt(attempt),
+      retry_attempt: identity.retry_attempt,
       quota_probe:
         quota_probe_issue?(
           state,
@@ -1918,8 +1975,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue.id
         ),
       lifecycle_state: :implementing,
-      lifecycle_started_at: started_at,
-      started_at: started_at
+      lifecycle_started_at: worker.started_at,
+      started_at: worker.started_at
     }
   end
 
@@ -1957,6 +2014,10 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
       recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, []),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
+      retry_attempt: Map.get(running_entry, :retry_attempt, 0),
       priority: issue.priority,
       created_at: issue.created_at,
       request: request
@@ -1979,6 +2040,9 @@ defmodule SymphonyElixir.Orchestrator do
         schedule_issue_retry(state, issue.id, 1, %{
           identifier: issue.identifier,
           issue: issue,
+          run_id: Map.get(running_entry, :run_id),
+          parent_run_id: Map.get(running_entry, :parent_run_id),
+          retry_id: Map.get(running_entry, :retry_id),
           delay_type: :continuation,
           backend: Map.get(running_entry, :backend),
           worker_host: Map.get(running_entry, :worker_host),
@@ -2002,6 +2066,9 @@ defmodule SymphonyElixir.Orchestrator do
     |> schedule_issue_retry(issue_id, 1, %{
       identifier: running_entry.identifier,
       issue: Map.get(running_entry, :issue),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
       delay_type: :continuation,
       backend: Map.get(running_entry, :backend),
       worker_host: Map.get(running_entry, :worker_host),
@@ -2042,6 +2109,9 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: entry.identifier,
             title: entry.title,
             issue: Map.get(entry, :issue),
+            run_id: Map.get(entry, :run_id),
+            parent_run_id: Map.get(entry, :parent_run_id),
+            retry_id: Map.get(entry, :retry_id),
             delay_type: :continuation,
             delay_ms_override: index * @quota_resume_spacing_ms,
             backend: entry.backend,
@@ -2070,6 +2140,10 @@ defmodule SymphonyElixir.Orchestrator do
         condition: entry.request.condition,
         condition_key: entry.request.condition_key,
         backend: entry.backend,
+        run_id: Map.get(entry, :run_id),
+        parent_run_id: Map.get(entry, :parent_run_id),
+        retry_id: Map.get(entry, :retry_id),
+        retry_attempt: Map.get(entry, :retry_attempt, 0),
         worker_host: entry.worker_host,
         workspace_path: entry.workspace_path,
         parked_at: entry.parked_at,
@@ -2147,6 +2221,9 @@ defmodule SymphonyElixir.Orchestrator do
     retry_kind = metadata[:retry_kind] || Map.get(previous_retry, :retry_kind)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
+    retry_id = RunManifest.new_id()
+    previous_retry_id = metadata[:retry_id] || Map.get(previous_retry, :retry_id)
+    parent_run_id = metadata[:run_id] || metadata[:parent_run_id] || Map.get(previous_retry, :parent_run_id)
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     title = pick_retry_title(previous_retry, metadata)
@@ -2164,30 +2241,37 @@ defmodule SymphonyElixir.Orchestrator do
     timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
     log_scheduled_retry(retry_kind, issue_id, identifier, delay_ms, next_attempt, error)
 
+    retry_entry = %{
+      attempt: next_attempt,
+      retry_id: retry_id,
+      previous_retry_id: previous_retry_id,
+      parent_run_id: parent_run_id,
+      timer_ref: timer_ref,
+      retry_token: retry_token,
+      due_at_ms: due_at_ms,
+      identifier: identifier,
+      title: title,
+      error: error,
+      backend: backend,
+      failure_class: failure_class,
+      worker_host: worker_host,
+      workspace_path: workspace_path,
+      codex_session_logs: codex_session_logs,
+      recent_codex_transcript_blocks: recent_codex_transcript_blocks,
+      wait_resume_prompt: wait_resume_prompt,
+      retry_kind: retry_kind
+    }
+
     %{
       state
-      | retry_attempts:
-          Map.put(state.retry_attempts, issue_id, %{
-            attempt: next_attempt,
-            timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            identifier: identifier,
-            title: title,
-            error: error,
-            backend: backend,
-            failure_class: failure_class,
-            worker_host: worker_host,
-            workspace_path: workspace_path,
-            codex_session_logs: codex_session_logs,
-            recent_codex_transcript_blocks: recent_codex_transcript_blocks,
-            wait_resume_prompt: wait_resume_prompt,
-            retry_kind: retry_kind
-          })
+      | retry_attempts: Map.put(state.retry_attempts, issue_id, retry_entry)
     }
     |> maybe_emit_retry_policy(
       issue_id,
-      Map.put(metadata, :retry_kind, retry_kind),
+      metadata
+      |> Map.put(:retry_kind, retry_kind)
+      |> Map.put(:retry_id, retry_entry.retry_id)
+      |> Map.put(:previous_retry_id, retry_entry.previous_retry_id),
       :scheduled,
       next_attempt,
       delay_ms
@@ -2365,7 +2449,10 @@ defmodule SymphonyElixir.Orchestrator do
           codex_session_logs: Map.get(retry_entry, :codex_session_logs, []),
           recent_codex_transcript_blocks: Map.get(retry_entry, :recent_codex_transcript_blocks, []),
           wait_resume_prompt: Map.get(retry_entry, :wait_resume_prompt),
-          retry_kind: Map.get(retry_entry, :retry_kind)
+          retry_kind: Map.get(retry_entry, :retry_kind),
+          retry_id: Map.get(retry_entry, :retry_id),
+          previous_retry_id: Map.get(retry_entry, :previous_retry_id),
+          parent_run_id: Map.get(retry_entry, :parent_run_id)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -2584,6 +2671,8 @@ defmodule SymphonyElixir.Orchestrator do
         prompt when is_binary(prompt) -> [wait_resume_prompt: prompt]
         _ -> []
       end
+      |> Keyword.put(:parent_run_id, metadata[:parent_run_id])
+      |> Keyword.put(:retry_id, metadata[:retry_id])
 
     case dispatch_issue_outcome(state, issue, attempt, metadata[:worker_host], agent_opts) do
       {:dispatched, state} ->
@@ -3099,6 +3188,10 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(fn {issue_id, metadata} ->
         %{
           issue_id: issue_id,
+          run_id: Map.get(metadata, :run_id),
+          parent_run_id: Map.get(metadata, :parent_run_id),
+          retry_id: Map.get(metadata, :retry_id),
+          retry_attempt: Map.get(metadata, :retry_attempt, 0),
           identifier: metadata.identifier,
           title: metadata.issue.title,
           state: metadata.issue.state,
@@ -3154,6 +3247,9 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           attempt: attempt,
+          retry_id: Map.get(retry, :retry_id),
+          previous_retry_id: Map.get(retry, :previous_retry_id),
+          parent_run_id: Map.get(retry, :parent_run_id),
           due_in_ms: max(0, due_at_ms - now_ms),
           status: :scheduled,
           identifier: Map.get(retry, :identifier),
@@ -4754,19 +4850,7 @@ defmodule SymphonyElixir.Orchestrator do
       %{} = circuit ->
         state = drop_retry_attempt(state, issue_id)
         parked_at = DateTime.utc_now()
-
-        parked_entry = %{
-          issue_id: issue_id,
-          identifier: metadata[:identifier] || issue_identifier(metadata[:issue]) || issue_id,
-          title: metadata[:title] || title_from_issue(metadata[:issue]),
-          attempt: max(normalize_retry_attempt(attempt), 1),
-          error: metadata[:error] || circuit.reason,
-          backend: backend,
-          failure_class: metadata[:failure_class] || retry_failure_class(metadata[:failure]),
-          worker_host: metadata[:worker_host],
-          workspace_path: metadata[:workspace_path],
-          parked_at: parked_at
-        }
+        parked_entry = quota_parked_entry(issue_id, attempt, metadata, circuit, backend, parked_at)
 
         parked =
           circuit.parked
@@ -4778,11 +4862,48 @@ defmodule SymphonyElixir.Orchestrator do
         state
         |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
         |> put_quota_circuit(circuit_key, updated)
-        |> emit_retry_policy(issue_id, metadata, :parked, parked_entry.attempt, nil)
+        |> emit_retry_policy(
+          issue_id,
+          Map.merge(metadata, %{
+            retry_id: parked_entry.retry_id,
+            previous_retry_id: parked_entry.previous_retry_id
+          }),
+          :parked,
+          parked_entry.attempt,
+          nil
+        )
 
       _ ->
         schedule_issue_retry(state, issue_id, attempt, metadata)
     end
+  end
+
+  defp quota_parked_entry(issue_id, attempt, metadata, circuit, backend, parked_at) do
+    {retry_id, previous_retry_id} = quota_parked_retry_lineage(metadata)
+
+    %{
+      issue_id: issue_id,
+      identifier: metadata[:identifier] || issue_identifier(metadata[:issue]) || issue_id,
+      title: metadata[:title] || title_from_issue(metadata[:issue]),
+      attempt: max(normalize_retry_attempt(attempt), 1),
+      retry_id: retry_id,
+      previous_retry_id: previous_retry_id,
+      parent_run_id: metadata[:run_id] || metadata[:parent_run_id],
+      error: metadata[:error] || circuit.reason,
+      backend: backend,
+      failure_class: metadata[:failure_class] || retry_failure_class(metadata[:failure]),
+      worker_host: metadata[:worker_host],
+      workspace_path: metadata[:workspace_path],
+      parked_at: parked_at
+    }
+  end
+
+  defp quota_parked_retry_lineage(%{run_id: run_id} = metadata) when is_binary(run_id) do
+    {RunManifest.new_id(), metadata[:retry_id] || metadata[:previous_retry_id]}
+  end
+
+  defp quota_parked_retry_lineage(metadata) do
+    {metadata[:retry_id] || RunManifest.new_id(), metadata[:previous_retry_id]}
   end
 
   defp handle_quota_probe_due(%State{} = state, circuit_key, timer_token) do
@@ -4882,10 +5003,12 @@ defmodule SymphonyElixir.Orchestrator do
         timer_token: nil
     }
 
-    attempt = parked_entry && parked_entry.attempt
-    preferred_worker_host = (parked_entry && parked_entry.worker_host) || circuit.worker_host
+    {attempt, preferred_worker_host, agent_opts} = quota_probe_dispatch(circuit, parked_entry)
+
     state = put_quota_circuit(state, circuit_key, updated)
-    {_outcome, dispatched_state} = dispatch_issue_outcome(state, issue, attempt, preferred_worker_host)
+
+    {_outcome, dispatched_state} =
+      dispatch_issue_outcome(state, issue, attempt, preferred_worker_host, agent_opts)
 
     if Map.has_key?(dispatched_state.running, issue.id) do
       Logger.info("Started controlled provider quota probe backend=#{backend} issue_id=#{issue.id} issue_identifier=#{issue.identifier}")
@@ -4893,11 +5016,14 @@ defmodule SymphonyElixir.Orchestrator do
       dispatched_state
       |> emit_retry_policy(
         issue.id,
-        %{
-          identifier: issue.identifier,
-          backend: backend,
-          failure_class: :usage_quota_limit
-        },
+        Map.merge(
+          %{
+            identifier: issue.identifier,
+            backend: backend,
+            failure_class: :usage_quota_limit
+          },
+          quota_probe_lineage(parked_entry)
+        ),
         :probed,
         attempt || 1,
         nil
@@ -4918,6 +5044,26 @@ defmodule SymphonyElixir.Orchestrator do
       |> reopen_quota_circuit(circuit_key, metadata.error)
       |> park_issue_retry(issue.id, attempt || 1, metadata)
     end
+  end
+
+  defp quota_probe_dispatch(circuit, nil), do: {nil, circuit.worker_host, []}
+
+  defp quota_probe_dispatch(circuit, parked_entry) do
+    opts = [
+      parent_run_id: Map.get(parked_entry, :parent_run_id),
+      retry_id: Map.get(parked_entry, :retry_id)
+    ]
+
+    {parked_entry.attempt, parked_entry.worker_host || circuit.worker_host, opts}
+  end
+
+  defp quota_probe_lineage(nil), do: %{}
+
+  defp quota_probe_lineage(parked_entry) do
+    %{
+      parent_run_id: Map.get(parked_entry, :parent_run_id),
+      retry_id: Map.get(parked_entry, :retry_id)
+    }
   end
 
   defp defer_quota_probe(%State{} = state, circuit_key) do
@@ -4988,6 +5134,9 @@ defmodule SymphonyElixir.Orchestrator do
         failure_class: Map.get(entry, :failure_class),
         worker_host: entry.worker_host,
         workspace_path: entry.workspace_path,
+        retry_id: Map.get(entry, :retry_id),
+        previous_retry_id: Map.get(entry, :previous_retry_id),
+        parent_run_id: Map.get(entry, :parent_run_id),
         delay_ms_override: (index + 1) * @quota_resume_spacing_ms,
         circuit_recovery: true
       })
@@ -5177,6 +5326,9 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: entry.issue_id,
           attempt: entry.attempt,
+          retry_id: Map.get(entry, :retry_id),
+          previous_retry_id: Map.get(entry, :previous_retry_id),
+          parent_run_id: Map.get(entry, :parent_run_id),
           due_in_ms: due_in_ms,
           status: :parked,
           identifier: entry.identifier,
@@ -5223,6 +5375,11 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id: issue_id,
       issue_identifier: metadata[:identifier],
       parent_issue_id: Map.get(issue, :parent_id),
+      run_id: metadata[:run_id] || metadata[:parent_run_id],
+      parent_run_id: metadata[:parent_run_id],
+      retry_id: metadata[:retry_id],
+      previous_retry_id: metadata[:previous_retry_id],
+      retry_attempt: attempt,
       repository: repository_for_issue(issue),
       backend: metadata[:backend],
       failure_class: failure_class && Atom.to_string(failure_class),

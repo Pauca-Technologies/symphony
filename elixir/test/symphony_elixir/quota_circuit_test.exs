@@ -135,7 +135,15 @@ defmodule SymphonyElixir.QuotaCircuitTest do
     pid = start_orchestrator!(:RepeatedQuotaProbeOrchestrator)
     probe = issue("issue-probe-quota", "MT-8")
     ref = make_ref()
-    probe_running_entry = running_entry(probe, ref, quota_probe: true)
+
+    probe_running_entry =
+      probe
+      |> running_entry(ref, quota_probe: true)
+      |> Map.merge(%{
+        run_id: "run-current",
+        parent_run_id: "run-parent",
+        retry_id: "retry-current"
+      })
 
     :sys.replace_state(pid, fn state ->
       %{
@@ -153,8 +161,20 @@ defmodule SymphonyElixir.QuotaCircuitTest do
     state = :sys.get_state(pid)
     assert state.failure_counts == %{}
 
-    assert %{status: :open, parked: [%{issue_id: "issue-probe-quota"}]} =
+    assert %{
+             status: :open,
+             parked: [
+               %{
+                 issue_id: "issue-probe-quota",
+                 retry_id: retry_id,
+                 previous_retry_id: "retry-current",
+                 parent_run_id: "run-current"
+               }
+             ]
+           } =
              state.quota_circuits["codex::local"]
+
+    refute retry_id == "retry-current"
   end
 
   test "a due circuit starts exactly its designated probe and keeps other work suppressed" do

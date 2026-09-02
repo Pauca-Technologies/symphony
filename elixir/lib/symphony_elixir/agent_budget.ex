@@ -35,6 +35,7 @@ defmodule SymphonyElixir.AgentBudget do
   @type t :: %{
           decision: map(),
           issue: map(),
+          event_context: map(),
           high_waters: map(),
           parent_thread_id: String.t() | nil,
           crossed: term(),
@@ -56,9 +57,17 @@ defmodule SymphonyElixir.AgentBudget do
   @doc "Create accounting state that can span all continuation turns in one run."
   @spec new(map(), map()) :: t()
   def new(decision, issue) when is_map(decision) and is_map(issue) do
+    new(decision, issue, %{})
+  end
+
+  @doc "Create accounting state with immutable event-correlation context."
+  @spec new(map(), map(), map()) :: t()
+  def new(decision, issue, event_context)
+      when is_map(decision) and is_map(issue) and is_map(event_context) do
     %{
       decision: decision,
       issue: issue,
+      event_context: event_context,
       high_waters: %{},
       parent_thread_id: nil,
       crossed: MapSet.new(),
@@ -225,15 +234,18 @@ defmodule SymphonyElixir.AgentBudget do
   defp action_applied?(_decision, _action), do: false
 
   defp emit_transition(state, transition) do
-    Telemetry.emit(:budget_transition, %{
-      issue_id: state.issue.id,
-      issue_identifier: state.issue.identifier,
-      task_type: state.decision.task_type,
-      budget_profile: state.decision.budget_profile,
-      budget_mode: state.decision.mode,
-      metrics: state.metrics,
-      transition: transition
-    })
+    Telemetry.emit(
+      :budget_transition,
+      Map.merge(state.event_context, %{
+        issue_id: state.issue.id,
+        issue_identifier: state.issue.identifier,
+        task_type: state.decision.task_type,
+        budget_profile: state.decision.budget_profile,
+        budget_mode: state.decision.mode,
+        metrics: state.metrics,
+        transition: transition
+      })
+    )
   end
 
   defp metrics(state, elapsed_ms) do

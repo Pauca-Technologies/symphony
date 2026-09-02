@@ -83,6 +83,33 @@ defmodule SymphonyElixir.AgentRunnerTest.TurnCountingBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.ManifestOrderingBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(_workspace, _opts), do: {:ok, %{worker_host: nil}}
+
+  @impl true
+  def run_turn(_session, _prompt, _issue, _opts) do
+    events =
+      SymphonyElixir.Telemetry.read_events(
+        Date.utc_today(),
+        Date.utc_today()
+      )
+
+    send(
+      Application.fetch_env!(:symphony_elixir, :manifest_ordering_recipient),
+      {:events_before_agent_turn, events}
+    )
+
+    {:ok, %{session_id: "manifest-ordering-session"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.WaitingBackend do
   @moduledoc false
   @behaviour SymphonyElixir.AgentBackend
@@ -315,7 +342,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
     File.write!(ctx.verdict_path, Jason.encode!(exact))
   end
 
-  alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.{AgentRunner, RunManifest}
   alias SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend
   alias SymphonyElixir.AgentRunnerTest.BudgetRuntimeRecipient
   alias SymphonyElixir.AgentRunnerTest.BudgetStressBackend
@@ -325,6 +352,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.HandoffPromptBackend
   alias SymphonyElixir.AgentRunnerTest.HandoffToolBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
+  alias SymphonyElixir.AgentRunnerTest.ManifestOrderingBackend
   alias SymphonyElixir.AgentRunnerTest.PendingGateBackend
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
   alias SymphonyElixir.AgentRunnerTest.WaitingBackend
@@ -346,6 +374,249 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end)
 
     :ok
+  end
+
+  test "emits one correlated manifest after routing and before the first agent turn" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+    Application.put_env(:symphony_elixir, :manifest_ordering_recipient, self())
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :manifest_ordering_recipient)
+    end)
+
+    issue = %Issue{
+      id: "issue-run-manifest",
+      identifier: "UDPE-7500",
+      title: "Add reproducible run identifiers",
+      state: "In Progress",
+      labels: ["repo:symphony"]
+    }
+
+    workflow = %{
+      prompt_template: "consumer-owned prompt that is hashed, not persisted",
+      config: %{}
+    }
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               "/tmp",
+               issue,
+               nil,
+               [
+                 agent_backend: {ManifestOrderingBackend, %{model: "test-model", reasoning_effort: "high"}},
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                 per_repo_workflow: workflow,
+                 workflow_source: "repository:WORKFLOW.md",
+                 repository_id: "symphony",
+                 repository_manifest: %{
+                   head_sha: "head-sha",
+                   base_sha: "base-sha",
+                   candidate_base_sha: "candidate-base-sha",
+                   dirty: false
+                 },
+                 run_id: "run-7500",
+                 parent_run_id: "run-7499",
+                 retry_id: "retry-7500",
+                 attempt: 3,
+                 max_turns: 1
+               ],
+               nil
+             )
+
+    assert_receive {:events_before_agent_turn, events}
+    event_names = Enum.map(events, & &1["event"])
+    assert Enum.count(event_names, &(&1 == "run_manifest")) == 1
+
+    routing_index = Enum.find_index(event_names, &(&1 == "routing_decision"))
+    manifest_index = Enum.find_index(event_names, &(&1 == "run_manifest"))
+    prompt_index = Enum.find_index(event_names, &(&1 == "prompt_built"))
+    assert routing_index < manifest_index
+    assert manifest_index < prompt_index
+
+    manifest = Enum.find(events, &(&1["event"] == "run_manifest"))
+    assert manifest["manifest_version"] == 1
+    assert manifest["run_id"] == "run-7500"
+    assert manifest["parent_run_id"] == "run-7499"
+    assert manifest["retry_id"] == "retry-7500"
+    assert manifest["retry_attempt"] == 3
+    assert manifest["attempt"] == 3
+    assert manifest["repository"]["head_sha"] == "head-sha"
+    assert manifest["agent"]["model"] == "test-model"
+    assert manifest["agent"]["reasoning_effort"] == "high"
+    assert manifest["workflow"]["source"] == "repository:WORKFLOW.md"
+    assert manifest["configuration"]["workflow"] == manifest["workflow"]
+
+    assert manifest["configuration"]["prompt"]["template_sha256"] ==
+             manifest["prompt"]["template_sha256"]
+
+    assert manifest["prompt"]["composition_version"] == "prompt-sections/v1"
+
+    assert manifest["prompt"]["section_hashes"] == %{
+             "availability" => "per_turn",
+             "event" => "prompt_built",
+             "field" => "injected_section_hashes"
+           }
+
+    assert manifest["config_digest"] =~ ~r/^[0-9a-f]{64}$/
+
+    changed_prompt_configuration =
+      put_in(
+        manifest,
+        ["configuration", "prompt", "template_sha256"],
+        String.duplicate("0", 64)
+      )["configuration"]
+
+    refute RunManifest.config_digest(changed_prompt_configuration) == manifest["config_digest"]
+    refute inspect(manifest) =~ workflow.prompt_template
+
+    correlated = Enum.filter(events, &(&1["event"] in ~w(routing_decision run_manifest prompt_built)))
+
+    assert Enum.all?(correlated, fn event ->
+             event["run_id"] == "run-7500" and event["parent_run_id"] == "run-7499" and
+               event["retry_id"] == "retry-7500" and event["retry_attempt"] == 3
+           end)
+  end
+
+  test "collects repository provenance when no runtime-info recipient is present" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-manifest-nil-recipient-#{System.unique_integer([:positive])}"
+      )
+
+    origin = Path.join(root, "origin")
+    workspace_root = Path.join(root, "workspaces")
+    File.mkdir_p!(origin)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    System.cmd("git", ["-C", origin, "init", "--quiet", "--initial-branch", "main"])
+    System.cmd("git", ["-C", origin, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", origin, "config", "user.email", "test@example.com"])
+    File.write!(Path.join(origin, "WORKFLOW.md"), "Repository workflow for provenance.\n")
+    System.cmd("git", ["-C", origin, "add", "WORKFLOW.md"])
+    System.cmd("git", ["-C", origin, "commit", "--quiet", "-m", "initial"])
+    {expected_head, 0} = System.cmd("git", ["-C", origin, "rev-parse", "HEAD"])
+
+    write_workflow_file!(SymphonyElixir.Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root
+    )
+
+    File.write!(
+      Application.fetch_env!(:symphony_elixir, :repo_config_path),
+      """
+      linear:
+        team_id: UDPE
+      repos:
+        - id: manifest-repo
+          label: repo:manifest-repo
+          repo_url: #{origin}
+          workflow_path: WORKFLOW.md
+          base_branch: main
+      """
+    )
+
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+    Application.put_env(:symphony_elixir, :manifest_ordering_recipient, self())
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :manifest_ordering_recipient)
+    end)
+
+    issue = %Issue{
+      id: "issue-manifest-nil-recipient",
+      identifier: "UDPE-7500-NIL",
+      title: "Capture repository state without a recipient",
+      state: "In Progress",
+      labels: ["repo:manifest-repo"],
+      comments: []
+    }
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               agent_backend: {ManifestOrderingBackend, %{}},
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+               max_turns: 1
+             )
+
+    assert_receive {:events_before_agent_turn, events}
+    manifest = Enum.find(events, &(&1["event"] == "run_manifest"))
+    assert manifest["repository"]["id"] == "manifest-repo"
+    assert manifest["repository"]["head_sha"] == String.trim(expected_head)
+    assert manifest["repository"]["dirty"] == false
+  end
+
+  test "builds safe manifest policies for alternate backends and reviewer workflows" do
+    issue = %Issue{
+      id: "issue-manifest-backends",
+      identifier: "UDPE-7500-BACKENDS",
+      title: "Capture alternate backend policy",
+      labels: ["repo:alternate"]
+    }
+
+    acp_route = %{
+      backend: SymphonyElixir.Acp.Client,
+      overrides: %{model: "acp-model"},
+      profile: "alternate",
+      source: :injected
+    }
+
+    assert {:ok, efficiency} =
+             SymphonyElixir.AgentEfficiency.decide(issue, acp_route, %{config: %{}})
+
+    identity = RunManifest.execution_identity(nil)
+    assert identity.attempt == nil
+    assert identity.retry_attempt == 0
+
+    context = %{
+      identity: identity,
+      issue: issue,
+      route: acp_route,
+      efficiency: efficiency,
+      settings: Config.settings!(),
+      workspace: "/tmp",
+      repo_workflow: %{prompt_template: "implementation workflow"},
+      review_workflow: %{prompt_template: "reviewer workflow", config: %{}}
+    }
+
+    acp_manifest = RunManifest.build(context)
+    assert acp_manifest.repository.id == "alternate"
+    assert acp_manifest.approval == %{auto_approve: context.settings.acp.auto_approve}
+    assert acp_manifest.sandbox.advertise_fs == context.settings.acp.advertise_fs
+    assert acp_manifest.workflow.review_prompt_template_sha256 =~ ~r/^[0-9a-f]{64}$/
+
+    claude_manifest =
+      RunManifest.build(%{
+        context
+        | route: %{acp_route | backend: SymphonyElixir.ClaudeCode.Client}
+      })
+
+    assert claude_manifest.approval == %{
+             permission_mode: context.settings.claude_code.permission_mode
+           }
+
+    assert claude_manifest.sandbox == nil
+
+    codex_manifest =
+      RunManifest.build(%{
+        context
+        | issue: %{issue | labels: ["unrelated", "repo:alternate"]},
+          route: %{acp_route | backend: SymphonyElixir.Codex.AppServer},
+          repo_workflow: nil
+      })
+
+    assert codex_manifest.approval == context.settings.codex.approval_policy
+    assert codex_manifest.sandbox.thread == context.settings.codex.thread_sandbox
+    assert codex_manifest.prompt.template_sha256 =~ ~r/^[0-9a-f]{64}$/
+
+    fallback_repository =
+      context
+      |> Map.put(:issue, %{id: "map-issue", identifier: "UDPE-MAP"})
+      |> Map.put(:repository_id, nil)
+      |> RunManifest.build()
+
+    assert fallback_repository.repository.id == "default"
+    assert RunManifest.config_digest(%{date: ~D[2026-09-02]}) =~ ~r/^[0-9a-f]{64}$/
   end
 
   test "routed after_create failures stop the run before an agent starts" do

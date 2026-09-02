@@ -61,8 +61,14 @@ defmodule SymphonyElixir.QuotaCircuitStoreTest do
              next_probe_at: ^next_probe_at,
              probe_issue_id: nil,
              parked: [
-               %{issue_id: "issue-a", failure_class: :usage_quota_limit},
-               %{issue_id: "issue-b"}
+               %{
+                 issue_id: "issue-a",
+                 failure_class: :usage_quota_limit,
+                 retry_id: nil,
+                 previous_retry_id: nil,
+                 parent_run_id: nil
+               },
+               %{issue_id: "issue-b", retry_id: nil, previous_retry_id: nil, parent_run_id: nil}
              ]
            } = restored["codex::worker:worker-a"]
   end

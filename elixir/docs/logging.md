@@ -19,6 +19,10 @@ When logging Codex execution lifecycle events, include:
 
 - `session_id`: combined Codex thread/turn identifier.
 
+Compact lifecycle telemetry also includes `run_id`, which is unique to one worker attempt. Retried
+runs retain `parent_run_id`, the triggering `retry_id`, and a numeric retry attempt; do not replace
+the existing issue, session, thread, or turn identifiers with run lineage.
+
 ## Message Design
 
 - Use explicit `key=value` pairs in message text for high-signal fields.
@@ -41,7 +45,8 @@ the issue, workspace, worker, and retry-attempt context. The local JSONL telemet
 same fields as a `prompt_built` event so prompt-size regressions can be measured across runs.
 
 Never include raw prompt content in prompt observability. Per-turn `session_id` is not yet available
-when the prompt is built; correlate these events by issue, workspace, attempt, and turn number.
+when the prompt is built; correlate these events by `run_id`, issue, workspace, attempt, and turn
+number.
 `prompt_chars` and `prompt_bytes` measure only the newly submitted turn text. Retained thread history
 and effective model-input cost remain represented by the backend's context/input-token telemetry.
 
@@ -71,6 +76,7 @@ handoffs.
 ## Checklist For New Logs
 
 - Is this event tied to a Linear issue? Include `issue_id` and `issue_identifier`.
+- Is this event tied to a worker attempt? Include `run_id` and available retry lineage.
 - Is this event tied to a Codex session? Include `session_id`.
 - Is the failure reason present and concise?
 - Is the message format consistent with existing lifecycle logs?

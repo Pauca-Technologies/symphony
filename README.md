@@ -59,6 +59,9 @@ reconciles cumulative usage by actual parent and delegated threads, retains roll
 failure history, and keeps complete recursively redacted compressed protocol traces selectively for
 failed/sampled sessions while compacting high-frequency semantic streams by tool/message identity.
 This makes weekly token/time/quality reports bounded without discarding incident evidence.
+Each worker attempt has a unique correlation identity and emits one non-secret reproducibility
+manifest after routing and before its first model turn. Retry lineage links scheduling decisions
+and attempts without collapsing the existing issue, session, thread, and turn dimensions.
 
 Repositories can turn that telemetry into task-specific soft budgets. Shadow mode records proposed
 task/model/review routes and one-shot strategy transitions before enforcement; enforce mode applies

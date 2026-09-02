@@ -60,6 +60,33 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     assert Registry.list() == []
   end
 
+  test "registry reads manifests written before run lineage fields existed" do
+    issue = issue("legacy-run-lineage")
+
+    assert {:ok, manifest} =
+             Registry.prepare(issue, 2, nil,
+               run_id: "run-new",
+               parent_run_id: "run-parent",
+               retry_id: "retry-new"
+             )
+
+    legacy_payload =
+      manifest.manifest_path
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.drop(~w(run_id parent_run_id retry_id retry_attempt))
+
+    File.write!(manifest.manifest_path, Jason.encode!(legacy_payload))
+
+    assert {:ok, restored} = Registry.load_manifest(manifest.manifest_path)
+    assert restored.run_id == nil
+    assert restored.parent_run_id == nil
+    assert restored.retry_id == nil
+    assert restored.retry_attempt == nil
+    assert restored.attempt == 2
+    assert restored.worker_id == manifest.worker_id
+  end
+
   test "completed records are reclaimed instead of reattached as failed workers" do
     issue = issue("completed-record")
     assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
@@ -282,7 +309,15 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     issue = issue("orchestrator-adoption")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
-    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+
+    assert {:ok, manifest} =
+             Registry.prepare(issue, nil, nil,
+               run_id: "run-initial-adoption",
+               retry_attempt: 0
+             )
+
+    assert manifest.attempt == 1
+    assert manifest.retry_attempt == 0
     assert {:ok, spec} = Registry.load_spec(manifest)
     test_pid = self()
 
@@ -313,8 +348,11 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     assert_eventually(fn ->
       case Orchestrator.snapshot(first_name, 1_000) do
-        %{running: [%{issue_id: issue_id}]} -> issue_id == issue.id
-        _other -> false
+        %{running: [%{issue_id: issue_id, run_id: run_id, retry_attempt: 0}]} ->
+          issue_id == issue.id and run_id == "run-initial-adoption"
+
+        _other ->
+          false
       end
     end)
 
@@ -327,8 +365,11 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     assert_eventually(fn ->
       case Orchestrator.snapshot(second_name, 1_000) do
-        %{running: [%{issue_id: issue_id}]} -> issue_id == issue.id
-        _other -> false
+        %{running: [%{issue_id: issue_id, run_id: run_id, retry_attempt: 0}]} ->
+          issue_id == issue.id and run_id == "run-initial-adoption"
+
+        _other ->
+          false
       end
     end)
 
