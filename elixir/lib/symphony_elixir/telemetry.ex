@@ -25,6 +25,7 @@ defmodule SymphonyElixir.Telemetry do
           :run_start
           | :run_end
           | :run_manifest
+          | :task_outcome
           | :prompt_built
           | :lifecycle
           | :token_high_water
@@ -131,6 +132,25 @@ defmodule SymphonyElixir.Telemetry do
     |> Enum.flat_map(&parse_event_file/1)
   end
 
+  @doc "Read a date window with explicit newest-file and newest-event bounds."
+  @spec read_events(Date.t() | nil, Date.t() | nil, keyword()) :: [map()]
+  def read_events(from, to, opts) when is_list(opts) do
+    max_files = positive_limit(Keyword.get(opts, :max_files), 60)
+    max_events = positive_limit(Keyword.get(opts, :max_events), 50_000)
+
+    root_dir()
+    |> list_files()
+    |> Enum.filter(&within_range?(&1, from, to))
+    |> Enum.take(-max_files)
+    |> Enum.reverse()
+    |> Enum.reduce_while({[], max_events}, fn path, {acc, remaining} ->
+      rows = path |> parse_event_file() |> Enum.take(-remaining)
+      next = {rows ++ acc, remaining - length(rows)}
+      if elem(next, 1) == 0, do: {:halt, next}, else: {:cont, next}
+    end)
+    |> elem(0)
+  end
+
   @doc "Delete analytics files older than the configured rolling window."
   @spec prune() :: :ok
   def prune do
@@ -228,6 +248,9 @@ defmodule SymphonyElixir.Telemetry do
         []
     end
   end
+
+  defp positive_limit(value, _default) when is_integer(value) and value > 0, do: value
+  defp positive_limit(_value, default), do: default
 
   defp within_range?(path, from, to) do
     case date_from_path(path) do

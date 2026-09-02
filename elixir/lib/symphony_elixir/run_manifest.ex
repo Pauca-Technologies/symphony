@@ -99,7 +99,10 @@ defmodule SymphonyElixir.RunManifest do
         head_sha: Map.get(repository, :head_sha),
         base_sha: Map.get(repository, :base_sha),
         candidate_base_sha: Map.get(repository, :candidate_base_sha),
-        dirty: Map.get(repository, :dirty)
+        dirty: Map.get(repository, :dirty),
+        worktree_status_fingerprint: Map.get(repository, :worktree_status_fingerprint),
+        worktree_content_fingerprint: Map.get(repository, :worktree_content_fingerprint),
+        worktree_fingerprint_complete: Map.get(repository, :worktree_fingerprint_complete)
       },
       symphony: %{version: OrchestratorVersion.current(), sha: @symphony_sha},
       workflow: workflow,

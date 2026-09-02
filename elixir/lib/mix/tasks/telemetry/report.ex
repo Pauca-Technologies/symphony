@@ -39,7 +39,12 @@ defmodule Mix.Tasks.Telemetry.Report do
     Mix.shell().info("================================================")
     Mix.shell().info("Window: #{summary.window.from || "(beginning)"} → #{summary.window.to || "(now)"}")
     Mix.shell().info("")
-    Mix.shell().info("Runs: #{fleet.run_ends}/#{fleet.run_starts} completed (#{format_rate(fleet.completion_rate)})")
+
+    Mix.shell().info(
+      "Worker runs ended: #{fleet.run_ends}/#{fleet.run_starts} " <>
+        "(worker-run completion #{format_rate(fleet.completion_rate)})"
+    )
+
     Mix.shell().info("Time p50/p90: #{format_duration(fleet.duration_ms_p50)} / #{format_duration(fleet.duration_ms_p90)}")
     Mix.shell().info("Tokens: #{fleet.tokens.total_tokens} total; p50/p90 per thread #{format_number(fleet.tokens_p50)} / #{format_number(fleet.tokens_p90)}")
     Mix.shell().info("  input=#{fleet.tokens.input_tokens} cached_input=#{fleet.tokens.cached_input_tokens} output=#{fleet.tokens.output_tokens} reasoning=#{fleet.tokens.reasoning_tokens}")

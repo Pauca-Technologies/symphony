@@ -148,6 +148,52 @@ defmodule SymphonyElixir.HandoffGateTest do
              HandoffGate.parse_protocol_result(Jason.encode!(infrastructure), 1, nil, 1_000)
   end
 
+  test "only an authoritative protocol pass emits an exact-head task outcome" do
+    workspace = temp_workspace!("handoff-task-outcome")
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+    passed = protocol_report("passed")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: Path.dirname(workspace)
+    )
+
+    assert {:passed, %{status: :passed}} =
+             SymphonyElixir.Telemetry.with_context(%{run_id: "run-handoff"}, fn ->
+               HandoffGate.run_before_handoff(
+                 workspace,
+                 issue("MT-HANDOFF-OUTCOME"),
+                 nil,
+                 "In Review",
+                 hook_command: hook_command(passed, 0)
+               )
+             end)
+
+    assert :ok =
+             HandoffGate.run_before_handoff(
+               workspace,
+               issue("MT-HANDOFF-LEGACY"),
+               nil,
+               "In Review",
+               hook_command: "printf '{\"checks\":[]}'"
+             )
+
+    outcomes =
+      Date.utc_today()
+      |> then(&SymphonyElixir.Telemetry.read_events(&1, &1))
+      |> Enum.filter(&(&1["event"] == "task_outcome"))
+
+    assert [outcome] = outcomes
+    assert outcome["outcome_version"] == 1
+    assert outcome["run_id"] == "run-handoff"
+    assert outcome["stage"] == "exact_head_handoff"
+    assert outcome["status"] == "accepted"
+    assert outcome["authoritative"]
+    assert outcome["candidate_sha"] == "head-1"
+    assert outcome["exact_sha"] == "head-1"
+    assert outcome["candidate_fingerprint"] == "candidate-1"
+    assert outcome["exact_fingerprint"] == "exact-1"
+  end
+
   test "protocol v1 accepts producer string and legacy integer PR numbers" do
     producer_report = protocol_report("passed")
     legacy_report = put_in(producer_report, ["identity", "prNumber"], 1854)

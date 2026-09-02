@@ -74,6 +74,7 @@ defmodule Mix.Tasks.TelemetryReportTaskTest do
       end)
 
     assert output =~ "Symphony fleet efficiency"
+    assert output =~ "Worker runs ended: 1/1 (worker-run completion 100.0%)"
     assert output =~ "Tokens: 100 total"
     assert output =~ "Repositories:"
     assert output =~ "Parent/subagent reconciliation:"

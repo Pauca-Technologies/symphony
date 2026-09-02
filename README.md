@@ -62,6 +62,11 @@ This makes weekly token/time/quality reports bounded without discarding incident
 Each worker attempt has a unique correlation identity and emits one non-secret reproducibility
 manifest after routing and before its first model turn. Retry lineage links scheduling decisions
 and attempts without collapsing the existing issue, session, thread, and turn dimensions.
+The reference dashboard also provides a bounded 7/30-day historical evaluation cockpit. It keeps
+worker-run completion separate from material repository progress, accepted exact-head handoff, and
+explicit downstream CI/review/merge/reopen/revert outcomes; absent downstream evidence remains
+unknown. Historical issue detail falls back to retained compact telemetry after live state leaves
+memory, and cohort filters use repository/task/model/prompt/configuration identities.
 
 Repositories can turn that telemetry into task-specific soft budgets. Shadow mode records proposed
 task/model/review routes and one-shot strategy transitions before enforcement; enforce mode applies

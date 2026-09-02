@@ -1892,6 +1892,37 @@ reclaimed bytes, and protect active session paths. Benign
 per-notification debug logs SHOULD be disabled by default so lifecycle/error history is not rotated
 away by streaming chatter.
 
+Historical harness evaluation MUST keep worker transport/lifecycle completion distinct from task
+delivery. A normal `run_end` means only that a worker attempt ended normally; it MUST NOT imply
+material repository progress, an accepted handoff, CI success, human approval, or a merged change.
+Where these states cannot be derived safely, implementations SHOULD emit a versioned
+`task_outcome` event with an explicit `stage`, `status`, and authority indicator. The standard stages
+are `material_progress`, `exact_head_handoff`, `ci`, `human_review`, and `pull_request`; applicable
+statuses include `recorded`, `accepted`, `passed`, `failed`, `merged`, `reopened`, and `reverted`.
+Missing task-outcome evidence is `unknown`, not success or failure. Legacy quality events MAY be
+normalized through an explicit documented mapping, but legacy handoff evidence without exact-head
+identity MUST remain distinguishable from verified acceptance.
+
+Material-progress evidence SHOULD compare repository state immediately before and after the agent
+turn, including handled error returns when the workspace is preserved. A content comparison MAY use
+only non-secret cryptographic fingerprints of tracked, staged, and untracked worktree state. Such
+collection MUST be bounded and MUST distinguish an unavailable probe from a changed result; a probe
+failure or an unchanged dirty flag MUST NOT itself record progress. Exact-head handoff acceptance
+MUST be emitted only from the authoritative gate transition that verified the candidate. Downstream
+CI, human-review, merge, reopen, and revert states MUST NOT be inferred from worker exit or tracker
+terminal state. Delivery evidence SHOULD correlate by exact/candidate/reviewed/head SHA when
+available, then by `run_id`, with conservative legacy issue/date fallback.
+
+An implementation that exposes a historical evaluation cockpit SHOULD offer exact selectable 7-
+and 30-day views, clamped to configured retention, and cap files, event rows, rendered runs, and
+per-issue detail. It SHOULD filter by repository, task family, model, prompt version, and
+`config_digest`, preserving those selections in the URL. Historical issue lookup MAY fall back to
+retained compact telemetry after an issue leaves live orchestrator memory, but MUST label that view
+as historical and MUST NOT expose live controls or claim transcript availability. Cost and
+cost-per-accepted-handoff MUST remain unavailable unless explicit numeric cost telemetry exists.
+For compatibility, machine reports MAY retain a legacy `completion_rate` field, but human-readable
+surfaces SHOULD label it as worker-run completion.
+
 ### 13.7 Telemetry-Driven Soft Budgets and Routing
 
 Repository workflows MAY configure `agent.efficiency` with `mode` (`off`, `shadow`, or `enforce`),
@@ -1990,6 +2021,9 @@ Enablement (extension):
   available for the complete persisted transcript.
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
   consumes the JSON API below.
+- An implementation MAY host a bounded historical harness-evaluation view at `/history`. Such a
+  view SHOULD follow the outcome, retention, filtering, cost, and historical-detail semantics in
+  Section 13.6 and remain usable when the live orchestrator snapshot is unavailable.
 
 #### 13.7.2 JSON REST API (`/api/v1/*`)
 

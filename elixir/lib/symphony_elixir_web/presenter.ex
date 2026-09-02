@@ -4,6 +4,7 @@ defmodule SymphonyElixirWeb.Presenter do
   """
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.Telemetry.Evaluation
 
   @live_transcript_read_limit 1_000_000
   @live_transcript_block_limit 200
@@ -68,6 +69,35 @@ defmodule SymphonyElixirWeb.Presenter do
   def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms, transcript_cache)
       when is_binary(issue_identifier) and is_map(transcript_cache) do
     issue_payload_with_mode(issue_identifier, orchestrator, snapshot_timeout_ms, transcript_cache, :live)
+  end
+
+  @doc "Return live issue detail when present, otherwise bounded historical telemetry detail."
+  @spec issue_payload_with_history(String.t(), GenServer.name(), timeout(), map(), keyword()) ::
+          {:ok, map(), map()} | {:error, :issue_not_found}
+  def issue_payload_with_history(
+        issue_identifier,
+        orchestrator,
+        snapshot_timeout_ms,
+        transcript_cache,
+        opts \\ []
+      )
+      when is_binary(issue_identifier) and is_map(transcript_cache) and is_list(opts) do
+    case issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms, transcript_cache) do
+      {:ok, payload, new_cache} ->
+        {:ok, payload, new_cache}
+
+      {:error, :issue_not_found} ->
+        case Evaluation.issue(issue_identifier, opts) do
+          {:ok, historical} -> {:ok, historical, %{}}
+          {:error, :issue_not_found} = error -> error
+        end
+    end
+  end
+
+  @doc "Build the bounded historical evaluation payload for the dashboard cockpit."
+  @spec evaluation_payload(7 | 30, map(), keyword()) :: map()
+  def evaluation_payload(window_days, filters \\ %{}, opts \\ []) do
+    Evaluation.query(window_days, filters, opts)
   end
 
   defp issue_payload_with_mode(issue_identifier, orchestrator, snapshot_timeout_ms, transcript_cache, mode) do

@@ -769,6 +769,13 @@ codex:
   event for dynamic injected-section hashes that only exist after prompt composition. Raw prompts,
   commands, environment values, and credentials are excluded. Older unversioned events and
   persisted records remain readable.
+  Symphony also emits versioned `task_outcome` records at authoritative transitions. A hash-only,
+  bounded before/after worktree comparison records material progress even when a preserved
+  workspace was already dirty; unavailable Git probes do not count as change. Only a passed
+  versioned exact-head handoff protocol records accepted handoff. CI, human-review, merge, reopen,
+  and revert states remain unknown unless explicit telemetry reports them; they are never inferred
+  from a normal worker exit or a terminal tracker state. SHA identity correlates downstream delivery
+  evidence even when an external outcome does not carry `run_id`.
   `mix telemetry.report --from YYYY-MM-DD --to YYYY-MM-DD --json` reports fleet, repository,
   issue, parent/delegated-thread, phase, failure, gate, review, tool-output, percentile, and quality
   views without parsing transcripts. Percentiles use the conventional nearest-rank definition.
@@ -779,6 +786,8 @@ codex:
   and compare tokens, time, review findings, CI/human outcomes, and extreme outliers over the
   requested rolling window (use the prior 30 days for the rollout comparison). Unversioned telemetry
   JSONL remains readable as schema version 0.
+  The text report calls the legacy JSON `completion_rate` metric **worker-run completion** so it
+  cannot be confused with task delivery.
 - Benign protocol notifications and stdout chunks do not produce one debug-log line each by
   default. `observability.benign_notification_debug: true` is the short-lived log-level escape
   hatch; selective gzip raw traces are normally the more complete incident artifact.
@@ -799,6 +808,15 @@ codex:
 The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
+- A historical harness-evaluation cockpit at `/history`, with exact 7- and 30-day choices clamped
+  to configured retention. It uses capped telemetry file/event/run queries and filters by
+  repository, task family, model, prompt version, and configuration digest; filter state remains in
+  the URL. Worker completion, material progress, accepted exact-head handoff, CI/human-review, and
+  merged/reopened/reverted counts are displayed separately, with unobserved outcomes shown as such.
+  Cost remains unavailable unless a numeric cumulative USD value was explicitly emitted.
+- `/issues/<issue_identifier>` remains live-first. After an issue leaves orchestrator memory, it
+  falls back to bounded historical telemetry when available and renders a clearly historical view
+  without live wait/drain controls or transcript claims.
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap

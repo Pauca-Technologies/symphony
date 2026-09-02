@@ -24,6 +24,8 @@ defmodule SymphonyElixir.BaseDrift do
         }
 
   @workflow_runtime_paths ["WORKFLOW.md", "WORKFLOW_REVIEW.md"]
+  @worktree_fingerprint_max_paths 200
+  @worktree_fingerprint_batch_size 50
   @command_path_regex ~r{(?:^|[\s`'"(])((?:\.?/?[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)}m
 
   @doc "Assess base freshness, returning compact remediation for a stale candidate base."
@@ -86,13 +88,21 @@ defmodule SymphonyElixir.BaseDrift do
         _missing -> nil
       end
 
+    actual_paths = best_effort_candidate_paths(runner, workspace, candidate_base)
+    worktree = best_effort_worktree_state(runner, workspace, actual_paths)
+
     %{
       head_sha: head_sha,
       base_sha: current_base,
       base_age_seconds: commit_age_seconds(runner, workspace, current_base),
       candidate_base_sha: candidate_base,
-      actual_paths: best_effort_candidate_paths(runner, workspace, candidate_base),
-      dirty: best_effort_dirty?(runner, workspace)
+      actual_paths: actual_paths,
+      dirty: worktree.dirty,
+      worktree_fingerprint: worktree.fingerprint,
+      worktree_status_fingerprint: worktree.status_fingerprint,
+      worktree_content_fingerprint: worktree.content_fingerprint,
+      worktree_fingerprint_complete: worktree.complete,
+      worktree_fingerprint_path_count: worktree.path_count
     }
   end
 
@@ -198,12 +208,73 @@ defmodule SymphonyElixir.BaseDrift do
     error -> {:error, {:git_status_failed, error.__struct__, Exception.message(error)}}
   end
 
-  defp best_effort_dirty?(runner, workspace) do
-    case dirty?(runner, workspace) do
-      {:ok, dirty} -> dirty
-      {:error, _reason} -> true
+  defp best_effort_worktree_state(runner, workspace, paths) do
+    case runner.(["status", "--porcelain", "--untracked-files=normal"], workspace) do
+      {output, 0} ->
+        selected_paths = Enum.take(paths, @worktree_fingerprint_max_paths)
+        status_fingerprint = sha256(output)
+        content_fingerprint = content_fingerprint(runner, workspace, selected_paths, length(paths))
+
+        %{
+          dirty: String.trim(output) != "",
+          fingerprint: combined_fingerprint(status_fingerprint, content_fingerprint),
+          status_fingerprint: status_fingerprint,
+          content_fingerprint: content_fingerprint,
+          complete:
+            is_binary(content_fingerprint) and
+              length(paths) <= @worktree_fingerprint_max_paths,
+          path_count: length(paths)
+        }
+
+      {_output, _status} ->
+        unknown_worktree_state()
     end
+  rescue
+    _error -> unknown_worktree_state()
   end
+
+  defp content_fingerprint(runner, workspace, paths, path_count) do
+    paths
+    |> Enum.chunk_every(@worktree_fingerprint_batch_size)
+    |> Enum.reduce_while({:ok, []}, fn batch, {:ok, digests} ->
+      case runner.(["hash-object", "--no-filters", "--" | batch], workspace) do
+        {output, 0} -> {:cont, {:ok, [sha256(output) | digests]}}
+        {_output, _status} -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, digests} ->
+        sha256([
+          "worktree-content/v1\0",
+          sha256(Enum.join(paths, "\0")),
+          "\0",
+          Integer.to_string(path_count),
+          "\0",
+          digests |> Enum.reverse() |> Enum.join("\0")
+        ])
+
+      :error ->
+        nil
+    end
+  rescue
+    _error -> nil
+  end
+
+  defp combined_fingerprint(status_fingerprint, content_fingerprint)
+       when is_binary(status_fingerprint) and is_binary(content_fingerprint),
+       do: sha256(["worktree/v2\0", status_fingerprint, "\0", content_fingerprint])
+
+  defp combined_fingerprint(_status_fingerprint, _content_fingerprint), do: nil
+
+  defp unknown_worktree_state,
+    do: %{
+      dirty: true,
+      fingerprint: nil,
+      status_fingerprint: nil,
+      content_fingerprint: nil,
+      complete: false,
+      path_count: 0
+    }
 
   defp commit_age_seconds(_runner, _workspace, nil), do: nil
 
@@ -354,4 +425,6 @@ defmodule SymphonyElixir.BaseDrift do
   end
 
   defp git(args, workspace), do: System.cmd("git", args, cd: workspace, stderr_to_stdout: true)
+
+  defp sha256(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 end

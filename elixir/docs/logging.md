@@ -23,6 +23,15 @@ Compact lifecycle telemetry also includes `run_id`, which is unique to one worke
 runs retain `parent_run_id`, the triggering `retry_id`, and a numeric retry attempt; do not replace
 the existing issue, session, thread, or turn identifiers with run lineage.
 
+Task-delivery telemetry is separate from worker lifecycle. Version 1 `task_outcome` events carry
+`outcome_version`, `stage`, `status`, and `authoritative`. Current authoritative emit points are the
+before/after repository delta (`material_progress:recorded`) and a passed versioned exact-head
+handoff gate (`exact_head_handoff:accepted`). Worktree evidence contains only bounded SHA-256
+fingerprints, never file contents. CI, human-review, merge, reopen, and revert stay unknown unless a
+future authoritative integration emits them explicitly; do not infer them from `run_end` or Linear
+state. Correlate downstream delivery by exact/candidate/reviewed/head SHA before falling back to
+`run_id` or conservative legacy issue/date identity.
+
 ## Message Design
 
 - Use explicit `key=value` pairs in message text for high-signal fields.

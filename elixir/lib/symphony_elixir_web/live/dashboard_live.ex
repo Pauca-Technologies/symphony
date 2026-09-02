@@ -79,7 +79,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
     ~H"""
     <section class="dashboard-shell">
       <%= if @live_action == :issue do %>
-        <%= if @issue_payload[:error] do %>
+        <%= cond do %>
+          <% @issue_payload[:error] -> %>
           <header class="hero-card">
             <div class="hero-grid">
               <div>
@@ -110,7 +111,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <strong><%= @issue_payload.error.code %>:</strong> <%= @issue_payload.error.message %>
             </p>
           </section>
-        <% else %>
+          <% @issue_payload[:historical] -> %>
+            <.historical_issue_detail payload={@issue_payload} />
+          <% true -> %>
           <header class="hero-card">
             <div class="hero-grid">
               <div>
@@ -409,6 +412,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
 
             <div class="status-stack">
+              <.link class="subtle-button" navigate="/history">
+                Historical evaluation
+              </.link>
               <a
                 :if={waiting_count(@dashboard_payload) > 0}
                 class="status-badge status-badge-waiting"
@@ -824,6 +830,89 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
+  defp historical_issue_detail(assigns) do
+    ~H"""
+    <header class="hero-card">
+      <div class="hero-grid">
+        <div>
+          <p class="eyebrow">Symphony Historical Telemetry</p>
+          <h1 class="hero-title hero-title-sm"><%= @payload.title || @payload.issue_identifier %></h1>
+          <p :if={@payload.title} class="hero-subtitle mono"><%= @payload.issue_identifier %></p>
+          <p class="hero-copy">
+            Live state is unavailable or no longer retained. The fields below come from bounded retained telemetry and do not imply a live session or transcript.
+          </p>
+        </div>
+        <div class="status-stack">
+          <.link class="subtle-button" navigate="/history">Historical evaluation</.link>
+          <.link class="subtle-button" navigate="/">Back to live dashboard</.link>
+        </div>
+      </div>
+    </header>
+
+    <section class="metric-grid">
+      <article class="metric-card">
+        <p class="metric-label">Latest reported status</p>
+        <p class="metric-value metric-value-text"><%= @payload.status %></p>
+        <p class="metric-detail">Task-outcome evidence when present; otherwise worker lifecycle only.</p>
+      </article>
+      <article class="metric-card">
+        <p class="metric-label">Worker runs</p>
+        <p class="metric-value numeric"><%= length(@payload.runs) %></p>
+        <p class="metric-detail"><%= @payload.fleet.worker_runs_completed_normally %> normal worker exits.</p>
+      </article>
+      <article class="metric-card">
+        <p class="metric-label">Material progress</p>
+        <p class="metric-value numeric"><%= @payload.fleet.material_progress_runs %></p>
+        <p class="metric-detail">Observed repository deltas, not inferred from worker completion.</p>
+      </article>
+      <article class="metric-card">
+        <p class="metric-label">Accepted exact-head handoffs</p>
+        <p class="metric-value numeric"><%= @payload.fleet.accepted_handoffs %></p>
+        <p class="metric-detail"><%= @payload.fleet.post_handoff.unknown %> accepted handoffs lack downstream evidence.</p>
+      </article>
+    </section>
+
+    <section class="section-card">
+      <div class="section-header">
+        <div>
+          <h2 class="section-title">Historical run evidence</h2>
+          <p class="section-copy">Retained worker lifecycle and correlated explicit task outcomes.</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>Run</th><th>Started / ended</th><th>Worker result</th><th>Model</th><th>Task outcomes</th></tr></thead>
+          <tbody>
+            <tr :for={run <- @payload.runs}>
+              <td class="mono"><%= run.run_id || run.identity %></td>
+              <td><%= run.started_at || "unknown" %><div class="muted"><%= run.ended_at || "not reported" %></div></td>
+              <td><%= run.worker_outcome || "unknown" %><div class="muted"><%= run.failure_class || "no reported failure" %></div></td>
+              <td><%= run.model || "unknown" %></td>
+              <td><%= historical_outcome_labels(run.outcomes) %></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section-card">
+      <div class="section-header">
+        <div>
+          <h2 class="section-title">Recent compact telemetry</h2>
+          <p class="section-copy">At most 50 redacted event summaries; raw prompts, outputs, and transcript text are not reconstructed here.</p>
+        </div>
+      </div>
+      <p :if={@payload.recent_events == []} class="empty-state">No retained events.</p>
+      <div :for={event <- @payload.recent_events} class="field-list">
+        <div>
+          <span class="field-label"><%= Map.get(event, "ts") || "unknown time" %></span>
+          <pre class="code-panel"><%= historical_event_label(event) %></pre>
+        </div>
+      </div>
+    </section>
+    """
+  end
+
   defp usage_window(assigns) do
     ~H"""
     <div class="backend-window">
@@ -841,6 +930,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
       <% end %>
     </div>
     """
+  end
+
+  defp historical_outcome_labels([]), do: "none reported"
+
+  defp historical_outcome_labels(outcomes) do
+    Enum.map_join(outcomes, ", ", &"#{&1.stage}:#{&1.status}")
+  end
+
+  defp historical_event_label(event) do
+    details =
+      [event["stage"], event["status"], event["outcome"], event["failure_class"]]
+      |> Enum.filter(&is_binary/1)
+      |> Enum.join(" · ")
+
+    if details == "", do: event["event"] || "unknown event", else: "#{event["event"]} · #{details}"
   end
 
   defp session_groups(payload) do
@@ -941,7 +1045,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
     transcript_cache = socket.assigns[:transcript_cache] || %{}
 
     {issue_payload, transcript_cache} =
-      case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms(), transcript_cache) do
+      case Presenter.issue_payload_with_history(
+             issue_identifier,
+             orchestrator(),
+             snapshot_timeout_ms(),
+             transcript_cache
+           ) do
         {:ok, payload, new_cache} ->
           {payload, new_cache}
 

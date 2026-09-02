@@ -134,6 +134,41 @@ defmodule SymphonyElixir.BaseDriftTest do
     assert decision.candidate_base_sha == decision.current_base_sha
   end
 
+  test "manifest fingerprint detects content changes while the worktree remains dirty", context do
+    scratch = Path.join(context.workspace, "scratch.txt")
+    File.write!(scratch, "first dirty version\n")
+
+    before = BaseDrift.manifest(context.workspace, "main")
+    File.write!(scratch, "second dirty version\n")
+    after_run = BaseDrift.manifest(context.workspace, "main")
+
+    assert before.dirty
+    assert after_run.dirty
+    assert before.worktree_fingerprint =~ ~r/^[0-9a-f]{64}$/
+    assert after_run.worktree_fingerprint =~ ~r/^[0-9a-f]{64}$/
+    refute before.worktree_fingerprint == after_run.worktree_fingerprint
+    assert before.worktree_fingerprint_complete
+    assert before.worktree_fingerprint_path_count == 1
+    refute inspect(before.worktree_fingerprint) =~ "dirty version"
+  end
+
+  test "manifest marks content fingerprint unavailable when hash-object fails", context do
+    File.write!(Path.join(context.workspace, "scratch.txt"), "preserved content\n")
+
+    runner = fn
+      ["hash-object" | _args], _workspace -> {"transient hash failure", 17}
+      args, workspace -> System.cmd("git", args, cd: workspace, stderr_to_stdout: true)
+    end
+
+    manifest = BaseDrift.manifest(context.workspace, "main", git_runner: runner)
+
+    assert manifest.dirty
+    assert manifest.worktree_status_fingerprint =~ ~r/^[0-9a-f]{64}$/
+    assert manifest.worktree_content_fingerprint == nil
+    assert manifest.worktree_fingerprint == nil
+    refute manifest.worktree_fingerprint_complete
+  end
+
   test "a later handoff attempt refetches instead of trusting stale process state", context do
     commit_file!(context.workspace, "lib/account.ex", "account = :candidate\n", "candidate")
 

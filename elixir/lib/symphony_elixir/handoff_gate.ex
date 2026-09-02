@@ -5,7 +5,7 @@ defmodule SymphonyElixir.HandoffGate do
 
   require Logger
 
-  alias SymphonyElixir.{Config, Linear.Issue, Telemetry, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, TaskOutcome, Telemetry, Workspace}
 
   @telemetry_event [:symphony_elixir, :gate, :before_handoff]
   @handoff_target_states MapSet.new(["in review", "human review"])
@@ -647,6 +647,22 @@ defmodule SymphonyElixir.HandoffGate do
     output = Jason.encode!(%{"checks" => gate.checks})
     breakdown = gate_breakdown(output, hook_passed?)
     emit_telemetry(issue, target_state, gate.status, breakdown)
+
+    if hook_passed? do
+      head_sha = gate |> Map.get(:identity, %{}) |> Map.get("headSha")
+
+      TaskOutcome.emit(:exact_head_handoff, :accepted, %{
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        parent_issue_id: issue.parent_id,
+        target_state: target_state,
+        candidate_sha: head_sha,
+        exact_sha: head_sha,
+        candidate_fingerprint: gate.candidate_hash,
+        exact_fingerprint: gate.exact_hash,
+        gate_job_id: gate.job_id
+      })
+    end
   end
 
   defp normalize_state(state) when is_binary(state) do

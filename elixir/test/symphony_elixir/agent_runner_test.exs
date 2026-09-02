@@ -110,6 +110,34 @@ defmodule SymphonyElixir.AgentRunnerTest.ManifestOrderingBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.RepositoryProgressBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(workspace, _opts), do: {:ok, %{workspace: workspace, worker_host: nil}}
+
+  @impl true
+  def run_turn(%{workspace: workspace}, _prompt, _issue, _opts) do
+    case Application.fetch_env!(:symphony_elixir, :repository_progress_action) do
+      :append_then_error ->
+        File.write!(Path.join(workspace, "progress.txt"), "agent change\n", [:append])
+        {:error, :forced_turn_failure}
+
+      :break_post_probe ->
+        File.rename!(Path.join(workspace, ".git"), Path.join(workspace, ".git-hidden"))
+        {:ok, %{session_id: "broken-post-probe"}}
+
+      {:fail_hash_probe, probe_state} ->
+        Agent.update(probe_state, fn _previous -> :fail end)
+        {:ok, %{session_id: "failed-content-probe"}}
+    end
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.WaitingBackend do
   @moduledoc false
   @behaviour SymphonyElixir.AgentBackend
@@ -354,6 +382,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
   alias SymphonyElixir.AgentRunnerTest.ManifestOrderingBackend
   alias SymphonyElixir.AgentRunnerTest.PendingGateBackend
+  alias SymphonyElixir.AgentRunnerTest.RepositoryProgressBackend
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
   alias SymphonyElixir.AgentRunnerTest.WaitingBackend
   alias SymphonyElixir.Linear.Comment
@@ -544,6 +573,93 @@ defmodule SymphonyElixir.AgentRunnerTest do
     assert manifest["repository"]["id"] == "manifest-repo"
     assert manifest["repository"]["head_sha"] == String.trim(expected_head)
     assert manifest["repository"]["dirty"] == false
+  end
+
+  test "records dirty-to-dirty material progress even when the handled turn returns an error" do
+    {issue, _workspace_root} = prepare_progress_repository!("UDPE-PROGRESS-ERROR")
+    Application.put_env(:symphony_elixir, :repository_progress_action, :append_then_error)
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :repository_progress_action) end)
+
+    assert_raise RuntimeError, ~r/forced_turn_failure/, fn ->
+      AgentRunner.run(issue, nil,
+        agent_backend: {RepositoryProgressBackend, %{}},
+        issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+        max_turns: 1
+      )
+    end
+
+    outcomes =
+      Date.utc_today()
+      |> then(&SymphonyElixir.Telemetry.read_events(&1, &1))
+      |> Enum.filter(&(&1["event"] == "task_outcome"))
+
+    assert [progress] = outcomes
+    assert progress["stage"] == "material_progress"
+    assert progress["status"] == "recorded"
+    assert progress["run_id"] =~ ~r/^[0-9a-f-]{36}$/
+    assert progress["before_worktree_fingerprint"] =~ ~r/^[0-9a-f]{64}$/
+    assert progress["after_worktree_fingerprint"] =~ ~r/^[0-9a-f]{64}$/
+    refute progress["before_worktree_fingerprint"] == progress["after_worktree_fingerprint"]
+    assert progress["workspace_dirty"]
+  end
+
+  test "does not record progress when only the post-run repository probe fails" do
+    {issue, _workspace_root} = prepare_progress_repository!("UDPE-PROGRESS-PROBE")
+    Application.put_env(:symphony_elixir, :repository_progress_action, :break_post_probe)
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :repository_progress_action) end)
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               agent_backend: {RepositoryProgressBackend, %{}},
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+               max_turns: 1
+             )
+
+    events = SymphonyElixir.Telemetry.read_events(Date.utc_today(), Date.utc_today())
+    refute Enum.any?(events, &(&1["event"] == "task_outcome" and &1["stage"] == "material_progress"))
+  end
+
+  test "does not record progress when only the post-run content hash probe fails" do
+    {issue, _workspace_root} = prepare_progress_repository!("UDPE-PROGRESS-HASH-PROBE")
+    {:ok, probe_state} = Agent.start_link(fn -> :ok end)
+
+    git_runner = fn
+      ["hash-object" | _rest] = args, workspace ->
+        if Agent.get(probe_state, & &1) == :fail,
+          do: {"transient hash failure", 17},
+          else: System.cmd("git", args, cd: workspace, stderr_to_stdout: true)
+
+      args, workspace ->
+        System.cmd("git", args, cd: workspace, stderr_to_stdout: true)
+    end
+
+    Application.put_env(
+      :symphony_elixir,
+      :repository_progress_action,
+      {:fail_hash_probe, probe_state}
+    )
+
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :repository_progress_action)
+      if Process.alive?(probe_state), do: Agent.stop(probe_state)
+    end)
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               agent_backend: {RepositoryProgressBackend, %{}},
+               repository_git_runner: git_runner,
+               issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+               max_turns: 1
+             )
+
+    events = SymphonyElixir.Telemetry.read_events(Date.utc_today(), Date.utc_today())
+    refute Enum.any?(events, &(&1["event"] == "task_outcome" and &1["stage"] == "material_progress"))
   end
 
   test "builds safe manifest policies for alternate backends and reviewer workflows" do
@@ -3052,5 +3168,66 @@ defmodule SymphonyElixir.AgentRunnerTest do
       summary: nil,
       single_flight: true
     }
+  end
+
+  defp prepare_progress_repository!(identifier) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-repository-progress-#{System.unique_integer([:positive])}"
+      )
+
+    origin = Path.join(root, "origin")
+    workspace_root = Path.join(root, "workspaces")
+    File.mkdir_p!(origin)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    System.cmd("git", ["-C", origin, "init", "--quiet", "--initial-branch", "main"])
+    System.cmd("git", ["-C", origin, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", origin, "config", "user.email", "test@example.com"])
+
+    File.write!(
+      Path.join(origin, "WORKFLOW.md"),
+      """
+      ---
+      hooks:
+        before_run: printf before > progress.txt
+      ---
+      Test repository progress.
+      """
+    )
+
+    System.cmd("git", ["-C", origin, "add", "WORKFLOW.md"])
+    System.cmd("git", ["-C", origin, "commit", "--quiet", "-m", "initial"])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root
+    )
+
+    File.write!(
+      Application.fetch_env!(:symphony_elixir, :repo_config_path),
+      """
+      linear:
+        team_id: UDPE
+      repos:
+        - id: progress-repo
+          label: repo:progress-repo
+          repo_url: #{origin}
+          workflow_path: WORKFLOW.md
+          base_branch: main
+      """
+    )
+
+    issue = %Issue{
+      id: "issue-#{identifier}",
+      identifier: identifier,
+      title: "Track repository material progress",
+      state: "In Progress",
+      labels: ["repo:progress-repo"],
+      comments: []
+    }
+
+    {issue, workspace_root}
   end
 end

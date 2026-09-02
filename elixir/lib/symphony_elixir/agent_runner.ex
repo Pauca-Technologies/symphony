@@ -33,6 +33,7 @@ defmodule SymphonyElixir.AgentRunner do
     RunManifest,
     SessionStartHook,
     TaskContextPrompt,
+    TaskOutcome,
     Telemetry,
     TestWorkerBudget,
     Tracker,
@@ -300,7 +301,13 @@ defmodule SymphonyElixir.AgentRunner do
                  worker_host,
                  hook_command: Map.get(repo_hook_opts, :before_run)
                ) do
-          run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          run_agent_with_progress_tracking(%{
+            workspace: workspace,
+            issue: issue,
+            recipient: codex_update_recipient,
+            opts: opts,
+            worker_host: worker_host
+          })
         end
 
       {:error, reason} ->
@@ -503,7 +510,62 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_scheduling_runtime_info(_recipient, _issue, _manifest, _opts), do: :ok
 
   defp collect_repository_manifest(workspace, worker_host, opts) do
-    BaseDrift.manifest(workspace, Keyword.get(opts, :base_drift_ref), worker_host: worker_host)
+    manifest_opts =
+      [worker_host: worker_host]
+      |> maybe_put(:git_runner, Keyword.get(opts, :repository_git_runner))
+
+    BaseDrift.manifest(workspace, Keyword.get(opts, :base_drift_ref), manifest_opts)
+  end
+
+  defp run_agent_with_progress_tracking(context) do
+    before = collect_repository_manifest(context.workspace, context.worker_host, context.opts)
+    opts = Keyword.put(context.opts, :repository_manifest, before)
+
+    result =
+      run_codex_turns(
+        context.workspace,
+        context.issue,
+        context.recipient,
+        opts,
+        context.worker_host
+      )
+
+    after_run = collect_repository_manifest(context.workspace, context.worker_host, opts)
+    maybe_emit_material_progress(context.issue, opts, before, after_run)
+    result
+  end
+
+  defp maybe_emit_material_progress(issue, opts, before, after_run) do
+    if repository_progress?(before, after_run) do
+      TaskOutcome.emit(:material_progress, :recorded, %{
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        parent_issue_id: issue.parent_id,
+        repository: Keyword.get(opts, :repository_id) || repository_from_labels(issue.labels),
+        before_sha: Map.get(before, :head_sha),
+        after_sha: Map.get(after_run, :head_sha),
+        before_worktree_fingerprint: Map.get(before, :worktree_fingerprint),
+        after_worktree_fingerprint: Map.get(after_run, :worktree_fingerprint),
+        before_worktree_status_fingerprint: Map.get(before, :worktree_status_fingerprint),
+        after_worktree_status_fingerprint: Map.get(after_run, :worktree_status_fingerprint),
+        before_worktree_content_fingerprint: Map.get(before, :worktree_content_fingerprint),
+        after_worktree_content_fingerprint: Map.get(after_run, :worktree_content_fingerprint),
+        workspace_dirty: Map.get(after_run, :dirty)
+      })
+    end
+  end
+
+  defp repository_progress?(before, after_run) do
+    before_head = Map.get(before, :head_sha)
+    after_head = Map.get(after_run, :head_sha)
+    before_status = Map.get(before, :worktree_status_fingerprint)
+    after_status = Map.get(after_run, :worktree_status_fingerprint)
+    before_content = Map.get(before, :worktree_content_fingerprint)
+    after_content = Map.get(after_run, :worktree_content_fingerprint)
+
+    (is_binary(before_head) and is_binary(after_head) and before_head != after_head) or
+      (is_binary(before_status) and is_binary(after_status) and before_status != after_status) or
+      (is_binary(before_content) and is_binary(after_content) and before_content != after_content)
   end
 
   defp refresh_scheduling_runtime_info(recipient, issue, worker_host, workspace, opts)
