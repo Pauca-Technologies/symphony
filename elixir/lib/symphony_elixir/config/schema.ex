@@ -185,6 +185,9 @@ defmodule SymphonyElixir.Config.Schema do
       # failures remain active and retry at `max_retry_backoff_ms`. Reset when
       # the issue completes a turn normally.
       field(:max_retries, :integer, default: 10)
+      # Host-owned emergency gate for repository-declared experiments. This is
+      # intentionally a two-value switch rather than a feature-flag system.
+      field(:experiment_mode, :string, default: "off")
       field(:max_concurrent_agents_by_state, :map, default: %{})
       # Selects the coding-agent backend. "codex" = Codex app-server (default,
       # unchanged behavior); "acp" = Agent Client Protocol; "claude_code" =
@@ -213,6 +216,7 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_retries,
+          :experiment_mode,
           :max_concurrent_agents_by_state,
           :backend,
           :pre_command
@@ -226,6 +230,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:max_retries, greater_than: 0)
+      |> validate_inclusion(:experiment_mode, ["off", "apply"])
       |> validate_inclusion(:backend, @backend_names)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)

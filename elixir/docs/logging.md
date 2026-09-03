@@ -126,6 +126,33 @@ operator-owned `0700` staging directory; Symphony provides no approval, promotio
 cleanup command. Externally supplied approval metadata is review-process evidence, not
 cryptographic authentication.
 
+## Controlled Experiment Attribution
+
+Reasoning-effort experiments are default-off and explicitly opted in. Version 1
+`experiment_exposure` records one stable logical `exposure_id` per worker `run_id`, plus fixed
+assignment/arm/configuration digests, role, effort, retry attempt, and
+`assignment_reason=deterministic_opt_in`. A crash between packet persistence and event delivery may
+replay the same event; consumers deduplicate the stable ID. Version 1 `experiment_suspended`
+records the stable `suspension_id`, fixed reason, prior-exposure boolean, and
+`delivery=initial|replay`. It is contamination evidence, not a worker error.
+
+Neither event may contain the opt-in label, issue text, prompt, transcript, tool/workpad body, raw
+arguments/output, or arbitrary repository content. The compact assignment is persisted only in the
+trusted resume-packet sidecar and is excluded before visible-packet compaction, prompt rendering,
+and prompt hashing; runtime telemetry exposes only allowlisted IDs, digests, enums, and counts.
+The host kill switch is re-read fail-closed before each turn. Turning it off cannot interrupt an
+active turn; it permanently suspends the assignment for its next turn and emits at most one logical
+suspension, with at-least-once physical delivery across a crash.
+
+`mix telemetry.experiment_report` reads only retained compact telemetry for exact 7/30-day windows.
+It validates v1 events and same-run manifests, deduplicates stable event IDs, and stratifies cohorts
+by experiment version, repository, and task family. Suspensions, missing/mismatched manifests,
+cross-arm units, stratum conflicts, and digest conflicts are excluded as explicit contamination.
+Worker completion, authoritative task outcomes, post-handoff evidence, duration, token high-water,
+and explicit numeric cost retain separate denominators. Output is descriptive only; retries are not
+independent trials and pairing, Pass@k, Pass^k, significance, and causal confidence remain
+unavailable.
+
 ## Agent Profile Routing
 
 Repository profile classification logs the final `profile`, the classifier's proposed profile, and

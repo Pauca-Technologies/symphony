@@ -2061,6 +2061,46 @@ Offline accepted-fixture verification MUST replay and integrity-check the genera
 core, reject pending corpora, and remain bounded and deterministic. Candidate mining MUST NOT add a
 runtime process, poller, reaper, ticket mutation, or automatic fixture commit.
 
+An implementation MAY support an explicitly opted-in controlled experiment whose only version 1
+treatment variable is the Codex per-turn reasoning effort. The host-owned master mode MUST default
+and fail closed to `off`; repositories MAY declare one strict versioned manifest containing a
+control arm, at most three variants, bounded integer weights, eligible repositories/task families,
+and an exact opt-in label. Assignment MUST be deterministic and may be created only for a genuinely
+fresh task before its first backend turn. A task that begins disabled or ineligible MUST NOT join on
+a later continuation or retry. The persisted assignment remains authoritative across continuation,
+retry, wait, quota, and restart boundaries. Manifest/route/identity drift MUST permanently suspend
+and contaminate the assignment rather than reassign the same task.
+
+The host switch MUST be rechecked fail-closed immediately before every backend turn. Turning it off
+does not interrupt an active turn, but at the next turn boundary it permanently suspends both
+exposed and unexposed assignments and applies the baseline effort thereafter; re-enabling MUST NOT
+resume that task. The compact assignment MUST live only inside the existing trusted resume packet,
+MUST NOT create another store/process/poller/reaper, and MUST be removed before visible-packet
+compaction and prompt rendering so otherwise-identical prompt bytes and section hashes are
+independent of arm or suspension state. Assignment persistence and evaluation MUST add no Git,
+Linear, validation, or source-repository working-directory operation.
+
+An actually experiment-controlled turn SHOULD emit a versioned `experiment_exposure` with a stable
+logical ID derived from assignment and `run_id`; one run has one logical exposure and a retry is a
+new run exposure, never an independent repeated trial. A permanent suspension SHOULD likewise have
+a stable logical ID. Physical JSONL delivery MAY be at-least-once across a crash, so consumers MUST
+deduplicate equal IDs and treat conflicting duplicates as contamination. Events and runtime state
+MUST contain only fixed enums, bounded IDs/digests/counts, run/retry lineage, and the fixed
+assignment reason; labels, issue content, prompts, transcripts, tool arguments/output, workpad
+bodies, and arbitrary user/repository content are forbidden.
+
+Offline evaluation SHOULD use exact bounded 7- or 30-day compact-telemetry windows and join valid
+exposures to same-run versioned manifests and authoritative outcomes. Cohorts MUST be separated by
+experiment version, repository, and task family. Missing/conflicting manifests, cross-arm/config
+units, stratum conflicts, and suspensions are contaminated and excluded from comparable
+denominators. Reports MAY show raw worker-completion, task-outcome, exact-head/post-handoff,
+duration, token-high-water, and explicit-cost denominators plus descriptive treatment-minus-control
+deltas. They MUST NOT claim causality or significance. Pairing and Pass@k/Pass^k MUST remain
+explicitly unavailable without a genuine repeated-trial protocol; retries MUST NOT be relabeled as
+trials. Symphony supplies no experiment promotion or approval path. Before any operator routing
+decision, a human MUST independently verify the reviewed manifest, retention/window boundaries,
+workspace security, contamination, and material outcome evidence.
+
 ### 13.7 Telemetry-Driven Soft Budgets and Routing
 
 Repository workflows MAY configure `agent.efficiency` with `mode` (`off`, `shadow`, or `enforce`),

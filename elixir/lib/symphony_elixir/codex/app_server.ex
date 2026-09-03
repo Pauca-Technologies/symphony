@@ -141,8 +141,11 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
+    effective_reasoning_effort =
+      non_blank_turn_override(opts, :reasoning_effort) || reasoning_effort
+
     turn_options = %{
-      reasoning_effort: reasoning_effort,
+      reasoning_effort: effective_reasoning_effort,
       output_schema: Keyword.get(opts, :output_schema)
     }
 
@@ -168,7 +171,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             thread_id: thread_id,
             turn_id: turn_id,
             model: model,
-            reasoning_effort: reasoning_effort
+            reasoning_effort: effective_reasoning_effort
           },
           metadata
         )
@@ -667,6 +670,19 @@ defmodule SymphonyElixir.Codex.AppServer do
       base_instructions: Keyword.get(opts, :base_instructions),
       developer_instructions: Keyword.get(opts, :developer_instructions)
     }
+  end
+
+  defp non_blank_turn_override(opts, key) do
+    case Keyword.get(opts, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _value ->
+        nil
+    end
   end
 
   defp thread_config(opts) do

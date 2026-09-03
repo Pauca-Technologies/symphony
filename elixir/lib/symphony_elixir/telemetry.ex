@@ -25,6 +25,8 @@ defmodule SymphonyElixir.Telemetry do
           :run_start
           | :run_end
           | :run_manifest
+          | :experiment_exposure
+          | :experiment_suspended
           | :task_outcome
           | :no_progress_loop
           | :prompt_built

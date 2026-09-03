@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.Config.{AgentEfficiency, AgentRouting, NoProgress, Schema}
+  alias SymphonyElixir.Config.{AgentEfficiency, AgentRouting, Experiment, NoProgress, Schema}
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -226,6 +226,26 @@ defmodule SymphonyElixir.Config do
   @spec no_progress_settings(Workflow.loaded_workflow() | nil) :: NoProgress.t()
   def no_progress_settings(%{config: config}) when is_map(config), do: NoProgress.parse(config)
   def no_progress_settings(_missing_or_invalid), do: NoProgress.parse(%{})
+
+  @doc "Resolve the host-owned experiment kill switch, failing closed to off."
+  @spec experiment_mode() :: :off | :apply
+  def experiment_mode do
+    case settings() do
+      {:ok, %{agent: %{experiment_mode: "apply"}}} -> :apply
+      _disabled_or_invalid -> :off
+    end
+  rescue
+    _error -> :off
+  end
+
+  @doc "Parse a repository-owned versioned experiment manifest."
+  @spec experiment_settings(Workflow.loaded_workflow() | nil) ::
+          {:ok, Experiment.t() | nil} | {:error, term()}
+  def experiment_settings(%{config: config}) when is_map(config), do: Experiment.parse(config)
+  def experiment_settings(nil), do: {:ok, nil}
+
+  def experiment_settings(_workflow),
+    do: {:error, {:invalid_agent_experiment, "repository workflow must contain a config map"}}
 
   @doc """
   Resolve repository-owned automated-review settings from `WORKFLOW_REVIEW.md`.

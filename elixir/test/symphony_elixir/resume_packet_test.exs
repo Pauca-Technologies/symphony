@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.ResumePacketTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Config.Experiment, as: ExperimentConfig
+  alias SymphonyElixir.Experiment
   alias SymphonyElixir.Linear.Comment
   alias SymphonyElixir.ResumePacket
 
@@ -142,6 +144,86 @@ defmodule SymphonyElixir.ResumePacketTest do
     assert current["workpad"]["source"] == "persisted:#{previous["packet_id"]}"
     assert current["workpad"]["captured_at"] == previous["workpad"]["captured_at"]
     assert current["no_progress_warnings"]["items"] == []
+  end
+
+  test "persists experiment assignment without rendering it or changing prompt bytes across arms" do
+    context = %{
+      issue: %Issue{id: "issue-1", identifier: "UDPE-7505", comments: []},
+      identity: %{run_id: "run-1", retry_attempt: 0},
+      repository: %{head_sha: String.duplicate("a", 40), dirty: false},
+      boundary_reason: :turn_start
+    }
+
+    control_assignment = %{
+      "experiment_id" => "secret-experiment-id",
+      "assignment_id" => "exa-" <> String.duplicate("1", 32),
+      "arm_id" => "control",
+      "reasoning_effort" => "xhigh"
+    }
+
+    variant_assignment = %{
+      control_assignment
+      | "assignment_id" => "exa-" <> String.duplicate("2", 32),
+        "arm_id" => "low",
+        "reasoning_effort" => "low"
+    }
+
+    control = ResumePacket.build(Map.put(context, :experiment_assignment, control_assignment), now: @captured_at)
+    variant = ResumePacket.build(Map.put(context, :experiment_assignment, variant_assignment), now: @captured_at)
+
+    assert control["experiment_assignment"] == control_assignment
+    assert variant["experiment_assignment"] == variant_assignment
+    refute control["packet_id"] == variant["packet_id"]
+    assert ResumePacket.render(control, 8_000) == ResumePacket.render(variant, 8_000)
+
+    assert :crypto.hash(:sha256, ResumePacket.render(control, 8_000)) ==
+             :crypto.hash(:sha256, ResumePacket.render(variant, 8_000))
+
+    rendered = ResumePacket.render(control, 8_000)
+    refute rendered =~ "secret-experiment-id"
+    refute rendered =~ control_assignment["assignment_id"]
+    refute rendered =~ "arm_id"
+
+    assert {:ok, marked} = ResumePacket.mark_boundary(control, :retry_scheduled, now: @captured_at)
+    assert marked["experiment_assignment"] == control_assignment
+    assert {:ok, encoded} = ResumePacket.encode(marked)
+    assert {:ok, ^marked} = ResumePacket.decode(encoded)
+  end
+
+  test "near-cap compaction and prompt bytes are independent of valid assignment values and state" do
+    %{control: control_assignment, variant: variant_assignment} = valid_experiment_assignments()
+
+    suspended_assignment =
+      variant_assignment
+      |> Experiment.turn(%{mode: :off, run_id: "run-suspend"})
+      |> Map.fetch!(:assignment)
+
+    context = near_cap_experiment_context()
+
+    packets =
+      Enum.map([control_assignment, variant_assignment, suspended_assignment], fn assignment ->
+        packet = ResumePacket.build(Map.put(context, :experiment_assignment, assignment), now: @captured_at)
+        assert packet["experiment_assignment"] == assignment
+        assert packet["compaction"]["compacted_fields"] != []
+        assert {:ok, encoded} = ResumePacket.encode(packet)
+        assert byte_size(encoded) <= ResumePacket.max_bytes()
+        packet
+      end)
+
+    visible_packets =
+      Enum.map(packets, &Map.drop(&1, ["experiment_assignment", "packet_id", "packet_sha256"]))
+
+    assert Enum.uniq(visible_packets) |> length() == 1
+    assert packets |> Enum.map(&ResumePacket.render(&1, 16_000)) |> Enum.uniq() |> length() == 1
+
+    oversized =
+      ResumePacket.build(
+        Map.put(context, :experiment_assignment, %{"raw" => String.duplicate("x", 2_000)}),
+        now: @captured_at
+      )
+
+    refute Map.has_key?(oversized, "experiment_assignment")
+    assert {:ok, _encoded} = ResumePacket.encode(oversized)
   end
 
   test "normalizes structured warning state, renders fixed guidance, and preserves legacy packets" do
@@ -705,6 +787,7 @@ defmodule SymphonyElixir.ResumePacketTest do
             }
           },
           no_progress_warnings: Enum.map(1..200, &"#{&1}-#{long}"),
+          experiment_assignment: bounded_experiment_assignment(),
           errors:
             Enum.map(1..200, &"probe.error_#{&1}") ++
               ["#{long} raw output\nsecret-looking-detail"],
@@ -852,6 +935,108 @@ defmodule SymphonyElixir.ResumePacketTest do
     after
       File.rm_rf(workspace_root)
     end
+  end
+
+  defp bounded_experiment_assignment do
+    digest = String.duplicate("a", 64)
+
+    %{
+      "assignment_version" => 1,
+      "experiment_id" => String.duplicate("e", 64),
+      "revision" => 1_000_000,
+      "experiment_manifest_digest" => digest,
+      "unit_id" => "exu-" <> String.duplicate("b", 32),
+      "assignment_id" => "exa-" <> String.duplicate("c", 32),
+      "arm_id" => String.duplicate("d", 32),
+      "arm_role" => "variant",
+      "reasoning_effort" => "xhigh",
+      "baseline_reasoning_effort" => "max",
+      "arm_config_digest" => digest,
+      "control_config_digest" => digest,
+      "state" => "active",
+      "suspension_reason" => nil,
+      "suspension_id" => nil,
+      "ever_exposed" => false,
+      "last_exposure_id" => nil,
+      "contaminated" => false,
+      "assignment_digest" => digest
+    }
+  end
+
+  defp valid_experiment_assignments do
+    manifest_config = %{
+      "agent" => %{
+        "experiment" => %{
+          "schema_version" => 1,
+          "id" => String.duplicate("e", 64),
+          "revision" => 1,
+          "opt_in_label" => "experiment:effort",
+          "backend" => "codex",
+          "repositories" => ["symphony"],
+          "task_families" => ["simple_direct"],
+          "variable" => "reasoning_effort",
+          "control" => %{"id" => "control", "weight" => 1, "value" => "xhigh"},
+          "variants" => [
+            %{"id" => String.duplicate("v", 32), "weight" => 1, "value" => "low"}
+          ]
+        }
+      }
+    }
+
+    assert {:ok, manifest} = ExperimentConfig.parse(manifest_config)
+
+    assignments =
+      1..100
+      |> Enum.map(fn index ->
+        context = %{
+          fresh_task: true,
+          mode: :apply,
+          backend: :codex,
+          repository_id: "symphony",
+          issue_id: "issue-#{index}",
+          task_family: "simple_direct",
+          labels: ["experiment:effort"],
+          baseline_reasoning_effort: "xhigh"
+        }
+
+        assert {:assigned, assignment} = Experiment.assign(manifest, context)
+        assignment
+      end)
+
+    %{
+      control: Enum.find(assignments, &(&1["arm_role"] == "control")),
+      variant: Enum.find(assignments, &(&1["arm_role"] == "variant"))
+    }
+  end
+
+  defp near_cap_experiment_context do
+    sha = String.duplicate("a", 40)
+    label = fn prefix, index -> "#{prefix}-#{index}-#{String.duplicate("l", 100)}" end
+
+    %{
+      issue: issue_with_workpad(),
+      identity: %{run_id: "run-near-cap", retry_attempt: 0},
+      repository: %{
+        base_sha: sha,
+        head_sha: sha,
+        dirty: true,
+        actual_paths: Enum.map(1..50, &"#{&1}-#{String.duplicate("p", 220)}")
+      },
+      verification: %{
+        exact_sha: sha,
+        checks:
+          Enum.map(1..20, fn index ->
+            %{name: label.("check", index), status: "passed", sha: sha}
+          end),
+        attestations: %{
+          reused: Enum.map(1..20, &label.("reused", &1)),
+          rerun: Enum.map(1..20, &label.("rerun", &1))
+        }
+      },
+      no_progress_warnings: Enum.map(1..10, &"warning-#{&1}"),
+      errors: Enum.map(1..20, &"probe.error_#{&1}"),
+      boundary_reason: :turn_start
+    }
   end
 
   defp issue_with_workpad do

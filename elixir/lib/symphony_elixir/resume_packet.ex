@@ -23,6 +23,7 @@ defmodule SymphonyElixir.ResumePacket do
   @trusted_ref_suffix ".json.resume-packet.json"
   @max_count_keys 20
   @identity_reserve_bytes 192
+  @experiment_assignment_reserve_bytes 1_536
   @workpad_schema_marker "codex-workpad-v1"
 
   @budget_metric_keys ~w(
@@ -104,30 +105,32 @@ defmodule SymphonyElixir.ResumePacket do
     budget = budget_observation(value(context, :budget), previous, now)
     warnings = warnings_observation(value(context, :no_progress_warnings), now)
 
-    packet = %{
-      "protocol_version" => @version,
-      "packet_id" => nil,
-      "packet_sha256" => nil,
-      "previous_packet_id" => previous && string(previous["packet_id"]),
-      "captured_at" => now,
-      "boundary" => %{
-        "reason" => normalized_boundary(value(context, :boundary_reason)),
-        "source" => "symphony:host",
-        "captured_at" => now
-      },
-      "issue" => issue_identity(value(context, :issue)),
-      "run" => run_identity(value(context, :identity)),
-      "turns" => turns_observation(context, now),
-      "repository" => repository,
-      "workpad" => workpad,
-      "verification" => verification,
-      "budget" => budget,
-      "no_progress_warnings" => warnings,
-      "errors" => errors_observation(value(context, :errors), now),
-      "evidence_refs" => evidence_refs(context, repository, workpad, verification),
-      "unavailable_fields" => unavailable_fields(repository, workpad, verification, budget),
-      "compaction" => %{"compacted_fields" => []}
-    }
+    packet =
+      %{
+        "protocol_version" => @version,
+        "packet_id" => nil,
+        "packet_sha256" => nil,
+        "previous_packet_id" => previous && string(previous["packet_id"]),
+        "captured_at" => now,
+        "boundary" => %{
+          "reason" => normalized_boundary(value(context, :boundary_reason)),
+          "source" => "symphony:host",
+          "captured_at" => now
+        },
+        "issue" => issue_identity(value(context, :issue)),
+        "run" => run_identity(value(context, :identity)),
+        "turns" => turns_observation(context, now),
+        "repository" => repository,
+        "workpad" => workpad,
+        "verification" => verification,
+        "budget" => budget,
+        "no_progress_warnings" => warnings,
+        "errors" => errors_observation(value(context, :errors), now),
+        "evidence_refs" => evidence_refs(context, repository, workpad, verification),
+        "unavailable_fields" => unavailable_fields(repository, workpad, verification, budget),
+        "compaction" => %{"compacted_fields" => []}
+      }
+      |> maybe_put_experiment_assignment(value(context, :experiment_assignment))
 
     packet
     |> compact_to_limit()
@@ -231,6 +234,7 @@ defmodule SymphonyElixir.ResumePacket do
   @doc "Render the compact packet section appended to a model prompt."
   @spec render(packet(), pos_integer()) :: String.t()
   def render(packet, max_bytes) when is_map(packet) and is_integer(max_bytes) and max_bytes > 0 do
+    packet = prompt_safe_packet(packet)
     repository = packet_map(packet, "repository")
     workpad = packet_map(packet, "workpad")
     verification = packet_map(packet, "verification")
@@ -749,6 +753,14 @@ defmodule SymphonyElixir.ResumePacket do
     end)
   end
 
+  defp maybe_put_experiment_assignment(packet, assignment) when is_map(assignment) do
+    if encoded_experiment_assignment_size(assignment) <= @experiment_assignment_reserve_bytes,
+      do: Map.put(packet, "experiment_assignment", assignment),
+      else: packet
+  end
+
+  defp maybe_put_experiment_assignment(packet, _assignment), do: packet
+
   defp errors_observation(errors, now) do
     %{
       "source" => "symphony:host",
@@ -1010,6 +1022,34 @@ defmodule SymphonyElixir.ResumePacket do
 
   defp current_packet_body(packet), do: Map.drop(packet, ["packet_id", "packet_sha256"])
 
+  defp prompt_safe_packet(%{"experiment_assignment" => assignment} = packet)
+       when is_map(assignment) do
+    prompt_packet =
+      packet
+      |> Map.delete("experiment_assignment")
+      |> Map.put("packet_id", nil)
+      |> Map.put("packet_sha256", nil)
+      |> Map.update("previous_packet_id", nil, fn
+        value when is_binary(value) -> "integrity-checked"
+        _value -> nil
+      end)
+      |> scrub_persisted_sources()
+
+    digest = prompt_packet |> current_packet_body() |> canonical_json() |> sha256()
+    Map.put(prompt_packet, "packet_id", "resume-packet-v1-#{digest}")
+  end
+
+  defp prompt_safe_packet(packet), do: packet
+
+  defp scrub_persisted_sources(packet) do
+    Enum.reduce(~w(repository workpad verification budget), packet, fn field, current ->
+      update_in(current, [field, "source"], fn
+        "persisted:" <> _packet_id -> "persisted:trusted-resume-packet"
+        source -> source
+      end)
+    end)
+  end
+
   defp assign_identity(packet) do
     digest = packet |> current_packet_body() |> canonical_json() |> sha256()
 
@@ -1046,6 +1086,17 @@ defmodule SymphonyElixir.ResumePacket do
   defp valid_previous(_packet), do: nil
 
   defp compact_to_limit(packet) do
+    {assignment, visible_packet} = Map.pop(packet, "experiment_assignment")
+
+    body_limit =
+      @max_packet_bytes - @identity_reserve_bytes -
+        if(is_map(assignment), do: @experiment_assignment_reserve_bytes, else: 0)
+
+    compacted = compact_visible_to_limit(visible_packet, body_limit)
+    maybe_put_experiment_assignment(compacted, assignment)
+  end
+
+  defp compact_visible_to_limit(packet, body_limit) do
     steps = [
       &compact_paths(&1, 20),
       &compact_verification(&1, 8),
@@ -1057,7 +1108,7 @@ defmodule SymphonyElixir.ResumePacket do
     ]
 
     Enum.reduce_while(steps, packet, fn step, current ->
-      if encoded_body_size(current) <= @max_packet_bytes - @identity_reserve_bytes do
+      if encoded_body_size(current) <= body_limit do
         {:halt, current}
       else
         {:cont, step.(current)}
@@ -1132,6 +1183,9 @@ defmodule SymphonyElixir.ResumePacket do
   end
 
   defp encoded_body_size(packet), do: packet |> current_packet_body() |> canonical_json() |> byte_size()
+
+  defp encoded_experiment_assignment_size(assignment),
+    do: %{"experiment_assignment" => assignment} |> canonical_json() |> byte_size()
 
   defp bound_render(rendered, packet_id, max_bytes) do
     if byte_size(rendered) <= max_bytes do

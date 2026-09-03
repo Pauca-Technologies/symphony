@@ -75,20 +75,22 @@ defmodule SymphonyElixir.RunManifest do
       }
     }
 
-    configuration = %{
-      backend: backend,
-      model: route.overrides[:model],
-      reasoning_effort: route.overrides[:reasoning_effort],
-      execution_profile: route.profile,
-      route_source: route.source,
-      approval: policies.approval,
-      sandbox: policies.sandbox,
-      budget: budget,
-      no_progress: no_progress,
-      review: review,
-      workflow: workflow,
-      prompt: Map.delete(prompt, :template_bytes)
-    }
+    configuration =
+      %{
+        backend: backend,
+        model: route.overrides[:model],
+        reasoning_effort: route.overrides[:reasoning_effort],
+        execution_profile: route.profile,
+        route_source: route.source,
+        approval: policies.approval,
+        sandbox: policies.sandbox,
+        budget: budget,
+        no_progress: no_progress,
+        review: review,
+        workflow: workflow,
+        prompt: Map.delete(prompt, :template_bytes)
+      }
+      |> maybe_put_experiment(Map.get(context, :experiment_assignment))
 
     identity
     |> Map.merge(%{
@@ -157,6 +159,19 @@ defmodule SymphonyElixir.RunManifest do
 
   defp workflow_hash(%{prompt_template: prompt}) when is_binary(prompt), do: sha256(prompt)
   defp workflow_hash(_workflow), do: nil
+
+  defp maybe_put_experiment(configuration, assignment) when is_map(assignment) do
+    planned =
+      Map.take(assignment, ~w(
+        assignment_version experiment_id revision experiment_manifest_digest arm_id arm_role
+        reasoning_effort baseline_reasoning_effort arm_config_digest control_config_digest state
+        suspension_reason contaminated
+      ))
+
+    Map.put(configuration, :experiment, planned)
+  end
+
+  defp maybe_put_experiment(configuration, _assignment), do: configuration
 
   defp budget_policy(efficiency) do
     %{

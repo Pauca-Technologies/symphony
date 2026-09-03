@@ -15,6 +15,7 @@ defmodule SymphonyElixir.AgentRunner do
     BaseDrift,
     Cardinality,
     Config,
+    Experiment,
     Github.PrReviewSection,
     GitHubAuth,
     HandoffGate,
@@ -591,8 +592,39 @@ defmodule SymphonyElixir.AgentRunner do
     manifest
   end
 
+  defp prepare_experiment_turn(opts, issue, workspace, worker_host) do
+    case Keyword.get(opts, :experiment_assignment) do
+      assignment when is_map(assignment) ->
+        decision =
+          Experiment.turn(assignment, %{
+            mode: safe_experiment_mode(opts),
+            run_id: Map.get(Telemetry.current_context(), :run_id)
+          })
+
+        updated_opts =
+          opts
+          |> Keyword.put(:experiment_assignment, decision.assignment)
+          |> Keyword.put(
+            :experiment_suspension_pending,
+            Keyword.get(opts, :experiment_suspension_pending, false) or decision.emit_suspension
+          )
+
+        {decision, [], updated_opts}
+
+      _no_assignment ->
+        {nil, [], opts}
+    end
+  rescue
+    _error ->
+      experiment_failure(issue, workspace, worker_host, "experiment.decision_failed")
+      {nil, ["experiment.decision_failed"], opts}
+  end
+
   defp prepare_turn_resume_packet(workspace, issue, recipient, worker_host, opts, turn_number, max_turns) do
     {previous, load_errors} = resume_packet_fallback(workspace, worker_host, opts, issue)
+
+    {experiment_decision, experiment_errors, opts} =
+      prepare_experiment_turn(opts, issue, workspace, worker_host)
 
     {budget_snapshot, budget_errors} =
       opts
@@ -618,7 +650,8 @@ defmodule SymphonyElixir.AgentRunner do
     errors =
       load_errors ++
         List.wrap(Keyword.get(opts, :resume_packet_errors)) ++
-        repository_manifest_errors(Keyword.get(opts, :repository_manifest)) ++ budget_errors ++ restore_errors
+        repository_manifest_errors(Keyword.get(opts, :repository_manifest)) ++
+        budget_errors ++ restore_errors ++ experiment_errors
 
     packet =
       ResumePacket.build(%{
@@ -631,6 +664,7 @@ defmodule SymphonyElixir.AgentRunner do
         verification: current_resume_verification(opts),
         budget: budget,
         no_progress_warnings: warning_state,
+        experiment_assignment: Keyword.get(opts, :experiment_assignment),
         errors: errors,
         boundary_reason: :turn_start
       })
@@ -640,7 +674,9 @@ defmodule SymphonyElixir.AgentRunner do
     opts =
       opts
       |> Keyword.put(:resume_packet, packet)
+      |> Keyword.put(:resume_packet_load_errors, [])
       |> Keyword.put(:no_progress_warnings, warning_state.items)
+      |> Keyword.put(:experiment_turn_decision, experiment_decision)
       |> Keyword.put(:resume_packet_errors, persist_errors)
 
     {packet, opts}
@@ -678,6 +714,7 @@ defmodule SymphonyElixir.AgentRunner do
       verification: current_resume_verification(opts),
       budget: with_budget_thresholds(budget, opts),
       no_progress_warnings: current_warning_state,
+      experiment_assignment: Keyword.get(opts, :experiment_assignment),
       errors: errors,
       boundary_reason: boundary
     }
@@ -932,17 +969,22 @@ defmodule SymphonyElixir.AgentRunner do
     do: ~w(success failed nonzero_exit cancelled unsupported timeout unknown_failure)a
 
   defp resume_packet_fallback(workspace, worker_host, opts, issue) do
-    case Keyword.get(opts, :resume_packet) do
-      packet when is_map(packet) ->
-        {packet, []}
+    cond do
+      Keyword.get(opts, :resume_packet_loaded, false) ->
+        {Keyword.get(opts, :resume_packet), List.wrap(Keyword.get(opts, :resume_packet_load_errors))}
 
-      _missing ->
-        load_resume_packet_fallback(workspace, worker_host, issue)
+      is_map(Keyword.get(opts, :resume_packet)) ->
+        {Keyword.get(opts, :resume_packet), []}
+
+      true ->
+        load_resume_packet_fallback(workspace, worker_host, issue, opts)
     end
   end
 
-  defp load_resume_packet_fallback(workspace, worker_host, issue) do
-    case Workspace.load_resume_packet_with_diagnostics(workspace, worker_host) do
+  defp load_resume_packet_fallback(workspace, worker_host, issue, opts) do
+    loader = Keyword.get(opts, :resume_packet_loader, &Workspace.load_resume_packet_with_diagnostics/2)
+
+    case loader.(workspace, worker_host) do
       {:ok, packet, diagnostics} ->
         Enum.each(diagnostics, fn code ->
           resume_packet_failure(issue, workspace, worker_host, code, :persisted_packet_unavailable)
@@ -992,6 +1034,104 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_resume_packet_runtime_info(_recipient, _issue, _metadata), do: :ok
+
+  defp experiment_turn_effort(backend, opts) do
+    if experiment_backend_name(%{backend: backend}, opts) == "codex" do
+      case Keyword.get(opts, :experiment_turn_decision) do
+        %{reasoning_effort: effort} when is_binary(effort) -> effort
+        _no_experiment -> nil
+      end
+    end
+  end
+
+  defp emit_experiment_turn_event(issue, worker_host, opts, turn_number) do
+    decision = Keyword.get(opts, :experiment_turn_decision)
+    assignment = Keyword.get(opts, :experiment_assignment)
+
+    cond do
+      experiment_exposure_delivery?(decision, turn_number) ->
+        Telemetry.emit(
+          :experiment_exposure,
+          experiment_exposure_attrs(issue, worker_host, assignment, decision, turn_number)
+        )
+
+      experiment_suspension_delivery?(
+        assignment,
+        Keyword.get(opts, :experiment_suspension_pending, false),
+        turn_number
+      ) ->
+        Telemetry.emit(
+          :experiment_suspended,
+          experiment_suspension_attrs(
+            issue,
+            worker_host,
+            assignment,
+            turn_number,
+            Keyword.get(opts, :experiment_suspension_pending, false)
+          )
+        )
+
+      true ->
+        :ok
+    end
+  end
+
+  defp experiment_exposure_delivery?(%{action: "experiment", emit_exposure: true}, _turn_number),
+    do: true
+
+  defp experiment_exposure_delivery?(%{action: "experiment"}, 1), do: true
+  defp experiment_exposure_delivery?(_decision, _turn_number), do: false
+
+  defp experiment_suspension_delivery?(%{"state" => "suspended"}, true, _turn_number),
+    do: true
+
+  defp experiment_suspension_delivery?(%{"state" => "suspended"}, false, 1), do: true
+  defp experiment_suspension_delivery?(_assignment, _pending, _turn_number), do: false
+
+  defp experiment_exposure_attrs(issue, worker_host, assignment, decision, turn_number) do
+    experiment_event_attrs(issue, worker_host, assignment)
+    |> Map.merge(%{
+      experiment_event_version: 1,
+      exposure_id: decision.exposure_id,
+      assignment_reason: "deterministic_opt_in",
+      mode: "apply",
+      reasoning_effort: assignment["reasoning_effort"],
+      baseline_reasoning_effort: assignment["baseline_reasoning_effort"],
+      turn_number: turn_number,
+      delivery: if(decision.emit_exposure, do: "initial", else: "replay")
+    })
+  end
+
+  defp experiment_suspension_attrs(issue, worker_host, assignment, turn_number, pending?) do
+    experiment_event_attrs(issue, worker_host, assignment)
+    |> Map.merge(%{
+      experiment_event_version: 1,
+      suspension_id: assignment["suspension_id"],
+      mode: "baseline",
+      reason: assignment["suspension_reason"],
+      ever_exposed: assignment["ever_exposed"],
+      contaminated: assignment["contaminated"],
+      turn_number: turn_number,
+      delivery: if(pending?, do: "initial", else: "replay")
+    })
+  end
+
+  defp experiment_event_attrs(issue, worker_host, assignment) do
+    %{
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      worker_host: worker_host || "local",
+      experiment_id: assignment["experiment_id"],
+      experiment_revision: assignment["revision"],
+      experiment_manifest_digest: assignment["experiment_manifest_digest"],
+      unit_id: assignment["unit_id"],
+      assignment_id: assignment["assignment_id"],
+      arm_id: assignment["arm_id"],
+      arm_role: assignment["arm_role"],
+      arm_config_digest: assignment["arm_config_digest"],
+      control_config_digest: assignment["control_config_digest"]
+    }
+  end
 
   defp resume_packet_failure(issue, workspace, worker_host, code, reason) do
     Logger.warning(
@@ -1211,6 +1351,32 @@ defmodule SymphonyElixir.AgentRunner do
     with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
          {:ok, efficiency} <-
            AgentEfficiency.decide(issue, route, Keyword.get(opts, :per_repo_workflow)) do
+      {initial_packet, load_errors} = resume_packet_fallback(workspace, worker_host, opts, issue)
+
+      {experiment_assignment, experiment_errors} =
+        resolve_experiment_assignment(
+          issue,
+          route,
+          efficiency,
+          initial_packet,
+          load_errors,
+          workspace,
+          worker_host,
+          opts
+        )
+
+      opts =
+        opts
+        |> Keyword.put(:resume_packet, initial_packet)
+        |> Keyword.put(:resume_packet_loaded, true)
+        |> Keyword.put(:resume_packet_load_errors, load_errors)
+        |> Keyword.put(:experiment_assignment, experiment_assignment)
+        |> Keyword.put(
+          :experiment_suspension_pending,
+          newly_suspended_assignment?(initial_packet, experiment_assignment)
+        )
+        |> Keyword.update(:resume_packet_errors, experiment_errors, &(List.wrap(&1) ++ experiment_errors))
+
       emit_run_manifest(workspace, issue, route, efficiency, opts)
 
       recovery =
@@ -1290,7 +1456,8 @@ defmodule SymphonyElixir.AgentRunner do
       repo_workflow: Keyword.get(opts, :per_repo_workflow),
       review_workflow: Keyword.get(opts, :per_repo_review_workflow),
       workflow_source: Keyword.get(opts, :workflow_source),
-      review_workflow_source: Keyword.get(opts, :review_workflow_source)
+      review_workflow_source: Keyword.get(opts, :review_workflow_source),
+      experiment_assignment: Keyword.get(opts, :experiment_assignment)
     }
 
     Telemetry.emit(:run_manifest, RunManifest.build(context))
@@ -1377,6 +1544,93 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp resolve_experiment_assignment(
+         issue,
+         route,
+         efficiency,
+         packet,
+         load_errors,
+         workspace,
+         worker_host,
+         opts
+       ) do
+    {manifest, manifest_errors} = repository_experiment_manifest(issue, workspace, worker_host, opts)
+    previous = if is_map(packet), do: Map.get(packet, "experiment_assignment")
+    fresh_task? = fresh_experiment_lineage?(packet, load_errors)
+
+    context = %{
+      previous_assignment: previous,
+      fresh_task: fresh_task?,
+      mode: if(fresh_task?, do: safe_experiment_mode(opts), else: :off),
+      issue_id: issue.id,
+      labels: Issue.label_names(issue),
+      repository_id: Keyword.get(opts, :repository_id),
+      task_family: efficiency.task_type,
+      backend: experiment_backend_name(route, opts),
+      baseline_reasoning_effort: Map.get(route.overrides, :reasoning_effort)
+    }
+
+    case Experiment.assign(manifest, context) do
+      {:assigned, assignment} -> {assignment, manifest_errors}
+      {:restored, assignment} -> {assignment, manifest_errors}
+      {:suspended, assignment, _reason} -> {assignment, manifest_errors}
+      {:skip, :invalid_previous_assignment} -> {nil, manifest_errors ++ ["experiment.assignment_invalid"]}
+      {:skip, _reason} -> {nil, manifest_errors}
+    end
+  rescue
+    _error ->
+      experiment_failure(issue, workspace, worker_host, "experiment.assignment_failed")
+      {nil, ["experiment.assignment_failed"]}
+  end
+
+  defp repository_experiment_manifest(issue, workspace, worker_host, opts) do
+    case Config.experiment_settings(Keyword.get(opts, :per_repo_workflow)) do
+      {:ok, manifest} ->
+        {manifest, []}
+
+      {:error, _reason} ->
+        experiment_failure(issue, workspace, worker_host, "experiment.manifest_invalid")
+        {nil, ["experiment.manifest_invalid"]}
+    end
+  rescue
+    _error ->
+      experiment_failure(issue, workspace, worker_host, "experiment.manifest_invalid")
+      {nil, ["experiment.manifest_invalid"]}
+  end
+
+  defp fresh_experiment_lineage?(packet, load_errors) do
+    identity = Telemetry.current_context()
+
+    is_nil(packet) and load_errors == [] and Map.get(identity, :retry_attempt, 0) == 0 and
+      is_nil(Map.get(identity, :parent_run_id)) and is_nil(Map.get(identity, :retry_id))
+  end
+
+  defp newly_suspended_assignment?(packet, %{"state" => "suspended"}) do
+    get_in(packet || %{}, ["experiment_assignment", "state"]) != "suspended"
+  end
+
+  defp newly_suspended_assignment?(_packet, _assignment), do: false
+
+  defp experiment_backend_name(route, opts) do
+    AgentBackend.backend_name(route.backend) || Keyword.get(opts, :experiment_backend_name)
+  end
+
+  defp safe_experiment_mode(opts) do
+    resolver = Keyword.get(opts, :experiment_mode_resolver, &Config.experiment_mode/0)
+
+    case resolver.() do
+      :apply -> :apply
+      "apply" -> :apply
+      _off_or_invalid -> :off
+    end
+  rescue
+    _error -> :off
+  end
+
+  defp experiment_failure(issue, workspace, worker_host, code) do
+    resume_packet_failure(issue, workspace, worker_host, code, :experiment_unavailable)
+  end
+
   defp do_run_codex_turns(
          backend,
          app_session,
@@ -1457,13 +1711,22 @@ defmodule SymphonyElixir.AgentRunner do
     started_ms = System.monotonic_time(:millisecond)
     :ok = AgentBudgetCollector.start_turn(budget_collector, prompt, started_ms)
 
+    emit_experiment_turn_event(issue, app_session.worker_host, opts, turn_number)
+    opts = Keyword.put(opts, :experiment_suspension_pending, false)
+
+    turn_opts =
+      [
+        on_message: codex_message_handler(codex_update_recipient, issue, budget_ref),
+        tool_executor: tool_executor
+      ]
+      |> maybe_put(:reasoning_effort, experiment_turn_effort(backend, opts))
+
     turn_result =
       backend.run_turn(
         app_session,
         prompt,
         issue,
-        on_message: codex_message_handler(codex_update_recipient, issue, budget_ref),
-        tool_executor: tool_executor
+        turn_opts
       )
 
     budget_runtime =

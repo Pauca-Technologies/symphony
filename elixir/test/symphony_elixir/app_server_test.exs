@@ -313,6 +313,7 @@ defmodule SymphonyElixir.AppServerTest do
                    on_message: on_message,
                    issue_context_file: issue_context_file,
                    overrides: %{model: "gpt-5.6-sol", reasoning_effort: "xhigh"},
+                   reasoning_effort: "low",
                    thread_config: %{"project_doc_max_bytes" => 0},
                    output_schema: output_schema
                  )
@@ -322,7 +323,7 @@ defmodule SymphonyElixir.AppServerTest do
                           event: :session_started,
                           session_id: "thread-1001-turn-1001",
                           model: "gpt-5.6-sol",
-                          reasoning_effort: "xhigh"
+                          reasoning_effort: "low"
                         }}
 
         trace = File.read!(trace_file)
@@ -352,7 +353,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> then(fn payload ->
                      payload["method"] == "turn/start" &&
                        get_in(payload, ["params", "sandboxPolicy"]) == configured_policy &&
-                       get_in(payload, ["params", "effort"]) == "xhigh" &&
+                       get_in(payload, ["params", "effort"]) == "low" &&
                        get_in(payload, ["params", "outputSchema"]) == output_schema
                    end)
                  else

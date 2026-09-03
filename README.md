@@ -88,6 +88,11 @@ repository/workpad and exact-head evidence, survives retry/wait/quota/restart bo
 trusted sidecar, and degrades safely when legacy or malformed state is unavailable; raw prompt,
 diff, workpad, command, and secret content stays out of packet telemetry.
 
+The reference implementation can also run explicit default-off, fresh-task Codex
+reasoning-effort experiments. Assignments remain hidden from prompts and offline reports provide
+only bounded repository/task-stratified descriptive comparisons, never causal or repeated-trial
+claims.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

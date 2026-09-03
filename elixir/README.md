@@ -834,6 +834,14 @@ codex:
   promotes a candidate automatically. Export requires an explicit existing private staging
   directory, and `--verify` accepts only an externally reviewed accepted fixture. See the
   [offline regression candidate guide](docs/regression-candidates.md).
+  Explicitly opted-in Codex reasoning-effort experiments are default-off and repository-declared.
+  Assignment is deterministic only for a fresh task, is hidden from model prompts, and survives
+  retries/restarts in the existing trusted resume packet. The host kill switch is checked before
+  every turn and permanently suspends that task's assignment at the next safe boundary. Use
+  `mix telemetry.experiment_report --days 7` (or exact `--days 30`) for bounded, descriptive-only
+  repository/task-stratified cohorts. The report treats retries as run exposures rather than
+  repeated trials and makes causal, significance, pairing, and Pass@k claims unavailable. See the
+  [controlled experiment guide](docs/experiments.md).
 - Benign protocol notifications and stdout chunks do not produce one debug-log line each by
   default. `observability.benign_notification_debug: true` is the short-lived log-level escape
   hatch; selective gzip raw traces are normally the more complete incident artifact.

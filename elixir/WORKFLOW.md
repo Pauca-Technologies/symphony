@@ -99,6 +99,23 @@ agent:
   # Only classified authentication/configuration failures become human blockers.
   max_retries: 10
   max_retry_backoff_ms: 300000
+  # Host-owned master switch for repository-declared experiments. Default-off
+  # and fail-closed; changing it affects only future backend turns.
+  experiment_mode: off # off | apply
+  # A target repository may declare one reviewed v1 Codex effort experiment in
+  # its own WORKFLOW.md. Assignment still requires the exact opt-in label.
+  # experiment:
+  #   schema_version: 1
+  #   id: codex-effort-v1
+  #   revision: 1
+  #   opt_in_label: experiment:codex-effort-v1
+  #   backend: codex
+  #   repositories: [symphony]
+  #   task_families: [simple_direct]
+  #   variable: reasoning_effort
+  #   control: {id: control, weight: 1, value: xhigh}
+  #   variants:
+  #     - {id: high, weight: 1, value: high}
   # Soft budgets are policy/strategy signals, never completion or approval gates.
   # Shadow mode records proposed routing and transitions. The narrow action
   # allowlist below applies only low-risk context/output hygiene; review depth
