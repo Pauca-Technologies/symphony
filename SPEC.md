@@ -2040,6 +2040,27 @@ class breakdowns. Replayed warnings SHOULD be deduplicated by valid warning iden
 issue fallback MAY preserve only those fixed loop fields in its bounded recent-event summaries and
 MUST NOT expose raw tool identity, arguments, output, call IDs, or thread IDs from detector state.
 
+An implementation MAY provide an operator-run offline projection from retained compact telemetry to
+candidate regression fixtures. Such a projection MUST use a fixed event/field allowlist and MUST NOT
+ingest raw protocol/session transcripts by default, prompt or workpad bodies, tool arguments/output,
+arbitrary user content, credentials, or free-form failure/review prose. Selection, deduplication,
+clustering, sampling, candidate identity, and evidence references MUST be deterministic and bounded.
+Readers MUST enforce file, row, source-byte, expanded-byte, line, and output-corpus caps while
+streaming, including compressed input, and SHOULD retain complete decoded rows observed before a
+limit. Malformed, legacy, partial, unsafe, or unsupported input MUST fail closed per row or produce a
+bounded diagnostic without turning a partial valid corpus into authoritative evidence.
+
+Generated corpora MUST remain `pending_review`, and generated assertions MUST be proposals or
+unknowns rather than authoritative expected outcomes. Export MUST be explicit, use an existing
+operator-owned private staging directory outside the source tree, write private files atomically
+without replacing a conflicting deterministic name, and leave staging retention/cleanup to the
+operator. Symphony MUST NOT provide an automatic approve/promote path. An accepted regression
+fixture requires explicit current-policy external human or independent review metadata and fixed
+reviewed assertions. That metadata is process evidence, not a cryptographic identity or signature.
+Offline accepted-fixture verification MUST replay and integrity-check the generated safe evidence
+core, reject pending corpora, and remain bounded and deterministic. Candidate mining MUST NOT add a
+runtime process, poller, reaper, ticket mutation, or automatic fixture commit.
+
 ### 13.7 Telemetry-Driven Soft Budgets and Routing
 
 Repository workflows MAY configure `agent.efficiency` with `mode` (`off`, `shadow`, or `enforce`),

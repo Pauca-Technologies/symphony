@@ -828,6 +828,12 @@ codex:
   JSONL remains readable as schema version 0.
   The text report calls the legacy JSON `completion_rate` metric **worker-run completion** so it
   cannot be confused with task delivery.
+  `mix telemetry.regression_candidates` performs a separate offline, bounded dry-run over an exact
+  7-day window (`--days 30` is also supported). It projects only allowlisted compact telemetry into
+  deterministic pending regression candidates; it never reads protocol/session transcripts or
+  promotes a candidate automatically. Export requires an explicit existing private staging
+  directory, and `--verify` accepts only an externally reviewed accepted fixture. See the
+  [offline regression candidate guide](docs/regression-candidates.md).
 - Benign protocol notifications and stdout chunks do not produce one debug-log line each by
   default. `observability.benign_notification_debug: true` is the short-lived log-level escape
   hatch; selective gzip raw traces are normally the more complete incident artifact.

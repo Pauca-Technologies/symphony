@@ -109,6 +109,23 @@ is delivered on the next turn and cleared after a handled consuming turn. A cras
 redeliver it, so restart delivery is at-least-once rather than exactly-once. No event or warning may
 interrupt, retry, block, park, or change stall policy.
 
+## Offline Regression Candidate Privacy
+
+`mix telemetry.regression_candidates` reads retained compact JSONL through a separate bounded
+streaming reader. Candidate projection allowlists versioned manifests, classified failures,
+extreme-budget transitions, valid shadow loop alerts, and explicit task/review outcomes. It must
+not fall back to protocol/session transcripts, prompt or workpad bodies, original event rows, tool
+arguments/output, arbitrary failure or review text, or user content.
+
+The pending corpus contains only fixed enums/counts, non-secret manifest digests/provenance,
+generated evidence references, and deterministic candidate/corpus IDs. Human CLI output is
+narrower: candidate IDs, fixed selection reason enums, retained reproduction field names, safe
+evidence references, and fixed omission/cap diagnostics. The task emits no corpus body as runtime
+telemetry or application log context. Export is an explicit `0600` write to an existing
+operator-owned `0700` staging directory; Symphony provides no approval, promotion, pruning, or
+cleanup command. Externally supplied approval metadata is review-process evidence, not
+cryptographic authentication.
+
 ## Agent Profile Routing
 
 Repository profile classification logs the final `profile`, the classifier's proposed profile, and
