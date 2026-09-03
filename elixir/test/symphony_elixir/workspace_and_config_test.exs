@@ -188,13 +188,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       expected_shared_cache = Path.join(workspace_root, ".symphony-cache")
       expected_hook_output = "#{context_file}:#{expected_shared_cache}"
 
+      previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+      System.put_env("LINEAR_API_KEY", "must-not-reach-hooks")
+      on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+
       assert {:ok, ^expected_hook_output} =
                Workspace.run_session_start_hook(workspace, issue, nil, hook_command: "printf '%s:%s' \"$SYMPHONY_ISSUE_CONTEXT_FILE\" \"$SYMPHONY_SHARED_CACHE_DIR\"")
 
       updated_issue = %{issue | description: "Updated scope"}
 
-      assert {:ok, "3:4"} =
-               Workspace.run_before_handoff_hook(workspace, updated_issue, nil, hook_command: "printf '%s:%s' \"$SYMPHONY_TEST_WORKER_LIMIT\" \"$SYMPHONY_HEAVY_VALIDATION_LIMIT\"")
+      assert {:ok, "3:4:"} =
+               Workspace.run_before_handoff_hook(workspace, updated_issue, nil,
+                 hook_command: "printf '%s:%s:%s' \"$SYMPHONY_TEST_WORKER_LIMIT\" \"$SYMPHONY_HEAVY_VALIDATION_LIMIT\" \"$LINEAR_API_KEY\""
+               )
 
       assert get_in(context_file |> File.read!() |> Jason.decode!(), ["issue", "description"]) ==
                "Updated scope"

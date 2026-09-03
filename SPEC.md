@@ -403,6 +403,8 @@ Fields:
 - `api_key` (string)
   - MAY be a literal token or `$VAR_NAME`.
   - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
+  - Repository hooks and coding-agent children MUST NOT inherit the tracker credential or common
+    `LINEAR_*TOKEN` aliases; tracker access remains owned by Symphony's gated client.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
@@ -893,12 +895,13 @@ Sorting order (stable intent):
 
 ### 8.3 Concurrency Control
 
-Global implementation limit:
+Global worker limit:
 
-- `available_slots = max(max_concurrent_agents - implementation_count, 0)`
-- `implementation_count` excludes `handoff_pending_gate` and `handoff_pending_review` entries.
-  Those lifecycles remain claimed and visible as running work but have no coding-agent turn in
-  progress.
+- `available_slots = max(max_concurrent_agents - running_count, 0)`
+- `running_count` includes `handoff_pending_gate` and `handoff_pending_review` entries because their
+  worker VMs and validation/reviewer children still consume host resources. Those lifecycles remain
+  excluded from per-state and per-repository implementation counts because no coding-agent
+  implementation turn is in progress.
 
 Per-state limit:
 
@@ -993,6 +996,10 @@ Part A: Stall detection
   remains governed by the hook invocation timeout. Poll a durable asynchronous gate by job ID
   without starting a coding-agent turn. Status surfaces MUST expose the available job and candidate
   identity, pending age, heartbeat age/time, progress stage, and next-poll delay.
+- When stopping a local persistent worker, implementations SHOULD terminate both its captured
+  descendants and reparented processes that are scoped to the exact issue workspace and carry the
+  trusted `SYMPHONY_RUN=1` marker. Process identity checks MUST prevent recycled-PID or unrelated
+  workspace processes from being targeted.
 - Persist the captured tracker mutation and pending gate identity outside the agent-writable
   workspace. Persist the mutation before the initial asynchronous hook invocation as a starting
   handoff intent. If that invocation ends with infrastructure failure before returning a job ID,
@@ -1188,12 +1195,16 @@ Execution contract:
   reports additionally include `heartbeatAt`, `heartbeatAgeMs`, `nextPollMs`, and
   `progress.stage`; they exit `3`. Passed reports exit `0`; failed/invalidated reports exit `2`;
   infrastructure errors exit `1`. Polls set `SYMPHONY_HANDOFF_GATE_JOB_ID` and MUST attach to the
-  named job rather than starting another underlying gate.
+  named job rather than starting another underlying gate. Pending polls SHOULD use only the durable
+  gate artifact; tracker state MUST be revalidated when the gate becomes terminal and immediately
+  before applying handoff or remediation. The normal orchestrator reconciliation remains responsible
+  for stopping workers whose issues leave active states while a gate is pending.
 - Before the initial protocol-aware invocation, durably record the original tracker mutation. On
   pre-job infrastructure failure, preserve that intent and retry the hook without a model turn. On
   pending/running, replace the intent with the durable job identity, end the active model turn, and
-  poll without a model turn. Transient tracker refresh failures while starting or polling a durable
-  gate MUST preserve that intent and gate identity and SHOULD retry internally with capped backoff;
+  poll without a model turn. Transient tracker refresh failures while starting/recovering a durable
+  gate or validating a terminal result MUST preserve that intent and gate identity and SHOULD retry
+  internally by honoring `Retry-After` or using capped exponential backoff;
   they MUST NOT return the issue to an implementor turn. Apply the mutation only after a passed
   report is revalidated for the exact current candidate. Failed or invalidated terminal results
   clear pending state and resume the implementor once with bounded remediation. Infrastructure
@@ -3051,7 +3062,8 @@ Extension config:
 - Implementations MAY prefer the previously used host on retries when that host is still
   available.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
-  hosts.
+  hosts. Every live worker assigned to the host counts, including pending handoff-gate and review
+  lifecycles.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
 - Implementations MAY fail over to another host when the original host is unavailable before work

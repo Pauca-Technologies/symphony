@@ -723,10 +723,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state = state |> maybe_adopt_persistent_workers() |> reconcile_running_issues()
+    state = state |> maybe_adopt_persistent_workers() |> reconcile_stalled_running_issues()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      state = reconcile_running_issues_from_candidates(state, issues)
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -752,26 +753,46 @@ defmodule SymphonyElixir.Orchestrator do
 
         arm_poll_backoff(state, retry_after_ms)
 
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
-
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
-
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
-
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
-
       {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
+        handle_poll_failure(reason, state)
     end
+  end
+
+  defp handle_poll_failure(reason, state) do
+    case AgentFailure.classify(reason) do
+      %AgentFailure{class: :rate_limited, retry_after_ms: retry_after_ms} ->
+        Logger.warning("Linear rate limit hit during poll; backing off next tick. retry_after_ms=#{inspect(retry_after_ms)}")
+
+        arm_poll_backoff(state, retry_after_ms)
+
+      _failure ->
+        handle_non_rate_limited_poll_failure(reason, state)
+    end
+  end
+
+  defp handle_non_rate_limited_poll_failure({:invalid_workflow_config, message}, state) do
+    Logger.error("Invalid WORKFLOW.md config: #{message}")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure({:missing_workflow_file, path, reason}, state) do
+    Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure(:workflow_front_matter_not_a_map, state) do
+    Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure({:workflow_parse_error, reason}, state) do
+    Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure(reason, state) do
+    Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+    state
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -796,6 +817,83 @@ defmodule SymphonyElixir.Orchestrator do
 
           state
       end
+    end
+  end
+
+  defp reconcile_running_issues_from_candidates(%State{} = state, candidate_issues)
+       when is_list(candidate_issues) do
+    reconcile_running_issues_from_candidates(
+      state,
+      candidate_issues,
+      &Tracker.fetch_issue_states_by_ids/1
+    )
+  end
+
+  @doc false
+  @spec reconcile_running_issues_from_candidates_for_test(
+          term(),
+          [Issue.t()],
+          ([String.t()] -> {:ok, [Issue.t()]} | {:error, term()})
+        ) :: term()
+  def reconcile_running_issues_from_candidates_for_test(
+        %State{} = state,
+        candidate_issues,
+        issue_state_fetcher
+      )
+      when is_list(candidate_issues) and is_function(issue_state_fetcher, 1) do
+    reconcile_running_issues_from_candidates(state, candidate_issues, issue_state_fetcher)
+  end
+
+  defp reconcile_running_issues_from_candidates(
+         %State{} = state,
+         candidate_issues,
+         issue_state_fetcher
+       )
+       when is_list(candidate_issues) and is_function(issue_state_fetcher, 1) do
+    running_ids = Map.keys(state.running)
+    running_id_set = MapSet.new(running_ids)
+
+    visible_running_issues =
+      Enum.filter(candidate_issues, fn
+        %Issue{id: issue_id} when is_binary(issue_id) -> MapSet.member?(running_id_set, issue_id)
+        _issue -> false
+      end)
+
+    visible_running_ids =
+      visible_running_issues
+      |> Enum.map(& &1.id)
+      |> MapSet.new()
+
+    state =
+      reconcile_running_issue_states(
+        visible_running_issues,
+        state,
+        active_state_set(),
+        terminal_state_set()
+      )
+
+    missing_ids = Enum.reject(running_ids, &MapSet.member?(visible_running_ids, &1))
+
+    case missing_ids do
+      [] ->
+        state
+
+      ids ->
+        case issue_state_fetcher.(ids) do
+          {:ok, issues} ->
+            issues
+            |> reconcile_running_issue_states(
+              state,
+              active_state_set(),
+              terminal_state_set()
+            )
+            |> reconcile_missing_running_issue_ids(ids, issues)
+
+          {:error, reason} ->
+            Logger.debug("Failed to refresh running issues absent from candidate poll: #{inspect(reason)}; keeping active workers")
+
+            state
+        end
     end
   end
 
@@ -2546,32 +2644,63 @@ defmodule SymphonyElixir.Orchestrator do
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
 
       {:error, {:rate_limited, retry_after_ms} = reason} ->
-        Logger.warning("Retry poll rate-limited for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
-
-        state = arm_poll_backoff(state, retry_after_ms)
-
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{
-             error: "retry poll failed: #{inspect(reason)}",
-             delay_ms_override: tracker_retry_delay_ms(retry_after_ms)
-           })
-         )}
+        handle_rate_limited_retry_poll(
+          state,
+          issue_id,
+          attempt,
+          metadata,
+          reason,
+          retry_after_ms
+        )
 
       {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+        case AgentFailure.classify(reason) do
+          %AgentFailure{class: :rate_limited, retry_after_ms: retry_after_ms} ->
+            handle_rate_limited_retry_poll(
+              state,
+              issue_id,
+              attempt,
+              metadata,
+              reason,
+              retry_after_ms
+            )
 
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-         )}
+          _failure ->
+            Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+            {:noreply,
+             schedule_issue_retry(
+               state,
+               issue_id,
+               attempt + 1,
+               Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+             )}
+        end
     end
+  end
+
+  defp handle_rate_limited_retry_poll(
+         state,
+         issue_id,
+         attempt,
+         metadata,
+         reason,
+         retry_after_ms
+       ) do
+    Logger.warning("Retry poll rate-limited for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+    state = arm_poll_backoff(state, retry_after_ms)
+
+    {:noreply,
+     schedule_issue_retry(
+       state,
+       issue_id,
+       attempt + 1,
+       Map.merge(metadata, %{
+         error: "retry poll failed: #{inspect(reason)}",
+         delay_ms_override: tracker_retry_delay_ms(retry_after_ms)
+       })
+     )}
   end
 
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
@@ -3100,8 +3229,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_worker_host_count(running, worker_host) when is_map(running) and is_binary(worker_host) do
     Enum.count(running, fn
-      {_issue_id, %{worker_host: ^worker_host} = running_entry} ->
-        consumes_implementation_slot?(running_entry)
+      {_issue_id, %{worker_host: ^worker_host}} ->
+        true
 
       _ ->
         false
@@ -3155,7 +3284,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
-        implementation_slots_used(state.running),
+        map_size(state.running),
       0
     )
   end

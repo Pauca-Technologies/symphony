@@ -400,9 +400,13 @@ Notes:
   While an unchanged PR observation still contains pending checks (or checks have not appeared yet),
   watcher polling is capped at 60 seconds; probe failures retain exponential backoff so a GitHub
   outage does not create a request loop.
-- Every Linear caller shares one process-wide rate-limit cooldown. A rate-limit response pauses
-  polling, workpad/label writes, and agent tool requests together, honoring a longer `Retry-After`
-  hint when Linear supplies one instead of letting concurrent callers immediately refill the limit.
+- Every Linear caller shares one host-wide rate-limit cooldown, including calls from detached
+  persistent-worker BEAM VMs. A rate-limit response publishes an atomic deadline shard under
+  `~/.symphony/linear-rate-limit/` and pauses polling, workpad/label writes, and agent tool requests
+  together, honoring a longer `Retry-After` hint when Linear supplies one instead of letting
+  concurrent callers immediately refill the limit. A normal dispatch tick reuses its candidate
+  snapshot to reconcile visible running issues and performs an additional by-ID lookup only for
+  running issues absent from that snapshot.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
   provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local
@@ -481,10 +485,11 @@ Notes:
   `SYMPHONY_HEAVY_VALIDATION_LIMIT` to agents and lifecycle hooks so repository harnesses can admit
   CPU-heavy validation across worktrees independently of per-command test worker fan-out.
 - In-flight `before_handoff` validation (including a synchronous initial hook invocation) and
-  detached `handoff_pending_gate` / `handoff_pending_review` lifecycles keep their issue claim and
-  path-overlap reservation, but no longer consume global, per-state, per-host, or per-repository
-  implementation capacity. Disjoint implementation can therefore continue while a completed
-  candidate validates or is reviewed without allowing overlapping work into reserved paths.
+  detached `handoff_pending_gate` / `handoff_pending_review` lifecycles keep their issue claim,
+  global worker slot, per-host worker slot, and path-overlap reservation. They release per-state and
+  per-repository implementation capacity because no implementor turn is active, but the worker VM
+  and its validation/reviewer children still count toward the host safety ceiling. Disjoint
+  implementation can continue only while global and host worker capacity remains.
 - `agent.label_presets` chooses the backend (and model) **per task** from the issue's Linear labels,
   overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
   whose `label` is present on the issue wins (positional precedence — list order, first match), and
@@ -656,8 +661,10 @@ Notes:
   `before_handoff` with `SYMPHONY_HANDOFF_GATE_JOB_ID` and skip GitHub auth preparation and
   issue-context refresh. The hook should read that job before normal setup. Symphony durably records
   the attempted mutation before the initial invocation too, so an infrastructure failure before job
-  creation retries the hook without starting another model session. Transient tracker refresh failures
-  while starting or polling a durable gate use capped internal backoff and preserve the gate, candidate,
+  creation retries the hook without starting another model session. Pending durable-gate polls read
+  only the local gate artifact; Symphony revalidates the tracker state when starting/recovering a job
+  and once a poll becomes terminal, immediately before applying handoff or remediation. Transient
+  tracker refresh failures honor Retry-After or use bounded exponential backoff and preserve the gate, candidate,
   and review approval; they do not return the issue to an implementor turn. Before a fresh invocation or a
   durable pre-job retry, base-drift validation treats `WORKFLOW.md`, `WORKFLOW_REVIEW.md`, and
   repository-relative scripts referenced by the configured hook as runtime dependencies. If the base
@@ -689,7 +696,11 @@ Notes:
   review.
   When a worker is stopped or exits, Symphony terminates its external descendant processes before
   discarding the worker, preventing hook and validation commands from being orphaned while
-  preserving the worker BEAM's own runtime helpers until the VM exits normally.
+  preserving the worker BEAM's own runtime helpers until the VM exits normally. For local
+  workspaces it also reclaims reparented/detached
+  processes whose cwd remains inside that exact issue workspace and whose environment carries
+  `SYMPHONY_RUN=1`; this covers durable validation jobs that are no longer descendants of the worker
+  BEAM without targeting unrelated host processes.
   Non-timeout reviewer session/verdict failures receive one bounded retry and are then latched for
   that candidate during the current orchestration run; budget exhaustion is likewise latched and never
   spawns another reviewer in that run. To recover, repair reviewer tool/auth/runtime or verdict
@@ -736,6 +747,9 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+  Symphony retains that credential in its own tracker processes but removes it and the common
+  `LINEAR_*TOKEN` variants from every local or remote repository hook. Hooks receive the trusted
+  issue-context file and must not bypass Symphony's rate-limit and mutation gates.
 - `tracker.project_slug` reads from `LINEAR_PROJECT_SLUG` when unset or when value is `$LINEAR_PROJECT_SLUG`.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,

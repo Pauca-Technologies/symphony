@@ -1203,7 +1203,7 @@ defmodule SymphonyElixir.CoreTest do
     Application.put_env(
       :symphony_elixir,
       :memory_tracker_candidate_issues_result,
-      {:error, {:rate_limited, retry_after_ms}}
+      {:error, {:linear_api_request, {:rate_limited, retry_after_ms}}}
     )
 
     on_exit(fn ->
@@ -1529,7 +1529,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-b"
   end
 
-  test "detached handoff lifecycles release implementation and host slots" do
+  test "detached handoff lifecycles release implementation slots but retain worker capacity" do
     write_workflow_file!(Workflow.workflow_file_path(),
       worker_ssh_hosts: ["worker-a"],
       worker_max_concurrent_agents_per_host: 1
@@ -1557,8 +1557,37 @@ defmodule SymphonyElixir.CoreTest do
     candidate = %Issue{id: "candidate", identifier: "UDPE-NEXT", title: "Next", state: "Todo"}
 
     assert Orchestrator.implementation_slots_used_for_test(running) == 1
-    assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-a"
-    assert Orchestrator.should_dispatch_issue_for_test(candidate, state)
+    assert Orchestrator.select_worker_host_for_test(state, nil) == :no_worker_capacity
+    refute Orchestrator.should_dispatch_issue_for_test(candidate, state)
+  end
+
+  test "candidate poll snapshot reconciles visible workers without a duplicate state query" do
+    issue = %Issue{
+      id: "visible-running",
+      identifier: "UDPE-VISIBLE",
+      title: "Already visible in candidate poll",
+      state: "In Progress"
+    }
+
+    state = %Orchestrator.State{
+      running: %{
+        issue.id => %{
+          issue: %{issue | title: "Stale title"},
+          identifier: issue.identifier,
+          lifecycle_state: :implementing
+        }
+      },
+      claimed: MapSet.new([issue.id])
+    }
+
+    reconciled =
+      Orchestrator.reconcile_running_issues_from_candidates_for_test(
+        state,
+        [issue],
+        fn _ids -> flunk("visible running issues must not be fetched twice") end
+      )
+
+    assert reconciled.running[issue.id].issue.title == issue.title
   end
 
   test "select_worker_host_for_test returns no_worker_capacity when every ssh host is full" do

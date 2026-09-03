@@ -10,6 +10,8 @@ defmodule SymphonyElixir.OSProcess do
           optional(:name) => String.t()
         }
   @type deps :: %{
+          optional(:read_cwd) => (pos_integer() -> {:ok, Path.t()} | {:error, term()}),
+          optional(:read_environ) => (pos_integer() -> {:ok, binary()} | {:error, term()}),
           list_proc: (-> {:ok, [String.t()]} | {:error, term()}),
           read_stat: (pos_integer() -> {:ok, binary()} | {:error, term()}),
           find_kill: (-> Path.t() | nil),
@@ -28,6 +30,23 @@ defmodule SymphonyElixir.OSProcess do
   @spec snapshot_tree(pos_integer(), deps()) :: [identity()]
   def snapshot_tree(root_pid, deps) when is_integer(root_pid) and root_pid > 0 and is_map(deps) do
     process_tree(root_pid, deps)
+  end
+
+  @doc false
+  @spec snapshot_workspace(Path.t()) :: [identity()]
+  def snapshot_workspace(workspace) when is_binary(workspace) do
+    snapshot_workspace(workspace, runtime_deps())
+  end
+
+  @doc false
+  @spec snapshot_workspace(Path.t(), deps()) :: [identity()]
+  def snapshot_workspace(workspace, deps) when is_binary(workspace) and is_map(deps) do
+    expanded_workspace = Path.expand(workspace)
+
+    deps
+    |> process_snapshot()
+    |> Map.values()
+    |> Enum.filter(&workspace_process?(&1, expanded_workspace, deps))
   end
 
   @doc false
@@ -154,6 +173,27 @@ defmodule SymphonyElixir.OSProcess do
     end
   end
 
+  defp workspace_process?(%{pid: pid}, workspace, deps) do
+    with read_cwd when is_function(read_cwd, 1) <- Map.get(deps, :read_cwd),
+         read_environ when is_function(read_environ, 1) <- Map.get(deps, :read_environ),
+         {:ok, cwd} when is_binary(cwd) <- read_cwd.(pid),
+         true <- path_within?(Path.expand(cwd), workspace),
+         {:ok, environ} when is_binary(environ) <- read_environ.(pid) do
+      symphony_process_env?(environ)
+    else
+      _missing_or_unreadable -> false
+    end
+  end
+
+  defp path_within?(path, workspace),
+    do: path == workspace or String.starts_with?(path <> "/", workspace <> "/")
+
+  defp symphony_process_env?(environ) do
+    environ
+    |> :binary.split(<<0>>, [:global])
+    |> Enum.member?("SYMPHONY_RUN=1")
+  end
+
   defp last_close_paren(stat) do
     case :binary.matches(stat, ")") do
       [] -> nil
@@ -203,6 +243,8 @@ defmodule SymphonyElixir.OSProcess do
     %{
       list_proc: fn -> File.ls("/proc") end,
       read_stat: fn pid -> File.read("/proc/#{pid}/stat") end,
+      read_cwd: fn pid -> File.read_link("/proc/#{pid}/cwd") end,
+      read_environ: fn pid -> File.read("/proc/#{pid}/environ") end,
       find_kill: fn -> System.find_executable("kill") end,
       run_command: fn executable, args ->
         System.cmd(executable, args, stderr_to_stdout: true)

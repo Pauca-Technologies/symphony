@@ -12,6 +12,8 @@ defmodule SymphonyElixir.WarningFloodGuardTest do
   """
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Linear.RateLimit
+
   @marker_label "symphony:routing-warned"
 
   defp memory_workflow! do
@@ -216,6 +218,31 @@ defmodule SymphonyElixir.WarningFloodGuardTest do
   end
 
   describe "linear client rate-limit classification" do
+    test "a local cooldown keeps the direct rate-limit shape and skips the HTTP request" do
+      assert :ok = RateLimit.reset()
+      on_exit(fn -> RateLimit.reset() end)
+      assert :ok = RateLimit.backoff(1_000)
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:rate_limited, remaining_ms}} =
+                   Client.graphql(
+                     "query Viewer { viewer { id } }",
+                     %{},
+                     rate_limit_gate: true,
+                     request_fun: fn _payload, _headers ->
+                       send(self(), :unexpected_linear_request)
+                       {:ok, %{status: 200, body: %{}}}
+                     end
+                   )
+
+          assert remaining_ms > 0
+        end)
+
+      assert log == ""
+      refute_received :unexpected_linear_request
+    end
+
     test "a RATELIMITED body maps to {:rate_limited, retry_after_ms}" do
       log =
         capture_log(fn ->

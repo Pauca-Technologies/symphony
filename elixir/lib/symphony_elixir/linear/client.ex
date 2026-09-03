@@ -782,6 +782,12 @@ defmodule SymphonyElixir.Linear.Client do
          {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
       {:ok, body}
     else
+      {:error, {:rate_limited, _retry_after_ms} = reason} ->
+        # A local cooldown is an expected denial, not a failed HTTP request.
+        # Preserve the stable shape so poll/retry callers honor the remaining
+        # delay instead of wrapping it as a generic transport failure.
+        {:error, reason}
+
       {:ok, response} ->
         case rate_limit_retry_after_ms(response) do
           {:rate_limited, retry_after_ms} ->

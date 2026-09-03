@@ -25,7 +25,7 @@ defmodule SymphonyElixir.Application do
 
     children =
       if persistent_worker_mode?() do
-        []
+        [SymphonyElixir.Linear.RateLimit]
       else
         [
           {Phoenix.PubSub, name: SymphonyElixir.PubSub},

@@ -64,6 +64,7 @@ defmodule SymphonyElixir.HandoffGateTest do
     assert gate.passed == false
 
     child_pid = child_pid_file |> File.read!() |> String.to_integer()
+    Process.sleep(100)
     refute File.exists?("/proc/#{child_pid}")
   end
 

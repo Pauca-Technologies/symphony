@@ -2863,23 +2863,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     if sleep_first?, do: handoff_gate_sleep(gate.next_poll_ms, opts)
 
-    case refresh_handoff_issue(issue, issue_state_fetcher, opts) do
-      {:continue, refreshed_issue} ->
-        request = Map.put(request, :issue, refreshed_issue)
-        poll_current_handoff_gate(request, recipient, backend, issue_state_fetcher, opts)
-
-      {:done, refreshed_issue} ->
-        case finish_pending_gate(request, recipient, :issue_no_longer_active) do
-          :ok -> {:completed, refreshed_issue}
-          {:error, reason} -> {:error, reason}
-        end
-
-      {:error, reason} ->
-        # Tracker refresh is an operational precondition, not a gate verdict.
-        # Keep the durable job and its lifecycle intact so recovery can attach
-        # to the same exact candidate instead of starting an implementor turn.
-        {:error, {:handoff_issue_refresh_failed, reason}}
-    end
+    poll_current_handoff_gate(request, recipient, backend, issue_state_fetcher, opts)
   end
 
   defp poll_current_handoff_gate(request, recipient, backend, issue_state_fetcher, opts) do
@@ -2903,7 +2887,59 @@ defmodule SymphonyElixir.AgentRunner do
         poll_opts
       )
 
+    handle_pending_gate_poll_with_refresh(
+      result,
+      request,
+      recipient,
+      backend,
+      issue_state_fetcher,
+      opts
+    )
+  end
+
+  # Pending gate state is local/durable and may be polled frequently. The main
+  # orchestrator already reconciles every running issue, so another Linear read
+  # before every pending poll only multiplies account usage by the number of
+  # gates. Revalidate once the gate becomes terminal, immediately before any
+  # handoff or remediation side effect.
+  defp handle_pending_gate_poll_with_refresh(
+         {:pending, _next_gate} = result,
+         request,
+         recipient,
+         backend,
+         issue_state_fetcher,
+         opts
+       ) do
     handle_pending_gate_poll(result, request, recipient, backend, issue_state_fetcher, opts)
+  end
+
+  defp handle_pending_gate_poll_with_refresh(
+         result,
+         request,
+         recipient,
+         backend,
+         issue_state_fetcher,
+         opts
+       ) do
+    case refresh_handoff_issue(request.issue, issue_state_fetcher, opts) do
+      {:continue, refreshed_issue} ->
+        request = Map.put(request, :issue, refreshed_issue)
+        handle_pending_gate_poll(result, request, recipient, backend, issue_state_fetcher, opts)
+
+      {:done, refreshed_issue} ->
+        request = Map.put(request, :issue, refreshed_issue)
+
+        case finish_pending_gate(request, recipient, :issue_no_longer_active) do
+          :ok -> {:completed, refreshed_issue}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        # Tracker refresh is an operational precondition, not a gate verdict.
+        # Keep the durable job and its lifecycle intact so recovery can attach
+        # to the same exact candidate instead of starting an implementor turn.
+        {:error, {:handoff_issue_refresh_failed, reason}}
+    end
   end
 
   defp handle_pending_gate_poll(
@@ -3128,7 +3164,11 @@ defmodule SymphonyElixir.AgentRunner do
     case continue_with_issue?(issue, issue_state_fetcher, opts) do
       {:error, reason} = error ->
         if transient_handoff_issue_refresh_failure?(reason) do
-          delay_ms = handoff_issue_refresh_retry_delay_ms(issue, retry_attempt)
+          delay_ms =
+            max(
+              AgentFailure.classify(reason).retry_after_ms || 0,
+              handoff_issue_refresh_retry_delay_ms(issue, retry_attempt)
+            )
 
           Logger.warning(
             "handoff.gate issue refresh failed; retrying #{issue_context(issue)} " <>

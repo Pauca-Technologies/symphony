@@ -104,16 +104,23 @@ defmodule SymphonyElixir.AgentFailure do
   end
 
   defp classify_non_usage_limit_failure(reason, backend) do
-    cond do
-      match?({:rate_limited, _}, reason) ->
+    case nested_rate_limit(reason) do
+      {:ok, retry_after_ms} ->
         %__MODULE__{
           class: :rate_limited,
           message: reason_message(reason),
           backend: backend,
-          retry_after_ms: retry_after_ms(reason),
+          retry_after_ms: retry_after_ms,
           details: reason
         }
 
+      :error ->
+        classify_non_rate_limit_failure(reason, backend)
+    end
+  end
+
+  defp classify_non_rate_limit_failure(reason, backend) do
+    cond do
       transient_transport_failure?(reason) ->
         failure(:transient_infrastructure, reason, backend)
 
@@ -136,6 +143,35 @@ defmodule SymphonyElixir.AgentFailure do
         failure(:agent_protocol_failure, reason, backend)
     end
   end
+
+  defp nested_rate_limit({:rate_limited, value})
+       when (is_integer(value) and value >= 0) or is_nil(value),
+       do: {:ok, value}
+
+  defp nested_rate_limit({:rate_limited, value}), do: {:ok, retry_after_ms(value)}
+
+  defp nested_rate_limit(tuple) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> nested_rate_limit()
+  end
+
+  defp nested_rate_limit(list) when is_list(list) do
+    Enum.find_value(list, :error, fn value ->
+      case nested_rate_limit(value) do
+        {:ok, _retry_after_ms} = found -> found
+        :error -> false
+      end
+    end)
+  end
+
+  defp nested_rate_limit(%_{} = struct),
+    do: struct |> Map.from_struct() |> nested_rate_limit()
+
+  defp nested_rate_limit(map) when is_map(map),
+    do: nested_rate_limit(Map.to_list(map))
+
+  defp nested_rate_limit(_reason), do: :error
 
   @doc "Return a JSON/dashboard-safe representation of a classified failure."
   @spec to_map(t()) :: map()
@@ -263,8 +299,6 @@ defmodule SymphonyElixir.AgentFailure do
       nil -> parse_reset_from_message(reason_message(reason))
     end
   end
-
-  defp retry_after_ms({:rate_limited, value}) when is_integer(value) and value >= 0, do: value
 
   defp retry_after_ms(reason) do
     case deep_value(reason, @retry_after_keys ++ Enum.map(@retry_after_keys, &String.to_atom/1)) do

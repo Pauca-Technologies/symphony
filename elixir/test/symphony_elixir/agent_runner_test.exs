@@ -3808,6 +3808,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       original_gate = async_gate(:pending)
       replacement_gate = %{original_gate | job_id: "job-86814", candidate_hash: "candidate-86814"}
       {:ok, original_polls} = Agent.start_link(fn -> 0 end)
+      {:ok, state_reads} = Agent.start_link(fn -> 0 end)
 
       assert :ok =
                Workspace.persist_handoff_gate_state(workspace, %{
@@ -3834,6 +3835,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       on_exit(fn ->
         Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
         if Process.alive?(original_polls), do: Agent.stop(original_polls)
+        if Process.alive?(state_reads), do: Agent.stop(state_reads)
         File.rm_rf(workspace_root)
       end)
 
@@ -3859,6 +3861,11 @@ defmodule SymphonyElixir.AgentRunnerTest do
         {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
       end
 
+      state_fetcher = fn ["issue-gate-replacement"] ->
+        Agent.update(state_reads, &(&1 + 1))
+        {:ok, [issue]}
+      end
+
       assert :ok =
                AgentRunner.run_codex_turns_for_test(
                  workspace,
@@ -3867,7 +3874,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                  [
                    agent_backend: {TurnCountingBackend, %{}},
                    issue_context_file: Workspace.issue_context_path(workspace),
-                   issue_state_fetcher: fn ["issue-gate-replacement"] -> {:ok, [issue]} end,
+                   issue_state_fetcher: state_fetcher,
                    handoff_gate_poller: poller,
                    handoff_gate_sleep: fn _milliseconds -> :ok end,
                    linear_client: linear_client,
@@ -3880,6 +3887,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert_received :replacement_gate_adopted
       assert_received :replacement_gate_polled
       assert_received :replacement_gate_handoff_applied
+      assert Agent.get(state_reads, & &1) == 1
       assert_received {:agent_lifecycle, "issue-gate-replacement", :handoff_pending_gate, %{gate_job_id: "job-7157"}}
 
       assert_received {:agent_lifecycle, "issue-gate-replacement", :handoff_pending_gate, %{gate_job_id: "job-86814"}}

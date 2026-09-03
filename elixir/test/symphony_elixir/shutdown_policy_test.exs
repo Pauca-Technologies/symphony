@@ -122,6 +122,63 @@ defmodule SymphonyElixir.ShutdownPolicyTest do
              OSProcess.terminate_identities([identity], 0, command_failure)
   end
 
+  test "workspace snapshot finds detached Symphony processes without selecting unrelated commands" do
+    workspace = "/tmp/symphony-workspaces/UDPE-1"
+
+    deps =
+      os_deps(%{
+        list_proc: fn -> {:ok, ["100", "101", "102"]} end,
+        read_stat: fn pid -> {:ok, proc_stat(pid, 1, Integer.to_string(pid + 50))} end,
+        read_cwd: fn
+          100 -> {:ok, workspace}
+          101 -> {:ok, workspace}
+          102 -> {:ok, "/tmp/symphony-workspaces/UDPE-2"}
+        end,
+        read_environ: fn
+          100 -> {:ok, "PATH=/bin\0SYMPHONY_RUN=1\0"}
+          101 -> {:ok, "PATH=/bin\0"}
+          102 -> {:ok, "SYMPHONY_RUN=1\0"}
+        end
+      })
+
+    assert [%{pid: 100}] = OSProcess.snapshot_workspace(workspace, deps)
+  end
+
+  test "workspace snapshot uses proc cwd and environment readers" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-workspace-process-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(workspace)
+    shell = System.find_executable("sh")
+
+    port =
+      Port.open(
+        {:spawn_executable, String.to_charlist(shell)},
+        [
+          :binary,
+          :exit_status,
+          args: [~c"-c", ~c"exec sleep 30"],
+          cd: String.to_charlist(workspace),
+          env: [{~c"SYMPHONY_RUN", ~c"1"}]
+        ]
+      )
+
+    {:os_pid, child_pid} = :erlang.port_info(port, :os_pid)
+
+    on_exit(fn ->
+      OSProcess.terminate_tree(child_pid, 0)
+      File.rm_rf(workspace)
+    end)
+
+    assert Enum.any?(OSProcess.snapshot_workspace(workspace), &(&1.pid == child_pid))
+    assert :ok = OSProcess.terminate_tree(child_pid)
+    assert_receive {^port, {:exit_status, _status}}, 1_000
+    File.rm_rf(workspace)
+  end
+
   test "process-tree termination escalates survivors and polls graceful exits" do
     identity = %{pid: 100, ppid: 1, start_time: "55"}
     always_alive = fn _pid -> {:ok, proc_stat(100, 1, "55")} end
@@ -206,6 +263,8 @@ defmodule SymphonyElixir.ShutdownPolicyTest do
       %{
         list_proc: fn -> {:ok, ["100"]} end,
         read_stat: fn _pid -> {:error, :enoent} end,
+        read_cwd: fn _pid -> {:error, :enoent} end,
+        read_environ: fn _pid -> {:error, :enoent} end,
         find_kill: fn -> "/bin/kill" end,
         run_command: fn _executable, _args -> {"", 0} end,
         monotonic_ms: fn -> 0 end,

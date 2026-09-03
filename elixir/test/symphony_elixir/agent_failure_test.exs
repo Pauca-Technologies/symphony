@@ -68,6 +68,12 @@ defmodule SymphonyElixir.AgentFailureTest do
     assert %AgentFailure{class: :rate_limited, retry_after_ms: 30_000, scope: :issue} =
              AgentFailure.classify({:rate_limited, 30_000}, backend: "codex")
 
+    assert %AgentFailure{class: :rate_limited, retry_after_ms: 45_000, scope: :issue} =
+             AgentFailure.classify(
+               {:issue_state_refresh_failed, {:linear_api_request, {:rate_limited, 45_000}}},
+               backend: "codex"
+             )
+
     assert AgentFailure.classify({:mystery, "usage limit"}, backend: "codex").class ==
              :agent_protocol_failure
   end

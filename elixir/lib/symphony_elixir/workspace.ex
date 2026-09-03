@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{BareClone, Config, GitHubAuth, OSProcess, PathSafety, ResumePacket, SSH, TestWorkerBudget}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @linear_credential_env_vars ~w(LINEAR_API_KEY LINEAR_TOKEN LINEAR_API_TOKEN LINEAR_ACCESS_TOKEN)
 
   @type worker_host :: String.t() | nil
 
@@ -893,7 +894,7 @@ defmodule SymphonyElixir.Workspace do
       {"SYMPHONY_RUN", "1"},
       {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)},
       {"SYMPHONY_SHARED_CACHE_DIR", shared_cache_path(workspace)}
-    ] ++ extra_env
+    ] ++ extra_env ++ Enum.map(@linear_credential_env_vars, &{&1, false})
   end
 
   defp shared_cache_path(workspace), do: Path.join(Path.dirname(workspace), ".symphony-cache")
@@ -948,7 +949,7 @@ defmodule SymphonyElixir.Workspace do
        {"SYMPHONY_RUN", "1"},
        {"SYMPHONY_ISSUE_CONTEXT_FILE", issue_context_path(workspace)},
        {"SYMPHONY_SHARED_CACHE_DIR", shared_cache_path(workspace)}
-     ] ++ extra_env)
+     ] ++ extra_env ++ Enum.map(@linear_credential_env_vars, &{&1, false}))
     |> Enum.map_join(" ", fn
       {name, false} -> "unset #{name} &&"
       {name, value} -> "export #{name}=#{shell_escape(value)} &&"

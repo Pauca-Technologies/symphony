@@ -65,7 +65,7 @@ defmodule SymphonyElixir.PersistentWorker.Server do
       acceptor = spawn_link(fn -> accept_loop(listener, server) end)
 
       process_terminator =
-        Keyword.get_lazy(opts, :process_terminator, fn -> default_process_terminator(opts) end)
+        Keyword.get_lazy(opts, :process_terminator, fn -> default_process_terminator(spec, opts) end)
 
       state = %State{
         spec: spec,
@@ -373,18 +373,32 @@ defmodule SymphonyElixir.PersistentWorker.Server do
       :ok
   end
 
-  defp snapshot_worker_processes do
-    case os_pid() do
-      worker_pid when is_integer(worker_pid) and worker_pid > 0 ->
-        OSProcess.snapshot_tree(worker_pid)
+  defp snapshot_worker_processes(spec) do
+    tree =
+      case os_pid() do
+        worker_pid when is_integer(worker_pid) and worker_pid > 0 ->
+          OSProcess.snapshot_tree(worker_pid)
 
-      _worker_pid ->
+        _worker_pid ->
+          []
+      end
+
+    (tree ++ snapshot_detached_workspace_processes(spec))
+    |> Enum.uniq_by(&{&1.pid, &1.start_time})
+  end
+
+  defp snapshot_detached_workspace_processes(spec) do
+    case Registry.load_manifest(spec.manifest_path) do
+      {:ok, %{workspace_path: workspace, worker_host: nil}} when is_binary(workspace) ->
+        OSProcess.snapshot_workspace(workspace)
+
+      _missing_remote_or_invalid ->
         []
     end
   end
 
-  defp default_process_terminator(opts) do
-    process_snapshotter = Keyword.get(opts, :process_snapshotter, &snapshot_worker_processes/0)
+  defp default_process_terminator(spec, opts) do
+    process_snapshotter = Keyword.get(opts, :process_snapshotter, fn -> snapshot_worker_processes(spec) end)
     identity_terminator = Keyword.get(opts, :identity_terminator, &OSProcess.terminate_identities/1)
 
     if Application.get_env(:symphony_elixir, :persistent_worker_mode, false) or
