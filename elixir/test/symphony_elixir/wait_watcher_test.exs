@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.WaitWatcherTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{WaitCondition, WaitStore, WaitWatcher}
+  alias SymphonyElixir.{ResumePacket, WaitCondition, WaitStore, WaitWatcher}
 
   setup do
     root = Path.join(System.tmp_dir!(), "symphony-waits-#{System.unique_integer([:positive])}")
@@ -287,6 +287,20 @@ defmodule SymphonyElixir.WaitWatcherTest do
 
     :ok = WaitWatcher.acknowledge(name, "issue-1")
     assert WaitWatcher.issue_ids(name) == MapSet.new(["issue-2"])
+  end
+
+  test "wait persistence round-trips packet references and accepts legacy omissions" do
+    packet = ResumePacket.build(%{boundary_reason: :wait_parked})
+    packet_ref = ResumePacket.reference(packet, "wait.json.resume-packet.json")
+    request = %{condition: %{"type" => "linear_issue_changed"}, condition_key: "wait-ref", reason: "wait"}
+
+    with_ref = entry("issue-ref", "UDPE-REF", request) |> Map.put(:resume_packet_ref, packet_ref)
+    legacy = entry("issue-legacy", "UDPE-LEGACY", request)
+
+    assert :ok = WaitStore.save(%{"issue-ref" => with_ref, "issue-legacy" => legacy})
+    restored = WaitStore.load()
+    assert restored["issue-ref"].resume_packet_ref == packet_ref
+    assert restored["issue-legacy"].resume_packet_ref == nil
   end
 
   test "probes restored waits immediately instead of preserving an old backoff deadline" do

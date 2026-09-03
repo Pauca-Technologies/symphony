@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Orchestrator do
     QuotaCircuitStore,
     RepoConfig,
     RepositoryScheduler,
+    ResumePacket,
     Router,
     RunManifest,
     SessionTranscript,
@@ -36,6 +37,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.Github.ReviewerRequest
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.PersistentWorker.Registry, as: PersistentWorkerRegistry
 
   # States we treat as "the agent handed off to a human reviewer" — the
   # moment an issue lands in any of these, request the issue owner as PR
@@ -275,6 +277,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+        running_entry = mark_resume_packet_transition(running_entry, :outer_worker_exit)
 
         SessionTranscript.finalize(
           Map.get(running_entry, :codex_session_logs, []),
@@ -304,6 +307,7 @@ defmodule SymphonyElixir.Orchestrator do
                 failure: failure,
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path),
+                resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
                 codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
                 recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
               }
@@ -354,6 +358,10 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:base_age_seconds, runtime_info[:base_age_seconds])
           |> maybe_put_runtime_value(:candidate_base_sha, runtime_info[:candidate_base_sha])
           |> maybe_put_runtime_value(:workspace_dirty, runtime_info[:workspace_dirty])
+          |> maybe_put_runtime_value(
+            :resume_packet_ref,
+            ResumePacket.reference_from_runtime_info(runtime_info)
+          )
 
         issue = Map.get(updated_running_entry, :issue, %{})
 
@@ -1061,7 +1069,10 @@ defmodule SymphonyElixir.Orchestrator do
         failure:
           AgentFailure.classify(:handoff_review_timeout,
             backend: Map.get(running_entry, :backend)
-          )
+          ),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        resume_packet_ref: Map.get(running_entry, :resume_packet_ref)
       })
     else
       state
@@ -1089,7 +1100,10 @@ defmodule SymphonyElixir.Orchestrator do
         retry_id: Map.get(running_entry, :retry_id),
         error: "stalled for #{elapsed_ms}ms without codex activity",
         backend: Map.get(running_entry, :backend),
-        failure: AgentFailure.classify(:stalled, backend: Map.get(running_entry, :backend))
+        failure: AgentFailure.classify(:stalled, backend: Map.get(running_entry, :backend)),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        resume_packet_ref: Map.get(running_entry, :resume_packet_ref)
       })
     else
       state
@@ -1743,7 +1757,7 @@ defmodule SymphonyElixir.Orchestrator do
     runner_opts = Keyword.merge(agent_opts, Map.to_list(Map.delete(proposed_identity, :attempt)))
 
     case start_issue_worker(issue, attempt, recipient, worker_host, runner_opts) do
-      {:ok, pid, persistent_worker_id, identity} ->
+      {:ok, pid, persistent_worker_id, identity, resume_packet_ref} ->
         ref = Process.monitor(pid)
         if Keyword.has_key?(agent_opts, :wait_resume_prompt), do: wait_watcher_acknowledge(issue.id)
 
@@ -1764,7 +1778,8 @@ defmodule SymphonyElixir.Orchestrator do
                 ref: ref,
                 persistent_worker_id: persistent_worker_id,
                 started_at: DateTime.utc_now(),
-                identity: identity
+                identity: identity,
+                resume_packet_ref: resume_packet_ref
               }
             )
           )
@@ -1789,7 +1804,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: "failed to spawn agent: #{inspect(reason)}",
           backend: predicted_backend(issue),
           failure: AgentFailure.classify({:spawn_failed, reason}, backend: predicted_backend(issue)),
-          worker_host: worker_host
+          worker_host: worker_host,
+          resume_packet_ref: ResumePacket.normalize_reference(Keyword.get(agent_opts, :resume_packet_ref))
         })
     end
   end
@@ -1807,7 +1823,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, %{pid: pid, manifest: manifest, spec: spec}} ->
         identity = persistent_worker_identity(manifest, spec)
 
-        {:ok, pid, manifest.worker_id, identity}
+        {:ok, pid, manifest.worker_id, identity, manifest.resume_packet_ref}
 
       {:error, reason} ->
         {:error, reason}
@@ -1823,7 +1839,7 @@ defmodule SymphonyElixir.Orchestrator do
            )
          end) do
       {:ok, pid} ->
-        {:ok, pid, nil, RunManifest.execution_identity(attempt, agent_opts)}
+        {:ok, pid, nil, RunManifest.execution_identity(attempt, agent_opts), ResumePacket.normalize_reference(Keyword.get(agent_opts, :resume_packet_ref))}
 
       {:error, reason} ->
         {:error, reason}
@@ -1876,9 +1892,14 @@ defmodule SymphonyElixir.Orchestrator do
             ref: ref,
             persistent_worker_id: manifest.worker_id,
             started_at: started_at,
-            identity: persistent_worker_identity(manifest, spec)
+            identity: persistent_worker_identity(manifest, spec),
+            workspace_path: manifest.workspace_path,
+            resume_packet_ref: manifest.resume_packet_ref
           }
         )
+        |> mark_resume_packet_transition(:restart_adopted)
+
+      _ = persist_adopted_resume_packet_ref(manifest, running_entry)
 
       Logger.info("Reconnected persistent worker worker_id=#{manifest.worker_id} #{issue_context(issue)} pid=#{inspect(pid)}")
 
@@ -1929,7 +1950,7 @@ defmodule SymphonyElixir.Orchestrator do
       identifier: issue.identifier,
       issue: issue,
       worker_host: worker_host,
-      workspace_path: nil,
+      workspace_path: Map.get(worker, :workspace_path),
       backend: predicted_backend(issue),
       model: nil,
       reasoning_effort: nil,
@@ -1947,6 +1968,7 @@ defmodule SymphonyElixir.Orchestrator do
       base_age_seconds: nil,
       candidate_base_sha: nil,
       workspace_dirty: nil,
+      resume_packet_ref: ResumePacket.normalize_reference(Map.get(worker, :resume_packet_ref)),
       session_id: nil,
       last_codex_message: nil,
       last_codex_timestamp: nil,
@@ -2001,6 +2023,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
   defp park_completed_worker(%State{} = state, running_entry) do
+    running_entry = mark_resume_packet_transition(running_entry, :wait_parked)
     issue = Map.get(running_entry, :issue)
     request = Map.get(running_entry, :wait_request)
 
@@ -2012,6 +2035,7 @@ defmodule SymphonyElixir.Orchestrator do
       backend: Map.get(running_entry, :backend),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
       codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
       recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, []),
       run_id: Map.get(running_entry, :run_id),
@@ -2047,6 +2071,7 @@ defmodule SymphonyElixir.Orchestrator do
           backend: Map.get(running_entry, :backend),
           worker_host: Map.get(running_entry, :worker_host),
           workspace_path: Map.get(running_entry, :workspace_path),
+          resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
           codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
           recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
         })
@@ -2073,6 +2098,7 @@ defmodule SymphonyElixir.Orchestrator do
       backend: Map.get(running_entry, :backend),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
       codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
       recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
     })
@@ -2117,6 +2143,7 @@ defmodule SymphonyElixir.Orchestrator do
             backend: entry.backend,
             worker_host: entry.worker_host,
             workspace_path: entry.workspace_path,
+            resume_packet_ref: Map.get(entry, :resume_packet_ref),
             codex_session_logs: Map.get(entry, :codex_session_logs, []),
             recent_codex_transcript_blocks: Map.get(entry, :recent_codex_transcript_blocks, []),
             wait_resume_prompt: entry.resume_prompt
@@ -2146,6 +2173,7 @@ defmodule SymphonyElixir.Orchestrator do
         retry_attempt: Map.get(entry, :retry_attempt, 0),
         worker_host: entry.worker_host,
         workspace_path: entry.workspace_path,
+        resume_packet_ref: Map.get(entry, :resume_packet_ref),
         parked_at: entry.parked_at,
         next_probe_at: entry.next_probe_at,
         waiting_seconds: running_seconds(entry.parked_at, now),
@@ -2235,6 +2263,24 @@ defmodule SymphonyElixir.Orchestrator do
     codex_session_logs = pick_retry_codex_session_logs(previous_retry, metadata)
     recent_codex_transcript_blocks = pick_retry_codex_transcript_blocks(previous_retry, metadata)
     wait_resume_prompt = pick_retry_wait_resume_prompt(previous_retry, metadata)
+    resume_packet_ref = pick_retry_resume_packet_ref(previous_retry, metadata)
+
+    transition =
+      mark_resume_packet_transition(
+        %{
+          issue: metadata[:issue],
+          identifier: identifier,
+          run_id: metadata[:run_id],
+          parent_run_id: parent_run_id,
+          retry_id: previous_retry_id,
+          worker_host: worker_host,
+          workspace_path: workspace_path,
+          resume_packet_ref: resume_packet_ref
+        },
+        :retry_scheduled
+      )
+
+    resume_packet_ref = Map.get(transition, :resume_packet_ref)
 
     cancel_retry_timer(old_timer)
 
@@ -2259,6 +2305,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_session_logs: codex_session_logs,
       recent_codex_transcript_blocks: recent_codex_transcript_blocks,
       wait_resume_prompt: wait_resume_prompt,
+      resume_packet_ref: resume_packet_ref,
       retry_kind: retry_kind
     }
 
@@ -2452,7 +2499,8 @@ defmodule SymphonyElixir.Orchestrator do
           retry_kind: Map.get(retry_entry, :retry_kind),
           retry_id: Map.get(retry_entry, :retry_id),
           previous_retry_id: Map.get(retry_entry, :previous_retry_id),
-          parent_run_id: Map.get(retry_entry, :parent_run_id)
+          parent_run_id: Map.get(retry_entry, :parent_run_id),
+          resume_packet_ref: Map.get(retry_entry, :resume_packet_ref)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -2673,6 +2721,7 @@ defmodule SymphonyElixir.Orchestrator do
       end
       |> Keyword.put(:parent_run_id, metadata[:parent_run_id])
       |> Keyword.put(:retry_id, metadata[:retry_id])
+      |> Keyword.put(:resume_packet_ref, metadata[:resume_packet_ref])
 
     case dispatch_issue_outcome(state, issue, attempt, metadata[:worker_host], agent_opts) do
       {:dispatched, state} ->
@@ -2765,6 +2814,106 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_wait_resume_prompt(previous_retry, metadata) do
     metadata[:wait_resume_prompt] || Map.get(previous_retry, :wait_resume_prompt)
+  end
+
+  defp pick_retry_resume_packet_ref(previous_retry, metadata) do
+    ResumePacket.normalize_reference(metadata[:resume_packet_ref] || Map.get(previous_retry, :resume_packet_ref))
+  end
+
+  defp mark_resume_packet_transition(entry, boundary)
+       when is_map(entry) and (is_atom(boundary) or is_binary(boundary)) do
+    current_ref = ResumePacket.normalize_reference(Map.get(entry, :resume_packet_ref))
+    entry = Map.put(entry, :resume_packet_ref, current_ref)
+    boundary = to_string(boundary)
+    workspace = Map.get(entry, :workspace_path)
+
+    if is_binary(workspace) do
+      workspace
+      |> call_resume_packet_boundary_marker(boundary, Map.get(entry, :worker_host))
+      |> apply_resume_packet_boundary_result(entry, boundary, workspace)
+    else
+      entry
+    end
+  end
+
+  defp apply_resume_packet_boundary_result({:ok, packet}, entry, boundary, workspace)
+       when is_map(packet) do
+    relative_ref = Path.basename(Workspace.resume_packet_path(workspace))
+
+    case ResumePacket.reference(packet, relative_ref) do
+      %{} = reference -> Map.put(entry, :resume_packet_ref, reference)
+      nil -> resume_packet_boundary_failure(entry, boundary, :invalid_marked_packet)
+    end
+  end
+
+  defp apply_resume_packet_boundary_result({:ok, nil}, entry, boundary, _workspace),
+    do: resume_packet_boundary_failure(entry, boundary, :packet_unavailable)
+
+  defp apply_resume_packet_boundary_result({:error, reason}, entry, boundary, _workspace),
+    do: resume_packet_boundary_failure(entry, boundary, reason)
+
+  defp call_resume_packet_boundary_marker(workspace, boundary, worker_host) do
+    marker =
+      Application.get_env(
+        :symphony_elixir,
+        :resume_packet_boundary_marker,
+        &Workspace.mark_resume_packet_boundary/3
+      )
+
+    marker.(workspace, boundary, worker_host)
+  rescue
+    _error -> {:error, :marker_exception}
+  catch
+    _kind, _reason -> {:error, :marker_exit}
+  end
+
+  defp resume_packet_boundary_failure(entry, boundary, reason) do
+    issue = Map.get(entry, :issue) || %{}
+    issue_id = Map.get(issue, :id)
+    identifier = Map.get(issue, :identifier) || Map.get(entry, :identifier) || issue_id
+
+    Logger.warning(
+      "resume_packet boundary mark failed issue_id=#{issue_id || "n/a"} " <>
+        "issue_identifier=#{identifier || "n/a"} boundary=#{boundary} " <>
+        "reason_class=#{resume_packet_boundary_reason_class(reason)}"
+    )
+
+    Telemetry.emit(:resume_packet_error, %{
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      run_id: Map.get(entry, :run_id),
+      parent_run_id: Map.get(entry, :parent_run_id),
+      retry_id: Map.get(entry, :retry_id),
+      worker_host: Map.get(entry, :worker_host),
+      error_code: "resume_packet_boundary_mark_failed",
+      boundary: boundary
+    })
+
+    entry
+  end
+
+  defp resume_packet_boundary_reason_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp resume_packet_boundary_reason_class(reason) when is_tuple(reason) and tuple_size(reason) > 0,
+    do: reason |> elem(0) |> resume_packet_boundary_reason_class()
+
+  defp resume_packet_boundary_reason_class(_reason), do: "unknown"
+
+  defp persist_adopted_resume_packet_ref(manifest, running_entry) do
+    reference = Map.get(running_entry, :resume_packet_ref)
+
+    if reference != manifest.resume_packet_ref do
+      case PersistentWorkerRegistry.update(manifest, %{resume_packet_ref: reference}) do
+        {:ok, _manifest} ->
+          :ok
+
+        {:error, reason} ->
+          _ = resume_packet_boundary_failure(running_entry, "restart_adopted", reason)
+          :ok
+      end
+    else
+      :ok
+    end
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
@@ -3215,6 +3364,7 @@ defmodule SymphonyElixir.Orchestrator do
           base_age_seconds: Map.get(metadata, :base_age_seconds),
           candidate_base_sha: Map.get(metadata, :candidate_base_sha),
           workspace_dirty: Map.get(metadata, :workspace_dirty),
+          resume_packet_ref: Map.get(metadata, :resume_packet_ref),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
@@ -3259,6 +3409,7 @@ defmodule SymphonyElixir.Orchestrator do
           failure_class: Map.get(retry, :failure_class),
           worker_host: Map.get(retry, :worker_host),
           workspace_path: Map.get(retry, :workspace_path),
+          resume_packet_ref: Map.get(retry, :resume_packet_ref),
           codex_session_logs: Map.get(retry, :codex_session_logs, []),
           recent_codex_transcript_blocks: Map.get(retry, :recent_codex_transcript_blocks, [])
         }
@@ -3406,7 +3557,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_persistent_checkpoint(state, issue_id, running_entry, seq, checkpoint)
        when is_map(checkpoint) do
     if seq > Map.get(running_entry, :persistent_checkpoint_seq, 0) do
-      safe_checkpoint = Map.drop(checkpoint, [:pid, :ref, :persistent_worker_id])
+      safe_checkpoint =
+        checkpoint
+        |> Map.drop([:pid, :ref, :persistent_worker_id])
+        |> normalize_checkpoint_resume_packet_ref()
+        |> preserve_adoption_resume_packet_ref(running_entry)
 
       updated_entry =
         running_entry
@@ -3439,6 +3594,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_persistent_checkpoint(state, _issue_id, _running_entry, _seq, _checkpoint),
     do: state
+
+  defp normalize_checkpoint_resume_packet_ref(checkpoint) do
+    if Map.has_key?(checkpoint, :resume_packet_ref) do
+      case ResumePacket.normalize_reference(Map.get(checkpoint, :resume_packet_ref)) do
+        %{} = reference -> Map.put(checkpoint, :resume_packet_ref, reference)
+        nil -> Map.delete(checkpoint, :resume_packet_ref)
+      end
+    else
+      checkpoint
+    end
+  end
+
+  defp preserve_adoption_resume_packet_ref(checkpoint, running_entry) do
+    case ResumePacket.normalize_reference(Map.get(running_entry, :resume_packet_ref)) do
+      %{boundary: "restart_adopted"} = reference -> Map.put(checkpoint, :resume_packet_ref, reference)
+      _reference -> checkpoint
+    end
+  end
 
   defp remember_rate_limit_update(running_entry, update) do
     if is_map(extract_rate_limits(update)) do
@@ -4850,6 +5023,12 @@ defmodule SymphonyElixir.Orchestrator do
       %{} = circuit ->
         state = drop_retry_attempt(state, issue_id)
         parked_at = DateTime.utc_now()
+
+        metadata =
+          metadata
+          |> Map.put_new(:identifier, issue_id)
+          |> mark_resume_packet_transition(:quota_parked)
+
         parked_entry = quota_parked_entry(issue_id, attempt, metadata, circuit, backend, parked_at)
 
         parked =
@@ -4894,6 +5073,7 @@ defmodule SymphonyElixir.Orchestrator do
       failure_class: metadata[:failure_class] || retry_failure_class(metadata[:failure]),
       worker_host: metadata[:worker_host],
       workspace_path: metadata[:workspace_path],
+      resume_packet_ref: ResumePacket.normalize_reference(metadata[:resume_packet_ref]),
       parked_at: parked_at
     }
   end
@@ -5051,7 +5231,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp quota_probe_dispatch(circuit, parked_entry) do
     opts = [
       parent_run_id: Map.get(parked_entry, :parent_run_id),
-      retry_id: Map.get(parked_entry, :retry_id)
+      retry_id: Map.get(parked_entry, :retry_id),
+      resume_packet_ref: Map.get(parked_entry, :resume_packet_ref)
     ]
 
     {parked_entry.attempt, parked_entry.worker_host || circuit.worker_host, opts}
@@ -5134,6 +5315,7 @@ defmodule SymphonyElixir.Orchestrator do
         failure_class: Map.get(entry, :failure_class),
         worker_host: entry.worker_host,
         workspace_path: entry.workspace_path,
+        resume_packet_ref: Map.get(entry, :resume_packet_ref),
         retry_id: Map.get(entry, :retry_id),
         previous_retry_id: Map.get(entry, :previous_retry_id),
         parent_run_id: Map.get(entry, :parent_run_id),
@@ -5338,6 +5520,7 @@ defmodule SymphonyElixir.Orchestrator do
           failure_class: Map.get(entry, :failure_class),
           worker_host: entry.worker_host,
           workspace_path: entry.workspace_path,
+          resume_packet_ref: Map.get(entry, :resume_packet_ref),
           codex_session_logs: [],
           recent_codex_transcript_blocks: []
         }

@@ -3,6 +3,7 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
   alias SymphonyElixir.PersistentWorker
   alias SymphonyElixir.PersistentWorker.{Client, Registry, Server}
+  alias SymphonyElixir.ResumePacket
 
   defmodule RelayTarget do
     use GenServer
@@ -38,16 +39,20 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
   test "registry creates one private discoverable record per issue" do
     issue = issue("registry")
+    packet = ResumePacket.build(%{boundary_reason: :retry_scheduled})
+    packet_ref = ResumePacket.reference(packet, "registry.json.resume-packet.json")
 
-    assert {:ok, manifest} = Registry.prepare(issue, 2, "worker-a")
+    assert {:ok, manifest} = Registry.prepare(issue, 2, "worker-a", resume_packet_ref: packet_ref)
     assert manifest.attempt == 2
     assert manifest.worker_host == "worker-a"
+    assert manifest.resume_packet_ref == packet_ref
     assert {:existing, %{worker_id: worker_id}} = Registry.prepare(issue, 3, nil)
     assert worker_id == manifest.worker_id
 
     assert {:ok, spec} = Registry.load_spec(manifest)
     assert spec.issue == issue
     assert spec.attempt == 2
+    assert spec.runner_opts[:resume_packet_ref] == packet_ref
     assert [listed] = Registry.list()
     assert listed.worker_id == manifest.worker_id
 
@@ -74,7 +79,7 @@ defmodule SymphonyElixir.PersistentWorkerTest do
       manifest.manifest_path
       |> File.read!()
       |> Jason.decode!()
-      |> Map.drop(~w(run_id parent_run_id retry_id retry_attempt))
+      |> Map.drop(~w(run_id parent_run_id retry_id retry_attempt workspace_path resume_packet_ref))
 
     File.write!(manifest.manifest_path, Jason.encode!(legacy_payload))
 
@@ -83,6 +88,8 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     assert restored.parent_run_id == nil
     assert restored.retry_id == nil
     assert restored.retry_attempt == nil
+    assert restored.workspace_path == nil
+    assert restored.resume_packet_ref == nil
     assert restored.attempt == 2
     assert restored.worker_id == manifest.worker_id
   end
@@ -245,12 +252,23 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
     assert {:ok, spec} = Registry.load_spec(manifest)
 
+    packet = ResumePacket.build(%{boundary_reason: :turn_start})
+
+    packet_runtime = %{
+      workspace_path: "/tmp/reconnected-workspace",
+      resume_packet_id: packet["packet_id"],
+      resume_packet_sha256: packet["packet_sha256"],
+      resume_packet_ref: "reconnected.json.resume-packet.json",
+      resume_packet_boundary: "turn_start",
+      resume_packet_evidence_refs: []
+    }
+
     runner_fun = fn recipient ->
       send(test_pid, {:runner_started, self(), recipient})
 
       send(
         recipient,
-        {:worker_runtime_info, issue.id, %{workspace_path: "/tmp/reconnected-workspace"}}
+        {:worker_runtime_info, issue.id, packet_runtime}
       )
 
       receive do
@@ -267,10 +285,20 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     assert_receive {:checkpoint, ^first_target, worker_id, 0, nil}, 5_000
 
-    assert_receive {:event, ^first_target, ^worker_id, 1, {:worker_runtime_info, issue_id, %{workspace_path: "/tmp/reconnected-workspace"}}},
+    assert_receive {:event, ^first_target, ^worker_id, 1, {:worker_runtime_info, issue_id, ^packet_runtime}},
                    5_000
 
     assert issue_id == issue.id
+
+    assert_eventually(fn ->
+      case Registry.list() do
+        [%{workspace_path: "/tmp/reconnected-workspace", resume_packet_ref: reference}] ->
+          reference == ResumePacket.reference(packet, "reconnected.json.resume-packet.json")
+
+        _other ->
+          false
+      end
+    end)
 
     GenServer.stop(first_target)
     assert_eventually(fn -> not Process.alive?(first_client) end)
@@ -310,16 +338,33 @@ defmodule SymphonyElixir.PersistentWorkerTest do
     issue = issue("orchestrator-adoption")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
 
+    packet = ResumePacket.build(%{identity: %{run_id: "run-initial-adoption"}, boundary_reason: :turn_start})
+    packet_ref = ResumePacket.reference(packet, "adoption.json.resume-packet.json")
+
     assert {:ok, manifest} =
              Registry.prepare(issue, nil, nil,
                run_id: "run-initial-adoption",
-               retry_attempt: 0
+               retry_attempt: 0,
+               resume_packet_ref: packet_ref
              )
+
+    assert {:ok, manifest} =
+             Registry.update(manifest, %{workspace_path: "/tmp/adoption-workspace"})
 
     assert manifest.attempt == 1
     assert manifest.retry_attempt == 0
     assert {:ok, spec} = Registry.load_spec(manifest)
     test_pid = self()
+    {:ok, packet_state} = Agent.start_link(fn -> packet end)
+
+    Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, fn workspace, boundary, worker_host ->
+      send(test_pid, {:adoption_packet_boundary, workspace, boundary, worker_host})
+
+      Agent.get_and_update(packet_state, fn current ->
+        {:ok, marked} = ResumePacket.mark_boundary(current, boundary)
+        {{:ok, marked}, marked}
+      end)
+    end)
 
     runner_fun = fn recipient ->
       send(test_pid, {:adoption_runner_started, self(), recipient})
@@ -341,6 +386,8 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     on_exit(fn ->
       Application.delete_env(:symphony_elixir, :persistent_worker_liveness_check)
+      Application.delete_env(:symphony_elixir, :resume_packet_boundary_marker)
+      if Process.alive?(packet_state), do: Agent.stop(packet_state)
     end)
 
     first_name = :persistent_adoption_first
@@ -348,13 +395,24 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     assert_eventually(fn ->
       case Orchestrator.snapshot(first_name, 1_000) do
-        %{running: [%{issue_id: issue_id, run_id: run_id, retry_attempt: 0}]} ->
+        %{
+          running: [
+            %{
+              issue_id: issue_id,
+              run_id: run_id,
+              retry_attempt: 0,
+              resume_packet_ref: %{boundary: "restart_adopted"}
+            }
+          ]
+        } ->
           issue_id == issue.id and run_id == "run-initial-adoption"
 
         _other ->
           false
       end
     end)
+
+    assert_receive {:adoption_packet_boundary, "/tmp/adoption-workspace", "restart_adopted", nil}
 
     GenServer.stop(first)
     assert Process.alive?(runner_pid)
@@ -365,13 +423,24 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     assert_eventually(fn ->
       case Orchestrator.snapshot(second_name, 1_000) do
-        %{running: [%{issue_id: issue_id, run_id: run_id, retry_attempt: 0}]} ->
+        %{
+          running: [
+            %{
+              issue_id: issue_id,
+              run_id: run_id,
+              retry_attempt: 0,
+              resume_packet_ref: %{boundary: "restart_adopted"}
+            }
+          ]
+        } ->
           issue_id == issue.id and run_id == "run-initial-adoption"
 
         _other ->
           false
       end
     end)
+
+    assert_receive {:adoption_packet_boundary, "/tmp/adoption-workspace", "restart_adopted", nil}
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
     send(runner_pid, :finish)

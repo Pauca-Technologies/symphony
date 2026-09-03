@@ -26,6 +26,7 @@ defmodule SymphonyElixir.AgentRunner do
     PromptComposer,
     PromptSection,
     RepoConfig,
+    ResumePacket,
     ReviewGate,
     ReviewOutcome,
     ReviewPacket,
@@ -48,6 +49,7 @@ defmodule SymphonyElixir.AgentRunner do
   @deferred_handoff_gate_key {__MODULE__, :deferred_handoff_gate}
   @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
   @agent_wait_request_key {__MODULE__, :agent_wait_request}
+  @resume_packet_verification_key {__MODULE__, :resume_packet_verification}
   @handoff_issue_refresh_retry_base_ms 1_000
   @handoff_issue_refresh_retry_max_ms 30_000
 
@@ -257,17 +259,6 @@ defmodule SymphonyElixir.AgentRunner do
        }) do
     send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
-    repository_manifest = collect_repository_manifest(workspace, worker_host, opts)
-
-    send_scheduling_runtime_info(
-      codex_update_recipient,
-      issue,
-      repository_manifest,
-      opts
-    )
-
-    opts = Keyword.put(opts, :repository_manifest, repository_manifest)
-
     case prepare_github_auth(workspace, issue, worker_host) do
       {:ok, _github_auth} ->
         session_start =
@@ -301,11 +292,20 @@ defmodule SymphonyElixir.AgentRunner do
                  worker_host,
                  hook_command: Map.get(repo_hook_opts, :before_run)
                ) do
+          repository_manifest = collect_repository_manifest(workspace, issue, worker_host, opts)
+
+          send_scheduling_runtime_info(
+            codex_update_recipient,
+            issue,
+            repository_manifest,
+            opts
+          )
+
           run_agent_with_progress_tracking(%{
             workspace: workspace,
             issue: issue,
             recipient: codex_update_recipient,
-            opts: opts,
+            opts: Keyword.put(opts, :repository_manifest, repository_manifest),
             worker_host: worker_host
           })
         end
@@ -509,30 +509,42 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_scheduling_runtime_info(_recipient, _issue, _manifest, _opts), do: :ok
 
-  defp collect_repository_manifest(workspace, worker_host, opts) do
+  defp collect_repository_manifest(workspace, issue, worker_host, opts) do
     manifest_opts =
       [worker_host: worker_host]
       |> maybe_put(:git_runner, Keyword.get(opts, :repository_git_runner))
 
-    BaseDrift.manifest(workspace, Keyword.get(opts, :base_drift_ref), manifest_opts)
+    collector = Keyword.get(opts, :repository_manifest_collector, &BaseDrift.manifest/3)
+
+    manifest =
+      case collector.(workspace, Keyword.get(opts, :base_drift_ref), manifest_opts) do
+        manifest when is_map(manifest) -> manifest
+        _invalid -> repository_collection_failure_manifest()
+      end
+
+    Enum.each(repository_manifest_errors(manifest), fn code ->
+      resume_packet_failure(issue, workspace, worker_host, code, :repository_probe_unavailable)
+    end)
+
+    manifest
+  rescue
+    error ->
+      resume_packet_failure(issue, workspace, worker_host, "repository.collection_failed", error.__struct__)
+      repository_collection_failure_manifest()
+  catch
+    kind, _reason ->
+      resume_packet_failure(issue, workspace, worker_host, "repository.collection_failed", kind)
+      repository_collection_failure_manifest()
   end
 
   defp run_agent_with_progress_tracking(context) do
-    before = collect_repository_manifest(context.workspace, context.worker_host, context.opts)
-    opts = Keyword.put(context.opts, :repository_manifest, before)
-
-    result =
-      run_codex_turns(
-        context.workspace,
-        context.issue,
-        context.recipient,
-        opts,
-        context.worker_host
-      )
-
-    after_run = collect_repository_manifest(context.workspace, context.worker_host, opts)
-    maybe_emit_material_progress(context.issue, opts, before, after_run)
-    result
+    run_codex_turns(
+      context.workspace,
+      context.issue,
+      context.recipient,
+      context.opts,
+      context.worker_host
+    )
   end
 
   defp maybe_emit_material_progress(issue, opts, before, after_run) do
@@ -568,14 +580,258 @@ defmodule SymphonyElixir.AgentRunner do
       (is_binary(before_content) and is_binary(after_content) and before_content != after_content)
   end
 
-  defp refresh_scheduling_runtime_info(recipient, issue, worker_host, workspace, opts)
-       when is_pid(recipient) do
-    manifest = collect_repository_manifest(workspace, worker_host, opts)
+  defp refresh_scheduling_runtime_info(recipient, issue, worker_host, workspace, opts) do
+    manifest = collect_repository_manifest(workspace, issue, worker_host, opts)
     send_scheduling_runtime_info(recipient, issue, manifest, opts)
+    manifest
   end
 
-  defp refresh_scheduling_runtime_info(_recipient, _issue, _worker_host, _workspace, _opts),
-    do: :ok
+  defp prepare_turn_resume_packet(workspace, issue, recipient, worker_host, opts, turn_number, max_turns) do
+    {previous, load_errors} = resume_packet_fallback(workspace, worker_host, opts, issue)
+
+    {budget_snapshot, budget_errors} =
+      opts
+      |> Keyword.get(:budget_collector)
+      |> safe_budget_snapshot(issue, workspace, worker_host, opts)
+
+    budget =
+      budget_snapshot
+      |> with_budget_thresholds(opts)
+
+    errors =
+      load_errors ++
+        List.wrap(Keyword.get(opts, :resume_packet_errors)) ++
+        repository_manifest_errors(Keyword.get(opts, :repository_manifest)) ++ budget_errors
+
+    packet =
+      ResumePacket.build(%{
+        previous_packet: previous,
+        issue: issue,
+        identity: Telemetry.current_context(),
+        turn_number: turn_number,
+        max_turns: max_turns,
+        repository: turn_repository_for_packet(opts, turn_number),
+        verification: current_resume_verification(opts),
+        budget: budget,
+        no_progress_warnings: Keyword.get(opts, :no_progress_warnings, []),
+        errors: errors,
+        boundary_reason: :turn_start
+      })
+
+    persist_errors = persist_and_emit_resume_packet(workspace, issue, recipient, worker_host, packet)
+
+    opts =
+      opts
+      |> Keyword.put(:resume_packet, packet)
+      |> Keyword.put(:resume_packet_errors, persist_errors)
+
+    {packet, opts}
+  end
+
+  defp refresh_after_turn(
+         workspace,
+         issue,
+         recipient,
+         worker_host,
+         opts,
+         budget,
+         {turn_number, max_turns},
+         boundary
+       ) do
+    before = Keyword.get(opts, :repository_manifest, %{})
+    after_turn = refresh_scheduling_runtime_info(recipient, issue, worker_host, workspace, opts)
+    maybe_emit_material_progress(issue, opts, before, after_turn)
+
+    errors =
+      List.wrap(Keyword.get(opts, :resume_packet_errors)) ++
+        repository_manifest_errors(after_turn)
+
+    packet =
+      ResumePacket.build(%{
+        previous_packet: Keyword.get(opts, :resume_packet),
+        issue: issue,
+        identity: Telemetry.current_context(),
+        turn_number: turn_number,
+        max_turns: max_turns,
+        repository: repository_for_packet(after_turn),
+        verification: current_resume_verification(opts),
+        budget: with_budget_thresholds(budget, opts),
+        no_progress_warnings: Keyword.get(opts, :no_progress_warnings, []),
+        errors: errors,
+        boundary_reason: boundary
+      })
+
+    persist_errors = persist_and_emit_resume_packet(workspace, issue, recipient, worker_host, packet)
+
+    opts
+    |> Keyword.put(:repository_manifest, after_turn)
+    |> Keyword.put(:resume_packet, packet)
+    |> Keyword.put(:resume_packet_errors, persist_errors)
+  end
+
+  defp resume_packet_fallback(workspace, worker_host, opts, issue) do
+    case Keyword.get(opts, :resume_packet) do
+      packet when is_map(packet) ->
+        {packet, []}
+
+      _missing ->
+        load_resume_packet_fallback(workspace, worker_host, issue)
+    end
+  end
+
+  defp load_resume_packet_fallback(workspace, worker_host, issue) do
+    case Workspace.load_resume_packet_with_diagnostics(workspace, worker_host) do
+      {:ok, packet, diagnostics} ->
+        Enum.each(diagnostics, fn code ->
+          resume_packet_failure(issue, workspace, worker_host, code, :persisted_packet_unavailable)
+        end)
+
+        {packet, diagnostics}
+
+      {:error, reason} ->
+        resume_packet_failure(issue, workspace, worker_host, "resume_packet_read_failed", reason)
+        {nil, ["resume_packet_read_failed"]}
+    end
+  end
+
+  defp persist_and_emit_resume_packet(workspace, issue, recipient, worker_host, packet) do
+    persist_errors =
+      case Workspace.persist_resume_packet(workspace, packet, worker_host) do
+        :ok ->
+          []
+
+        {:error, reason} ->
+          resume_packet_failure(issue, workspace, worker_host, "resume_packet_write_failed", reason)
+          ["resume_packet_write_failed"]
+      end
+
+    metadata = %{
+      resume_packet_id: packet["packet_id"],
+      resume_packet_sha256: packet["packet_sha256"],
+      resume_packet_ref: if(persist_errors == [], do: Path.basename(Workspace.resume_packet_path(workspace))),
+      resume_packet_boundary: get_in(packet, ["boundary", "reason"]),
+      resume_packet_evidence_refs: packet["evidence_refs"]
+    }
+
+    send_resume_packet_runtime_info(recipient, issue, metadata)
+
+    Telemetry.emit(
+      :resume_packet,
+      Map.merge(metadata, telemetry_issue_attrs(issue, worker_host))
+    )
+
+    persist_errors
+  end
+
+  defp send_resume_packet_runtime_info(recipient, %Issue{id: issue_id}, metadata)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:worker_runtime_info, issue_id, metadata})
+    :ok
+  end
+
+  defp send_resume_packet_runtime_info(_recipient, _issue, _metadata), do: :ok
+
+  defp resume_packet_failure(issue, workspace, worker_host, code, reason) do
+    Logger.warning(
+      "resume_packet failure #{issue_context(issue)} workspace=#{workspace} " <>
+        "worker_host=#{worker_host_for_log(worker_host)} code=#{code} reason_class=#{resume_failure_reason_class(reason)}"
+    )
+
+    Telemetry.emit(:resume_packet_error, %{
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      workspace: workspace,
+      worker_host: worker_host,
+      error_code: code
+    })
+  end
+
+  defp resume_failure_reason_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp resume_failure_reason_class(reason) when is_tuple(reason) and tuple_size(reason) > 0 do
+    reason |> elem(0) |> resume_failure_reason_class()
+  end
+
+  defp resume_failure_reason_class(%{__struct__: module}) when is_atom(module),
+    do: inspect(module)
+
+  defp resume_failure_reason_class(_reason), do: "unknown"
+
+  defp safe_budget_snapshot(pid, issue, workspace, worker_host, opts) when is_pid(pid) do
+    snapshotter = Keyword.get(opts, :budget_snapshotter, &AgentBudgetCollector.snapshot/1)
+    {snapshotter.(pid), []}
+  rescue
+    _error ->
+      resume_packet_failure(issue, workspace, worker_host, "budget.snapshot_failed", :collector_unavailable)
+      {nil, ["budget.snapshot_failed"]}
+  catch
+    _kind, _reason ->
+      resume_packet_failure(issue, workspace, worker_host, "budget.snapshot_failed", :collector_unavailable)
+      {nil, ["budget.snapshot_failed"]}
+  end
+
+  defp safe_budget_snapshot(_pid, _issue, _workspace, _worker_host, _opts), do: {nil, []}
+
+  defp with_budget_thresholds(runtime, opts) when is_map(runtime) do
+    thresholds =
+      case Keyword.get(opts, :efficiency_decision) do
+        %{budget: budget} when is_map(budget) -> budget
+        _decision -> %{}
+      end
+
+    Map.put(runtime, :thresholds, thresholds)
+  end
+
+  defp with_budget_thresholds(_runtime, _opts), do: nil
+
+  defp repository_for_packet(manifest) when is_map(manifest) do
+    if Enum.any?(
+         [:head_sha, :base_sha, :worktree_status_fingerprint, :worktree_content_fingerprint],
+         &is_binary(Map.get(manifest, &1))
+       ) do
+      manifest
+    end
+  end
+
+  defp repository_for_packet(_manifest), do: nil
+
+  defp turn_repository_for_packet(opts, 1),
+    do: repository_for_packet(Keyword.get(opts, :repository_manifest))
+
+  defp turn_repository_for_packet(_opts, _turn_number), do: nil
+
+  defp repository_manifest_errors(manifest) when is_map(manifest),
+    do: List.wrap(Map.get(manifest, :errors))
+
+  defp repository_manifest_errors(_manifest), do: []
+
+  defp repository_collection_failure_manifest do
+    %{
+      head_sha: nil,
+      base_sha: nil,
+      base_age_seconds: nil,
+      candidate_base_sha: nil,
+      actual_paths: [],
+      dirty: true,
+      diff_counts: nil,
+      worktree_fingerprint: nil,
+      worktree_status_fingerprint: nil,
+      worktree_content_fingerprint: nil,
+      worktree_fingerprint_complete: false,
+      worktree_fingerprint_path_count: 0,
+      errors: ["repository.collection_failed"]
+    }
+  end
+
+  defp current_resume_verification(opts),
+    do: Process.get(@resume_packet_verification_key) || Keyword.get(opts, :resume_verification)
+
+  defp status_packet_max_bytes(opts) do
+    case Keyword.get(opts, :efficiency_decision) do
+      %{capsule_max_bytes: max_bytes} when is_integer(max_bytes) and max_bytes > 0 -> max_bytes
+      _decision -> 4_000
+    end
+  end
 
   defp maybe_put_actual_manifest(info, []), do: info
 
@@ -677,6 +933,16 @@ defmodule SymphonyElixir.AgentRunner do
   def prompt_built_telemetry_event, do: @prompt_built_telemetry_event
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+    Process.delete(@resume_packet_verification_key)
+
+    try do
+      run_codex_turns_body(workspace, issue, codex_update_recipient, opts, worker_host)
+    after
+      Process.delete(@resume_packet_verification_key)
+    end
+  end
+
+  defp run_codex_turns_body(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
@@ -888,6 +1154,18 @@ defmodule SymphonyElixir.AgentRunner do
     budget_collector = Keyword.fetch!(opts, :budget_collector)
     strategy_prompt = AgentBudgetCollector.take_strategy_prompt(budget_collector)
     opts = maybe_put(opts, :efficiency_strategy_prompt, strategy_prompt)
+
+    {_resume_packet, opts} =
+      prepare_turn_resume_packet(
+        workspace,
+        issue,
+        codex_update_recipient,
+        app_session.worker_host,
+        opts,
+        turn_number,
+        max_turns
+      )
+
     prompt_composition = build_turn_prompt(issue, opts, turn_number, max_turns)
     prompt = prompt_composition.prompt
 
@@ -932,14 +1210,6 @@ defmodule SymphonyElixir.AgentRunner do
 
     send_budget_runtime_info(codex_update_recipient, issue, budget_runtime)
 
-    refresh_scheduling_runtime_info(
-      codex_update_recipient,
-      issue,
-      app_session.worker_host,
-      workspace,
-      opts
-    )
-
     case turn_result do
       {:ok, turn_session} ->
         Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
@@ -966,6 +1236,19 @@ defmodule SymphonyElixir.AgentRunner do
         infrastructure_failure = pop_handoff_infrastructure_failure()
         wait_request = pop_agent_wait_request()
         continuation = continue_with_issue?(issue, issue_state_fetcher, opts)
+        packet_issue = continuation_issue(continuation, issue)
+
+        opts =
+          refresh_after_turn(
+            workspace,
+            packet_issue,
+            codex_update_recipient,
+            app_session.worker_host,
+            opts,
+            budget_runtime,
+            {turn_number, max_turns},
+            successful_turn_boundary(continuation, wait_request)
+          )
 
         finish_successful_turn(
           %{
@@ -1013,10 +1296,30 @@ defmodule SymphonyElixir.AgentRunner do
           opts
         )
 
+        _opts =
+          refresh_after_turn(
+            workspace,
+            issue,
+            codex_update_recipient,
+            app_session.worker_host,
+            opts,
+            budget_runtime,
+            {turn_number, max_turns},
+            :turn_error
+          )
+
         Logger.warning("Agent turn ended abnormally for #{issue_context(issue)} turn=#{turn_number}/#{max_turns} reason=#{inspect(reason)}")
         error
     end
   end
+
+  defp continuation_issue({_status, %Issue{} = issue}, _fallback), do: issue
+  defp continuation_issue(_continuation, issue), do: issue
+
+  defp successful_turn_boundary(_continuation, %{}), do: :turn_waiting
+  defp successful_turn_boundary({:done, _issue}, _wait_request), do: :turn_terminal
+  defp successful_turn_boundary({:error, _reason}, _wait_request), do: :turn_state_error
+  defp successful_turn_boundary(_continuation, _wait_request), do: :turn_complete
 
   defp ensure_implementation_pr_draft(workspace, issue, opts) do
     opts
@@ -1179,7 +1482,8 @@ defmodule SymphonyElixir.AgentRunner do
             "handoff/v1",
             handoff_guidance,
             true
-          )
+          ),
+          status_resume_packet_section(opts)
         ]
 
     canonical_fragments =
@@ -1213,33 +1517,33 @@ defmodule SymphonyElixir.AgentRunner do
 
     static_reused = reusable_static_sections(prior_state)
 
-    sections = [
-      prompt_section(
-        "review.open_findings",
-        :open_findings,
-        "symphony:latest_handoff_gate",
-        "review-findings/v1",
-        handoff_gate_prompt,
-        false
-      ),
-      prompt_section(
-        "efficiency.current_strategy",
-        :efficiency_strategy,
-        "symphony:agent_budget",
-        "efficiency-strategy/v1",
-        efficiency_strategy,
-        false
-      ),
-      prompt_section(
-        "continuation.resume_capsule",
-        :continuation_capsule,
-        "symphony:agent_runner",
-        "resume-capsule/v1",
-        continuation_capsule(static_reused, reused, changed_for_prompt, turn_number, max_turns),
-        false
-      )
-      | changed_for_prompt
-    ]
+    sections =
+      [
+        prompt_section(
+          "review.open_findings",
+          :open_findings,
+          "symphony:latest_handoff_gate",
+          "review-findings/v1",
+          handoff_gate_prompt,
+          false
+        ),
+        prompt_section(
+          "efficiency.current_strategy",
+          :efficiency_strategy,
+          "symphony:agent_budget",
+          "efficiency-strategy/v1",
+          efficiency_strategy,
+          false
+        ),
+        prompt_section(
+          "continuation.resume_capsule",
+          :continuation_capsule,
+          "symphony:agent_runner",
+          "resume-capsule/v1",
+          continuation_capsule(static_reused, reused, changed_for_prompt, turn_number, max_turns),
+          false
+        )
+      ] ++ changed_for_prompt ++ [status_resume_packet_section(opts)]
 
     composition = PromptComposer.compose(sections)
     current_state = PromptComposer.compose(current_sections).state
@@ -1265,6 +1569,19 @@ defmodule SymphonyElixir.AgentRunner do
           |> Map.merge(current_state)
           |> TaskContextPrompt.put_activity_cursor(issue)
     }
+  end
+
+  defp status_resume_packet_section(opts) do
+    packet = Keyword.get(opts, :resume_packet, %{})
+
+    prompt_section(
+      "continuation.status_resume_packet",
+      :status_resume_packet,
+      "symphony:trusted_resume_packet/#{packet["packet_id"] || "unavailable"}",
+      "resume-packet/v#{packet["protocol_version"] || ResumePacket.version()}",
+      ResumePacket.render(packet, status_packet_max_bytes(opts)),
+      false
+    )
   end
 
   defp emit_prompt_built(
@@ -1345,6 +1662,7 @@ defmodule SymphonyElixir.AgentRunner do
       |> Map.put(:handoff_gate_clear_callback, &clear_starting_handoff_gate/1)
       |> Map.put(:deferred_handoff_gate_callback, &store_deferred_handoff_gate/1)
       |> Map.put(:handoff_infrastructure_failure_callback, &store_handoff_infrastructure_failure/2)
+      |> Map.put(:handoff_gate_verification_callback, &remember_handoff_gate_verification/1)
       |> Map.put(
         :handoff_gate_lifecycle_callback,
         handoff_gate_lifecycle_callback(lifecycle_recipient, issue)
@@ -1884,6 +2202,7 @@ defmodule SymphonyElixir.AgentRunner do
          _issue_state_fetcher,
          _opts
        ) do
+    remember_gate_verification(gate)
     store_handoff_infrastructure_failure(prompt, gate)
     {:resume, prompt, request.issue}
   end
@@ -1896,6 +2215,7 @@ defmodule SymphonyElixir.AgentRunner do
          _issue_state_fetcher,
          _opts
        ) do
+    remember_gate_verification(gate)
     finish_starting_handoff_gate(Map.put(request, :gate, gate), recipient, backend)
   end
 
@@ -1911,13 +2231,14 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp handle_starting_handoff_result(
-         {:blocked, prompt, _gates},
+         {:blocked, prompt, gates},
          request,
          _recipient,
          _backend,
          _issue_state_fetcher,
          _opts
        ) do
+    remember_blocked_gate_verification(gates)
     resume_after_starting_handoff_gate(request, prompt)
   end
 
@@ -1930,6 +2251,7 @@ defmodule SymphonyElixir.AgentRunner do
          _opts
        )
        when status in [:failed, :invalidated] do
+    remember_gate_verification(gate)
     resume_after_starting_handoff_gate(Map.put(request, :gate, gate), prompt)
   end
 
@@ -2083,6 +2405,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp handle_pending_gate_poll({:passed, gate}, request, recipient, backend, _fetcher, _opts) do
+    remember_gate_verification(gate)
     request = Map.put(request, :gate, gate)
 
     case finish_pending_gate(request, recipient, :passed) do
@@ -2095,6 +2418,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp handle_pending_gate_poll({:failed, prompt, gate}, request, recipient, _backend, _fetcher, _opts) do
+    remember_gate_verification(gate)
     resume_after_terminal_gate(request, gate, prompt, recipient, :failed)
   end
 
@@ -2106,6 +2430,7 @@ defmodule SymphonyElixir.AgentRunner do
          _fetcher,
          _opts
        ) do
+    remember_gate_verification(gate)
     resume_after_terminal_gate(request, gate, prompt, recipient, :invalidated)
   end
 
@@ -2118,11 +2443,14 @@ defmodule SymphonyElixir.AgentRunner do
          _opts
        ) do
     terminal_gate = if is_map(gate) and Map.has_key?(gate, :job_id), do: gate, else: request.gate
+    remember_gate_verification(terminal_gate)
     store_handoff_infrastructure_failure(prompt, gate)
     resume_after_terminal_gate(request, terminal_gate, prompt, recipient, :infrastructure_error)
   end
 
-  defp handle_pending_gate_poll({:blocked, prompt, _gates}, request, recipient, _backend, _fetcher, _opts) do
+  defp handle_pending_gate_poll({:blocked, prompt, gates}, request, recipient, _backend, _fetcher, _opts) do
+    remember_blocked_gate_verification(gates)
+
     case finish_pending_gate(request, recipient, :legacy_failure) do
       :ok -> {:resume, prompt, request.issue}
       {:error, reason} -> {:error, reason}
@@ -2386,6 +2714,8 @@ defmodule SymphonyElixir.AgentRunner do
           {terminal_outcome, review_nonapproval_prompt(issue, review_outcome), review_outcome}
       end
 
+    remember_review_verification(review_outcome)
+
     :ok =
       transition_agent_lifecycle(recipient, issue, :implementing, %{
         review_job_id: review_job_id,
@@ -2394,6 +2724,126 @@ defmodule SymphonyElixir.AgentRunner do
       })
 
     handoff_gate_prompt
+  end
+
+  defp remember_review_verification(%ReviewOutcome{} = outcome) do
+    captured_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+    remember_resume_verification(%{
+      source: "symphony:automated_review",
+      captured_at: captured_at,
+      review_source: "symphony:automated_review",
+      review_captured_at: captured_at,
+      exact_sha: outcome.reviewed_sha,
+      reviewed_sha: outcome.reviewed_sha,
+      review_outcome: outcome.outcome,
+      review_packet_id: outcome.packet_id,
+      open_finding_count: length(outcome.findings),
+      severity_counts: outcome.severity_counts,
+      attestation_report: outcome.attestation_report
+    })
+  end
+
+  defp remember_gate_verification(gate) when is_map(gate) do
+    identity = mixed_map_value(gate, :identity, "identity", %{})
+    head_sha = mixed_map_value(identity, :head_sha, "headSha")
+    source = "symphony:before_handoff_gate"
+
+    captured_at =
+      mixed_map_value(gate, :completed_at, "completedAt") || current_timestamp()
+
+    remember_resume_verification(%{
+      source: source,
+      captured_at: captured_at,
+      gate_source: source,
+      gate_captured_at: captured_at,
+      exact_sha: head_sha,
+      gate_status: mixed_map_value(gate, :status, "status"),
+      gate_job_id: mixed_map_value(gate, :job_id, "jobId"),
+      checks: mixed_map_value(gate, :checks, "checks", []),
+      evidence_refs: List.wrap(mixed_map_value(gate, :result_artifact, "resultArtifact"))
+    })
+  end
+
+  defp remember_gate_verification(_gate), do: :ok
+
+  defp mixed_map_value(map, atom_key, string_key, default \\ nil) do
+    case Map.get(map, atom_key) do
+      nil -> Map.get(map, string_key, default)
+      value -> value
+    end
+  end
+
+  defp current_timestamp,
+    do: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+  defp remember_blocked_gate_verification(gates) when is_list(gates) do
+    captured_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+    source = "symphony:before_handoff_gate"
+
+    remember_resume_verification(%{
+      source: source,
+      captured_at: captured_at,
+      gate_source: source,
+      gate_captured_at: captured_at,
+      exact_sha: nil,
+      gate_status: "blocked",
+      gate_check_count: length(gates),
+      checks: gates
+    })
+  end
+
+  defp remember_blocked_gate_verification(_gates), do: :ok
+
+  defp remember_handoff_gate_verification(gates) when is_list(gates),
+    do: remember_blocked_gate_verification(gates)
+
+  defp remember_handoff_gate_verification(gate) when is_map(gate),
+    do: remember_gate_verification(gate)
+
+  defp remember_handoff_gate_verification(_evidence), do: :ok
+
+  defp remember_resume_verification(evidence) do
+    existing = Process.get(@resume_packet_verification_key, %{})
+
+    merged =
+      existing
+      |> Map.merge(evidence, fn
+        :evidence_refs, left, right -> Enum.uniq(List.wrap(left) ++ List.wrap(right))
+        _key, _left, right -> right
+      end)
+      |> truthful_verification_provenance()
+
+    Process.put(@resume_packet_verification_key, merged)
+    :ok
+  end
+
+  defp truthful_verification_provenance(evidence) do
+    gate_source = Map.get(evidence, :gate_source)
+    review_source = Map.get(evidence, :review_source)
+
+    cond do
+      is_binary(gate_source) and is_binary(review_source) ->
+        evidence
+        |> Map.put(:source, "symphony:combined_gate_review")
+        |> Map.put(
+          :captured_at,
+          Enum.max([Map.get(evidence, :gate_captured_at), Map.get(evidence, :review_captured_at)])
+        )
+
+      is_binary(gate_source) ->
+        evidence
+        |> Map.put(:source, gate_source)
+        |> Map.put(:captured_at, Map.get(evidence, :gate_captured_at))
+
+      is_binary(review_source) ->
+        evidence
+        |> Map.put(:source, review_source)
+        |> Map.put(:captured_at, Map.get(evidence, :review_captured_at))
+
+      true ->
+        evidence
+    end
   end
 
   defp apply_reviewed_handoff(request, review_key, review_opts, %ReviewOutcome{} = review_outcome) do

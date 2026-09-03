@@ -26,6 +26,8 @@ defmodule SymphonyElixir.BaseDrift do
   @workflow_runtime_paths ["WORKFLOW.md", "WORKFLOW_REVIEW.md"]
   @worktree_fingerprint_max_paths 200
   @worktree_fingerprint_batch_size 50
+  @diff_count_max_paths 50
+  @diff_count_scope "bounded_tracked_git_diff_numstat_v1"
   @command_path_regex ~r{(?:^|[\s`'"(])((?:\.?/?[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)}m
 
   @doc "Assess base freshness, returning compact remediation for a stale candidate base."
@@ -69,27 +71,31 @@ defmodule SymphonyElixir.BaseDrift do
   @spec manifest(Path.t(), String.t() | nil, keyword()) :: map()
   def manifest(workspace, base_ref, opts \\ []) when is_binary(workspace) do
     runner = git_runner(opts)
+    head_sha = resolved_git_value(runner, workspace, ["rev-parse", "HEAD"])
+    current_base = resolved_base_value(runner, workspace, base_ref)
+    candidate_base = resolved_candidate_base(runner, workspace, current_base)
 
-    head_sha =
-      case value(runner, workspace, ["rev-parse", "HEAD"]) do
-        {:ok, sha} -> sha
-        _missing -> nil
-      end
+    {actual_paths, untracked_paths, path_errors} =
+      best_effort_candidate_path_details(runner, workspace, candidate_base)
 
-    current_base =
-      case base_ref && value(runner, workspace, ["rev-parse", "refs/remotes/origin/#{base_ref}"]) do
-        {:ok, sha} -> sha
-        _missing -> nil
-      end
-
-    candidate_base =
-      case current_base && value(runner, workspace, ["merge-base", "HEAD", current_base]) do
-        {:ok, sha} -> sha
-        _missing -> nil
-      end
-
-    actual_paths = best_effort_candidate_paths(runner, workspace, candidate_base)
     worktree = best_effort_worktree_state(runner, workspace, actual_paths)
+
+    {diff_counts, diff_errors} =
+      if path_errors == [] do
+        best_effort_diff_counts(runner, workspace, candidate_base, actual_paths, untracked_paths)
+      else
+        {nil, ["repository.diff_counts_unavailable"]}
+      end
+
+    errors =
+      []
+      |> maybe_error(is_nil(head_sha), "repository.head_unavailable")
+      |> maybe_error(is_binary(base_ref) and is_nil(current_base), "repository.base_unavailable")
+      |> Kernel.++(path_errors)
+      |> maybe_error(is_nil(worktree.status_fingerprint), "repository.worktree_status_unavailable")
+      |> Kernel.++(diff_errors)
+      |> Enum.uniq()
+      |> Enum.sort()
 
     %{
       head_sha: head_sha,
@@ -97,6 +103,8 @@ defmodule SymphonyElixir.BaseDrift do
       base_age_seconds: commit_age_seconds(runner, workspace, current_base),
       candidate_base_sha: candidate_base,
       actual_paths: actual_paths,
+      diff_counts: diff_counts,
+      errors: errors,
       dirty: worktree.dirty,
       worktree_fingerprint: worktree.fingerprint,
       worktree_status_fingerprint: worktree.status_fingerprint,
@@ -104,6 +112,23 @@ defmodule SymphonyElixir.BaseDrift do
       worktree_fingerprint_complete: worktree.complete,
       worktree_fingerprint_path_count: worktree.path_count
     }
+  end
+
+  defp resolved_base_value(_runner, _workspace, base_ref) when not is_binary(base_ref), do: nil
+
+  defp resolved_base_value(runner, workspace, base_ref),
+    do: resolved_git_value(runner, workspace, ["rev-parse", "refs/remotes/origin/#{base_ref}"])
+
+  defp resolved_candidate_base(_runner, _workspace, current_base) when not is_binary(current_base), do: nil
+
+  defp resolved_candidate_base(runner, workspace, current_base),
+    do: resolved_git_value(runner, workspace, ["merge-base", "HEAD", current_base])
+
+  defp resolved_git_value(runner, workspace, args) do
+    case value(runner, workspace, args) do
+      {:ok, sha} -> sha
+      _missing -> nil
+    end
   end
 
   defp compute(runner, workspace, issue, base_ref, head_sha, current_base_sha, critical_paths) do
@@ -161,6 +186,12 @@ defmodule SymphonyElixir.BaseDrift do
   end
 
   defp candidate_paths(runner, workspace, candidate_base) do
+    with {:ok, %{paths: paths}} <- candidate_path_details(runner, workspace, candidate_base) do
+      {:ok, paths}
+    end
+  end
+
+  defp candidate_path_details(runner, workspace, candidate_base) do
     committed_result =
       if is_binary(candidate_base),
         do: changed_paths(runner, workspace, candidate_base, "HEAD"),
@@ -170,16 +201,128 @@ defmodule SymphonyElixir.BaseDrift do
          {:ok, working} <- name_only(runner, workspace, ["diff", "--name-only", "HEAD"]),
          {:ok, staged} <- name_only(runner, workspace, ["diff", "--name-only", "--cached"]),
          {:ok, untracked} <- name_only(runner, workspace, ["ls-files", "--others", "--exclude-standard"]) do
-      {:ok, RepositoryScheduler.normalize_paths(committed ++ working ++ staged ++ untracked)}
+      {:ok,
+       %{
+         paths: RepositoryScheduler.normalize_paths(committed ++ working ++ staged ++ untracked),
+         untracked_paths: RepositoryScheduler.normalize_paths(untracked)
+       }}
     end
   end
 
-  defp best_effort_candidate_paths(runner, workspace, candidate_base) do
-    case candidate_paths(runner, workspace, candidate_base) do
-      {:ok, paths} -> paths
-      {:error, _reason} -> []
+  defp best_effort_candidate_path_details(runner, workspace, candidate_base) do
+    case candidate_path_details(runner, workspace, candidate_base) do
+      {:ok, %{paths: paths, untracked_paths: untracked_paths}} -> {paths, untracked_paths, []}
+      {:error, _reason} -> {[], [], ["repository.changed_paths_unavailable"]}
     end
   end
+
+  defp best_effort_diff_counts(_runner, _workspace, _candidate_base, [], _untracked_paths) do
+    {%{
+       files: 0,
+       additions: 0,
+       deletions: 0,
+       binary_files: 0,
+       paths_considered: 0,
+       paths_omitted: 0,
+       scope: @diff_count_scope
+     }, []}
+  end
+
+  defp best_effort_diff_counts(runner, workspace, candidate_base, paths, untracked_paths) do
+    untracked_paths = MapSet.new(untracked_paths)
+
+    selected_paths =
+      paths
+      |> Enum.take(@diff_count_max_paths)
+      |> Enum.reject(&MapSet.member?(untracked_paths, &1))
+
+    paths_omitted = max(length(paths) - length(selected_paths), 0)
+    from = candidate_base || "HEAD"
+
+    partial_errors =
+      []
+      |> maybe_error(paths_omitted > 0, "repository.diff_counts_partial")
+      |> maybe_error(MapSet.size(untracked_paths) > 0, "repository.diff_counts_partial_untracked")
+
+    if selected_paths == [] do
+      {%{
+         files: 0,
+         additions: 0,
+         deletions: 0,
+         binary_files: 0,
+         paths_considered: 0,
+         paths_omitted: paths_omitted,
+         scope: @diff_count_scope
+       }, partial_errors}
+    else
+      case runner.(["diff", "--numstat", from, "--" | selected_paths], workspace) do
+        {output, 0} ->
+          {counts, parse_errors} =
+            parse_numstat(output, length(selected_paths), paths_omitted)
+
+          {counts, Enum.uniq(partial_errors ++ parse_errors)}
+
+        {_output, _status} ->
+          {nil, ["repository.diff_counts_unavailable"]}
+      end
+    end
+  rescue
+    _error -> {nil, ["repository.diff_counts_unavailable"]}
+  end
+
+  defp parse_numstat(output, paths_considered, paths_omitted) do
+    rows = String.split(output, "\n", trim: true)
+
+    {files, additions, deletions, binary_files, malformed_rows} =
+      Enum.reduce(rows, {0, 0, 0, 0, 0}, &accumulate_numstat_row/2)
+
+    counts = %{
+      files: files,
+      additions: additions,
+      deletions: deletions,
+      binary_files: binary_files,
+      paths_considered: paths_considered,
+      paths_omitted: paths_omitted,
+      scope: @diff_count_scope
+    }
+
+    errors = if malformed_rows > 0, do: ["repository.diff_numstat_malformed"], else: []
+    {counts, errors}
+  end
+
+  defp accumulate_numstat_row(row, counts) do
+    case String.split(row, "\t", parts: 3) do
+      ["-", "-", path] when path != "" -> increment_binary_file(counts)
+      [added, deleted, path] when path != "" -> accumulate_text_numstat(added, deleted, counts)
+      _malformed -> increment_malformed_row(counts)
+    end
+  end
+
+  defp accumulate_text_numstat(added, deleted, {files, additions, deletions, binary_files, malformed_rows} = counts) do
+    case {parse_count(added), parse_count(deleted)} do
+      {{:ok, added}, {:ok, deleted}} ->
+        {files + 1, additions + added, deletions + deleted, binary_files, malformed_rows}
+
+      _invalid ->
+        increment_malformed_row(counts)
+    end
+  end
+
+  defp increment_binary_file({files, additions, deletions, binary_files, malformed_rows}),
+    do: {files + 1, additions, deletions, binary_files + 1, malformed_rows}
+
+  defp increment_malformed_row({files, additions, deletions, binary_files, malformed_rows}),
+    do: {files, additions, deletions, binary_files, malformed_rows + 1}
+
+  defp parse_count(value) do
+    case Integer.parse(value) do
+      {count, ""} when count >= 0 -> {:ok, count}
+      _invalid -> :error
+    end
+  end
+
+  defp maybe_error(errors, true, code), do: [code | errors]
+  defp maybe_error(errors, false, _code), do: errors
 
   defp changed_paths(_runner, _workspace, from, to) when from == to, do: {:ok, []}
 

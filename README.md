@@ -82,6 +82,12 @@ ambiguous safety, tenant/auth, validation, acceptance, and handoff rules fail op
 prompt. Continuations reference unchanged section versions/hashes in bounded resume capsules, while
 fleet telemetry records section sizes and decisions without persisting raw prompt content.
 
+Each fresh or continuation turn also receives one bounded, integrity-checked host status/resume
+packet as its final dynamic section. The latest packet links run/retry lineage to hash-only
+repository/workpad and exact-head evidence, survives retry/wait/quota/restart boundaries in a
+trusted sidecar, and degrades safely when legacy or malformed state is unavailable; raw prompt,
+diff, workpad, command, and secret content stays out of packet telemetry.
+
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 

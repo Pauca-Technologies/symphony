@@ -10,6 +10,8 @@ defmodule SymphonyElixir.QuotaCircuitStore do
 
   require Logger
 
+  alias SymphonyElixir.ResumePacket
+
   @default_filename "quota-circuits.json"
   @failure_classes [
     :agent_protocol_failure,
@@ -163,6 +165,7 @@ defmodule SymphonyElixir.QuotaCircuitStore do
             failure_class: deserialize_failure_class(entry["failure_class"]),
             worker_host: entry["worker_host"],
             workspace_path: entry["workspace_path"],
+            resume_packet_ref: ResumePacket.normalize_reference(entry["resume_packet_ref"]),
             parked_at: parse_datetime(entry["parked_at"]) || DateTime.utc_now()
           }
         ]
@@ -195,6 +198,7 @@ defmodule SymphonyElixir.QuotaCircuitStore do
           :failure_class,
           :worker_host,
           :workspace_path,
+          :resume_packet_ref,
           :parked_at
         ])
         |> Map.update(:parked_at, nil, &iso8601/1)

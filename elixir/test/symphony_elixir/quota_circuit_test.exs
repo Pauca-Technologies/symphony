@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.QuotaCircuitTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{AgentFailure, QuotaCircuitStore, Telemetry}
+  alias SymphonyElixir.{AgentFailure, QuotaCircuitStore, ResumePacket, Telemetry}
 
   test "simultaneous trusted failures create one circuit and park without consuming failure counts" do
     pid = start_orchestrator!(:SimultaneousQuotaOrchestrator)
@@ -53,6 +53,50 @@ defmodule SymphonyElixir.QuotaCircuitTest do
            ] = dashboard_payload.quota_circuits
 
     assert Enum.all?(dashboard_payload.retrying, &(&1.status == "parked"))
+  end
+
+  test "quota parking marks and retains the compact resume packet reference" do
+    pid = start_orchestrator!(:QuotaPacketBoundaryOrchestrator)
+    issue = issue("issue-quota-packet", "MT-QUOTA-PACKET")
+    ref = make_ref()
+    parent = self()
+    previous_marker = Application.get_env(:symphony_elixir, :resume_packet_boundary_marker)
+    packet = ResumePacket.build(%{identity: %{run_id: "run-quota"}, boundary_reason: :turn_end})
+    packet_ref = ResumePacket.reference(packet, "quota.json.resume-packet.json")
+
+    Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, fn workspace, boundary, worker_host ->
+      send(parent, {:quota_packet_boundary, workspace, boundary, worker_host})
+      ResumePacket.mark_boundary(packet, boundary)
+    end)
+
+    on_exit(fn ->
+      if is_nil(previous_marker) do
+        Application.delete_env(:symphony_elixir, :resume_packet_boundary_marker)
+      else
+        Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, previous_marker)
+      end
+    end)
+
+    entry =
+      issue
+      |> running_entry(ref)
+      |> Map.merge(%{
+        run_id: "run-quota",
+        retry_id: "retry-quota",
+        workspace_path: "/tmp/MT-QUOTA-PACKET",
+        resume_packet_ref: packet_ref
+      })
+
+    install_running(pid, [{issue, entry}])
+    send(pid, {:worker_run_failure, issue.id, self(), usage_failure(nil)})
+    send(pid, {:DOWN, ref, :process, self(), {:shutdown, :quota}})
+    state = :sys.get_state(pid)
+
+    assert %{parked: [%{resume_packet_ref: parked_ref}]} = state.quota_circuits["codex::local"]
+    assert parked_ref.boundary == "quota_parked"
+    assert_receive {:quota_packet_boundary, "/tmp/MT-QUOTA-PACKET", "outer_worker_exit", nil}
+    assert_receive {:quota_packet_boundary, "/tmp/MT-QUOTA-PACKET", "quota_parked", nil}
+    refute_receive {:quota_packet_boundary, "/tmp/MT-QUOTA-PACKET", _, _}, 50
   end
 
   test "future reset is honored while past or missing reset uses a bounded probe" do
@@ -281,10 +325,29 @@ defmodule SymphonyElixir.QuotaCircuitTest do
     probe = issue("issue-probe", "MT-10")
     ref = make_ref()
     now = DateTime.utc_now()
+    parent = self()
+    previous_marker = Application.get_env(:symphony_elixir, :resume_packet_boundary_marker)
+    packet = ResumePacket.build(%{identity: %{run_id: "run-parked"}, boundary_reason: :quota_parked})
+    packet_ref = ResumePacket.reference(packet, "quota-resume.json.resume-packet.json")
+
+    Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, fn workspace, boundary, worker_host ->
+      send(parent, {:quota_resume_packet_boundary, workspace, boundary, worker_host})
+      ResumePacket.mark_boundary(packet, boundary)
+    end)
+
+    on_exit(fn ->
+      if is_nil(previous_marker) do
+        Application.delete_env(:symphony_elixir, :resume_packet_boundary_marker)
+      else
+        Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, previous_marker)
+      end
+    end)
 
     parked = [
-      parked_entry("issue-first", "MT-11", now),
+      parked_entry("issue-first", "MT-11", now)
+      |> Map.merge(%{workspace_path: "/tmp/MT-11", resume_packet_ref: packet_ref}),
       parked_entry("issue-second", "MT-12", DateTime.add(now, 1, :millisecond))
+      |> Map.merge(%{workspace_path: "/tmp/MT-12", resume_packet_ref: packet_ref})
     ]
 
     circuit = circuit(:probe, probe.id, parked)
@@ -306,6 +369,14 @@ defmodule SymphonyElixir.QuotaCircuitTest do
     assert state.failure_counts == %{}
     assert state.retry_attempts["issue-first"].due_at_ms < state.retry_attempts["issue-second"].due_at_ms
     assert state.retry_attempts["issue-second"].due_at_ms < state.retry_attempts[probe.id].due_at_ms
+    assert state.retry_attempts["issue-first"].resume_packet_ref.boundary == "retry_scheduled"
+    assert state.retry_attempts["issue-second"].resume_packet_ref.boundary == "retry_scheduled"
+    assert_receive {:quota_resume_packet_boundary, "/tmp/MT-11", "retry_scheduled", nil}
+    assert_receive {:quota_resume_packet_boundary, "/tmp/MT-12", "retry_scheduled", nil}
+
+    refute_receive {:quota_resume_packet_boundary, "/tmp/MT-11", _, _}, 50
+    refute_receive {:quota_resume_packet_boundary, "/tmp/MT-12", _, _}, 50
+
     refute File.read!(QuotaCircuitStore.path()) =~ "codex"
   end
 

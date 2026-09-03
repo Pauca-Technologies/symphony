@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.ResumePacket
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -257,6 +259,61 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.model == "claude-opus-4-8"
     assert snapshot_entry.reasoning_effort == "xhigh"
     assert snapshot_entry.profile == "standard"
+  end
+
+  test "worker runtime metadata stores only the compact resume packet reference" do
+    issue_id = "issue-resume-packet-ref"
+    issue = %Issue{id: issue_id, identifier: "UDPE-7502-REF", title: "Retain packet ref", state: "In Progress"}
+    orchestrator_name = Module.concat(__MODULE__, :ResumePacketRefOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      %{initial_state | running: %{issue_id => running_entry}, claimed: MapSet.new([issue_id])}
+    end)
+
+    packet = ResumePacket.build(%{identity: %{run_id: "run-ref"}, boundary_reason: :turn_start})
+
+    runtime_info = %{
+      resume_packet_id: packet["packet_id"],
+      resume_packet_sha256: packet["packet_sha256"],
+      resume_packet_ref: "issue.json.resume-packet.json",
+      resume_packet_boundary: "turn_start",
+      resume_packet_evidence_refs: ["git:head/abc"]
+    }
+
+    send(pid, {:worker_runtime_info, issue_id, runtime_info})
+
+    assert %{running: [%{resume_packet_ref: reference}]} = Orchestrator.snapshot(orchestrator_name, 5_000)
+
+    assert reference == %{
+             id: packet["packet_id"],
+             sha256: packet["packet_sha256"],
+             ref: "issue.json.resume-packet.json",
+             boundary: "turn_start",
+             evidence_refs: ["git:head/abc"]
+           }
+
+    refute Map.has_key?(:sys.get_state(pid).running[issue_id], :resume_packet)
   end
 
   test "orchestrator snapshot keeps the configured model when the agent reports none" do
@@ -2116,9 +2173,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     orchestrator_name = Module.concat(__MODULE__, :ParkedWaitOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
     previous_probe = Application.get_env(:symphony_elixir, :wait_condition_probe)
+    previous_marker = Application.get_env(:symphony_elixir, :resume_packet_boundary_marker)
+    parent = self()
+    packet = ResumePacket.build(%{identity: %{run_id: "run-wait"}, boundary_reason: :turn_end})
+    packet_ref = ResumePacket.reference(packet, "wait.json.resume-packet.json")
 
     Application.put_env(:symphony_elixir, :wait_condition_probe, fn _request ->
       {:unchanged, %{"status" => "degraded"}}
+    end)
+
+    Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, fn workspace, boundary, worker_host ->
+      send(parent, {:wait_packet_boundary, workspace, boundary, worker_host})
+      ResumePacket.mark_boundary(packet, boundary)
     end)
 
     on_exit(fn ->
@@ -2130,9 +2196,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       else
         Application.put_env(:symphony_elixir, :wait_condition_probe, previous_probe)
       end
-    end)
 
-    parent = self()
+      if is_nil(previous_marker) do
+        Application.delete_env(:symphony_elixir, :resume_packet_boundary_marker)
+      else
+        Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, previous_marker)
+      end
+    end)
 
     worker_pid =
       spawn(fn ->
@@ -2171,8 +2241,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       issue: issue,
       session_id: "thread-waiting",
       backend: "codex",
+      run_id: "run-wait",
+      retry_id: "retry-wait",
       worker_host: nil,
       workspace_path: "/tmp/UDPE-WAIT-PARKED",
+      resume_packet_ref: packet_ref,
       codex_session_logs: [],
       recent_codex_transcript_blocks: [],
       codex_input_tokens: 0,
@@ -2208,12 +2281,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         Enum.any?(snapshot.waiting, &(&1.issue_id == issue_id))
       end)
 
-    assert Enum.any?(snapshot.waiting, &(&1.issue_id == issue_id))
+    assert Enum.any?(snapshot.waiting, fn entry ->
+             entry.issue_id == issue_id and entry.resume_packet_ref.boundary == "wait_parked"
+           end)
+
+    assert_receive {:wait_packet_boundary, "/tmp/UDPE-WAIT-PARKED", "outer_worker_exit", nil}
+    assert_receive {:wait_packet_boundary, "/tmp/UDPE-WAIT-PARKED", "wait_parked", nil}
 
     state = :sys.get_state(pid)
     refute Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
     assert MapSet.member?(state.claimed, issue_id)
+
+    [parked_entry] = Enum.filter(SymphonyElixir.WaitWatcher.snapshot(), &(&1.issue_id == issue_id))
+    parked_entry = Map.put(parked_entry, :resume_prompt, "The wait condition changed. Resume work.")
+    send(pid, {:wait_entries_ready, [parked_entry]})
+    resumed = :sys.get_state(pid)
+
+    assert resumed.retry_attempts[issue_id].resume_packet_ref.boundary == "retry_scheduled"
+    assert_receive {:wait_packet_boundary, "/tmp/UDPE-WAIT-PARKED", "retry_scheduled", nil}
+    refute_receive {:wait_packet_boundary, _, _, _}, 50
 
     send(worker_pid, :done)
   end

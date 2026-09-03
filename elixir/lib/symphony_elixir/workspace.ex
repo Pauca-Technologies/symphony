@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{BareClone, Config, GitHubAuth, OSProcess, PathSafety, SSH, TestWorkerBudget}
+  alias SymphonyElixir.{BareClone, Config, GitHubAuth, OSProcess, PathSafety, ResumePacket, SSH, TestWorkerBudget}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -71,6 +71,65 @@ defmodule SymphonyElixir.Workspace do
   @spec handoff_gate_state_path(Path.t()) :: Path.t()
   def handoff_gate_state_path(workspace) when is_binary(workspace) do
     issue_context_path(workspace) <> ".handoff-gate.json"
+  end
+
+  @doc "Return the trusted durable resume-packet file associated with a workspace."
+  @spec resume_packet_path(Path.t()) :: Path.t()
+  def resume_packet_path(workspace) when is_binary(workspace) do
+    issue_context_path(workspace) <> ".resume-packet.json"
+  end
+
+  @doc "Atomically persist the latest integrity-checked resume packet outside the agent workspace."
+  @spec persist_resume_packet(Path.t(), ResumePacket.packet(), worker_host()) :: :ok | {:error, term()}
+  def persist_resume_packet(workspace, packet, worker_host \\ nil)
+      when is_binary(workspace) and is_map(packet) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, payload} <- ResumePacket.encode(packet) do
+      write_resume_packet(workspace, payload, worker_host)
+    end
+  end
+
+  @doc "Load the latest integrity-checked resume packet, treating malformed data as unavailable."
+  @spec load_resume_packet(Path.t(), worker_host()) ::
+          {:ok, ResumePacket.packet() | nil} | {:error, term()}
+  def load_resume_packet(workspace, worker_host \\ nil) when is_binary(workspace) do
+    case load_resume_packet_with_diagnostics(workspace, worker_host) do
+      {:ok, packet, _diagnostics} -> {:ok, packet}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc "Load a resume packet plus bounded non-secret corruption diagnostics for the next fresh build."
+  @spec load_resume_packet_with_diagnostics(Path.t(), worker_host()) ::
+          {:ok, ResumePacket.packet() | nil, [String.t()]} | {:error, term()}
+  def load_resume_packet_with_diagnostics(workspace, worker_host \\ nil) when is_binary(workspace) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, payload} <- read_resume_packet(workspace, worker_host) do
+      decode_resume_packet_with_diagnostics(payload)
+    end
+  end
+
+  @doc "Update only the persisted packet boundary; no repository or workpad probe is performed."
+  @spec mark_resume_packet_boundary(Path.t(), String.t() | atom(), worker_host(), keyword()) ::
+          {:ok, ResumePacket.packet() | nil} | {:error, term()}
+  def mark_resume_packet_boundary(workspace, reason, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) and (is_binary(reason) or is_atom(reason)) and is_list(opts) do
+    with {:ok, packet} when is_map(packet) <- load_resume_packet(workspace, worker_host),
+         {:ok, marked} <- ResumePacket.mark_boundary(packet, reason, opts),
+         :ok <- persist_resume_packet(workspace, marked, worker_host) do
+      {:ok, marked}
+    else
+      {:ok, nil} -> {:ok, nil}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc "Remove the persisted resume packet for a workspace; absence is a successful legacy case."
+  @spec clear_resume_packet(Path.t(), worker_host()) :: :ok | {:error, term()}
+  def clear_resume_packet(workspace, worker_host \\ nil) when is_binary(workspace) do
+    with :ok <- validate_workspace_path(workspace, worker_host) do
+      remove_resume_packet(workspace, worker_host)
+    end
   end
 
   @doc "Atomically persist pending asynchronous handoff state outside the agent workspace."
@@ -241,6 +300,7 @@ defmodule SymphonyElixir.Workspace do
             maybe_run_before_remove_hook(workspace, nil)
             result = File.rm_rf(workspace)
             remove_handoff_gate_state(workspace, nil)
+            remove_resume_packet(workspace, nil)
             remove_issue_context(workspace)
             result
 
@@ -251,6 +311,7 @@ defmodule SymphonyElixir.Workspace do
       false ->
         result = File.rm_rf(workspace)
         remove_handoff_gate_state(workspace, nil)
+        remove_resume_packet(workspace, nil)
         remove_issue_context(workspace)
         result
     end
@@ -264,9 +325,11 @@ defmodule SymphonyElixir.Workspace do
         remote_shell_assign("workspace", workspace),
         remote_shell_assign("context_file", issue_context_path(workspace)),
         remote_shell_assign("handoff_file", handoff_gate_state_path(workspace)),
+        remote_shell_assign("resume_file", resume_packet_path(workspace)),
         "rm -rf \"$workspace\"",
         "rm -f \"$context_file\"",
         "rm -f \"$handoff_file\"",
+        "rm -f \"$resume_file\"",
         "rmdir \"$(dirname \"$context_file\")\" 2>/dev/null || true"
       ]
       |> Enum.join("\n")
@@ -1094,6 +1157,103 @@ defmodule SymphonyElixir.Workspace do
     case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
       {:ok, {_output, 0}} -> :ok
       {:ok, {output, status}} -> {:error, {:handoff_gate_state_remove_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp write_resume_packet(workspace, payload, nil) do
+    state_file = resume_packet_path(workspace)
+    state_dir = Path.dirname(state_file)
+    temporary_file = state_file <> ".tmp.#{System.unique_integer([:positive])}"
+
+    result =
+      with :ok <- File.mkdir_p(state_dir),
+           :ok <- File.write(temporary_file, payload, [:binary]),
+           :ok <- File.chmod(temporary_file, 0o600),
+           do: File.rename(temporary_file, state_file)
+
+    if result != :ok, do: File.rm(temporary_file)
+    result
+  end
+
+  defp write_resume_packet(workspace, payload, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("state_file", resume_packet_path(workspace)),
+        "state_dir=$(dirname \"$state_file\")",
+        "mkdir -p \"$state_dir\"",
+        "temporary_file=\"$state_file.tmp.$$\"",
+        "trap 'rm -f \"$temporary_file\"' EXIT",
+        "umask 077",
+        "printf '%s' #{shell_escape(payload)} > \"$temporary_file\"",
+        "chmod 600 \"$temporary_file\"",
+        "mv \"$temporary_file\" \"$state_file\"",
+        "trap - EXIT"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:resume_packet_write_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_resume_packet(workspace, nil) do
+    case File.read(resume_packet_path(workspace)) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, :enoent} -> {:ok, nil}
+      {:error, reason} -> {:error, {:resume_packet_read_failed, reason}}
+    end
+  end
+
+  defp read_resume_packet(workspace, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("state_file", resume_packet_path(workspace)),
+        "if [ -f \"$state_file\" ]; then cat \"$state_file\"; else exit 3; fi"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {payload, 0}} -> {:ok, payload}
+      {:ok, {_output, 3}} -> {:ok, nil}
+      {:ok, {output, status}} -> {:error, {:resume_packet_read_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp decode_resume_packet_with_diagnostics(nil), do: {:ok, nil, []}
+
+  defp decode_resume_packet_with_diagnostics(payload) when is_binary(payload) do
+    case ResumePacket.decode(payload) do
+      {:ok, packet} -> {:ok, packet, []}
+      {:error, :packet_too_large} -> {:ok, nil, ["resume_packet_too_large"]}
+      {:error, :unsupported_version} -> {:ok, nil, ["resume_packet_unsupported_version"]}
+      {:error, :invalid_resume_packet} -> {:ok, nil, ["resume_packet_invalid"]}
+    end
+  end
+
+  defp remove_resume_packet(workspace, nil) do
+    case File.rm(resume_packet_path(workspace)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:resume_packet_remove_failed, reason}}
+    end
+  end
+
+  defp remove_resume_packet(workspace, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("state_file", resume_packet_path(workspace)),
+        "rm -f \"$state_file\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:resume_packet_remove_failed, worker_host, status, output}}
       {:error, reason} -> {:error, reason}
     end
   end

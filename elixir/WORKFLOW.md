@@ -112,6 +112,8 @@ agent:
       - bound_future_tool_output
       - fresh_thin_context_delegation_only
       - prohibit_full_history_delegation
+    # Also caps the rendered v1 status/resume packet appended as the literal
+    # final dynamic section of every fresh and continuation backend turn.
     capsule_max_bytes: 4000
     extreme_multiplier: 2.0
     # Defaults are seeded from recent fleet p50/p90 bands and differ for
@@ -128,6 +130,12 @@ codex:
 # Repository workflow
 
 This workflow governs work in the Symphony repository for the issue described in the task context above.
+
+Symphony appends one host-owned `continuation.status_resume_packet` v1 section after all repository
+and dynamic guidance. Treat it as bounded resume evidence: observation timestamps/sources, current
+run/retry identity, repository/workpad hashes, budget, and exact-head attestation status. Do not
+reconstruct or persist its body in repository files. It may carry existing `no_progress_warnings`,
+but warning/loop detection is not part of this version.
 
 {% if attempt %}
 Retry context:

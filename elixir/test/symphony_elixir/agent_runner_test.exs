@@ -138,6 +138,52 @@ defmodule SymphonyElixir.AgentRunnerTest.RepositoryProgressBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.ResumePacketErrorBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(workspace, _opts), do: {:ok, %{worker_host: nil, workspace: workspace}}
+
+  @impl true
+  def run_turn(session, prompt, _issue, _opts) do
+    send(Application.fetch_env!(:symphony_elixir, :resume_packet_error_recipient), {:resume_packet_error_prompt, prompt})
+
+    send(
+      Application.fetch_env!(:symphony_elixir, :resume_packet_error_recipient),
+      {:resume_packet_error_pre_turn_packet, SymphonyElixir.Workspace.load_resume_packet(session.workspace)}
+    )
+
+    {:error, :handled_resume_packet_error}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
+defmodule SymphonyElixir.AgentRunnerTest.ResumePacketProbeBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(workspace, _opts), do: {:ok, %{worker_host: nil, workspace: workspace}}
+
+  @impl true
+  def run_turn(session, prompt, issue, _opts) do
+    recipient = Application.fetch_env!(:symphony_elixir, :resume_packet_probe_recipient)
+    probe_state = Application.fetch_env!(:symphony_elixir, :resume_packet_probe_state)
+    turn = Process.get(:resume_packet_probe_turn, 0) + 1
+    Process.put(:resume_packet_probe_turn, turn)
+    head_calls = Agent.get(probe_state, & &1.head_calls)
+    packet = SymphonyElixir.Workspace.load_resume_packet(session.workspace)
+    send(recipient, {:resume_packet_probe_turn, turn, head_calls, prompt, issue, packet})
+    {:ok, %{session_id: "resume-packet-probe-#{turn}"}}
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.WaitingBackend do
   @moduledoc false
   @behaviour SymphonyElixir.AgentBackend
@@ -370,7 +416,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
     File.write!(ctx.verdict_path, Jason.encode!(exact))
   end
 
-  alias SymphonyElixir.{AgentRunner, RunManifest}
+  alias SymphonyElixir.{AgentRunner, ResumePacket, RunManifest, Telemetry}
   alias SymphonyElixir.AgentRunnerTest.BlockingDeferredBackend
   alias SymphonyElixir.AgentRunnerTest.BudgetRuntimeRecipient
   alias SymphonyElixir.AgentRunnerTest.BudgetStressBackend
@@ -383,6 +429,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.ManifestOrderingBackend
   alias SymphonyElixir.AgentRunnerTest.PendingGateBackend
   alias SymphonyElixir.AgentRunnerTest.RepositoryProgressBackend
+  alias SymphonyElixir.AgentRunnerTest.ResumePacketErrorBackend
+  alias SymphonyElixir.AgentRunnerTest.ResumePacketProbeBackend
   alias SymphonyElixir.AgentRunnerTest.TurnCountingBackend
   alias SymphonyElixir.AgentRunnerTest.WaitingBackend
   alias SymphonyElixir.Linear.Comment
@@ -606,7 +654,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   test "does not record progress when only the post-run repository probe fails" do
-    {issue, _workspace_root} = prepare_progress_repository!("UDPE-PROGRESS-PROBE")
+    {issue, workspace_root} = prepare_progress_repository!("UDPE-PROGRESS-PROBE")
     Application.put_env(:symphony_elixir, :repository_progress_action, :break_post_probe)
     Application.put_env(:symphony_elixir, :telemetry_enabled, true)
 
@@ -621,6 +669,13 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
     events = SymphonyElixir.Telemetry.read_events(Date.utc_today(), Date.utc_today())
     refute Enum.any?(events, &(&1["event"] == "task_outcome" and &1["stage"] == "material_progress"))
+    assert Enum.any?(events, &(&1["event"] == "resume_packet_error" and &1["error_code"] == "repository.head_unavailable"))
+
+    workspace = Path.join(workspace_root, "UDPE-PROGRESS-PROBE")
+    assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+    assert packet["repository"]["availability"] == "stale"
+    assert packet["repository"]["source"] == "persisted:#{packet["previous_packet_id"]}"
+    assert "repository.head_unavailable" in packet["errors"]["codes"]
   end
 
   test "does not record progress when only the post-run content hash probe fails" do
@@ -660,6 +715,273 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
     events = SymphonyElixir.Telemetry.read_events(Date.utc_today(), Date.utc_today())
     refute Enum.any?(events, &(&1["event"] == "task_outcome" and &1["stage"] == "material_progress"))
+  end
+
+  test "resume packets use one post-turn repository collection and remain the final prompt section" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+    Application.put_env(:symphony_elixir, :resume_packet_probe_recipient, self())
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :resume_packet_probe_recipient)
+      Application.delete_env(:symphony_elixir, :resume_packet_probe_state)
+    end)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-runner-resume-packet-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-resume-packet-turns",
+      identifier: "UDPE-7502-TURNS",
+      title: "Keep continuation state deterministic",
+      state: "In Progress",
+      labels: ["repo:symphony"],
+      comments: [
+        %Comment{id: "workpad-resume", body: "## Codex Workpad\n### Plan\n- [ ] finish integration"}
+      ]
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    File.write!(Workspace.resume_packet_path(workspace), "corrupt legacy packet")
+    {git_runner, probe_state} = counting_manifest_runner(workspace, fail_head_calls: [1])
+    Application.put_env(:symphony_elixir, :resume_packet_probe_state, probe_state)
+
+    on_exit(fn ->
+      if Process.alive?(probe_state), do: Agent.stop(probe_state)
+      File.rm_rf(workspace_root)
+    end)
+
+    fetcher = fn [_issue_id] ->
+      count = Process.get(:resume_packet_fetch_count, 0) + 1
+      Process.put(:resume_packet_fetch_count, count)
+      state = if count == 1, do: "In Progress", else: "Done"
+      {:ok, [%{issue | state: state}]}
+    end
+
+    initial_manifest = %{
+      head_sha: String.duplicate("a", 40),
+      base_sha: nil,
+      candidate_base_sha: nil,
+      actual_paths: ["lib/path-1.ex"],
+      dirty: true,
+      diff_counts: %{files: 1, additions: 1, deletions: 0},
+      worktree_status_fingerprint: String.duplicate("1", 64),
+      worktree_content_fingerprint: String.duplicate("2", 64),
+      worktree_fingerprint_complete: true,
+      errors: []
+    }
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               self(),
+               [
+                 agent_backend: {ResumePacketProbeBackend, %{}},
+                 issue_state_fetcher: fetcher,
+                 repository_manifest: initial_manifest,
+                 repository_git_runner: git_runner,
+                 resume_verification: %{
+                   source: "symphony:test_gate",
+                   exact_sha: String.duplicate("b", 40),
+                   gate_status: "passed",
+                   evidence_refs: [
+                     ".artifacts/before-handoff/result.json",
+                     "gate:raw\nRESUME_PACKET_INJECTION",
+                     "/tmp/raw-command-output.txt"
+                   ],
+                   checks: [
+                     %{
+                       name: "make all",
+                       status: "passed",
+                       sha: String.duplicate("b", 40),
+                       evidence_ref: "gate:job-7502"
+                     },
+                     %{
+                       name: "unsafe check\nRESUME_PACKET_INJECTION",
+                       status: "failed\nraw output",
+                       sha: String.duplicate("b", 40),
+                       evidence_ref: "gate:unsafe\nraw-output"
+                     }
+                   ]
+                 },
+                 run_id: "run-resume-packet",
+                 retry_attempt: 0,
+                 max_turns: 2
+               ],
+               nil
+             )
+
+    assert_receive {:resume_packet_probe_turn, 1, 0, first_prompt, ^issue, {:ok, first_turn_packet}}
+
+    assert_receive {:resume_packet_probe_turn, 2, 1, continuation_prompt, _refreshed_issue, {:ok, second_turn_packet}}
+
+    assert first_turn_packet["repository"]["source"] == "host:git"
+    assert second_turn_packet["repository"]["availability"] == "stale"
+
+    assert second_turn_packet["repository"]["source"] ==
+             "persisted:#{second_turn_packet["previous_packet_id"]}"
+
+    Enum.each([first_prompt, continuation_prompt], fn prompt ->
+      assert length(:binary.matches(prompt, "Symphony status/resume packet v1")) == 1
+    end)
+
+    assert first_prompt =~ "resume_packet_invalid"
+    refute continuation_prompt =~ "resume_packet_invalid"
+    assert continuation_prompt =~ "repository.head_unavailable"
+
+    assert prompt_position(first_prompt, "Symphony status/resume packet v1") >
+             prompt_position(first_prompt, "Symphony waiting requirement:")
+
+    assert prompt_position(continuation_prompt, "Symphony status/resume packet v1") >
+             prompt_position(continuation_prompt, "Continuation guidance:")
+
+    probes = Agent.get(probe_state, & &1)
+    assert probes.head_calls == 2
+    assert probes.numstat_calls == 2
+    assert probes.numstat_path_counts == [50, 50]
+    assert Enum.all?(probes.cwds, &(&1 == workspace))
+    refute Enum.any?(probes.cwds, &(&1 == File.cwd!()))
+
+    assert {:ok, final_packet} = Workspace.load_resume_packet(workspace)
+    assert final_packet["boundary"]["reason"] == "turn_terminal"
+    assert final_packet["turns"]["current"] == 2
+    assert final_packet["budget"]["availability"] == "current"
+    assert final_packet["verification"]["current_head_status"] == "current"
+    refute "resume_packet_invalid" in final_packet["errors"]["codes"]
+    refute "repository.head_unavailable" in final_packet["errors"]["codes"]
+
+    assert [%{"name" => "make all", "status" => "passed", "head_status" => "current"}] =
+             Enum.map(
+               final_packet["verification"]["check_summaries"],
+               &Map.take(&1, ~w(name status head_status))
+             )
+
+    assert final_packet["repository"]["diff_files"] == 50
+    assert final_packet["repository"]["diff_additions"] == 50
+
+    events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+    resume_events = Enum.filter(events, &(&1["event"] == "resume_packet"))
+
+    assert Enum.map(resume_events, & &1["resume_packet_boundary"]) ==
+             ~w(turn_start turn_complete turn_start turn_terminal)
+
+    assert Enum.all?(resume_events, fn event ->
+             is_binary(event["resume_packet_id"]) and is_binary(event["resume_packet_sha256"]) and
+               is_binary(event["resume_packet_ref"]) and
+               not String.contains?(event["resume_packet_ref"], "/") and
+               ".artifacts/before-handoff/result.json" in event["resume_packet_evidence_refs"] and
+               "gate:job-7502" in event["resume_packet_evidence_refs"] and
+               Enum.all?(event["resume_packet_evidence_refs"], fn reference ->
+                 not String.contains?(reference, ["\n", "\r", "RESUME_PACKET_INJECTION", "/tmp/"])
+               end) and
+               not Map.has_key?(event, "resume_packet")
+           end)
+
+    prompt_events = Enum.filter(events, &(&1["event"] == "prompt_built"))
+    assert length(prompt_events) == 2
+
+    assert Enum.all?(prompt_events, fn event ->
+             List.last(event["prompt_sections"])["id"] == "continuation.status_resume_packet" and
+               is_binary(event["injected_section_hashes"]["continuation.status_resume_packet"])
+           end)
+
+    refute inspect(events) =~ "Symphony status/resume packet v1"
+    refute inspect(events) =~ "RESUME_PACKET_INJECTION"
+    refute inspect(events) =~ "/tmp/raw-command-output.txt"
+    assert Enum.any?(events, &(&1["event"] == "resume_packet_error" and &1["error_code"] == "resume_packet_invalid"))
+  end
+
+  test "handled turn errors still refresh and persist one post-turn resume packet" do
+    Application.put_env(:symphony_elixir, :resume_packet_error_recipient, self())
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :resume_packet_error_recipient) end)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-runner-error-packet-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-resume-packet-error",
+      identifier: "UDPE-7502-ERROR",
+      title: "Persist handled failures",
+      state: "In Progress",
+      comments: []
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    {git_runner, probe_state} = counting_manifest_runner(workspace)
+
+    old_packet =
+      ResumePacket.build(
+        %{
+          identity: %{run_id: "old-run", retry_attempt: 9},
+          repository: %{head_sha: String.duplicate("a", 40), dirty: true},
+          budget: %{metrics: %{total_tokens: 999}, thresholds: %{total_tokens: 1_000}},
+          boundary_reason: :retry_scheduled
+        },
+        now: ~U[2026-09-02 09:00:00Z]
+      )
+
+    assert :ok = Workspace.persist_resume_packet(workspace, old_packet)
+
+    on_exit(fn ->
+      if Process.alive?(probe_state), do: Agent.stop(probe_state)
+      File.rm_rf(workspace_root)
+    end)
+
+    assert {:error, :handled_resume_packet_error} =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               nil,
+               [
+                 agent_backend: {ResumePacketErrorBackend, %{}},
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end,
+                 repository_manifest: %{
+                   head_sha: String.duplicate("a", 40),
+                   actual_paths: ["lib/path-1.ex"],
+                   dirty: true,
+                   worktree_status_fingerprint: String.duplicate("1", 64),
+                   errors: []
+                 },
+                 repository_git_runner: git_runner,
+                 per_repo_workflow: %{
+                   prompt_template: "Repository test workflow.",
+                   config: %{"agent" => %{"efficiency" => %{"capsule_max_bytes" => 512}}}
+                 },
+                 run_id: "new-error-run",
+                 parent_run_id: "old-run",
+                 retry_attempt: 10,
+                 budget_snapshotter: fn _collector -> exit(:transient_snapshot_failure) end,
+                 max_turns: 1
+               ],
+               nil
+             )
+
+    assert_receive {:resume_packet_error_prompt, prompt}
+    assert_receive {:resume_packet_error_pre_turn_packet, {:ok, pre_turn_packet}}
+    assert "budget.snapshot_failed" in pre_turn_packet["errors"]["codes"]
+    assert pre_turn_packet["budget"]["availability"] == "stale"
+    assert pre_turn_packet["budget"]["metrics"]["total_tokens"] == 999
+    assert length(:binary.matches(prompt, "Symphony status/resume packet v1")) == 1
+    assert prompt =~ "run_id=new-error-run"
+    refute prompt =~ "Run: run_id=old-run"
+    status_offset = prompt_position(prompt, "Symphony status/resume packet v1")
+    assert byte_size(binary_part(prompt, status_offset, byte_size(prompt) - status_offset)) <= 512
+
+    probes = Agent.get(probe_state, & &1)
+    assert probes.head_calls == 1
+    assert probes.numstat_calls == 1
+
+    assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+    assert packet["boundary"]["reason"] == "turn_error"
+    assert packet["turns"]["current"] == 1
+    assert packet["run"]["run_id"] == "new-error-run"
+    assert packet["run"]["parent_run_id"] == "old-run"
+    assert packet["budget"]["metrics"]["total_tokens"] == 0
+    refute "budget.snapshot_failed" in packet["errors"]["codes"]
   end
 
   test "builds safe manifest policies for alternate backends and reviewer workflows" do
@@ -930,6 +1252,15 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
     assert_receive {:handoff_tool_result, %{"success" => false}}
     assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+
+    assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+    assert packet["verification"]["gate_status"] == "blocked"
+    assert packet["verification"]["gate_source"] == "symphony:before_handoff_gate"
+
+    assert Enum.any?(packet["verification"]["check_summaries"], fn summary ->
+             summary["name"] == "before_handoff" and summary["status"] == "failed" and
+               summary["head_status"] == "unavailable_evidence_sha"
+           end)
   end
 
   describe "soft-budget continuations" do
@@ -1029,7 +1360,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
                "task.activity",
                "repository.workflow",
                "symphony.test_worker_budget",
-               "symphony.handoff_constraints"
+               "symphony.handoff_constraints",
+               "continuation.status_resume_packet"
              ]
 
       assert_receive {:activity_prompt_telemetry,
@@ -1041,7 +1373,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       assert Enum.map(continuation_sections, & &1.id) == [
                "continuation.resume_capsule",
-               "task.activity"
+               "task.activity",
+               "continuation.status_resume_packet"
              ]
 
       reused_ids =
@@ -1726,6 +2059,13 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert query =~ "issueUpdate"
       refute_received :review_started_before_gate
       assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+
+      assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+      assert packet["verification"]["source"] == "symphony:combined_gate_review"
+      assert packet["verification"]["gate_source"] == "symphony:before_handoff_gate"
+      assert packet["verification"]["review_source"] == "symphony:automated_review"
+      assert is_binary(packet["verification"]["gate_captured_at"])
+      assert is_binary(packet["verification"]["review_captured_at"])
     end
 
     test "ends the worker attempt when review infrastructure is unavailable" do
@@ -2313,6 +2653,76 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "asynchronous handoff gate recovery" do
+    test "retains a blocked recovered-start gate breakdown without claiming exact-head evidence" do
+      workspace_root =
+        Path.join(System.tmp_dir!(), "symphony-gate-start-blocked-#{System.unique_integer([:positive])}")
+
+      workspace = Path.join(workspace_root, "UDPE-7502-BLOCKED")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      issue = %Issue{
+        id: "issue-gate-start-blocked",
+        identifier: "UDPE-7502-BLOCKED",
+        title: "Retain blocked gate evidence",
+        state: "In Progress",
+        labels: []
+      }
+
+      query =
+        "mutation Move { issueUpdate(id: \"issue-gate-start-blocked\", input: {stateId: \"review\"}) { success } }"
+
+      assert :ok =
+               Workspace.persist_handoff_gate_state(workspace, %{
+                 "phase" => "starting",
+                 "query" => query,
+                 "variables" => %{},
+                 "targetState" => "In Review"
+               })
+
+      Application.put_env(:symphony_elixir, :handoff_prompt_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :handoff_prompt_recipient_for_test)
+        File.rm_rf(workspace_root)
+      end)
+
+      starter = fn ^workspace, ^issue, nil, "In Review", _start_opts ->
+        {:blocked, "Fix the recovered gate.",
+         [
+           %{name: "make all", status: "failed", passed: false, detail: "failed"}
+         ]}
+      end
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {HandoffPromptBackend, %{}},
+                   issue_context_file: Workspace.issue_context_path(workspace),
+                   issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end,
+                   handoff_gate_starter: starter,
+                   repository_manifest: %{head_sha: String.duplicate("a", 40), dirty: false, errors: []},
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert_receive {:handoff_prompt, prompt, ^issue}
+      assert prompt =~ "Fix the recovered gate."
+
+      assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+      assert packet["verification"]["gate_status"] == "blocked"
+
+      assert [%{"name" => "make all", "status" => "failed", "head_status" => "unavailable_evidence_sha"}] =
+               Enum.map(
+                 packet["verification"]["check_summaries"],
+                 &Map.take(&1, ~w(name status head_status))
+               )
+    end
+
     test "retries a durable gate start without opening another model session" do
       workspace_root =
         Path.join(System.tmp_dir!(), "symphony-gate-start-recovery-#{System.unique_integer([:positive])}")
@@ -3168,6 +3578,77 @@ defmodule SymphonyElixir.AgentRunnerTest do
       summary: nil,
       single_flight: true
     }
+  end
+
+  defp prompt_position(prompt, marker) do
+    case :binary.match(prompt, marker) do
+      {position, _length} -> position
+      :nomatch -> flunk("expected prompt marker #{inspect(marker)}")
+    end
+  end
+
+  defp counting_manifest_runner(expected_workspace, opts \\ []) do
+    {:ok, state} =
+      Agent.start_link(fn ->
+        %{head_calls: 0, numstat_calls: 0, numstat_path_counts: [], cwds: []}
+      end)
+
+    paths = Enum.map_join(1..70, "\n", &"lib/path-#{&1}.ex") <> "\n"
+
+    fail_head_calls = MapSet.new(Keyword.get(opts, :fail_head_calls, []))
+
+    runner = fn args, cwd ->
+      Agent.update(state, &Map.update!(&1, :cwds, fn values -> [cwd | values] end))
+      assert cwd == expected_workspace
+
+      case args do
+        ["rev-parse", "HEAD"] ->
+          head_probe_result(state, fail_head_calls)
+
+        ["diff", "--name-only", "HEAD"] ->
+          {paths, 0}
+
+        ["diff", "--name-only", "--cached"] ->
+          {"", 0}
+
+        ["ls-files", "--others", "--exclude-standard"] ->
+          {"", 0}
+
+        ["status", "--porcelain", "--untracked-files=normal"] ->
+          {" M lib/path-1.ex\n", 0}
+
+        ["hash-object", "--no-filters", "--" | selected] ->
+          {Enum.map_join(selected, "\n", fn _path -> String.duplicate("c", 40) end) <> "\n", 0}
+
+        ["diff", "--numstat", "HEAD", "--" | selected] ->
+          numstat_probe_result(state, selected)
+      end
+    end
+
+    {runner, state}
+  end
+
+  defp increment_head_calls(state) do
+    Agent.get_and_update(state, fn current ->
+      call = current.head_calls + 1
+      {call, %{current | head_calls: call}}
+    end)
+  end
+
+  defp head_probe_result(state, fail_head_calls) do
+    if MapSet.member?(fail_head_calls, increment_head_calls(state)),
+      do: {"transient head probe failure", 17},
+      else: {String.duplicate("b", 40) <> "\n", 0}
+  end
+
+  defp numstat_probe_result(state, selected) do
+    Agent.update(state, fn current ->
+      current
+      |> Map.update!(:numstat_calls, &(&1 + 1))
+      |> Map.update!(:numstat_path_counts, &[length(selected) | &1])
+    end)
+
+    {Enum.map_join(selected, "\n", &"1\t0\t#{&1}") <> "\n", 0}
   end
 
   defp prepare_progress_repository!(identifier) do

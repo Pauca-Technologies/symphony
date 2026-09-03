@@ -9,6 +9,7 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
 
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.RepoConfig
+  alias SymphonyElixir.ResumePacket
   alias SymphonyElixir.Workflow
 
   @version 1
@@ -26,6 +27,8 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
           retry_id: String.t() | nil,
           retry_attempt: non_neg_integer() | nil,
           worker_host: String.t() | nil,
+          workspace_path: Path.t() | nil,
+          resume_packet_ref: ResumePacket.packet_reference() | nil,
           auth_token: String.t(),
           port: non_neg_integer() | nil,
           os_pid: pos_integer() | nil,
@@ -160,7 +163,7 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
 
   def update(path, changes) when is_binary(path) and is_map(changes) do
     with {:ok, manifest} <- load_manifest(path),
-         updated <- Map.merge(manifest, Map.take(changes, [:port, :os_pid, :status])),
+         updated <- Map.merge(manifest, safe_manifest_changes(changes)),
          :ok <- write_manifest(path, updated) do
       {:ok, updated}
     end
@@ -222,6 +225,8 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
       retry_id: Keyword.get(runner_opts, :retry_id),
       retry_attempt: Keyword.get(runner_opts, :retry_attempt),
       worker_host: worker_host,
+      workspace_path: nil,
+      resume_packet_ref: ResumePacket.normalize_reference(Keyword.get(runner_opts, :resume_packet_ref)),
       auth_token: auth_token,
       port: nil,
       os_pid: nil,
@@ -375,6 +380,8 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
         :retry_id,
         :retry_attempt,
         :worker_host,
+        :workspace_path,
+        :resume_packet_ref,
         :auth_token,
         :port,
         :os_pid,
@@ -437,6 +444,8 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
        retry_id: Map.get(decoded, "retry_id"),
        retry_attempt: Map.get(decoded, "retry_attempt"),
        worker_host: Map.get(decoded, "worker_host"),
+       workspace_path: Map.get(decoded, "workspace_path"),
+       resume_packet_ref: ResumePacket.normalize_reference(Map.get(decoded, "resume_packet_ref")),
        auth_token: auth_token,
        port: Map.get(decoded, "port"),
        os_pid: Map.get(decoded, "os_pid"),
@@ -474,8 +483,19 @@ defmodule SymphonyElixir.PersistentWorker.Registry do
       :run_id,
       :parent_run_id,
       :retry_id,
-      :retry_attempt
+      :retry_attempt,
+      :resume_packet_ref
     ])
+  end
+
+  defp safe_manifest_changes(changes) do
+    changes = Map.take(changes, [:port, :os_pid, :status, :workspace_path, :resume_packet_ref])
+
+    if Map.has_key?(changes, :resume_packet_ref) do
+      Map.update!(changes, :resume_packet_ref, &ResumePacket.normalize_reference/1)
+    else
+      changes
+    end
   end
 
   defp process_exists_fallback?(pid) do

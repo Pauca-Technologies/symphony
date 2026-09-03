@@ -7,7 +7,7 @@ defmodule SymphonyElixir.PersistentWorker.Server do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{AgentRunner, OSProcess}
+  alias SymphonyElixir.{AgentRunner, OSProcess, ResumePacket}
   alias SymphonyElixir.PersistentWorker.{Protocol, Registry}
 
   @runtime_process_names MapSet.new(["beam.smp", "erl_child_setup", "inet_gethost"])
@@ -194,8 +194,21 @@ defmodule SymphonyElixir.PersistentWorker.Server do
     {:noreply, %{state | connection: nil, connection_ref: nil}}
   end
 
-  def handle_info({:worker_runtime_info, _issue_id, _runtime_info} = event, state),
-    do: {:noreply, record_event(state, event)}
+  def handle_info({:worker_runtime_info, _issue_id, runtime_info} = event, state) do
+    changes =
+      %{}
+      |> maybe_put_manifest_change(:workspace_path, runtime_info[:workspace_path])
+      |> maybe_put_manifest_change(
+        :resume_packet_ref,
+        ResumePacket.reference_from_runtime_info(runtime_info)
+      )
+
+    if map_size(changes) > 0 do
+      _ = Registry.update(state.spec.manifest_path, changes)
+    end
+
+    {:noreply, record_event(state, event)}
+  end
 
   def handle_info({:worker_run_failure, _issue_id, _pid, _failure} = event, state),
     do: {:noreply, record_event(state, event)}
@@ -224,6 +237,9 @@ defmodule SymphonyElixir.PersistentWorker.Server do
       )
     )
   end
+
+  defp maybe_put_manifest_change(changes, _key, nil), do: changes
+  defp maybe_put_manifest_change(changes, key, value), do: Map.put(changes, key, value)
 
   defp record_event(%State{} = state, event) do
     seq = state.next_seq

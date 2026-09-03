@@ -169,6 +169,81 @@ defmodule SymphonyElixir.BaseDriftTest do
     refute manifest.worktree_fingerprint_complete
   end
 
+  test "manifest reports bounded tracked diff scope, omissions, and binary files", context do
+    generated = Path.join(context.workspace, "generated")
+    File.mkdir_p!(generated)
+    File.write!(Path.join(generated, "001.bin"), <<0, 1, 2, 3>>)
+
+    Enum.each(2..52, fn index ->
+      name = index |> Integer.to_string() |> String.pad_leading(3, "0")
+      File.write!(Path.join(generated, "#{name}.txt"), "line #{index}\n")
+    end)
+
+    git!(context.workspace, ["add", "generated"])
+    git!(context.workspace, ["commit", "-m", "bounded diff fixture"])
+    File.write!(Path.join(context.workspace, "zz-untracked.txt"), "not represented by git numstat\n")
+
+    manifest = BaseDrift.manifest(context.workspace, "main")
+
+    assert manifest.diff_counts == %{
+             files: 50,
+             additions: 49,
+             deletions: 0,
+             binary_files: 1,
+             paths_considered: 50,
+             paths_omitted: 3,
+             scope: "bounded_tracked_git_diff_numstat_v1"
+           }
+
+    assert "repository.diff_counts_partial" in manifest.errors
+    assert "repository.diff_counts_partial_untracked" in manifest.errors
+  end
+
+  test "manifest marks untracked-only diff counts partial without probing file contents", context do
+    File.write!(Path.join(context.workspace, "untracked-only.txt"), "untracked\n")
+
+    manifest = BaseDrift.manifest(context.workspace, "main")
+
+    assert manifest.diff_counts == %{
+             files: 0,
+             additions: 0,
+             deletions: 0,
+             binary_files: 0,
+             paths_considered: 0,
+             paths_omitted: 1,
+             scope: "bounded_tracked_git_diff_numstat_v1"
+           }
+
+    assert "repository.diff_counts_partial_untracked" in manifest.errors
+  end
+
+  test "manifest excludes malformed numstat rows and reports the probe defect", context do
+    File.write!(Path.join(context.workspace, "lib/account.ex"), "account = :changed\n")
+    File.write!(Path.join(context.workspace, "docs/readme.md"), <<0, 4, 8>>)
+
+    runner = fn
+      ["diff", "--numstat" | _args], _workspace ->
+        {"3\t1\tlib/account.ex\n-\t-\tdocs/readme.md\nmalformed\nbad\t2\tinvalid.txt\n", 0}
+
+      args, workspace ->
+        System.cmd("git", args, cd: workspace, stderr_to_stdout: true)
+    end
+
+    manifest = BaseDrift.manifest(context.workspace, "main", git_runner: runner)
+
+    assert manifest.diff_counts == %{
+             files: 2,
+             additions: 3,
+             deletions: 1,
+             binary_files: 1,
+             paths_considered: 2,
+             paths_omitted: 0,
+             scope: "bounded_tracked_git_diff_numstat_v1"
+           }
+
+    assert "repository.diff_numstat_malformed" in manifest.errors
+  end
+
   test "a later handoff attempt refetches instead of trusting stale process state", context do
     commit_file!(context.workspace, "lib/account.ex", "account = :candidate\n", "candidate")
 

@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.ResumePacket
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -582,8 +584,19 @@ defmodule SymphonyElixir.CoreTest do
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    parent = self()
+    previous_marker = Application.get_env(:symphony_elixir, :resume_packet_boundary_marker)
+    packet = ResumePacket.build(%{identity: %{run_id: "run-crash"}, boundary_reason: :turn_end})
+    packet_ref = ResumePacket.reference(packet, "issue-crash.json.resume-packet.json")
+
+    Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, fn workspace, boundary, worker_host ->
+      send(parent, {:resume_packet_boundary, workspace, boundary, worker_host})
+      ResumePacket.mark_boundary(packet, boundary)
+    end)
 
     on_exit(fn ->
+      restore_app_env(:resume_packet_boundary_marker, previous_marker)
+
       if Process.alive?(pid) do
         Process.exit(pid, :normal)
       end
@@ -596,6 +609,11 @@ defmodule SymphonyElixir.CoreTest do
       ref: ref,
       identifier: "MT-559",
       retry_attempt: 2,
+      run_id: "run-crash",
+      retry_id: "retry-crash",
+      worker_host: "worker-a",
+      workspace_path: "/tmp/MT-559",
+      resume_packet_ref: packet_ref,
       issue: %Issue{id: issue_id, identifier: "MT-559", state: "In Progress"},
       started_at: DateTime.utc_now()
     }
@@ -615,7 +633,159 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
+    assert state.retry_attempts[issue_id].parent_run_id == "run-crash"
+    assert state.retry_attempts[issue_id].previous_retry_id == "retry-crash"
+    assert state.retry_attempts[issue_id].resume_packet_ref.boundary == "retry_scheduled"
+    assert state.retry_attempts[issue_id].resume_packet_ref.id != packet_ref.id
+    assert_receive {:resume_packet_boundary, "/tmp/MT-559", "outer_worker_exit", "worker-a"}
+    assert_receive {:resume_packet_boundary, "/tmp/MT-559", "retry_scheduled", "worker-a"}
+    refute_receive {:resume_packet_boundary, _, _, _}, 50
     assert_due_in_range(due_at_ms, start_ms, 40_000)
+  end
+
+  test "resume packet boundary marker failure does not block a failure retry" do
+    issue_id = "issue-marker-failure"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :MarkerFailureRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    previous_marker = Application.get_env(:symphony_elixir, :resume_packet_boundary_marker)
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, fn _workspace, _boundary, _worker_host ->
+      {:error, :simulated_io_failure}
+    end)
+
+    packet = ResumePacket.build(%{identity: %{run_id: "run-marker-failure"}, boundary_reason: :turn_end})
+    packet_ref = ResumePacket.reference(packet, "marker-failure.json.resume-packet.json")
+
+    on_exit(fn ->
+      restore_app_env(:resume_packet_boundary_marker, previous_marker)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-MARKER-FAILURE",
+      run_id: "run-marker-failure",
+      retry_id: "retry-marker-failure",
+      worker_host: nil,
+      workspace_path: "/tmp/MT-MARKER-FAILURE",
+      resume_packet_ref: packet_ref,
+      issue: %Issue{id: issue_id, identifier: "MT-MARKER-FAILURE", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    state = :sys.get_state(pid)
+
+    assert %{attempt: 1, resume_packet_ref: ^packet_ref} = state.retry_attempts[issue_id]
+
+    errors =
+      SymphonyElixir.Telemetry.read_events(nil, nil)
+      |> Enum.filter(&(&1["event"] == "resume_packet_error" and &1["issue_id"] == issue_id))
+
+    assert Enum.map(errors, & &1["boundary"]) == ["outer_worker_exit", "retry_scheduled"]
+    assert Enum.all?(errors, &(&1["error_code"] == "resume_packet_boundary_mark_failed"))
+  end
+
+  test "failure retry dispatch gets a new run id while retaining its packet reference" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-resume-packet-retry-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    previous_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_states = Application.get_env(:symphony_elixir, :memory_tracker_states_by_ids_result)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"],
+      workspace_root: workspace_root,
+      hook_before_run: "sleep 30",
+      poll_interval_ms: 30_000
+    )
+
+    issue = %Issue{
+      id: "issue-packet-retry-dispatch",
+      identifier: "MT-PACKET-RETRY",
+      title: "Retain packet on retry dispatch",
+      state: "In Progress",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_states_by_ids_result, {:ok, [issue]})
+
+    orchestrator_name = Module.concat(__MODULE__, :PacketRetryDispatchOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    packet = ResumePacket.build(%{identity: %{run_id: "run-parent"}, boundary_reason: :retry_scheduled})
+    packet_ref = ResumePacket.reference(packet, "packet-retry.json.resume-packet.json")
+    retry_token = make_ref()
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_issues)
+      restore_app_env(:memory_tracker_states_by_ids_result, previous_states)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm_rf(test_root)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{})
+      |> Map.put(:claimed, MapSet.new([issue.id]))
+      |> Map.put(:retry_attempts, %{
+        issue.id => %{
+          attempt: 3,
+          retry_id: "retry-dispatch",
+          previous_retry_id: "retry-parent",
+          parent_run_id: "run-parent",
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: issue.identifier,
+          workspace_path: Path.join(workspace_root, issue.identifier),
+          resume_packet_ref: packet_ref
+        }
+      })
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    send(pid, {:retry_issue, issue.id, retry_token})
+
+    running =
+      Enum.reduce_while(1..100, nil, fn _, _ ->
+        case :sys.get_state(pid).running[issue.id] do
+          nil ->
+            Process.sleep(10)
+            {:cont, nil}
+
+          entry ->
+            {:halt, entry}
+        end
+      end)
+
+    assert is_map(running)
+    assert running.parent_run_id == "run-parent"
+    assert running.retry_id == "retry-dispatch"
+    assert running.run_id != "run-parent"
+    assert running.resume_packet_ref == packet_ref
+
+    GenServer.stop(pid, :normal)
+    Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, running.pid)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -2260,7 +2430,13 @@ defmodule SymphonyElixir.CoreTest do
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
       assert String.length(Enum.at(turn_texts, 1)) < String.length(Enum.at(turn_texts, 0))
-      assert String.length(Enum.at(turn_texts, 1)) < 1_200
+
+      [continuation_prefix, packet_tail] =
+        String.split(Enum.at(turn_texts, 1), "Symphony status/resume packet v", parts: 2)
+
+      assert String.length(continuation_prefix) < 1_200
+      assert byte_size("Symphony status/resume packet v" <> packet_tail) <= 4_000
+      refute packet_tail =~ "Symphony status/resume packet v"
 
       prompt_event = AgentRunner.prompt_built_telemetry_event()
 
@@ -2274,7 +2450,8 @@ defmodule SymphonyElixir.CoreTest do
                           "task_context",
                           "repository_workflow",
                           "test_worker_budget",
-                          "handoff_tool_guidance"
+                          "handoff_tool_guidance",
+                          "continuation.status_resume_packet"
                         ],
                         turn_number: 1,
                         max_turns: 3
@@ -2289,7 +2466,10 @@ defmodule SymphonyElixir.CoreTest do
                         issue_id: "issue-continue",
                         issue_identifier: "MT-247",
                         prompt_kind: "continuation",
-                        included_sections: ["continuation_guidance"],
+                        included_sections: [
+                          "continuation_guidance",
+                          "continuation.status_resume_packet"
+                        ],
                         turn_number: 2,
                         max_turns: 3
                       }}
@@ -2483,7 +2663,8 @@ defmodule SymphonyElixir.CoreTest do
                           "task_context",
                           "repository_workflow",
                           "test_worker_budget",
-                          "handoff_tool_guidance"
+                          "handoff_tool_guidance",
+                          "continuation.status_resume_packet"
                         ],
                         turn_number: 1
                       }}
@@ -2493,7 +2674,8 @@ defmodule SymphonyElixir.CoreTest do
                         prompt_kind: "continuation",
                         included_sections: [
                           "handoff_gate_remediation",
-                          "continuation_guidance"
+                          "continuation_guidance",
+                          "continuation.status_resume_packet"
                         ],
                         turn_number: 2
                       }}

@@ -338,6 +338,30 @@ Notes:
   records prompt character/byte counts and included section names without storing raw prompt text.
   It also records SHA-256 hashes for the complete prompt and each injected section, allowing prompt
   reuse/duplication analysis without retaining task or workflow prose.
+  Every fresh and continuation turn ends with exactly one versioned
+  `continuation.status_resume_packet` section. The packet is a bounded host-owned summary of issue
+  and run lineage, repository state, workpad checklist hashes, current budget, and exact-head
+  gate/review evidence; it never includes prompt, diff, workpad, command-output, credential, or
+  token bodies. Sanitized bounded single-line validation/check/attestation labels may be retained,
+  but raw command output is not. The persisted v1 JSON is capped at 16,384 bytes, while its literal
+  prompt-tail rendering uses `agent.efficiency.capsule_max_bytes` (default 4,000). Prompt telemetry
+  records the section version/hash/bytes but only carries the packet id/hash/trusted relative
+  reference, boundary, and bounded evidence references.
+  The first packet reuses the repository manifest already collected during startup. Each handled
+  backend result, including terminal and handled-error results, performs at most one post-turn
+  repository refresh and persists it for the next continuation. Production therefore performs N+1
+  repository snapshots for N handled turns: the existing startup snapshot plus N post-turn
+  refreshes. Symphony does not add a packet-specific pre-turn probe or Linear request. Diff counts
+  cover at most 50 changed paths using tracked `git diff --numstat`; omitted paths, binary files,
+  malformed rows, and untracked-file partiality are explicit. Persisted verification is current
+  only when a known HEAD matches its evidence SHA.
+  The latest packet lives in the host-owned `.symphony-context` sibling directory as
+  `<workspace>.json.resume-packet.json`, is atomically written with local mode `0600`, and is removed
+  with the owned issue context/workspace. Lifecycle transitions mark the existing packet without
+  Git or tracker collection using `outer_worker_exit`, `retry_scheduled`, `wait_parked`,
+  `quota_parked`, and `restart_adopted`. Missing, corrupt, oversized, unknown-version, or unreadable
+  legacy sidecars are non-blocking and produce bounded diagnostics. `no_progress_warnings` is only
+  pass-through data in this version; Symphony does not detect loops or synthesize those warnings.
   A newly started backend thread still receives the full first-turn prompt, including on retries,
   because it cannot safely rely on context retained by a previous process. Reaching `max_turns`
   ends only that worker session; it does not change the Linear state or add `needs-human-input`.

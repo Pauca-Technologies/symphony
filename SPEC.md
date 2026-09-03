@@ -233,6 +233,7 @@ Fields (logical):
 - `retry_attempt` (integer, `0` for an initial attempt and `>=1` for retries/continuations)
 - `attempt` (integer or null, `null` for first run, `>=1` for retries/continuation)
 - `workspace_path`
+- `resume_packet_ref` (OPTIONAL compact reference to the latest trusted status/resume packet)
 - `started_at`
 - `status`
 - `error` (OPTIONAL)
@@ -274,6 +275,7 @@ Fields:
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
+- `resume_packet_ref` (OPTIONAL compact reference retained across retry scheduling)
 
 #### 4.1.8 Orchestrator Runtime State
 
@@ -289,6 +291,34 @@ Fields:
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
+
+#### 4.1.9 Status/Resume Packet
+
+One versioned, bounded, host-owned summary of the evidence needed to resume an issue/run lineage.
+Version 1 is integrity-checked with a canonical SHA-256 identity and is limited to 16,384 encoded
+bytes. Its logical fields are:
+
+- packet version/id/digest and `previous_packet_id`
+- issue and current run/retry identity
+- boundary reason and timestamp
+- turn position
+- repository/base/HEAD/dirty/changed-path and bounded diff-count observations
+- workpad marker/id/update time and hash-only checklist summary
+- exact-head gate/review/check attestations
+- current budget summary
+- pass-through no-progress warnings, bounded host error codes, evidence references, unavailable
+  fields, and compaction metadata
+
+Each observation records its own `source` and `captured_at`. Fresh host observations take
+precedence. A carried observation retains its original timestamp and is relabeled
+`persisted:<previous_packet_id>`; a lightweight lifecycle boundary changes only packet lineage and
+the boundary timestamp/source. No prompt, diff, workpad body, command output, credential, or token
+is stored in the packet. Validation, check, and attestation names/statuses MAY be included only as
+bounded, sanitized, single-line structured labels; raw command-output bodies remain excluded.
+
+Runtime state and durable retry/wait/quota/persistent-worker records carry only a compact reference:
+packet id, SHA-256, trusted sidecar basename, boundary, and bounded evidence references. Readers
+MUST accept legacy records where this reference is absent.
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -1075,6 +1105,10 @@ Workspace persistence:
 
 - Workspaces are reused across runs for the same issue.
 - Successful runs do not auto-delete workspaces.
+- The latest status/resume packet is stored outside the agent-writable workspace beside the trusted
+  issue-context file. Local writes MUST be atomic and owner-only (`0600`). Its basename MUST be a
+  single safe `<workspace_key>.json.resume-packet.json` component. Removing the owned issue context
+  and workspace MUST also remove this sidecar; legacy cleanup MUST tolerate its absence.
 
 ### 9.2 Workspace Creation and Reuse
 
@@ -1294,6 +1328,16 @@ Invariant 3: Workspace key is sanitized.
 - Only `[A-Za-z0-9._-]` allowed in workspace directory names.
 - Replace all other characters with `_`.
 
+Invariant 4: Status/resume persistence remains host-owned and best effort.
+
+- Packet collection and sidecar I/O MUST use the validated issue workspace and its owning local or
+  SSH worker, never the Symphony source-repository cwd.
+- Malformed, unknown-version, oversized, absent, or unreadable packets MUST NOT block dispatch,
+  retry, wait/quota parking, or restart adoption. Emit only a bounded diagnostic/error code and
+  continue with an available prior compact reference.
+- Lifecycle transitions MAY mark only the existing sidecar. They MUST NOT run Git, workpad/tracker,
+  gate, or review collection.
+
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
 This section defines Symphony's language-neutral responsibilities when integrating a Codex
@@ -1356,6 +1400,9 @@ client to:
   remain diagnostic output rather than prompt content.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
+- Append exactly one `continuation.status_resume_packet` section to every fresh or continuation
+  turn. It MUST be the literal final dynamic section and expose the packet protocol version and
+  section hash through ordinary prompt provenance.
 - Supply the implementation's documented approval and sandbox policy using fields supported by the
   targeted protocol.
 - Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
@@ -1703,10 +1750,12 @@ The first turn is assembled in this order:
 3. Annotated Markdown startup artifacts produced by `session_start`, when present.
 4. The rendered repository workflow template.
 5. Any host-owned handoff-tool guidance.
+6. The versioned status/resume packet as the literal final dynamic section.
 
 Repository templates do not need to reconstruct issue details, activity, or startup-artifact
 meaning. Later in-worker turns retain the original task context and use the live tracker tool only
-for newer or omitted context.
+for newer or omitted context. Continuation turns also append the current status/resume packet as
+their literal final dynamic section, after efficiency, activity, wait, gate, and review context.
 
 ### 12.2 Rendering Rules
 
@@ -1723,6 +1772,13 @@ instructions for:
 - first run (`attempt` null or absent)
 - continuation run after a successful prior session
 - retry after error/timeout/stall
+
+The packet presented to turn 1 SHOULD reuse the repository manifest already collected during
+startup. After each handled backend turn result, including handled errors and terminal results, the
+worker SHOULD perform at most one expensive repository refresh, persist the resulting packet, and
+reuse it as the next continuation input. It MUST NOT make another repository/workpad collection
+immediately before that continuation. Workpad observations SHOULD come from already-fetched issue
+activity rather than a packet-specific tracker request.
 
 ### 12.4 Failure Semantics
 
@@ -1867,6 +1923,27 @@ workflow and prompt-template identities so a template change produces a differen
 per-turn section hashes are emitted by the prompt event after composition and SHOULD be referenced
 from the pre-turn manifest rather than guessed early. Readers MUST continue accepting older
 telemetry and persisted worker/wait/circuit records without these fields.
+
+The worker SHOULD maintain one latest version 1 status/resume packet per issue/run lineage. The
+persisted packet is capped at 16,384 bytes; its prompt rendering is additionally capped by
+`agent.efficiency.capsule_max_bytes`. Repository observations use a bounded changed-path set and
+tracked `git diff --numstat` only: report paths considered/omitted and binary files explicitly,
+never claim line counts for binary content, and mark counts partial or unavailable when untracked
+files or malformed/probe-failed rows prevent a complete result. A prior gate/review attestation is
+current only when a known current HEAD matches its evidence SHA; otherwise mark it stale or
+unavailable.
+
+The existing startup repository-manifest snapshot is reused for turn 1. After each handled backend
+turn, at most one post-turn repository refresh becomes the persisted input for the next
+continuation. Thus N handled turns perform N+1 repository snapshots in production (the existing
+startup snapshot plus N post-turn refreshes), with no extra packet-specific pre-turn probe.
+Lifecycle-only packet marks use the standard boundaries `outer_worker_exit`, `retry_scheduled`,
+`wait_parked`, `quota_parked`, and `restart_adopted` and preserve observation timestamps/sources.
+Failures are best effort and emit bounded codes without changing the underlying
+retry/wait/quota/adoption decision. Runtime and telemetry events carry only the compact packet
+id/hash/trusted relative reference/boundary/evidence references, never the packet body.
+`no_progress_warnings` is a bounded pass-through field in this version; loop detection or warning
+synthesis is outside this contract.
 
 Compact reporting SHOULD provide fleet, repository, issue, parent/delegated-thread, phase,
 failure-class, tool, review, and percentile views. At minimum it SHOULD include p50/p90 token and

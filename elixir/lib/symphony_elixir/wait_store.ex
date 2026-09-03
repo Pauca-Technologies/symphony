@@ -3,6 +3,8 @@ defmodule SymphonyElixir.WaitStore do
 
   require Logger
 
+  alias SymphonyElixir.ResumePacket
+
   @default_filename "waits.json"
 
   @doc "Load persisted wait entries, returning an empty map on invalid state."
@@ -63,6 +65,7 @@ defmodule SymphonyElixir.WaitStore do
       :backend,
       :worker_host,
       :workspace_path,
+      :resume_packet_ref,
       :codex_session_logs,
       :recent_codex_transcript_blocks,
       :priority,
@@ -96,6 +99,7 @@ defmodule SymphonyElixir.WaitStore do
       backend: entry["backend"],
       worker_host: entry["worker_host"],
       workspace_path: entry["workspace_path"],
+      resume_packet_ref: ResumePacket.normalize_reference(entry["resume_packet_ref"]),
       codex_session_logs: entry["codex_session_logs"] || [],
       recent_codex_transcript_blocks: entry["recent_codex_transcript_blocks"] || [],
       priority: entry["priority"],

@@ -743,14 +743,28 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp handle_terminal_handoff_gate_result(:ok, _request), do: :ok
   defp handle_terminal_handoff_gate_result({:passed, _gate}, _request), do: :ok
 
-  defp handle_terminal_handoff_gate_result({:blocked, prompt, gates}, _request),
-    do: {:handoff_blocked, prompt, gates}
+  defp handle_terminal_handoff_gate_result({:blocked, prompt, gates}, request) do
+    notify_handoff_gate_verification(request.context, gates)
+    {:handoff_blocked, prompt, gates}
+  end
 
-  defp handle_terminal_handoff_gate_result({:failed, prompt, gate}, _request),
-    do: {:handoff_blocked, prompt, protocol_gate_list(gate)}
+  defp handle_terminal_handoff_gate_result({:failed, prompt, gate}, request) do
+    notify_handoff_gate_verification(request.context, gate)
+    {:handoff_blocked, prompt, protocol_gate_list(gate)}
+  end
 
-  defp handle_terminal_handoff_gate_result({:invalidated, prompt, gate}, _request),
-    do: {:handoff_blocked, prompt, protocol_gate_list(gate)}
+  defp handle_terminal_handoff_gate_result({:invalidated, prompt, gate}, request) do
+    notify_handoff_gate_verification(request.context, gate)
+    {:handoff_blocked, prompt, protocol_gate_list(gate)}
+  end
+
+  defp notify_handoff_gate_verification(context, evidence) do
+    case Map.get(context, :handoff_gate_verification_callback) ||
+           Map.get(context, "handoff_gate_verification_callback") do
+      callback when is_function(callback, 1) -> callback.(evidence)
+      _callback -> :ok
+    end
+  end
 
   defp run_review_gate_for_request(request) do
     run_review_gate(

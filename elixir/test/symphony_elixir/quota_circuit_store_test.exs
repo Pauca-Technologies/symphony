@@ -1,11 +1,13 @@
 defmodule SymphonyElixir.QuotaCircuitStoreTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.QuotaCircuitStore
+  alias SymphonyElixir.{QuotaCircuitStore, ResumePacket}
 
   test "persists outage deadlines and parked retry order across restart" do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     next_probe_at = DateTime.add(now, 3_600, :second)
+    packet = ResumePacket.build(%{boundary_reason: :quota_parked})
+    packet_ref = ResumePacket.reference(packet, "quota.json.resume-packet.json")
 
     circuits = %{
       "codex::worker:worker-a" => %{
@@ -30,6 +32,7 @@ defmodule SymphonyElixir.QuotaCircuitStoreTest do
             failure_class: :usage_quota_limit,
             worker_host: nil,
             workspace_path: "/tmp/workspace-a",
+            resume_packet_ref: packet_ref,
             parked_at: now
           },
           %{
@@ -66,9 +69,16 @@ defmodule SymphonyElixir.QuotaCircuitStoreTest do
                  failure_class: :usage_quota_limit,
                  retry_id: nil,
                  previous_retry_id: nil,
-                 parent_run_id: nil
+                 parent_run_id: nil,
+                 resume_packet_ref: ^packet_ref
                },
-               %{issue_id: "issue-b", retry_id: nil, previous_retry_id: nil, parent_run_id: nil}
+               %{
+                 issue_id: "issue-b",
+                 retry_id: nil,
+                 previous_retry_id: nil,
+                 parent_run_id: nil,
+                 resume_packet_ref: nil
+               }
              ]
            } = restored["codex::worker:worker-a"]
   end

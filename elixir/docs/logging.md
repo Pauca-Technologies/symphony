@@ -59,6 +59,34 @@ number.
 `prompt_chars` and `prompt_bytes` measure only the newly submitted turn text. Retained thread history
 and effective model-input cost remain represented by the backend's context/input-token telemetry.
 
+## Status/Resume Packet Observability
+
+Every fresh and continuation backend turn includes one
+`continuation.status_resume_packet` v1 section as its literal final dynamic section. Ordinary
+`prompt_built` provenance reports that section's source/version/hash/bytes. Runtime-info and compact
+telemetry MUST carry only the validated packet id, SHA-256, trusted relative sidecar reference,
+boundary, and bounded evidence references—never the packet or prompt body, diff/workpad content,
+command-output body, environment values, credentials, or tokens. Sanitized bounded single-line
+validation/check/attestation labels may be retained as structured evidence; raw command output may
+not.
+
+The worker reuses its existing startup repository manifest for turn 1 and performs at most one
+post-turn repository refresh after each handled turn. Production therefore performs N+1 repository
+snapshots for N handled turns: the startup snapshot plus N post-turn refreshes. That refreshed
+packet becomes the next continuation input without an additional packet-specific pre-turn probe.
+Bounded diff telemetry is scoped to the selected paths and tracked `git diff --numstat`; paths
+considered/omitted, binary files, partial untracked coverage, and probe failures must remain
+explicit. Verification evidence is current only when its SHA matches a known current HEAD.
+
+Lifecycle-only packet marks are `outer_worker_exit`, `retry_scheduled`, `wait_parked`,
+`quota_parked`, and `restart_adopted`. They update only the trusted sidecar boundary and preserve
+the original observation timestamps/sources. Mark/load/write failures emit
+`resume_packet_error` with issue/run/retry context plus a bounded `error_code` and boundary; never
+log raw I/O/command output, and never let the error block the underlying exit, retry, park, resume,
+or adoption. Legacy records without a reference remain valid. The packet's
+`no_progress_warnings` field is pass-through only; this version does not emit loop-detection
+warnings.
+
 ## Agent Profile Routing
 
 Repository profile classification logs the final `profile`, the classifier's proposed profile, and
