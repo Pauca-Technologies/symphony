@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.Config.{AgentEfficiency, AgentRouting, Schema}
+  alias SymphonyElixir.Config.{AgentEfficiency, AgentRouting, NoProgress, Schema}
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -221,6 +221,11 @@ defmodule SymphonyElixir.Config do
 
   def agent_efficiency_settings(_workflow),
     do: {:error, {:invalid_agent_efficiency, "repository workflow must contain a config map"}}
+
+  @doc "Resolve bounded shadow-mode no-progress thresholds from a repository workflow."
+  @spec no_progress_settings(Workflow.loaded_workflow() | nil) :: NoProgress.t()
+  def no_progress_settings(%{config: config}) when is_map(config), do: NoProgress.parse(config)
+  def no_progress_settings(_missing_or_invalid), do: NoProgress.parse(%{})
 
   @doc """
   Resolve repository-owned automated-review settings from `WORKFLOW_REVIEW.md`.

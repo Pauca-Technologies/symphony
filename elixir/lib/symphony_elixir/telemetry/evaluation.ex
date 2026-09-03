@@ -18,6 +18,11 @@ defmodule SymphonyElixir.Telemetry.Evaluation do
   @max_issue_events 500
   @filter_keys ~w(repository task_family model prompt_version config_digest)a
   @terminal_gate_outcomes ~w(passed failed invalidated infrastructure_error)
+  @no_progress_decisions ~w(alert suppressed_progress progress_unavailable reset)
+  @no_progress_kinds ~w(repeated_error repeated_success_no_progress detector_unavailable)
+  @no_progress_tool_classes ~w(shell read edit web mcp dynamic other)
+  @no_progress_result_classes ~w(success failed nonzero_exit cancelled unsupported timeout unknown_failure)
+  @no_progress_states ~w(changed unchanged unavailable)
   @negative_post_handoff MapSet.new([
                            {"ci", "failed"},
                            {"human_review", "failed"},
@@ -73,6 +78,7 @@ defmodule SymphonyElixir.Telemetry.Evaluation do
     filtered = Enum.filter(events, &matches_filters?(&1, normalized_filters, manifests))
     base = safe_report(filtered)
     outcomes = normalize_outcomes(filtered)
+    no_progress = no_progress_view(filtered)
     runs = run_summaries(filtered, manifests, outcomes)
     fleet = fleet_metrics(filtered, outcomes, base)
 
@@ -83,6 +89,7 @@ defmodule SymphonyElixir.Telemetry.Evaluation do
       filter_options: filter_options(events, manifests),
       fleet: fleet,
       outcomes: outcome_view(outcomes, fleet),
+      no_progress: no_progress,
       failures: base.failures,
       tools: base.tools,
       prompts: base.prompts,
@@ -139,6 +146,7 @@ defmodule SymphonyElixir.Telemetry.Evaluation do
            workspace: %{path: nil, host: latest_present(rows, "worker_host")},
            runs: evaluation.runs,
            outcomes: evaluation.outcomes,
+           no_progress: evaluation.no_progress,
            fleet: evaluation.fleet,
            recent_events: rows |> Enum.reverse() |> Enum.take(50) |> Enum.map(&historical_event/1),
            retention: %{event_count: length(rows), capped: length(rows) == @max_issue_events}
@@ -205,6 +213,79 @@ defmodule SymphonyElixir.Telemetry.Evaluation do
   defp outcome_status_count(outcomes, stage, status) do
     Enum.count(outcomes, &(&1.authoritative and &1.stage == stage and &1.status == status))
   end
+
+  defp no_progress_view(events) do
+    rows = Enum.flat_map(events, &normalize_no_progress_event/1)
+    alerts = rows |> Enum.filter(&(&1.decision == "alert")) |> deduplicate_no_progress_alerts()
+
+    %{
+      alerts: length(alerts),
+      progress_suppressions: Enum.count(rows, &(&1.decision == "suppressed_progress")),
+      progress_unavailable: Enum.count(rows, &(&1.decision == "progress_unavailable")),
+      resets: Enum.count(rows, &(&1.decision == "reset")),
+      by_kind: Enum.frequencies_by(alerts, & &1.kind),
+      by_result_class: Enum.frequencies_by(alerts, & &1.result_class),
+      by_tool_class: Enum.frequencies_by(alerts, & &1.tool_class)
+    }
+  end
+
+  defp normalize_no_progress_event(
+         %{
+           "event" => "no_progress_loop",
+           "no_progress_version" => 1,
+           "shadow" => true,
+           "decision" => decision
+         } = event
+       )
+       when decision in @no_progress_decisions do
+    with true <- valid_no_progress_dimensions?(event, decision),
+         {:ok, warning_id} <- normalize_warning_id(event["warning_id"]) do
+      [
+        %{
+          decision: decision,
+          kind: event["kind"],
+          tool_class: event["tool_class"],
+          result_class: event["result_class"],
+          warning_id: warning_id
+        }
+      ]
+    else
+      _invalid -> []
+    end
+  end
+
+  defp normalize_no_progress_event(_event), do: []
+
+  defp valid_no_progress_dimensions?(event, "reset") do
+    valid_progress? = event["progress"] in @no_progress_states
+
+    valid_progress? and
+      optional_member?(event["kind"], @no_progress_kinds) and
+      optional_member?(event["tool_class"], @no_progress_tool_classes) and
+      optional_member?(event["result_class"], @no_progress_result_classes)
+  end
+
+  defp valid_no_progress_dimensions?(event, _candidate_decision) do
+    event["progress"] in @no_progress_states and event["kind"] in @no_progress_kinds and
+      event["tool_class"] in @no_progress_tool_classes and
+      event["result_class"] in @no_progress_result_classes
+  end
+
+  defp deduplicate_no_progress_alerts(alerts) do
+    {warning_ids, without_id} = Enum.split_with(alerts, &is_binary(&1.warning_id))
+    Enum.uniq_by(warning_ids, & &1.warning_id) ++ without_id
+  end
+
+  defp optional_member?(nil, _allowed), do: true
+  defp optional_member?(value, allowed), do: is_binary(value) and value in allowed
+
+  defp normalize_warning_id(nil), do: {:ok, nil}
+
+  defp normalize_warning_id("npw-" <> digest = warning_id) when byte_size(digest) == 24 do
+    if Regex.match?(~r/\A[0-9a-f]{24}\z/, digest), do: {:ok, warning_id}, else: :error
+  end
+
+  defp normalize_warning_id(_warning_id), do: :error
 
   defp post_handoff_metrics(outcomes, accepted_count) do
     accepted_keys = outcome_keys(outcomes, "exact_head_handoff", "accepted")
@@ -576,6 +657,28 @@ defmodule SymphonyElixir.Telemetry.Evaluation do
 
   defp historical_agent(run) do
     %{backend: nil, model: run.model, reasoning_effort: nil, profile: nil}
+  end
+
+  defp historical_event(%{"event" => "no_progress_loop"} = event) do
+    case normalize_no_progress_event(event) do
+      [_valid] ->
+        Map.take(event, [
+          "event",
+          "ts",
+          "run_id",
+          "no_progress_version",
+          "shadow",
+          "decision",
+          "kind",
+          "tool_class",
+          "result_class",
+          "warning_id",
+          "progress"
+        ])
+
+      [] ->
+        Map.take(event, ["event", "ts", "run_id"])
+    end
   end
 
   defp historical_event(event) do

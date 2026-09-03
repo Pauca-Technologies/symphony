@@ -83,9 +83,31 @@ Lifecycle-only packet marks are `outer_worker_exit`, `retry_scheduled`, `wait_pa
 the original observation timestamps/sources. Mark/load/write failures emit
 `resume_packet_error` with issue/run/retry context plus a bounded `error_code` and boundary; never
 log raw I/O/command output, and never let the error block the underlying exit, retry, park, resume,
-or adoption. Legacy records without a reference remain valid. The packet's
-`no_progress_warnings` field is pass-through only; this version does not emit loop-detection
-warnings.
+or adoption. Legacy records without a reference remain valid.
+
+## Shadow No-Progress Observability
+
+The existing budget collector keeps a fixed 128-slot ring of safe terminal tool-attempt signals and
+assesses it once at the post-turn packet boundary. Starts, output streams, unmatched terminals, and
+long-running single calls do not count as completed attempts. Tool fingerprints use a coarse
+allowlisted operation class plus canonical redacted argument and result-class hashes. Raw arguments,
+outputs, call/thread IDs, URLs with credentials, secret values, external tool names, and canonical
+fingerprint input MUST NOT enter ETS snapshots, logs, runtime info, packets, or telemetry.
+
+Version 1 `no_progress_loop` telemetry is always `shadow=true` and is emitted sparsely for
+`alert`, `suppressed_progress`, `progress_unavailable`, and an actual latched `reset`. Fields are
+limited to fixed decision/kind/tool/result/progress enums, bounded counts and omission codes,
+digest/warning identifiers, and changed/unchanged/unavailable progress-channel enums. Runtime info
+contains only the separately validated compact cumulative summary. The orchestrator rejects a
+malformed whole summary and retains the last valid value; it never persists the summary through
+retry, wait, or quota records because the trusted resume packet owns durable warning delivery.
+
+Warnings are generated only after a qualified repeated terminal pattern and safe post-turn progress
+comparison. Any comparable changed repository/workpad/exact-head channel suppresses and resets the
+episode; no comparable channels means progress unavailable and no warning. A pending packet warning
+is delivered on the next turn and cleared after a handled consuming turn. A crash before refresh can
+redeliver it, so restart delivery is at-least-once rather than exactly-once. No event or warning may
+interrupt, retry, block, park, or change stall policy.
 
 ## Agent Profile Routing
 

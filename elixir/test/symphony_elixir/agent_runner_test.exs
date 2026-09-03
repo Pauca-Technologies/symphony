@@ -184,6 +184,42 @@ defmodule SymphonyElixir.AgentRunnerTest.ResumePacketProbeBackend do
   def stop_session(_session), do: :ok
 end
 
+defmodule SymphonyElixir.AgentRunnerTest.NoProgressBackend do
+  @moduledoc false
+  @behaviour SymphonyElixir.AgentBackend
+
+  @impl true
+  def start_session(workspace, _opts), do: {:ok, %{worker_host: nil, workspace: workspace}}
+
+  @impl true
+  def run_turn(session, prompt, _issue, opts) do
+    config = Application.fetch_env!(:symphony_elixir, :no_progress_backend)
+    turn = Agent.get_and_update(config.state, fn turn -> {turn + 1, turn + 1} end)
+    packet = SymphonyElixir.Workspace.load_resume_packet(session.workspace)
+    send(config.recipient, {:no_progress_turn, turn, prompt, packet})
+
+    config.messages
+    |> Map.get(turn, [])
+    |> Enum.each(Keyword.fetch!(opts, :on_message))
+
+    case config |> Map.get(:verification, %{}) |> Map.get(turn) do
+      verification when is_map(verification) ->
+        Process.put({SymphonyElixir.AgentRunner, :resume_packet_verification}, verification)
+
+      _missing ->
+        :ok
+    end
+
+    case Map.get(config.results, turn, :ok) do
+      :ok -> {:ok, %{session_id: "no-progress-#{turn}"}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
+  def stop_session(_session), do: :ok
+end
+
 defmodule SymphonyElixir.AgentRunnerTest.WaitingBackend do
   @moduledoc false
   @behaviour SymphonyElixir.AgentBackend
@@ -427,6 +463,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
   alias SymphonyElixir.AgentRunnerTest.HandoffToolBackend
   alias SymphonyElixir.AgentRunnerTest.LifecycleRecipient
   alias SymphonyElixir.AgentRunnerTest.ManifestOrderingBackend
+  alias SymphonyElixir.AgentRunnerTest.NoProgressBackend
   alias SymphonyElixir.AgentRunnerTest.PendingGateBackend
   alias SymphonyElixir.AgentRunnerTest.RepositoryProgressBackend
   alias SymphonyElixir.AgentRunnerTest.ResumePacketErrorBackend
@@ -522,6 +559,8 @@ defmodule SymphonyElixir.AgentRunnerTest do
     assert manifest["agent"]["reasoning_effort"] == "high"
     assert manifest["workflow"]["source"] == "repository:WORKFLOW.md"
     assert manifest["configuration"]["workflow"] == manifest["workflow"]
+    assert manifest["no_progress"]["error_repeat_threshold"] == 3
+    assert manifest["configuration"]["no_progress"] == manifest["no_progress"]
 
     assert manifest["configuration"]["prompt"]["template_sha256"] ==
              manifest["prompt"]["template_sha256"]
@@ -544,6 +583,11 @@ defmodule SymphonyElixir.AgentRunnerTest do
       )["configuration"]
 
     refute RunManifest.config_digest(changed_prompt_configuration) == manifest["config_digest"]
+
+    changed_no_progress_configuration =
+      put_in(manifest["configuration"], ["no_progress", "error_repeat_threshold"], 9)
+
+    refute RunManifest.config_digest(changed_no_progress_configuration) == manifest["config_digest"]
     refute inspect(manifest) =~ workflow.prompt_template
 
     correlated = Enum.filter(events, &(&1["event"] in ~w(routing_decision run_manifest prompt_built)))
@@ -762,6 +806,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
     initial_manifest = %{
       head_sha: String.duplicate("a", 40),
       base_sha: nil,
+      base_age_seconds: nil,
       candidate_base_sha: nil,
       actual_paths: ["lib/path-1.ex"],
       dirty: true,
@@ -982,6 +1027,637 @@ defmodule SymphonyElixir.AgentRunnerTest do
     assert packet["run"]["parent_run_id"] == "old-run"
     assert packet["budget"]["metrics"]["total_tokens"] == 0
     refute "budget.snapshot_failed" in packet["errors"]["codes"]
+  end
+
+  test "delivers one structured warning in the next literal-tail packet and clears it after a handled turn" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-no-progress-delivery-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-no-progress-delivery",
+      identifier: "UDPE-7503-DELIVERY",
+      title: "Deliver bounded loop warning",
+      state: "In Progress",
+      comments: []
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    {:ok, backend_state} = Agent.start_link(fn -> 0 end)
+    {:ok, repository_calls} = Agent.start_link(fn -> 0 end)
+    {:ok, fetch_calls} = Agent.start_link(fn -> 0 end)
+    {:ok, assessment_calls} = Agent.start_link(fn -> 0 end)
+    manifest = no_progress_manifest()
+
+    repository_collector = fn ^workspace, _base_ref, _opts ->
+      Agent.update(repository_calls, &(&1 + 1))
+      manifest
+    end
+
+    failures = [
+      no_progress_terminal("secret-call-1", "RAW SECRET OUTPUT"),
+      no_progress_terminal("secret-call-2", "RAW SECRET OUTPUT")
+    ]
+
+    Application.put_env(:symphony_elixir, :no_progress_backend, %{
+      state: backend_state,
+      recipient: self(),
+      messages: %{1 => failures},
+      results: %{}
+    })
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :no_progress_backend)
+
+      Enum.each([backend_state, repository_calls, fetch_calls, assessment_calls], fn pid ->
+        if Process.alive?(pid), do: Agent.stop(pid)
+      end)
+
+      File.rm_rf(workspace_root)
+    end)
+
+    fetcher = fn [_issue_id] ->
+      call = Agent.get_and_update(fetch_calls, fn count -> {count + 1, count + 1} end)
+      state = if call == 1, do: "In Progress", else: "Done"
+      {:ok, [%{issue | state: state}]}
+    end
+
+    workflow = no_progress_workflow(error_repeat_threshold: 2)
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               self(),
+               [
+                 agent_backend: {NoProgressBackend, %{}},
+                 issue_state_fetcher: fetcher,
+                 repository_manifest: manifest,
+                 repository_manifest_collector: repository_collector,
+                 no_progress_assessor: fn collector, progress ->
+                   Agent.update(assessment_calls, &(&1 + 1))
+                   SymphonyElixir.AgentBudgetCollector.assess_no_progress(collector, progress)
+                 end,
+                 per_repo_workflow: workflow,
+                 run_id: "run-no-progress-delivery",
+                 max_turns: 2
+               ],
+               nil
+             )
+
+    assert_receive {:no_progress_turn, 1, first_prompt, {:ok, first_packet}}
+    assert_receive {:no_progress_turn, 2, second_prompt, {:ok, second_packet}}
+    refute first_prompt =~ "Repeated read attempts"
+    assert second_prompt =~ "Repeated read attempts ended as failed 2 times without observable progress"
+    assert second_prompt =~ "reassess evidence and approach before repeating the same operation"
+    assert length(:binary.matches(second_prompt, "No-progress warnings")) == 1
+    assert length(:binary.matches(second_prompt, "Symphony status/resume packet v1")) == 1
+    assert first_packet["no_progress_warnings"]["items"] == []
+    assert [_pending] = second_packet["no_progress_warnings"]["items"]
+
+    assert {:ok, final_packet} = Workspace.load_resume_packet(workspace)
+    assert final_packet["no_progress_warnings"]["items"] == []
+    assert length(final_packet["no_progress_warnings"]["latched_fingerprints"]) == 1
+    assert {:ok, encoded} = ResumePacket.encode(final_packet)
+    assert byte_size(encoded) <= ResumePacket.max_bytes()
+
+    assert Agent.get(repository_calls, & &1) == 2
+    assert Agent.get(fetch_calls, & &1) == 2
+    assert Agent.get(assessment_calls, & &1) == 2
+
+    assert_receive {:worker_runtime_info, "issue-no-progress-delivery", %{no_progress_summary: %{last_decision: "alert", last_kind: "repeated_error"}}}
+
+    events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+    loop_events = Enum.filter(events, &(&1["event"] == "no_progress_loop"))
+    assert [%{"decision" => "alert", "shadow" => true, "warning_id" => "npw-" <> _}] = loop_events
+    refute inspect(loop_events) =~ "secret-call"
+    refute inspect(loop_events) =~ "RAW SECRET OUTPUT"
+  end
+
+  test "handled error persists a pending warning and a fresh retry consumes it without re-alerting" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-no-progress-retry-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-no-progress-retry",
+      identifier: "UDPE-7503-RETRY",
+      title: "Retain warning across retry",
+      state: "In Progress",
+      comments: []
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    {:ok, repository_calls} = Agent.start_link(fn -> 0 end)
+    manifest = no_progress_manifest()
+
+    repository_collector = fn ^workspace, _base_ref, _opts ->
+      Agent.update(repository_calls, &(&1 + 1))
+      manifest
+    end
+
+    failures = [no_progress_terminal("call-1", "raw"), no_progress_terminal("call-2", "raw")]
+
+    on_exit(fn ->
+      stop_no_progress_backend_state()
+      Application.delete_env(:symphony_elixir, :no_progress_backend)
+      if Process.alive?(repository_calls), do: Agent.stop(repository_calls)
+      File.rm_rf(workspace_root)
+    end)
+
+    configure_no_progress_backend(self(), %{1 => failures}, %{1 => {:error, :handled_failure}})
+
+    common_opts = [
+      agent_backend: {NoProgressBackend, %{}},
+      repository_manifest: manifest,
+      repository_manifest_collector: repository_collector,
+      per_repo_workflow: no_progress_workflow(error_repeat_threshold: 2),
+      max_turns: 1
+    ]
+
+    assert {:error, :handled_failure} =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               nil,
+               Keyword.put(common_opts, :run_id, "run-before-retry"),
+               nil
+             )
+
+    assert_receive {:no_progress_turn, 1, first_prompt, {:ok, _first_start_packet}}
+    refute first_prompt =~ "Repeated read attempts"
+    assert {:ok, pending_packet} = Workspace.load_resume_packet(workspace)
+    assert [%{"fingerprint" => fingerprint}] = pending_packet["no_progress_warnings"]["items"]
+    assert pending_packet["no_progress_warnings"]["latched_fingerprints"] == [fingerprint]
+
+    configure_no_progress_backend(self(), %{1 => failures}, %{})
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               nil,
+               common_opts
+               |> Keyword.put(:run_id, "run-after-retry")
+               |> Keyword.put(:parent_run_id, "run-before-retry")
+               |> Keyword.put(:issue_state_fetcher, fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end),
+               nil
+             )
+
+    assert_receive {:no_progress_turn, 1, retry_prompt, {:ok, retry_start_packet}}
+    assert retry_prompt =~ "Repeated read attempts ended as failed 2 times without observable progress"
+    assert [%{"fingerprint" => ^fingerprint}] = retry_start_packet["no_progress_warnings"]["items"]
+
+    assert {:ok, consumed_packet} = Workspace.load_resume_packet(workspace)
+    assert consumed_packet["no_progress_warnings"]["items"] == []
+    assert consumed_packet["no_progress_warnings"]["latched_fingerprints"] == [fingerprint]
+
+    configure_no_progress_backend(self(), %{}, %{})
+    changed_manifest = %{manifest | head_sha: String.duplicate("b", 40)}
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               nil,
+               common_opts
+               |> Keyword.put(:run_id, "run-after-progress")
+               |> Keyword.put(:parent_run_id, "run-after-retry")
+               |> Keyword.put(:repository_manifest_collector, fn ^workspace, _base_ref, _opts ->
+                 Agent.update(repository_calls, &(&1 + 1))
+                 changed_manifest
+               end)
+               |> Keyword.put(:issue_state_fetcher, fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end),
+               nil
+             )
+
+    assert_receive {:no_progress_turn, 1, reset_prompt, {:ok, reset_start_packet}}
+    refute reset_prompt =~ "Repeated read attempts"
+    assert reset_start_packet["no_progress_warnings"]["latched_fingerprints"] == [fingerprint]
+
+    assert {:ok, reset_packet} = Workspace.load_resume_packet(workspace)
+    assert reset_packet["no_progress_warnings"]["latched_fingerprints"] == []
+    assert Agent.get(repository_calls, & &1) == 3
+
+    loop_events =
+      Date.utc_today()
+      |> then(&Telemetry.read_events(&1, &1))
+      |> Enum.filter(&(&1["event"] == "no_progress_loop" and &1["decision"] == "alert"))
+
+    assert length(loop_events) == 1
+
+    assert Enum.any?(
+             Telemetry.read_events(Date.utc_today(), Date.utc_today()),
+             &(&1["event"] == "no_progress_loop" and &1["decision"] == "reset")
+           )
+  end
+
+  test "suppresses a qualified repetition when the existing repository refresh observes progress" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-no-progress-suppressed-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-no-progress-suppressed",
+      identifier: "UDPE-7503-SUPPRESSED",
+      title: "Suppress warning on progress",
+      state: "In Progress",
+      comments: []
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    {:ok, backend_state} = Agent.start_link(fn -> 0 end)
+    {:ok, repository_calls} = Agent.start_link(fn -> 0 end)
+    changed_manifest = %{no_progress_manifest() | head_sha: String.duplicate("b", 40)}
+
+    Application.put_env(:symphony_elixir, :no_progress_backend, %{
+      state: backend_state,
+      recipient: self(),
+      messages: %{1 => [no_progress_terminal("call-a", "raw"), no_progress_terminal("call-b", "raw")]},
+      results: %{}
+    })
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :no_progress_backend)
+      Enum.each([backend_state, repository_calls], &if(Process.alive?(&1), do: Agent.stop(&1)))
+      File.rm_rf(workspace_root)
+    end)
+
+    repository_collector = fn ^workspace, _base_ref, _opts ->
+      Agent.update(repository_calls, &(&1 + 1))
+      changed_manifest
+    end
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               nil,
+               [
+                 agent_backend: {NoProgressBackend, %{}},
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                 repository_manifest: no_progress_manifest(),
+                 repository_manifest_collector: repository_collector,
+                 per_repo_workflow: no_progress_workflow(error_repeat_threshold: 2),
+                 run_id: "run-no-progress-suppressed",
+                 max_turns: 1
+               ],
+               nil
+             )
+
+    assert Agent.get(repository_calls, & &1) == 1
+    assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+    assert packet["no_progress_warnings"]["items"] == []
+    assert packet["no_progress_warnings"]["latched_fingerprints"] == []
+
+    events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+
+    assert Enum.any?(events, fn event ->
+             event["event"] == "no_progress_loop" and event["decision"] == "suppressed_progress" and
+               event["progress_channels"]["repository"] == "changed"
+           end)
+  end
+
+  test "workpad and newly-current exact-head evidence independently suppress qualified repetition" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+    manifest = no_progress_manifest()
+
+    Enum.each([:workpad, :exact_head], fn channel ->
+      workspace_root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-no-progress-#{channel}-#{System.unique_integer([:positive])}"
+        )
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      original_comment = %Comment{
+        id: "workpad-#{channel}",
+        updated_at: ~U[2026-09-03 10:00:00Z],
+        body: "## Codex Workpad\n### Plan\n- [ ] pending"
+      }
+
+      issue = %Issue{
+        id: "issue-no-progress-#{channel}",
+        identifier: "UDPE-7503-#{channel}",
+        title: "Suppress with #{channel}",
+        state: "In Progress",
+        comments: if(channel == :workpad, do: [original_comment], else: [])
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      refreshed_issue =
+        if channel == :workpad do
+          changed = %{
+            original_comment
+            | updated_at: ~U[2026-09-03 10:01:00Z],
+              body: "## Codex Workpad\n### Plan\n- [x] completed"
+          }
+
+          %{issue | state: "Done", comments: [changed]}
+        else
+          %{issue | state: "Done"}
+        end
+
+      configure_no_progress_backend(
+        self(),
+        %{1 => [no_progress_terminal("call-a", "raw"), no_progress_terminal("call-b", "raw")]},
+        %{}
+      )
+
+      if channel == :exact_head do
+        config = Application.fetch_env!(:symphony_elixir, :no_progress_backend)
+
+        Application.put_env(
+          :symphony_elixir,
+          :no_progress_backend,
+          Map.put(config, :verification, %{
+            1 => %{
+              exact_sha: manifest.head_sha,
+              gate_status: "passed",
+              checks: [%{name: "make all", status: "passed", sha: manifest.head_sha}]
+            }
+          })
+        )
+      end
+
+      try do
+        assert :ok =
+                 AgentRunner.run_codex_turns_for_test(
+                   workspace,
+                   issue,
+                   nil,
+                   [
+                     agent_backend: {NoProgressBackend, %{}},
+                     issue_state_fetcher: fn [_issue_id] -> {:ok, [refreshed_issue]} end,
+                     repository_manifest: manifest,
+                     repository_manifest_collector: fn ^workspace, _base_ref, _opts -> manifest end,
+                     per_repo_workflow: no_progress_workflow(error_repeat_threshold: 2),
+                     run_id: "run-no-progress-#{channel}",
+                     max_turns: 1
+                   ],
+                   nil
+                 )
+
+        assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+        assert packet["no_progress_warnings"]["items"] == []
+
+        events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+
+        assert Enum.any?(events, fn event ->
+                 event["event"] == "no_progress_loop" and event["issue_id"] == issue.id and
+                   event["decision"] == "suppressed_progress" and
+                   event["progress_channels"][Atom.to_string(channel)] == "changed"
+               end)
+      after
+        stop_no_progress_backend_state()
+        Application.delete_env(:symphony_elixir, :no_progress_backend)
+        File.rm_rf(workspace_root)
+      end
+    end)
+  end
+
+  test "qualified repetition with no comparable progress emits unavailable evidence but no warning" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-no-progress-unavailable-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-no-progress-unavailable",
+      identifier: "UDPE-7503-UNAVAILABLE",
+      title: "Avoid warning without progress evidence",
+      state: "In Progress",
+      comments: []
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    {:ok, backend_state} = Agent.start_link(fn -> 0 end)
+
+    unavailable_manifest = %{
+      no_progress_manifest()
+      | head_sha: nil,
+        worktree_status_fingerprint: nil,
+        worktree_content_fingerprint: nil,
+        errors: ["repository.head_unavailable"]
+    }
+
+    Application.put_env(:symphony_elixir, :no_progress_backend, %{
+      state: backend_state,
+      recipient: self(),
+      messages: %{1 => [no_progress_terminal("call-a", "raw"), no_progress_terminal("call-b", "raw")]},
+      results: %{}
+    })
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :no_progress_backend)
+      if Process.alive?(backend_state), do: Agent.stop(backend_state)
+      File.rm_rf(workspace_root)
+    end)
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               nil,
+               [
+                 agent_backend: {NoProgressBackend, %{}},
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                 repository_manifest: unavailable_manifest,
+                 repository_manifest_collector: fn ^workspace, _base_ref, _opts -> unavailable_manifest end,
+                 per_repo_workflow: no_progress_workflow(error_repeat_threshold: 2),
+                 run_id: "run-no-progress-unavailable",
+                 max_turns: 1
+               ],
+               nil
+             )
+
+    assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+    assert packet["no_progress_warnings"]["items"] == []
+
+    events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+
+    assert Enum.any?(events, fn event ->
+             event["event"] == "no_progress_loop" and event["decision"] == "progress_unavailable" and
+               event["progress_channels"] == %{
+                 "repository" => "unavailable",
+                 "workpad" => "unavailable",
+                 "exact_head" => "unavailable"
+               }
+           end)
+  end
+
+  test "assessment infrastructure failure is non-blocking and does not emit a loop decision" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-no-progress-assessment-error-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-no-progress-assessment-error",
+      identifier: "UDPE-7503-ASSESSMENT",
+      title: "Keep detector failure shadow-only",
+      state: "In Progress",
+      comments: []
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    {:ok, backend_state} = Agent.start_link(fn -> 0 end)
+    manifest = no_progress_manifest()
+
+    Application.put_env(:symphony_elixir, :no_progress_backend, %{
+      state: backend_state,
+      recipient: self(),
+      messages: %{},
+      results: %{}
+    })
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :no_progress_backend)
+      if Process.alive?(backend_state), do: Agent.stop(backend_state)
+      File.rm_rf(workspace_root)
+    end)
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               self(),
+               [
+                 agent_backend: {NoProgressBackend, %{}},
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                 repository_manifest: manifest,
+                 repository_manifest_collector: fn ^workspace, _base_ref, _opts -> manifest end,
+                 no_progress_latch_restorer: fn _collector, _latches -> exit(:injected_restore_failure) end,
+                 no_progress_assessor: fn _collector, _progress -> exit(:injected_assessment_failure) end,
+                 per_repo_workflow: no_progress_workflow(error_repeat_threshold: 2),
+                 run_id: "run-no-progress-assessment-error",
+                 max_turns: 1
+               ],
+               nil
+             )
+
+    assert_receive {:no_progress_turn, 1, _prompt, {:ok, turn_start_packet}}
+    assert "no_progress.restore_failed" in turn_start_packet["errors"]["codes"]
+
+    assert_receive {:worker_runtime_info, "issue-no-progress-assessment-error", %{no_progress_summary: %{last_decision: "progress_unavailable", last_kind: "detector_unavailable"}}}
+
+    assert {:ok, packet} = Workspace.load_resume_packet(workspace)
+    assert "no_progress.assessment_failed" in packet["errors"]["codes"]
+    assert packet["no_progress_warnings"]["items"] == []
+
+    events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+
+    refute Enum.any?(events, &(&1["event"] == "no_progress_loop"))
+
+    assert Enum.any?(events, fn event ->
+             event["event"] == "resume_packet_error" and
+               event["error_code"] == "no_progress.assessment_failed"
+           end)
+  end
+
+  test "runtime and loop telemetry reject unrecognized omission keys from an injected assessment" do
+    Application.put_env(:symphony_elixir, :telemetry_enabled, true)
+
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-no-progress-safe-metadata-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    issue = %Issue{
+      id: "issue-no-progress-safe-metadata",
+      identifier: "UDPE-7503-SAFE-METADATA",
+      title: "Keep metadata bounded",
+      state: "In Progress",
+      comments: []
+    }
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    {:ok, backend_state} = Agent.start_link(fn -> 0 end)
+    manifest = no_progress_manifest()
+
+    Application.put_env(:symphony_elixir, :no_progress_backend, %{
+      state: backend_state,
+      recipient: self(),
+      messages: %{},
+      results: %{}
+    })
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :no_progress_backend)
+      if Process.alive?(backend_state), do: Agent.stop(backend_state)
+      File.rm_rf(workspace_root)
+    end)
+
+    fingerprint = String.duplicate("a", 64)
+
+    assessment = %{
+      version: 1,
+      decision: :progress_unavailable,
+      progress: :unavailable,
+      warning: nil,
+      checkpoint: %{latched_fingerprints: []},
+      summary: %{
+        version: 1,
+        mode: "shadow",
+        active_warning_count: 0,
+        completed_attempts: 2,
+        alerts: 0,
+        progress_suppressions: 0,
+        progress_unavailable: 1,
+        fingerprint_evictions: 0,
+        signal_evictions: 1,
+        turn_completed_attempts: 2,
+        turn_omissions: %{"signal_evicted" => 1, "raw\nPROMPT-INJECTION" => 999},
+        last_decision: :progress_unavailable,
+        last_kind: :repeated_error,
+        last_fingerprint: fingerprint,
+        last_operation: :read,
+        last_result_class: :failed,
+        last_repeat_count: 2,
+        last_no_progress_turns: nil
+      }
+    }
+
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               self(),
+               [
+                 agent_backend: {NoProgressBackend, %{}},
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end,
+                 repository_manifest: manifest,
+                 repository_manifest_collector: fn ^workspace, _base_ref, _opts -> manifest end,
+                 no_progress_assessor: fn _collector, _progress -> assessment end,
+                 per_repo_workflow: no_progress_workflow(error_repeat_threshold: 2),
+                 run_id: "run-no-progress-safe-metadata",
+                 max_turns: 1
+               ],
+               nil
+             )
+
+    assert_receive {:worker_runtime_info, "issue-no-progress-safe-metadata", %{no_progress_summary: %{omissions: %{"signal_evicted" => 1}}} = runtime_info}
+
+    events = Telemetry.read_events(Date.utc_today(), Date.utc_today())
+    assert [loop_event] = Enum.filter(events, &(&1["event"] == "no_progress_loop"))
+    assert loop_event["omissions"] == %{"signal_evicted" => 1}
+    refute inspect(runtime_info) =~ "PROMPT-INJECTION"
+    refute inspect(loop_event) =~ "PROMPT-INJECTION"
   end
 
   test "builds safe manifest policies for alternate backends and reviewer workflows" do
@@ -3649,6 +4325,74 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end)
 
     {Enum.map_join(selected, "\n", &"1\t0\t#{&1}") <> "\n", 0}
+  end
+
+  defp no_progress_manifest do
+    %{
+      head_sha: String.duplicate("a", 40),
+      base_sha: nil,
+      base_age_seconds: nil,
+      candidate_base_sha: nil,
+      actual_paths: ["lib/example.ex"],
+      dirty: true,
+      diff_counts: %{files: 1, additions: 1, deletions: 0},
+      worktree_status_fingerprint: String.duplicate("1", 64),
+      worktree_content_fingerprint: String.duplicate("2", 64),
+      worktree_fingerprint_complete: true,
+      errors: []
+    }
+  end
+
+  defp no_progress_workflow(overrides) do
+    defaults = %{
+      "error_repeat_threshold" => 3,
+      "success_repeat_threshold" => 8,
+      "success_no_progress_turns" => 2,
+      "max_fingerprints" => 32
+    }
+
+    settings =
+      Enum.reduce(overrides, defaults, fn {key, value}, acc -> Map.put(acc, Atom.to_string(key), value) end)
+
+    %{
+      prompt_template: "Test no-progress workflow.",
+      config: %{"agent" => %{"no_progress" => settings}}
+    }
+  end
+
+  defp no_progress_terminal(call_id, output) do
+    %{
+      event: :tool_call_failed,
+      thread_id: "thread-no-progress",
+      payload: %{
+        "method" => "item/tool/call",
+        "params" => %{
+          "callId" => call_id,
+          "name" => "Read",
+          "arguments" => %{"file_path" => "README.md", "token" => "SECRET ARGUMENT"}
+        }
+      },
+      details: %{result: %{"success" => false, "output" => output}}
+    }
+  end
+
+  defp configure_no_progress_backend(recipient, messages, results) do
+    stop_no_progress_backend_state()
+    {:ok, state} = Agent.start_link(fn -> 0 end)
+
+    Application.put_env(:symphony_elixir, :no_progress_backend, %{
+      state: state,
+      recipient: recipient,
+      messages: messages,
+      results: results
+    })
+  end
+
+  defp stop_no_progress_backend_state do
+    case Application.get_env(:symphony_elixir, :no_progress_backend) do
+      %{state: state} when is_pid(state) -> if Process.alive?(state), do: Agent.stop(state)
+      _missing -> :ok
+    end
   end
 
   defp prepare_progress_repository!(identifier) do

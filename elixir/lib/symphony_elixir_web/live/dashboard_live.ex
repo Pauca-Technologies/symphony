@@ -215,6 +215,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </article>
           </section>
 
+          <section :if={active_no_progress_entry?(@issue_payload.running)} class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Shadow no-progress observation</h2>
+                <p class="section-copy">
+                  Symphony observed repeated tool behavior without comparable progress. This is advisory evidence only; it does not interrupt, retry, or block the worker.
+                </p>
+              </div>
+              <span class="status-badge status-badge-waiting">
+                <%= no_progress_warning_count(@issue_payload.running) %> active
+              </span>
+            </div>
+          </section>
+
           <section :if={@issue_payload.waiting} class="section-card">
             <div class="section-header">
               <div>
@@ -423,6 +437,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <span class="status-badge-dot"></span>
                 <%= waiting_count(@dashboard_payload) %> waiting
               </a>
+              <span
+                :if={active_no_progress_count(@dashboard_payload) > 0}
+                class="status-badge status-badge-waiting"
+              >
+                <span class="status-badge-dot"></span>
+                <%= active_no_progress_count(@dashboard_payload) %> shadow no-progress
+              </span>
               <span :if={draining?(@dashboard_payload)} class="status-badge status-badge-draining">
                 <span class="status-badge-dot"></span>
                 Draining
@@ -507,6 +528,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <p class="metric-label">Waiting</p>
               <p class="metric-value numeric"><%= @dashboard_payload.counts.waiting %></p>
               <p class="metric-detail">Parked on external conditions without consuming agent slots.</p>
+            </article>
+
+            <article class="metric-card">
+              <p class="metric-label">Active no-progress observations</p>
+              <p class="metric-value numeric"><%= active_no_progress_count(@dashboard_payload) %></p>
+              <p class="metric-detail">Shadow warnings only; Symphony does not interrupt or retry an agent from this signal.</p>
             </article>
 
             <article class="metric-card">
@@ -645,6 +672,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <span :if={entry[:review]} class="muted">
                           review: <%= review_value(entry[:review], :outcome) || "unknown" %>
                           · <%= review_iteration_label(entry[:review]) %>
+                        </span>
+                        <span :if={active_no_progress_entry?(entry)} class="muted">
+                          shadow no-progress observation · <%= no_progress_warning_count(entry) %> active
                         </span>
                       </td>
                       <td>
@@ -870,6 +900,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <p class="metric-value numeric"><%= @payload.fleet.accepted_handoffs %></p>
         <p class="metric-detail"><%= @payload.fleet.post_handoff.unknown %> accepted handoffs lack downstream evidence.</p>
       </article>
+      <article class="metric-card">
+        <p class="metric-label">Shadow no-progress alerts</p>
+        <p class="metric-value numeric"><%= @payload.no_progress.alerts %></p>
+        <p class="metric-detail"><%= @payload.no_progress.progress_suppressions %> candidates were suppressed by observable progress.</p>
+      </article>
     </section>
 
     <section class="section-card">
@@ -946,6 +981,23 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
     if details == "", do: event["event"] || "unknown event", else: "#{event["event"]} · #{details}"
   end
+
+  defp active_no_progress_count(%{counts: counts}) when is_map(counts) do
+    case Map.get(counts, :active_no_progress) do
+      count when is_integer(count) and count >= 0 -> count
+      _unavailable -> 0
+    end
+  end
+
+  defp active_no_progress_count(_payload), do: 0
+
+  defp active_no_progress_entry?(entry), do: no_progress_warning_count(entry) > 0
+
+  defp no_progress_warning_count(%{no_progress: %{active_warning_count: count}})
+       when is_integer(count) and count >= 0,
+       do: count
+
+  defp no_progress_warning_count(_entry), do: 0
 
   defp session_groups(payload) do
     implementing = %{

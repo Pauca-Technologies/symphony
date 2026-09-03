@@ -360,8 +360,14 @@ Notes:
   with the owned issue context/workspace. Lifecycle transitions mark the existing packet without
   Git or tracker collection using `outer_worker_exit`, `retry_scheduled`, `wait_parked`,
   `quota_parked`, and `restart_adopted`. Missing, corrupt, oversized, unknown-version, or unreadable
-  legacy sidecars are non-blocking and produce bounded diagnostics. `no_progress_warnings` is only
-  pass-through data in this version; Symphony does not detect loops or synthesize those warnings.
+  legacy sidecars are non-blocking and produce bounded diagnostics. At the safe post-turn boundary,
+  Symphony can add one structured shadow-only `no_progress_warnings` item after repeated identical
+  terminal tool results when comparable repository, workpad, and exact-head evidence shows no
+  change. A long-running call, starts, streaming output, unmatched terminals, harmless distinct
+  reads, and progress-unavailable turns do not produce a warning. The next backend turn consumes the
+  warning from the same literal packet tail; a handled result clears the delivered warning, while a
+  crash before refresh permits at-least-once delivery on retry/restart. Latches remain bounded to 32
+  fingerprints. This observation never interrupts, retries, blocks, or changes wait/stall policy.
   A newly started backend thread still receives the full first-turn prompt, including on retries,
   because it cannot safely rely on context retained by a previous process. Reaching `max_turns`
   ends only that worker session; it does not change the Linear state or add `needs-human-input`.
@@ -793,6 +799,16 @@ codex:
   event for dynamic injected-section hashes that only exist after prompt composition. Raw prompts,
   commands, environment values, and credentials are excluded. Older unversioned events and
   persisted records remain readable.
+  Shadow no-progress policy is configured under `agent.no_progress` with
+  `error_repeat_threshold` (default `3`, range `2..100`), `success_repeat_threshold` (default `8`,
+  range `2..1000`), `success_no_progress_turns` (default `2`, range `1..100`), and
+  `max_fingerprints` (default `32`, range `1..32`). The effective values are part of the run
+  manifest and `config_digest`. Completed tool attempts are normalized into bounded redacted
+  fingerprints in the existing budget collector; no raw arguments, output, call/thread IDs, or
+  external tool names enter the packet, runtime summary, or compact loop telemetry. Assessment uses
+  only the already-held startup/post-turn repository observations, already-fetched workpad
+  id/schema-marker/update-time/hash state,
+  and current exact-head evidence, adding no Git, Linear, validation, process, or polling path.
   Symphony also emits versioned `task_outcome` records at authoritative transitions. A hash-only,
   bounded before/after worktree comparison records material progress even when a preserved
   workspace was already dirty; unavailable Git probes do not count as change. Only a passed
@@ -838,6 +854,9 @@ The observability UI now runs on a minimal Phoenix stack:
   the URL. Worker completion, material progress, accepted exact-head handoff, CI/human-review, and
   merged/reopened/reverted counts are displayed separately, with unobserved outcomes shown as such.
   Cost remains unavailable unless a numeric cumulative USD value was explicitly emitted.
+  Version 1 shadow `no_progress_loop` evidence is summarized separately as alerts, candidates
+  suppressed by observed progress, unavailable progress decisions, resets, and bounded
+  kind/result/tool-class breakdowns. Replayed alert telemetry is deduplicated by warning id.
 - `/issues/<issue_identifier>` remains live-first. After an issue leaves orchestrator memory, it
   falls back to bounded historical telemetry when available and renders a clearly historical view
   without live wait/drain controls or transcript claims.
@@ -852,6 +871,8 @@ The observability UI now runs on a minimal Phoenix stack:
   owns progress: implementor events during implementation, reviewer heartbeats during automated
   review, and gate progress during final validation. Issue detail pages expose the corresponding
   handoff job identity and age.
+- Running rows and issue detail show a compact shadow no-progress badge/card when a validated active
+  warning exists. It is explicitly advisory and provides no control or automatic action.
 
 ## Project Layout
 

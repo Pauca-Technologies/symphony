@@ -718,7 +718,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 50)
 
-    assert payload.counts == %{running: 2, implementing: 1, handoff: 1, queued: 0, retrying: 1, waiting: 0}
+    assert payload.counts == %{
+             running: 2,
+             implementing: 1,
+             handoff: 1,
+             queued: 0,
+             retrying: 1,
+             waiting: 0,
+             active_no_progress: 0
+           }
+
     assert Enum.map(payload.implementing, & &1.issue_identifier) == ["MT-HTTP"]
     assert Enum.map(payload.handoff, & &1.issue_identifier) == ["UDPE-7016"]
     assert length(payload.running) == 2
@@ -743,6 +752,43 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "1 implementing · 1 in handoff"
     assert html =~ "Post-turn exact-candidate gates"
     assert html =~ "Running changed-scope tests"
+  end
+
+  test "dashboard renders active shadow no-progress observations without control semantics" do
+    summary = %{
+      version: 1,
+      mode: "shadow",
+      active_warning_count: 1,
+      completed_attempts: 8,
+      alerts: 1,
+      progress_suppressions: 0,
+      progress_unavailable: 0,
+      fingerprint_evictions: 0,
+      signal_evictions: 0,
+      last_decision: "alert",
+      last_kind: "repeated_error",
+      last_fingerprint: String.duplicate("a", 64),
+      omissions: %{}
+    }
+
+    snapshot = static_snapshot()
+    [running] = snapshot.running
+    snapshot = %{snapshot | running: [Map.put(running, :no_progress_summary, summary)]}
+    orchestrator_name = Module.concat(__MODULE__, :NoProgressDashboardOrchestrator)
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot})
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Active no-progress observations"
+    assert html =~ "1 shadow no-progress"
+    assert html =~ "shadow no-progress observation · 1 active"
+    assert html =~ "does not interrupt or retry an agent"
+
+    {:ok, _issue_view, issue_html} = live(build_conn(), "/issues/MT-HTTP")
+    assert issue_html =~ "Shadow no-progress observation"
+    assert issue_html =~ "advisory evidence only"
+    assert issue_html =~ "does not interrupt, retry, or block the worker"
+    refute issue_html =~ "Interrupt worker"
   end
 
   test "presenter keeps reviewer progress separate from the implementor event" do
@@ -866,7 +912,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                "handoff" => 0,
                "queued" => 0,
                "retrying" => 1,
-               "waiting" => 0
+               "waiting" => 0,
+               "active_no_progress" => 0
              },
              "queued" => [],
              "waiting" => [],
@@ -2091,7 +2138,8 @@ defmodule SymphonyElixir.ExtensionsTest do
              "handoff" => 0,
              "queued" => 0,
              "retrying" => 1,
-             "waiting" => 0
+             "waiting" => 0,
+             "active_no_progress" => 0
            }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
@@ -2164,7 +2212,8 @@ defmodule SymphonyElixir.ExtensionsTest do
              "handoff" => 0,
              "queued" => 0,
              "retrying" => 1,
-             "waiting" => 0
+             "waiting" => 0,
+             "active_no_progress" => 0
            }
   end
 
@@ -2210,7 +2259,8 @@ defmodule SymphonyElixir.ExtensionsTest do
              "handoff" => 0,
              "queued" => 0,
              "retrying" => 1,
-             "waiting" => 0
+             "waiting" => 0,
+             "active_no_progress" => 0
            }
   end
 

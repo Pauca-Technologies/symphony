@@ -306,7 +306,7 @@ bytes. Its logical fields are:
 - workpad marker/id/update time and hash-only checklist summary
 - exact-head gate/review/check attestations
 - current budget summary
-- pass-through no-progress warnings, bounded host error codes, evidence references, unavailable
+- bounded structured shadow no-progress warnings/latches, bounded host error codes, evidence references, unavailable
   fields, and compaction metadata
 
 Each observation records its own `source` and `captured_at`. Fresh host observations take
@@ -1942,8 +1942,43 @@ Lifecycle-only packet marks use the standard boundaries `outer_worker_exit`, `re
 Failures are best effort and emit bounded codes without changing the underlying
 retry/wait/quota/adoption decision. Runtime and telemetry events carry only the compact packet
 id/hash/trusted relative reference/boundary/evidence references, never the packet body.
-`no_progress_warnings` is a bounded pass-through field in this version; loop detection or warning
-synthesis is outside this contract.
+Implementations MAY use the existing per-run tool/budget collector to produce bounded shadow-only
+no-progress observations. The detector MUST NOT add a process, poller, reaper, Git/Linear request,
+validation, or per-tool repository probe, and MUST NOT interrupt, retry, block, park, or otherwise
+change worker lifecycle policy. Its only workflow settings are bounded thresholds/caps; effective
+values SHOULD participate in run-manifest configuration identity.
+
+Only safe terminal tool attempts count. Backend wrappers SHOULD normalize to a coarse operation
+class plus deterministic canonical/redacted/bounded argument and result-class identity. Raw
+arguments/output, secrets, call/thread IDs, URLs with credentials, external tool names, and
+canonical preimage text MUST NOT be persisted or emitted. Starts, streaming output, unmatched
+terminals without sufficient safe identity, and one long-running call MUST NOT count as repetition.
+Pending/correlation state and retained fingerprints MUST be deterministically capped.
+
+Repeated terminal errors MAY qualify at their configured consecutive threshold. Repeated successful
+attempts require a separately configured higher repetition threshold plus consecutive known
+no-progress turn boundaries and MUST NOT be labeled as errors. At the existing safe post-turn
+boundary, progress MUST be derived only from already-held before/after repository observations,
+already-fetched workpad identity/schema-marker/update-time/hash, and current accepted exact-head
+evidence. A changed comparable channel suppresses the candidate and resets a latched episode; all
+comparable channels
+unchanged establishes known no-progress; no comparable channels means unavailable and MUST NOT
+produce a warning. Emit at most one alert per fingerprint episode until observed progress resets it.
+
+The existing `no_progress_warnings` packet observation owns the bounded pending warning and minimal
+latched fingerprint state. A warning is appended through the one literal-tail resume-packet section,
+not a second prompt section or store. The next handled backend turn consumes and clears an old
+pending warning while optionally replacing it with a new one. If the process crashes before the
+post-turn refresh, retry/restart may redeliver the persisted warning; delivery is therefore
+at-least-once across crashes, not exactly-once. Lifecycle boundary marks MUST preserve warning state.
+
+Versioned compact loop telemetry SHOULD distinguish alerts, candidates suppressed by observed
+progress, qualified candidates whose progress was unavailable, and actual latched resets. It MUST
+remain shadow-labeled and contain only fixed enums, bounded counts/omission codes, digest/warning
+identifiers, and progress-channel states. Live state MAY expose a validated compact active-warning
+summary. Historical views MAY aggregate valid versioned shadow events and SHOULD deduplicate
+replayed alerts by warning identifier. Malformed/legacy events and summaries MUST be ignored without
+overwriting the last valid live summary or crashing readers.
 
 Compact reporting SHOULD provide fleet, repository, issue, parent/delegated-thread, phase,
 failure-class, tool, review, and percentile views. At minimum it SHOULD include p50/p90 token and
@@ -1999,6 +2034,11 @@ as historical and MUST NOT expose live controls or claim transcript availability
 cost-per-accepted-handoff MUST remain unavailable unless explicit numeric cost telemetry exists.
 For compatibility, machine reports MAY retain a legacy `completion_rate` field, but human-readable
 surfaces SHOULD label it as worker-run completion.
+Valid version 1 shadow `no_progress_loop` evidence MAY be shown as a separate compact group of
+alerts, progress suppressions, unavailable progress decisions, resets, and fixed kind/result/tool
+class breakdowns. Replayed warnings SHOULD be deduplicated by valid warning identifier. Historical
+issue fallback MAY preserve only those fixed loop fields in its bounded recent-event summaries and
+MUST NOT expose raw tool identity, arguments, output, call IDs, or thread IDs from detector state.
 
 ### 13.7 Telemetry-Driven Soft Budgets and Routing
 

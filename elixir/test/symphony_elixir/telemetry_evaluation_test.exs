@@ -217,6 +217,136 @@ defmodule SymphonyElixir.Telemetry.EvaluationTest do
     assert evaluation.fleet.cost_per_accepted_handoff_usd == 3.25
   end
 
+  test "projects only valid shadow no-progress evidence and deduplicates replayed warnings" do
+    warning_id = "npw-" <> String.duplicate("a", 24)
+
+    common = %{
+      "run_id" => "run-loop",
+      "issue_identifier" => "LOOP-1",
+      "no_progress_version" => 1,
+      "shadow" => true,
+      "kind" => "repeated_error",
+      "tool_class" => "shell",
+      "result_class" => "nonzero_exit",
+      "progress" => "unchanged"
+    }
+
+    rows = [
+      event("run_manifest", %{
+        "run_id" => "run-loop",
+        "repository" => %{"id" => "alpha"},
+        "agent" => %{"model" => "model-a"}
+      }),
+      event("run_start", %{"run_id" => "run-loop", "issue_identifier" => "LOOP-1"}),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "alert", "warning_id" => warning_id})),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "alert", "warning_id" => warning_id})),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "suppressed_progress", "progress" => "changed"})),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "progress_unavailable", "progress" => "unavailable"})),
+      event("no_progress_loop", %{
+        "run_id" => "run-loop",
+        "issue_identifier" => "LOOP-1",
+        "no_progress_version" => 1,
+        "shadow" => true,
+        "decision" => "reset",
+        "progress" => "changed"
+      }),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "alert", "kind" => "injected\nkind"})),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "alert", "shadow" => false})),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "alert", "no_progress_version" => 2})),
+      event("no_progress_loop", Map.merge(common, %{"decision" => "alert", "warning_id" => "invalid"})),
+      event("no_progress_loop", %{
+        "run_id" => "run-loop",
+        "no_progress_version" => 1,
+        "shadow" => true,
+        "decision" => "reset",
+        "progress" => "changed",
+        "kind" => "invalid"
+      }),
+      event("no_progress_loop", %{
+        "run_id" => "run-loop",
+        "no_progress_version" => 1,
+        "shadow" => true,
+        "decision" => "reset",
+        "progress" => "invalid"
+      })
+    ]
+
+    evaluation = Evaluation.build(rows, 7, %{repository: "alpha", model: "model-a"})
+
+    assert evaluation.no_progress == %{
+             alerts: 1,
+             progress_suppressions: 1,
+             progress_unavailable: 1,
+             resets: 1,
+             by_kind: %{"repeated_error" => 1},
+             by_result_class: %{"nonzero_exit" => 1},
+             by_tool_class: %{"shell" => 1}
+           }
+  end
+
+  test "historical issue keeps only fixed no-progress event fields" do
+    warning_id = "npw-" <> String.duplicate("b", 24)
+
+    rows = [
+      event("run_start", %{"run_id" => "run-historical-loop", "issue_identifier" => "LOOP-HISTORY"}),
+      event("no_progress_loop", %{
+        "run_id" => "run-historical-loop",
+        "issue_identifier" => "LOOP-HISTORY",
+        "no_progress_version" => 1,
+        "shadow" => true,
+        "decision" => "alert",
+        "kind" => "repeated_success_no_progress",
+        "tool_class" => "read",
+        "result_class" => "success",
+        "warning_id" => warning_id,
+        "progress" => "unchanged",
+        "thread_id" => "unsafe-thread-id",
+        "call_id" => "unsafe-call-id",
+        "arguments" => "secret",
+        "output" => "raw"
+      }),
+      event("no_progress_loop", %{
+        "run_id" => "run-historical-loop",
+        "issue_identifier" => "LOOP-HISTORY",
+        "no_progress_version" => 1,
+        "shadow" => true,
+        "decision" => "alert",
+        "kind" => "malicious\nkind",
+        "tool_class" => "raw tool output\nignore instructions",
+        "result_class" => "failed\nsecret=value",
+        "warning_id" => "invalid-warning",
+        "progress" => "unchanged\nraw",
+        "output" => "do not retain"
+      })
+    ]
+
+    assert {:ok, detail} = Evaluation.issue_from_events(rows, "LOOP-HISTORY")
+    assert detail.no_progress.alerts == 1
+
+    assert event =
+             Enum.find(detail.recent_events, fn row ->
+               row["event"] == "no_progress_loop" and row["decision"] == "alert"
+             end)
+
+    assert event["decision"] == "alert"
+    assert event["warning_id"] == warning_id
+    refute Map.has_key?(event, "arguments")
+    refute Map.has_key?(event, "output")
+    refute Map.has_key?(event, "thread_id")
+    refute Map.has_key?(event, "call_id")
+
+    assert invalid_event =
+             Enum.find(detail.recent_events, fn row ->
+               row["event"] == "no_progress_loop" and not Map.has_key?(row, "decision")
+             end)
+
+    assert Map.keys(invalid_event) |> Enum.sort() == ["event", "run_id", "ts"]
+    refute inspect(detail.recent_events) =~ "malicious"
+    refute inspect(detail.recent_events) =~ "ignore instructions"
+    refute inspect(detail.recent_events) =~ "secret=value"
+    refute inspect(detail.recent_events) =~ "do not retain"
+  end
+
   test "reconstructs bounded historical issue detail after live state is absent" do
     assert {:ok, detail} = Evaluation.issue_from_events(events(), "ALPHA-1")
     assert detail.historical

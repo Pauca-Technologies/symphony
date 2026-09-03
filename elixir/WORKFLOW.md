@@ -119,6 +119,13 @@ agent:
     # Defaults are seeded from recent fleet p50/p90 bands and differ for
     # simple, standard, and high-risk work. Repositories may override any
     # positive threshold under profiles.<name> and task_profiles.<task_type>.
+  # Shadow-only repeated-tool/no-progress observations. These values are
+  # clamped by Symphony; they cannot enable interruption, retries, or blocking.
+  no_progress:
+    error_repeat_threshold: 3 # 2..100 consecutive identical terminal failures
+    success_repeat_threshold: 8 # 2..1000 identical successful completions
+    success_no_progress_turns: 2 # 1..100 unchanged post-turn boundaries
+    max_fingerprints: 32 # 1..32 live/persisted alert latches
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -134,8 +141,9 @@ This workflow governs work in the Symphony repository for the issue described in
 Symphony appends one host-owned `continuation.status_resume_packet` v1 section after all repository
 and dynamic guidance. Treat it as bounded resume evidence: observation timestamps/sources, current
 run/retry identity, repository/workpad hashes, budget, and exact-head attestation status. Do not
-reconstruct or persist its body in repository files. It may carry existing `no_progress_warnings`,
-but warning/loop detection is not part of this version.
+reconstruct or persist its body in repository files. It may carry a bounded host-generated
+shadow no-progress warning. Reassess the evidence and approach instead of simply repeating the
+same operation; the warning is advisory and does not mean Symphony interrupted or failed the run.
 
 {% if attempt %}
 Retry context:

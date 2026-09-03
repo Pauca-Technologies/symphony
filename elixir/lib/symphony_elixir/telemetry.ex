@@ -26,6 +26,7 @@ defmodule SymphonyElixir.Telemetry do
           | :run_end
           | :run_manifest
           | :task_outcome
+          | :no_progress_loop
           | :prompt_built
           | :lifecycle
           | :token_high_water

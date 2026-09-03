@@ -27,7 +27,8 @@ defmodule SymphonyElixirWeb.Presenter do
             handoff: length(handoff),
             queued: length(Map.get(snapshot, :queued, [])),
             retrying: length(snapshot.retrying),
-            waiting: length(Map.get(snapshot, :waiting, []))
+            waiting: length(Map.get(snapshot, :waiting, [])),
+            active_no_progress: Enum.count(snapshot.running, &active_no_progress?/1)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           implementing: Enum.map(implementing, &running_entry_payload/1),
@@ -284,6 +285,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(entry)
     }
+    |> maybe_put_no_progress(entry)
     |> maybe_put_persistent_worker(entry)
     |> maybe_put_scheduling(entry)
     |> maybe_put_handoff_gate(entry)
@@ -557,6 +559,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       context: context_payload(running)
     }
+    |> maybe_put_no_progress(running)
     |> maybe_put_persistent_worker(running)
     |> maybe_put_scheduling(running)
     |> maybe_put_handoff_gate(running)
@@ -572,6 +575,20 @@ defmodule SymphonyElixirWeb.Presenter do
       Map.put(payload, :scheduling, scheduling)
     else
       payload
+    end
+  end
+
+  defp active_no_progress?(entry) do
+    case Map.get(entry, :no_progress_summary) do
+      %{active_warning_count: count} when is_integer(count) and count > 0 -> true
+      _none -> false
+    end
+  end
+
+  defp maybe_put_no_progress(payload, entry) do
+    case Map.get(entry, :no_progress_summary) do
+      summary when is_map(summary) -> Map.put(payload, :no_progress, summary)
+      _unavailable -> payload
     end
   end
 

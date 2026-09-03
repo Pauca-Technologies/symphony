@@ -16,6 +16,7 @@ defmodule SymphonyElixir.ResumePacket do
   @max_attestations 20
   @max_evidence_refs 20
   @max_warnings 10
+  @max_warning_latches 32
   @max_errors 20
   @max_string_bytes 240
   @max_evidence_label_bytes 120
@@ -189,6 +190,44 @@ defmodule SymphonyElixir.ResumePacket do
     end
   end
 
+  @doc "Return the bounded warning delivery/latch state from a current or legacy packet."
+  @spec no_progress_state(packet() | nil) :: %{items: [term()], latched_fingerprints: [String.t()]}
+  def no_progress_state(packet) when is_map(packet) do
+    observation = packet_map(packet, "no_progress_warnings")
+    items = bounded_warning_items(observation["items"])
+
+    %{
+      items: items,
+      latched_fingerprints: bounded_warning_latches(List.wrap(observation["latched_fingerprints"]) ++ warning_item_fingerprints(items))
+    }
+  end
+
+  def no_progress_state(_packet), do: %{items: [], latched_fingerprints: []}
+
+  @doc "Compare only already-captured packet observations for post-turn progress."
+  @spec progress_evidence(packet(), packet()) :: %{
+          repository: :changed | :unchanged | :unavailable,
+          workpad: :changed | :unchanged | :unavailable,
+          exact_head: :changed | :unchanged | :unavailable
+        }
+  def progress_evidence(before_packet, after_packet) when is_map(before_packet) and is_map(after_packet) do
+    %{
+      repository:
+        comparable_observation(
+          packet_map(before_packet, "repository"),
+          packet_map(after_packet, "repository"),
+          ~w(head_sha worktree_status_fingerprint worktree_content_fingerprint)
+        ),
+      workpad:
+        comparable_observation(
+          packet_map(before_packet, "workpad"),
+          packet_map(after_packet, "workpad"),
+          ~w(id sha256 schema_marker updated_at)
+        ),
+      exact_head: exact_head_progress(before_packet, after_packet)
+    }
+  end
+
   @doc "Render the compact packet section appended to a model prompt."
   @spec render(packet(), pos_integer()) :: String.t()
   def render(packet, max_bytes) when is_map(packet) and is_integer(max_bytes) and max_bytes > 0 do
@@ -211,7 +250,7 @@ defmodule SymphonyElixir.ResumePacket do
       Verification [#{observation_label(verification)}]: current_head=#{field(verification, "current_head_status")} exact_sha=#{field(verification, "exact_sha")} gate_status=#{field(verification, "gate_status")} gate_checks=#{field(verification, "gate_check_count")} gate_source=#{field(verification, "gate_source")} gate_captured_at=#{field(verification, "gate_captured_at")} validations=#{field(verification, "validation_count")} review=#{field(verification, "review_outcome")} reviewed_sha=#{field(verification, "reviewed_sha")} review_source=#{field(verification, "review_source")} review_captured_at=#{field(verification, "review_captured_at")} open_findings=#{field(verification, "open_finding_count")} attestations_reused=#{field(verification, "attestations_reused_count")} attestations_rerun=#{field(verification, "attestations_rerun_count")}.
       Exact-head check summaries: #{render_summaries(verification["check_summaries"])}.
       Budget [#{observation_label(budget)}]: remaining=#{render_pairs(budget["remaining"])} crossed=#{render_list(budget["crossed"])}.
-      No-progress warnings [#{observation_label(packet_map(packet, "no_progress_warnings"))}]: #{render_list(get_in(packet, ["no_progress_warnings", "items"]))}.
+      No-progress warnings [#{observation_label(packet_map(packet, "no_progress_warnings"))}]: #{render_warnings(get_in(packet, ["no_progress_warnings", "items"]))}.
       Host errors [#{observation_label(packet_map(packet, "errors"))}]: #{render_list(get_in(packet, ["errors", "codes"]))}.
       Evidence refs: #{render_list(packet["evidence_refs"])}.
       Unavailable fields: #{render_list(packet["unavailable_fields"])}.
@@ -227,6 +266,66 @@ defmodule SymphonyElixir.ResumePacket do
       _value -> %{}
     end
   end
+
+  defp comparable_observation(before, %{"availability" => "current"} = current, keys) do
+    comparable =
+      Enum.flat_map(keys, fn key ->
+        case {Map.get(before, key), Map.get(current, key)} do
+          {left, right} when not is_nil(left) and not is_nil(right) -> [{left, right}]
+          _unavailable -> []
+        end
+      end)
+
+    cond do
+      Enum.any?(comparable, fn {left, right} -> left != right end) -> :changed
+      comparable != [] -> :unchanged
+      true -> :unavailable
+    end
+  end
+
+  defp comparable_observation(_before, _current, _keys), do: :unavailable
+
+  defp exact_head_progress(before_packet, after_packet) do
+    before = accepted_exact_head_evidence(packet_map(before_packet, "verification"))
+    current = accepted_exact_head_evidence(packet_map(after_packet, "verification"))
+
+    cond do
+      current == [] -> :unavailable
+      before == current -> :unchanged
+      true -> :changed
+    end
+  end
+
+  defp accepted_exact_head_evidence(%{"current_head_status" => "current"} = verification) do
+    top_level =
+      []
+      |> accepted_evidence("gate", verification["gate_status"], verification["exact_sha"])
+      |> accepted_evidence("review", verification["review_outcome"], verification["reviewed_sha"])
+
+    checks =
+      verification
+      |> Map.get("check_summaries", [])
+      |> Enum.flat_map(fn
+        %{"head_status" => "current", "status" => status, "head_sha" => sha} = summary ->
+          if accepted_status?(status),
+            do: [Enum.join(["check", summary["kind"] || "reported", summary["name"] || "unnamed", sha], ":")],
+            else: []
+
+        _other ->
+          []
+      end)
+
+    (top_level ++ checks) |> Enum.uniq() |> Enum.sort()
+  end
+
+  defp accepted_exact_head_evidence(_verification), do: []
+
+  defp accepted_evidence(acc, kind, status, sha) do
+    if accepted_status?(status) and known_git_sha?(sha), do: [Enum.join([kind, status, sha], ":") | acc], else: acc
+  end
+
+  defp accepted_status?(status),
+    do: status in ~w(accepted approved complete completed pass passed success succeeded)
 
   defp repository_observation(repository, _previous, now) when is_map(repository) do
     paths = bounded_strings(value(repository, :actual_paths), @max_changed_paths)
@@ -552,11 +651,102 @@ defmodule SymphonyElixir.ResumePacket do
   end
 
   defp warnings_observation(warnings, now) do
+    {items, latches} = warning_input(warnings)
+    items = bounded_warning_items(items)
+
     %{
-      "source" => "symphony:no_progress_warnings_passthrough",
+      "source" => "symphony:no_progress_detector",
       "captured_at" => now,
-      "items" => bounded_strings(warnings, @max_warnings)
+      "items" => items,
+      "latched_fingerprints" => bounded_warning_latches(List.wrap(latches) ++ warning_item_fingerprints(items))
     }
+  end
+
+  defp warning_input(%{} = warning_state),
+    do: {value(warning_state, :items) || [], value(warning_state, :latched_fingerprints) || []}
+
+  defp warning_input(warnings), do: {warnings, []}
+
+  defp bounded_warning_items(values) when is_list(values) do
+    values
+    |> Enum.flat_map(fn
+      warning when is_map(warning) -> List.wrap(normalized_warning(warning))
+      warning when is_binary(warning) -> List.wrap(structured_label(warning))
+      _invalid -> []
+    end)
+    |> Enum.uniq_by(&canonical_json/1)
+    |> Enum.sort_by(&canonical_json/1)
+    |> Enum.take(@max_warnings)
+  end
+
+  defp bounded_warning_items(_values), do: []
+
+  defp normalized_warning(warning) do
+    normalized = %{
+      version: non_negative(value(warning, :version)),
+      warning_id: string(value(warning, :warning_id)),
+      kind: string(value(warning, :kind)),
+      fingerprint: string(value(warning, :fingerprint)),
+      operation: string(value(warning, :operation)),
+      result_class: string(value(warning, :result_class)),
+      repeat_count: non_negative(value(warning, :repeat_count)),
+      no_progress_turns: non_negative(value(warning, :no_progress_turns))
+    }
+
+    if valid_warning?(normalized) do
+      %{
+        "version" => 1,
+        "warning_id" => normalized.warning_id,
+        "kind" => normalized.kind,
+        "fingerprint" => normalized.fingerprint,
+        "operation" => normalized.operation,
+        "result_class" => normalized.result_class,
+        "repeat_count" => min(normalized.repeat_count, 1_000_000),
+        "no_progress_turns" => if(is_integer(normalized.no_progress_turns), do: min(normalized.no_progress_turns, 1_000_000))
+      }
+    end
+  end
+
+  defp valid_warning?(warning) do
+    warning.version == 1 and valid_warning_identity?(warning) and valid_warning_classification?(warning) and
+      valid_warning_counts?(warning)
+  end
+
+  defp valid_warning_identity?(warning),
+    do: valid_warning_id?(warning.warning_id) and valid_digest?(warning.fingerprint)
+
+  defp valid_warning_classification?(warning) do
+    warning.kind in ~w(repeated_error repeated_success_no_progress) and
+      warning.operation in ~w(shell read edit web mcp dynamic other) and
+      warning.result_class in ~w(success failed nonzero_exit cancelled unsupported timeout unknown_failure)
+  end
+
+  defp valid_warning_counts?(%{repeat_count: count, kind: "repeated_success_no_progress", no_progress_turns: turns}),
+    do: is_integer(count) and count > 0 and is_integer(turns) and turns > 0
+
+  defp valid_warning_counts?(%{repeat_count: count, kind: "repeated_error"}),
+    do: is_integer(count) and count > 0
+
+  defp valid_warning_id?("npw-" <> digest), do: byte_size(digest) == 24 and hex_digest?(digest)
+  defp valid_warning_id?(_id), do: false
+
+  defp valid_digest?(digest), do: is_binary(digest) and byte_size(digest) == 64 and hex_digest?(digest)
+  defp hex_digest?(digest), do: Regex.match?(~r/\A[0-9a-f]+\z/, digest)
+
+  defp bounded_warning_latches(values) do
+    values
+    |> List.wrap()
+    |> Enum.filter(&valid_digest?/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.take(@max_warning_latches)
+  end
+
+  defp warning_item_fingerprints(items) do
+    Enum.flat_map(items, fn
+      %{"fingerprint" => fingerprint} -> [fingerprint]
+      _legacy -> []
+    end)
   end
 
   defp errors_observation(errors, now) do
@@ -985,6 +1175,49 @@ defmodule SymphonyElixir.ResumePacket do
   defp render_pairs(_map), do: "unavailable"
   defp render_list(values) when is_list(values) and values != [], do: Enum.join(values, ", ")
   defp render_list(_values), do: "none"
+
+  defp render_warnings(values) when is_list(values) do
+    values
+    |> Enum.flat_map(&render_warning/1)
+    |> Enum.uniq()
+    |> case do
+      [] -> "none"
+      warnings -> Enum.join(warnings, " ")
+    end
+  end
+
+  defp render_warnings(_values), do: "none"
+
+  defp render_warning(%{"kind" => "repeated_error"} = warning) do
+    [
+      "Repeated ",
+      warning["operation"],
+      " attempts ended as ",
+      warning["result_class"],
+      " ",
+      Integer.to_string(warning["repeat_count"]),
+      " times without observable progress; reassess evidence and approach before repeating the same operation."
+    ]
+    |> IO.iodata_to_binary()
+    |> List.wrap()
+  end
+
+  defp render_warning(%{"kind" => "repeated_success_no_progress"} = warning) do
+    [
+      "Repeated successful ",
+      warning["operation"],
+      " attempts produced no observable progress across ",
+      Integer.to_string(warning["no_progress_turns"] || 0),
+      " boundaries; reassess evidence and approach before repeating the same operation."
+    ]
+    |> IO.iodata_to_binary()
+    |> List.wrap()
+  end
+
+  defp render_warning(warning) when is_binary(warning),
+    do: ["A legacy no-progress warning is pending; reassess evidence and approach before repeating work."]
+
+  defp render_warning(_invalid), do: []
 
   defp render_summaries(summaries) when is_list(summaries) and summaries != [] do
     Enum.map_join(summaries, "; ", fn summary ->

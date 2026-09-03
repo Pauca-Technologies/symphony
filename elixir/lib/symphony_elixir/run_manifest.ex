@@ -61,6 +61,7 @@ defmodule SymphonyElixir.RunManifest do
     repository = Map.get(context, :repository_manifest, %{}) || %{}
     prompt_template = workflow_prompt(Map.get(context, :repo_workflow))
     workflow = workflow_provenance(context, prompt_template)
+    no_progress = Config.no_progress_settings(Map.get(context, :repo_workflow))
 
     prompt = %{
       source: Map.get(context, :workflow_source) || "repository:WORKFLOW.md",
@@ -83,6 +84,7 @@ defmodule SymphonyElixir.RunManifest do
       approval: policies.approval,
       sandbox: policies.sandbox,
       budget: budget,
+      no_progress: no_progress,
       review: review,
       workflow: workflow,
       prompt: Map.delete(prompt, :template_bytes)
@@ -122,6 +124,7 @@ defmodule SymphonyElixir.RunManifest do
         ambiguity: efficiency.classification.ambiguity
       },
       budget: budget,
+      no_progress: no_progress,
       approval: policies.approval,
       sandbox: policies.sandbox,
       review: review,

@@ -141,6 +141,42 @@ defmodule SymphonyElixirWeb.HistoryLive do
       <section class="section-card">
         <div class="section-header">
           <div>
+            <h2 class="section-title">Shadow no-progress observations</h2>
+            <p class="section-copy">
+              Advisory post-turn evidence only. These observations never interrupt, retry, or block a worker.
+            </p>
+          </div>
+        </div>
+        <section class="metric-grid">
+          <.metric
+            label="Loop alerts"
+            value={format_integer(@evaluation.no_progress.alerts)}
+            detail="Deduplicated shadow warning observations"
+          />
+          <.metric
+            label="Suppressed by progress"
+            value={format_integer(@evaluation.no_progress.progress_suppressions)}
+            detail="Qualified patterns suppressed by an observed progress change"
+          />
+          <.metric
+            label="Progress unavailable"
+            value={format_integer(@evaluation.no_progress.progress_unavailable)}
+            detail="Qualified patterns withheld because no progress channel was comparable"
+          />
+          <.metric
+            label="Episodes reset"
+            value={format_integer(@evaluation.no_progress.resets)}
+            detail="Previously latched shadow episodes cleared by observed progress"
+          />
+          <.breakdown title="Alert kinds" rows={top_rows(@evaluation.no_progress.by_kind)} />
+          <.breakdown title="Alert result classes" rows={top_rows(@evaluation.no_progress.by_result_class)} />
+          <.breakdown title="Alert tool classes" rows={top_rows(@evaluation.no_progress.by_tool_class)} />
+        </section>
+      </section>
+
+      <section class="section-card">
+        <div class="section-header">
+          <div>
             <h2 class="section-title">Recent worker runs</h2>
             <p class="section-copy">
               At most 100 retained run groups. Outcome-only records remain in the outcome timeline and are not presented as worker runs.

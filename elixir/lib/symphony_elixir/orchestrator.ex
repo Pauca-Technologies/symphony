@@ -93,6 +93,17 @@ defmodule SymphonyElixir.Orchestrator do
   @poll_transition_render_delay_ms 20
   @recent_codex_events_limit 200
   @recent_codex_transcript_blocks_limit 80
+  @no_progress_decisions ~w(none provisional alert suppressed_progress progress_unavailable reset)
+  @no_progress_kinds ~w(repeated_error repeated_success_no_progress detector_unavailable)
+  @no_progress_omission_codes ~w(
+    assessment_failed invalid_signal normalization_failed pending_evicted signal_evicted
+    start_missing_correlation start_missing_operation start_without_terminal
+    terminal_missing_operation terminal_unmatched
+  )
+  @no_progress_count_keys ~w(
+    active_warning_count completed_attempts alerts progress_suppressions progress_unavailable
+    fingerprint_evictions signal_evictions
+  )a
   @persistent_checkpoint_interval_ms 1_000
   # Dead-man's-switch heartbeat (audit §9.10). The orchestrator writes
   # ~/.symphony/heartbeat every 60s with the current poll-loop state. A
@@ -362,6 +373,7 @@ defmodule SymphonyElixir.Orchestrator do
             :resume_packet_ref,
             ResumePacket.reference_from_runtime_info(runtime_info)
           )
+          |> maybe_put_no_progress_summary(runtime_info)
 
         issue = Map.get(updated_running_entry, :issue, %{})
 
@@ -1969,6 +1981,7 @@ defmodule SymphonyElixir.Orchestrator do
       candidate_base_sha: nil,
       workspace_dirty: nil,
       resume_packet_ref: ResumePacket.normalize_reference(Map.get(worker, :resume_packet_ref)),
+      no_progress_summary: nil,
       session_id: nil,
       last_codex_message: nil,
       last_codex_timestamp: nil,
@@ -2922,6 +2935,98 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(running_entry, key, value)
   end
 
+  defp maybe_put_no_progress_summary(running_entry, runtime_info) do
+    case fetch_runtime_value(runtime_info, :no_progress_summary) do
+      :missing -> running_entry
+      {:ok, summary} -> maybe_store_no_progress_summary(running_entry, normalize_no_progress_summary(summary))
+    end
+  end
+
+  defp maybe_store_no_progress_summary(running_entry, {:ok, summary}),
+    do: Map.put(running_entry, :no_progress_summary, summary)
+
+  defp maybe_store_no_progress_summary(running_entry, :error), do: running_entry
+
+  defp normalize_no_progress_summary(summary) when is_map(summary) do
+    with 1 <- runtime_value(summary, :version),
+         "shadow" <- runtime_value(summary, :mode),
+         {:ok, counts} <- normalize_no_progress_counts(summary),
+         {:ok, decision} <- optional_enum(runtime_value(summary, :last_decision), @no_progress_decisions),
+         {:ok, kind} <- optional_enum(runtime_value(summary, :last_kind), @no_progress_kinds),
+         {:ok, fingerprint} <- optional_digest(runtime_value(summary, :last_fingerprint)),
+         {:ok, omissions} <- normalize_no_progress_omissions(runtime_value(summary, :omissions)) do
+      {:ok,
+       counts
+       |> Map.merge(%{
+         version: 1,
+         mode: "shadow",
+         last_decision: decision,
+         last_kind: kind,
+         last_fingerprint: fingerprint,
+         omissions: omissions
+       })}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp normalize_no_progress_summary(_summary), do: :error
+
+  defp normalize_no_progress_counts(summary) do
+    Enum.reduce_while(@no_progress_count_keys, {:ok, %{}}, fn key, {:ok, acc} ->
+      maximum = if key == :active_warning_count, do: 32, else: 1_000_000
+
+      case runtime_value(summary, key) do
+        value when is_integer(value) and value >= 0 and value <= maximum ->
+          {:cont, {:ok, Map.put(acc, key, value)}}
+
+        _invalid ->
+          {:halt, :error}
+      end
+    end)
+  end
+
+  defp normalize_no_progress_omissions(omissions) when is_map(omissions) and map_size(omissions) <= 12 do
+    Enum.reduce_while(omissions, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      key = if is_atom(key), do: Atom.to_string(key), else: key
+
+      if key in @no_progress_omission_codes and is_integer(value) and value >= 0 and value <= 1_000_000 do
+        {:cont, {:ok, Map.put(acc, key, value)}}
+      else
+        {:halt, :error}
+      end
+    end)
+  end
+
+  defp normalize_no_progress_omissions(_omissions), do: :error
+
+  defp optional_enum(nil, _allowed), do: {:ok, nil}
+  defp optional_enum(value, allowed) when is_atom(value), do: optional_enum(Atom.to_string(value), allowed)
+
+  defp optional_enum(value, allowed) when is_binary(value) do
+    if value in allowed, do: {:ok, value}, else: :error
+  end
+
+  defp optional_enum(_value, _allowed), do: :error
+
+  defp optional_digest(nil), do: {:ok, nil}
+
+  defp optional_digest(value) when is_binary(value) and byte_size(value) == 64 do
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, value), do: {:ok, value}, else: :error
+  end
+
+  defp optional_digest(_value), do: :error
+
+  defp fetch_runtime_value(map, key) do
+    cond do
+      Map.has_key?(map, key) -> {:ok, Map.get(map, key)}
+      Map.has_key?(map, Atom.to_string(key)) -> {:ok, Map.get(map, Atom.to_string(key))}
+      true -> :missing
+    end
+  end
+
+  defp runtime_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+
   defp select_worker_host(%State{} = state, preferred_worker_host) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
@@ -3365,6 +3470,7 @@ defmodule SymphonyElixir.Orchestrator do
           candidate_base_sha: Map.get(metadata, :candidate_base_sha),
           workspace_dirty: Map.get(metadata, :workspace_dirty),
           resume_packet_ref: Map.get(metadata, :resume_packet_ref),
+          no_progress_summary: Map.get(metadata, :no_progress_summary),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,

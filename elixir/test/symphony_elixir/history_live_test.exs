@@ -33,6 +33,10 @@ defmodule SymphonyElixir.HistoryLiveTest do
     assert html =~ "CI"
     assert html =~ "Cost / accepted handoff"
     assert html =~ "Unavailable unless an explicit numeric cumulative USD value was emitted"
+    assert html =~ "Shadow no-progress observations"
+    assert html =~ "Loop alerts"
+    assert html =~ "repeated_error:"
+    assert html =~ "nonzero_exit:"
 
     assert has_element?(view, ~s(select[name="window"] option[selected][value="30"]))
     assert has_element?(view, ~s(select[name="repository"] option[selected][value="alpha"]))
@@ -63,6 +67,7 @@ defmodule SymphonyElixir.HistoryLiveTest do
     assert html =~ "ci passed"
     assert html =~ "Historical run evidence"
     assert html =~ "Recent compact telemetry"
+    assert html =~ "Shadow no-progress alerts"
     assert html =~ "material_progress:recorded"
     assert html =~ "exact_head_handoff:accepted"
     refute html =~ ~r/<h2[^>]*>Transcript<\/h2>/
@@ -93,6 +98,8 @@ defmodule SymphonyElixir.HistoryLiveTest do
     assert html =~ "Human review failed"
     assert html =~ "Pull requests reverted"
     assert html =~ "Unobserved in this cohort"
+    assert html =~ "Shadow no-progress observations"
+    assert html =~ "No reported data."
     refute html =~ "Internal Server Error"
   end
 
@@ -187,6 +194,20 @@ defmodule SymphonyElixir.HistoryLiveTest do
         duration_ms: 1_000,
         outcome: "ok"
       })
+
+      if identifier == "ALPHA-1" do
+        Telemetry.emit(:no_progress_loop, %{
+          no_progress_version: 1,
+          shadow: true,
+          issue_identifier: identifier,
+          decision: "alert",
+          kind: "repeated_error",
+          tool_class: "shell",
+          result_class: "nonzero_exit",
+          progress: "unchanged",
+          warning_id: "npw-" <> String.duplicate("a", 24)
+        })
+      end
     end)
 
     if identifier == "ALPHA-1" do

@@ -316,6 +316,94 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute Map.has_key?(:sys.get_state(pid).running[issue_id], :resume_packet)
   end
 
+  test "worker runtime metadata validates compact no-progress summaries and preserves last valid value" do
+    issue_id = "issue-no-progress-summary"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "UDPE-7503-LIVE",
+      title: "Retain safe loop summary",
+      state: "In Progress"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :NoProgressSummaryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      no_progress_summary: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      %{initial_state | running: %{issue_id => running_entry}, claimed: MapSet.new([issue_id])}
+    end)
+
+    digest = String.duplicate("a", 64)
+
+    valid = %{
+      version: 1,
+      mode: "shadow",
+      active_warning_count: 1,
+      completed_attempts: 8,
+      alerts: 1,
+      progress_suppressions: 2,
+      progress_unavailable: 3,
+      fingerprint_evictions: 4,
+      signal_evictions: 5,
+      last_decision: "alert",
+      last_kind: "repeated_error",
+      last_fingerprint: digest,
+      omissions: %{"signal_evicted" => 2},
+      unsafe_tool_name: "malicious\nname",
+      raw_output: "secret"
+    }
+
+    send(pid, {:worker_runtime_info, issue_id, %{no_progress_summary: valid}})
+
+    assert %{running: [%{no_progress_summary: stored}]} =
+             Orchestrator.snapshot(orchestrator_name, 5_000)
+
+    assert stored == Map.drop(valid, [:unsafe_tool_name, :raw_output])
+
+    payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 5_000)
+    assert payload.counts.active_no_progress == 1
+    assert [%{no_progress: ^stored}] = payload.running
+
+    invalid = %{valid | active_warning_count: "1", omissions: %{"raw\noutput" => 1}}
+    send(pid, {:worker_runtime_info, issue_id, %{no_progress_summary: invalid}})
+
+    assert %{running: [%{no_progress_summary: ^stored}]} =
+             Orchestrator.snapshot(orchestrator_name, 5_000)
+
+    send(
+      pid,
+      {:worker_runtime_info, issue_id, %{no_progress_summary: %{valid | active_warning_count: 33}}}
+    )
+
+    assert %{running: [%{no_progress_summary: ^stored}]} =
+             Orchestrator.snapshot(orchestrator_name, 5_000)
+
+    send(pid, {:worker_runtime_info, issue_id, %{"no_progress_summary" => Map.put(valid, :mode, "enforce")}})
+
+    assert %{running: [%{no_progress_summary: ^stored}]} =
+             Orchestrator.snapshot(orchestrator_name, 5_000)
+  end
+
   test "orchestrator snapshot keeps the configured model when the agent reports none" do
     issue_id = "issue-agent-meta-codex"
 

@@ -80,7 +80,7 @@ defmodule SymphonyElixir.ResumePacketTest do
     assert packet["budget"]["metrics"]["total_tokens"] == 0
     assert packet["budget"]["remaining"]["total_tokens"] == 1_000
     assert length(packet["no_progress_warnings"]["items"]) == 10
-    assert packet["no_progress_warnings"]["source"] == "symphony:no_progress_warnings_passthrough"
+    assert packet["no_progress_warnings"]["source"] == "symphony:no_progress_detector"
     assert packet["errors"]["codes"] == ["repository.diff_counts_unavailable"]
     assert packet["verification"]["gate_source"] == "symphony:gate"
     assert packet["verification"]["review_source"] == "symphony:review"
@@ -142,6 +142,169 @@ defmodule SymphonyElixir.ResumePacketTest do
     assert current["workpad"]["source"] == "persisted:#{previous["packet_id"]}"
     assert current["workpad"]["captured_at"] == previous["workpad"]["captured_at"]
     assert current["no_progress_warnings"]["items"] == []
+  end
+
+  test "normalizes structured warning state, renders fixed guidance, and preserves legacy packets" do
+    fingerprint = String.duplicate("a", 64)
+
+    warning = %{
+      version: 1,
+      warning_id: "npw-" <> String.duplicate("b", 24),
+      kind: :repeated_error,
+      fingerprint: fingerprint,
+      operation: :read,
+      result_class: :failed,
+      repeat_count: 4,
+      no_progress_turns: nil,
+      raw: "PROMPT INJECTION"
+    }
+
+    packet =
+      ResumePacket.build(
+        %{
+          no_progress_warnings: %{
+            items: [warning, %{warning | warning_id: "unsafe\nwarning"}, "legacy\nPROMPT INJECTION", 123],
+            latched_fingerprints: [fingerprint, "not-a-digest"]
+          }
+        },
+        now: @captured_at
+      )
+
+    assert [%{"warning_id" => "npw-" <> _}] = packet["no_progress_warnings"]["items"]
+    assert ResumePacket.no_progress_state(packet).latched_fingerprints == [fingerprint]
+
+    rendered = ResumePacket.render(packet, 4_000)
+    assert rendered =~ "Repeated read attempts ended as failed 4 times without observable progress"
+    assert rendered =~ "reassess evidence and approach"
+    refute rendered =~ "PROMPT INJECTION"
+    refute rendered =~ fingerprint
+
+    assert {:ok, marked} = ResumePacket.mark_boundary(packet, :retry_scheduled, now: @captured_at)
+    assert marked["no_progress_warnings"] == packet["no_progress_warnings"]
+    assert {:ok, encoded} = ResumePacket.encode(marked)
+    assert {:ok, ^marked} = ResumePacket.decode(encoded)
+
+    legacy = ResumePacket.build(%{no_progress_warnings: ["legacy warning body"]}, now: @captured_at)
+    assert ResumePacket.no_progress_state(legacy).items == ["legacy warning body"]
+    assert ResumePacket.no_progress_state(legacy).latched_fingerprints == []
+    assert ResumePacket.render(legacy, 4_000) =~ "A legacy no-progress warning is pending"
+    refute ResumePacket.render(legacy, 4_000) =~ "legacy warning body"
+
+    bounded_latches =
+      ResumePacket.build(
+        %{
+          no_progress_warnings: %{
+            items: [],
+            latched_fingerprints:
+              Enum.map(1..200, fn index ->
+                :crypto.hash(:sha256, "fingerprint-#{index}") |> Base.encode16(case: :lower)
+              end)
+          }
+        },
+        now: @captured_at
+      )
+
+    assert length(ResumePacket.no_progress_state(bounded_latches).latched_fingerprints) == 32
+    assert {:ok, bounded_encoded} = ResumePacket.encode(bounded_latches)
+    assert byte_size(bounded_encoded) <= ResumePacket.max_bytes()
+
+    success_warning = %{
+      warning
+      | warning_id: "npw-" <> String.duplicate("c", 24),
+        kind: :repeated_success_no_progress,
+        result_class: :success,
+        no_progress_turns: 2
+    }
+
+    success_packet = ResumePacket.build(%{no_progress_warnings: [success_warning]}, now: @captured_at)
+    assert ResumePacket.render(success_packet, 4_000) =~ "no observable progress across 2 boundaries"
+
+    invalid_count = ResumePacket.build(%{no_progress_warnings: [%{success_warning | no_progress_turns: nil}]}, now: @captured_at)
+    assert invalid_count["no_progress_warnings"]["items"] == []
+
+    invalid_render = put_in(success_packet, ["no_progress_warnings", "items"], [123])
+    assert ResumePacket.render(invalid_render, 4_000) =~ "No-progress warnings"
+  end
+
+  test "compares repository, workpad, and newly-current exact-head evidence without I/O" do
+    sha = String.duplicate("a", 40)
+
+    before =
+      ResumePacket.build(
+        %{
+          issue: issue_with_workpad(),
+          repository: %{
+            head_sha: sha,
+            dirty: true,
+            worktree_status_fingerprint: String.duplicate("1", 64),
+            worktree_content_fingerprint: String.duplicate("2", 64)
+          },
+          verification: %{exact_sha: sha, gate_status: "passed"}
+        },
+        now: @captured_at
+      )
+
+    same =
+      ResumePacket.build(
+        %{
+          previous_packet: before,
+          issue: issue_with_workpad(),
+          repository: %{
+            head_sha: sha,
+            dirty: true,
+            worktree_status_fingerprint: String.duplicate("1", 64),
+            worktree_content_fingerprint: String.duplicate("2", 64)
+          },
+          verification: %{exact_sha: sha, gate_status: "passed"}
+        },
+        now: @captured_at
+      )
+
+    assert ResumePacket.progress_evidence(before, same) == %{
+             repository: :unchanged,
+             workpad: :unchanged,
+             exact_head: :unchanged
+           }
+
+    issue = issue_with_workpad()
+    comment = hd(issue.comments)
+    changed_issue = %{issue | comments: [%{comment | body: "## Codex Workpad\n### Plan\n- [x] changed"}]}
+
+    changed =
+      ResumePacket.build(
+        %{
+          previous_packet: before,
+          issue: changed_issue,
+          repository: %{
+            head_sha: String.duplicate("b", 40),
+            dirty: true,
+            worktree_status_fingerprint: String.duplicate("3", 64),
+            worktree_content_fingerprint: String.duplicate("4", 64)
+          },
+          verification: %{exact_sha: String.duplicate("b", 40), review_outcome: "approved", reviewed_sha: String.duplicate("b", 40)}
+        },
+        now: @captured_at
+      )
+
+    assert ResumePacket.progress_evidence(before, changed) == %{
+             repository: :changed,
+             workpad: :changed,
+             exact_head: :changed
+           }
+
+    unavailable = ResumePacket.build(%{previous_packet: before, issue: %{comments: []}}, now: @captured_at)
+
+    assert ResumePacket.progress_evidence(before, unavailable) == %{
+             repository: :unavailable,
+             workpad: :unavailable,
+             exact_head: :unavailable
+           }
+
+    malformed_evidence = %{
+      "verification" => %{"current_head_status" => "current", "check_summaries" => [:invalid]}
+    }
+
+    assert ResumePacket.progress_evidence(before, malformed_evidence).exact_head == :unavailable
   end
 
   test "every persisted observation names its packet and preserves its observation timestamp" do

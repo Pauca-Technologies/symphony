@@ -52,6 +52,11 @@ defmodule SymphonyElixir.AgentRunner do
   @resume_packet_verification_key {__MODULE__, :resume_packet_verification}
   @handoff_issue_refresh_retry_base_ms 1_000
   @handoff_issue_refresh_retry_max_ms 30_000
+  @no_progress_omission_codes ~w(
+    assessment_failed invalid_signal normalization_failed pending_evicted signal_evicted
+    start_missing_correlation start_missing_operation start_without_terminal
+    terminal_missing_operation terminal_unmatched
+  )
 
   # See T04 in /data/projects/coding-harness/implementation-plan.md and audit §5.1 O9.
   # Symphony silently giving up on terminal failure is a trust-killer; we mark the
@@ -598,10 +603,22 @@ defmodule SymphonyElixir.AgentRunner do
       budget_snapshot
       |> with_budget_thresholds(opts)
 
+    warning_state = turn_no_progress_state(opts, previous)
+
+    {restore_errors, opts} =
+      maybe_restore_no_progress_latches(
+        Keyword.get(opts, :budget_collector),
+        warning_state,
+        workspace,
+        issue,
+        worker_host,
+        opts
+      )
+
     errors =
       load_errors ++
         List.wrap(Keyword.get(opts, :resume_packet_errors)) ++
-        repository_manifest_errors(Keyword.get(opts, :repository_manifest)) ++ budget_errors
+        repository_manifest_errors(Keyword.get(opts, :repository_manifest)) ++ budget_errors ++ restore_errors
 
     packet =
       ResumePacket.build(%{
@@ -613,7 +630,7 @@ defmodule SymphonyElixir.AgentRunner do
         repository: turn_repository_for_packet(opts, turn_number),
         verification: current_resume_verification(opts),
         budget: budget,
-        no_progress_warnings: Keyword.get(opts, :no_progress_warnings, []),
+        no_progress_warnings: warning_state,
         errors: errors,
         boundary_reason: :turn_start
       })
@@ -623,6 +640,7 @@ defmodule SymphonyElixir.AgentRunner do
     opts =
       opts
       |> Keyword.put(:resume_packet, packet)
+      |> Keyword.put(:no_progress_warnings, warning_state.items)
       |> Keyword.put(:resume_packet_errors, persist_errors)
 
     {packet, opts}
@@ -642,32 +660,276 @@ defmodule SymphonyElixir.AgentRunner do
     after_turn = refresh_scheduling_runtime_info(recipient, issue, worker_host, workspace, opts)
     maybe_emit_material_progress(issue, opts, before, after_turn)
 
+    captured_at = DateTime.utc_now()
+    previous_packet = Keyword.get(opts, :resume_packet)
+    current_warning_state = ResumePacket.no_progress_state(previous_packet)
+
     errors =
       List.wrap(Keyword.get(opts, :resume_packet_errors)) ++
         repository_manifest_errors(after_turn)
 
+    packet_context = %{
+      previous_packet: previous_packet,
+      issue: issue,
+      identity: Telemetry.current_context(),
+      turn_number: turn_number,
+      max_turns: max_turns,
+      repository: repository_for_packet(after_turn),
+      verification: current_resume_verification(opts),
+      budget: with_budget_thresholds(budget, opts),
+      no_progress_warnings: current_warning_state,
+      errors: errors,
+      boundary_reason: boundary
+    }
+
+    provisional_packet = ResumePacket.build(packet_context, now: captured_at)
+    progress = ResumePacket.progress_evidence(previous_packet || %{}, provisional_packet)
+
+    {assessment, assessment_errors} =
+      assess_no_progress(
+        Keyword.get(opts, :budget_collector),
+        progress,
+        issue,
+        recipient,
+        workspace,
+        worker_host,
+        opts
+      )
+
+    warning_state = next_no_progress_state(current_warning_state, assessment)
+
     packet =
-      ResumePacket.build(%{
-        previous_packet: Keyword.get(opts, :resume_packet),
-        issue: issue,
-        identity: Telemetry.current_context(),
-        turn_number: turn_number,
-        max_turns: max_turns,
-        repository: repository_for_packet(after_turn),
-        verification: current_resume_verification(opts),
-        budget: with_budget_thresholds(budget, opts),
-        no_progress_warnings: Keyword.get(opts, :no_progress_warnings, []),
-        errors: errors,
-        boundary_reason: boundary
-      })
+      packet_context
+      |> Map.put(:no_progress_warnings, warning_state)
+      |> Map.update!(:errors, &(&1 ++ assessment_errors))
+      |> ResumePacket.build(now: captured_at)
 
     persist_errors = persist_and_emit_resume_packet(workspace, issue, recipient, worker_host, packet)
 
     opts
     |> Keyword.put(:repository_manifest, after_turn)
     |> Keyword.put(:resume_packet, packet)
+    |> Keyword.put(:no_progress_warnings, warning_state.items)
     |> Keyword.put(:resume_packet_errors, persist_errors)
   end
+
+  defp turn_no_progress_state(opts, previous_packet) do
+    previous = ResumePacket.no_progress_state(previous_packet)
+
+    case Keyword.fetch(opts, :no_progress_warnings) do
+      {:ok, items} -> %{previous | items: List.wrap(items)}
+      :error -> previous
+    end
+  end
+
+  defp maybe_restore_no_progress_latches(collector, state, workspace, issue, worker_host, opts) do
+    if Keyword.get(opts, :no_progress_latches_restored, false),
+      do: {[], opts},
+      else: restore_no_progress_latches(collector, state, workspace, issue, worker_host, opts)
+  end
+
+  defp restore_no_progress_latches(collector, state, workspace, issue, worker_host, opts)
+       when is_pid(collector) do
+    restorer =
+      Keyword.get(opts, :no_progress_latch_restorer, &AgentBudgetCollector.restore_no_progress_latches/2)
+
+    :ok = restorer.(collector, state.latched_fingerprints)
+    {[], Keyword.put(opts, :no_progress_latches_restored, true)}
+  rescue
+    _error -> no_progress_restore_failure(workspace, issue, worker_host, opts)
+  catch
+    _kind, _reason -> no_progress_restore_failure(workspace, issue, worker_host, opts)
+  end
+
+  defp restore_no_progress_latches(_collector, _state, workspace, issue, worker_host, opts),
+    do: no_progress_restore_failure(workspace, issue, worker_host, opts)
+
+  defp no_progress_restore_failure(workspace, issue, worker_host, opts) do
+    resume_packet_failure(issue, workspace, worker_host, "no_progress.restore_failed", :collector_unavailable)
+    {["no_progress.restore_failed"], opts}
+  end
+
+  defp assess_no_progress(collector, progress, issue, recipient, workspace, worker_host, opts)
+       when is_pid(collector) do
+    assessor = Keyword.get(opts, :no_progress_assessor, &AgentBudgetCollector.assess_no_progress/2)
+
+    case assessor.(collector, progress) do
+      %{decision: decision, progress: progress_state, summary: summary} = assessment
+      when decision in [:none, :provisional, :alert, :suppressed_progress, :progress_unavailable, :reset] and
+             progress_state in [:changed, :unchanged, :unavailable] and is_map(summary) ->
+        send_no_progress_runtime_info(recipient, issue, summary)
+        emit_no_progress_decision(issue, worker_host, progress, assessment)
+        {assessment, []}
+
+      _invalid ->
+        no_progress_assessment_failure(issue, recipient, workspace, worker_host, progress)
+    end
+  rescue
+    _error -> no_progress_assessment_failure(issue, recipient, workspace, worker_host, progress)
+  catch
+    _kind, _reason -> no_progress_assessment_failure(issue, recipient, workspace, worker_host, progress)
+  end
+
+  defp assess_no_progress(_collector, progress, issue, recipient, workspace, worker_host, _opts),
+    do: no_progress_assessment_failure(issue, recipient, workspace, worker_host, progress)
+
+  defp no_progress_assessment_failure(issue, recipient, workspace, worker_host, _progress) do
+    assessment = %{
+      version: 1,
+      decision: :progress_unavailable,
+      progress: :unavailable,
+      warning: nil,
+      checkpoint: nil,
+      summary: %{
+        version: 1,
+        mode: "shadow",
+        active_warning_count: 0,
+        last_decision: :progress_unavailable,
+        last_kind: :detector_unavailable,
+        last_fingerprint: nil,
+        turn_omissions: %{"assessment_failed" => 1}
+      }
+    }
+
+    resume_packet_failure(issue, workspace, worker_host, "no_progress.assessment_failed", :collector_unavailable)
+    send_no_progress_runtime_info(recipient, issue, assessment.summary)
+    {assessment, ["no_progress.assessment_failed"]}
+  end
+
+  defp next_no_progress_state(current, assessment) do
+    latches =
+      case Map.get(assessment, :checkpoint) do
+        %{latched_fingerprints: fingerprints} when is_list(fingerprints) -> fingerprints
+        _assessment_unavailable -> current.latched_fingerprints
+      end
+
+    items =
+      case Map.get(assessment, :warning) do
+        %{fingerprint: fingerprint} = warning when is_binary(fingerprint) ->
+          [warning]
+
+        _no_new_warning ->
+          []
+      end
+
+    %{items: items, latched_fingerprints: latches}
+  end
+
+  defp send_no_progress_runtime_info(recipient, %Issue{id: issue_id}, summary)
+       when is_pid(recipient) and is_binary(issue_id) and is_map(summary) do
+    compact = %{
+      version: 1,
+      mode: "shadow",
+      active_warning_count: non_negative_count(summary[:active_warning_count]),
+      completed_attempts: non_negative_count(summary[:completed_attempts]),
+      alerts: non_negative_count(summary[:alerts]),
+      progress_suppressions: non_negative_count(summary[:progress_suppressions]),
+      progress_unavailable: non_negative_count(summary[:progress_unavailable]),
+      fingerprint_evictions: non_negative_count(summary[:fingerprint_evictions]),
+      signal_evictions: non_negative_count(summary[:signal_evictions]),
+      last_decision: safe_no_progress_enum(summary[:last_decision], no_progress_decisions()),
+      last_kind: safe_no_progress_enum(summary[:last_kind], no_progress_kinds()),
+      last_fingerprint: safe_no_progress_digest(summary[:last_fingerprint]),
+      omissions: safe_no_progress_omissions(summary[:turn_omissions])
+    }
+
+    send(recipient, {:worker_runtime_info, issue_id, %{no_progress_summary: compact}})
+    :ok
+  end
+
+  defp send_no_progress_runtime_info(_recipient, _issue, _summary), do: :ok
+
+  defp emit_no_progress_decision(issue, worker_host, channels, assessment) do
+    if assessment.decision in [:alert, :suppressed_progress, :progress_unavailable, :reset] do
+      summary = assessment.summary
+
+      attrs = %{
+        no_progress_version: 1,
+        shadow: true,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        worker_host: worker_host,
+        decision: safe_no_progress_enum(assessment.decision, no_progress_decisions()),
+        kind: safe_no_progress_enum(summary[:last_kind], no_progress_kinds()),
+        tool_class: safe_no_progress_enum(summary[:last_operation], no_progress_operations()),
+        result_class: safe_no_progress_enum(summary[:last_result_class], no_progress_results()),
+        fingerprint: safe_no_progress_digest(summary[:last_fingerprint]),
+        repeat_count: non_negative_count(summary[:last_repeat_count]),
+        no_progress_turns: non_negative_count(summary[:last_no_progress_turns]),
+        progress: safe_no_progress_enum(assessment.progress, ~w(changed unchanged unavailable)a),
+        progress_channels: safe_progress_channels(channels),
+        completed_attempts: non_negative_count(summary[:turn_completed_attempts]),
+        signal_evictions: non_negative_count(summary[:signal_evictions]),
+        omissions: safe_no_progress_omissions(summary[:turn_omissions]),
+        warning_id: safe_no_progress_warning_id(get_in(assessment, [:warning, :warning_id]))
+      }
+
+      Telemetry.emit(:no_progress_loop, attrs)
+    end
+
+    :ok
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp safe_progress_channels(channels) when is_map(channels) do
+    Map.new(~w(repository workpad exact_head)a, fn key ->
+      {key, safe_no_progress_enum(Map.get(channels, key), ~w(changed unchanged unavailable)a)}
+    end)
+  end
+
+  defp safe_no_progress_omissions(omissions) when is_map(omissions) do
+    omissions
+    |> Enum.flat_map(fn
+      {reason, count} when reason in @no_progress_omission_codes and is_integer(count) and count >= 0 ->
+        [{reason, min(count, 1_000_000)}]
+
+      _invalid ->
+        []
+    end)
+    |> Enum.sort()
+    |> Enum.take(12)
+    |> Map.new()
+  end
+
+  defp safe_no_progress_omissions(_omissions), do: %{}
+
+  defp safe_no_progress_digest(digest) when is_binary(digest) and byte_size(digest) == 64 do
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, digest), do: digest
+  end
+
+  defp safe_no_progress_digest(_digest), do: nil
+
+  defp safe_no_progress_warning_id("npw-" <> digest = warning_id) when byte_size(digest) == 24 do
+    if Regex.match?(~r/\A[0-9a-f]{24}\z/, digest), do: warning_id
+  end
+
+  defp safe_no_progress_warning_id(_warning_id), do: nil
+
+  defp safe_no_progress_enum(value, allowed) when is_atom(value),
+    do: safe_no_progress_enum(Atom.to_string(value), allowed)
+
+  defp safe_no_progress_enum(value, allowed) when is_binary(value) do
+    if value in Enum.map(allowed, &to_string/1), do: value
+  end
+
+  defp safe_no_progress_enum(_value, _allowed), do: nil
+
+  defp non_negative_count(value) when is_integer(value) and value >= 0, do: min(value, 1_000_000)
+  defp non_negative_count(_value), do: 0
+
+  defp no_progress_decisions,
+    do: ~w(none provisional alert suppressed_progress progress_unavailable reset)a
+
+  defp no_progress_kinds,
+    do: ~w(repeated_error repeated_success_no_progress detector_unavailable)a
+
+  defp no_progress_operations, do: ~w(shell read edit web mcp dynamic other)a
+
+  defp no_progress_results,
+    do: ~w(success failed nonzero_exit cancelled unsupported timeout unknown_failure)a
 
   defp resume_packet_fallback(workspace, worker_host, opts, issue) do
     case Keyword.get(opts, :resume_packet) do
@@ -1049,8 +1311,10 @@ defmodule SymphonyElixir.AgentRunner do
     codex_update_recipient = context.recipient
     opts = context.opts
 
+    no_progress = Config.no_progress_settings(Keyword.get(opts, :per_repo_workflow))
+
     with {:ok, budget_collector} <-
-           AgentBudgetCollector.start_link(efficiency, issue, Telemetry.current_context()) do
+           AgentBudgetCollector.start_link(efficiency, issue, Telemetry.current_context(), no_progress) do
       opts =
         opts
         |> Keyword.put(:efficiency_decision, efficiency)
@@ -1155,7 +1419,7 @@ defmodule SymphonyElixir.AgentRunner do
     strategy_prompt = AgentBudgetCollector.take_strategy_prompt(budget_collector)
     opts = maybe_put(opts, :efficiency_strategy_prompt, strategy_prompt)
 
-    {_resume_packet, opts} =
+    {_turn_start_packet, opts} =
       prepare_turn_resume_packet(
         workspace,
         issue,
