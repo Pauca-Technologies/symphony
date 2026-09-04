@@ -17,17 +17,132 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+observability:
+  # Compact, versioned fleet events are retained for rolling 30-day reports.
+  telemetry_retention_days: 30
+  # Compact session logs are eligible for explicit, dry-run-first maintenance.
+  session_retention_days: 30
+  # Raw protocol traces are gzip-compressed and retained for failures for 7 days.
+  raw_trace_retention_days: 7
+  raw_trace_policy: failures # none | failures | sampled | all
+  raw_trace_sample_rate: 0.01
+  raw_trace_debug: false
+  session_compaction_enabled: true
+  benign_notification_debug: false
+  # Incident-only final prompt rendering with typed provenance boundaries.
+  # Content is redacted and bounded; keep disabled during normal operation.
+  prompt_debug: false
+  prompt_debug_max_bytes: 32000
+  # Additional credential names; mandatory defaults below always apply
+  # and also match snake_case, kebab-case, and camelCase spellings.
+  redact_fields:
+    - authorization
+    - api_key
+    - token
+    - access_token
+    - refresh_token
+    - cookie
+    - set-cookie
+    - password
+    - secret
+    - client_secret
+    - private_key
+    - x-api-key
 hooks:
+  # Symphony consumes mandatory standalone udp-gh auth before routed repository
+  # lifecycle hooks; consumer workflows must not mint their own bot token.
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
+  # session_start runs before each Codex app-server session, including when an
+  # existing workspace/branch is resumed. It is informational: failures are
+  # logged and included in the first-turn task context but do not block the agent.
+  session_start: |
+    if [ -x scripts/hooks/session-start.sh ]; then
+      scripts/hooks/session-start.sh
+    fi
+  # before_handoff runs before a Linear issue moves from In Progress to In Review.
+  # In multi-repo mode Symphony first fetches the configured base branch and
+  # skips this expensive hook when newer base changes overlap the candidate or
+  # change the workflow/hook files needed to run the gate safely.
+  # It never rebases, resets, or stashes a dirty worktree automatically.
+  # Repositories can use it to block handoff until repo-local gates pass, for example:
+  # before_handoff: |
+  #   scripts/hooks/before-handoff.sh
+  # Async protocol invocations receive SYMPHONY_HANDOFF_GATE_PROTOCOL=1. Polls
+  # reuse before_handoff with SYMPHONY_HANDOFF_GATE_JOB_ID and skip repeated
+  # GitHub auth and issue-context preparation, so the command should branch to
+  # its cheap durable-job read before normal setup. Symphony persists the
+  # attempted mutation before initial startup so infrastructure retries rerun
+  # this hook directly instead of opening another model session. A retry first
+  # revalidates the base and returns to the agent if the gate runtime changed.
+  # These limits are independent of other lifecycle hooks.
+  before_handoff_timeout_ms: 60000
+  before_handoff_stale_ms: 120000
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
+# Automated-review packet/context/turn budgets are repository-owned. Configure
+# them under `review:` in that target repository's WORKFLOW_REVIEW.md; Symphony
+# always starts a fresh one-turn reviewer before the expensive handoff hook,
+# atomically publishes its final verdict, and requires exact-head approval.
 agent:
   max_concurrent_agents: 10
+  # Per-agent test process fan-out; this does not change max_concurrent_agents.
+  test_worker_limit: 2
+  # Shared host admission for CPU-heavy repository validation across worktrees.
+  heavy_validation_limit: 2
+  # This is a worker-session boundary only; exhaustion does not move Linear to Blocked.
   max_turns: 20
+  # Operational failures stay active at capped backoff after this threshold.
+  # Only classified authentication/configuration failures become human blockers.
+  max_retries: 10
+  max_retry_backoff_ms: 300000
+  # Host-owned master switch for repository-declared experiments. Default-off
+  # and fail-closed; changing it affects only future backend turns.
+  experiment_mode: off # off | apply
+  # A target repository may declare one reviewed v1 Codex effort experiment in
+  # its own WORKFLOW.md. Assignment still requires the exact opt-in label.
+  # experiment:
+  #   schema_version: 1
+  #   id: codex-effort-v1
+  #   revision: 1
+  #   opt_in_label: experiment:codex-effort-v1
+  #   backend: codex
+  #   repositories: [symphony]
+  #   task_families: [simple_direct]
+  #   variable: reasoning_effort
+  #   control: {id: control, weight: 1, value: xhigh}
+  #   variants:
+  #     - {id: high, weight: 1, value: high}
+  # Soft budgets are policy/strategy signals, never completion or approval gates.
+  # Shadow mode records proposed routing and transitions. The narrow action
+  # allowlist below applies only low-risk context/output hygiene; review depth
+  # and other quality-sensitive transitions remain shadow observations.
+  # In enforce mode, a complete bounded docs/test-only handoff diff may refine
+  # a standard reviewer to the simple profile. Explicit/high-risk/fallback routes
+  # and production or repository-control changes are never reduced.
+  efficiency:
+    mode: shadow # off | shadow | enforce
+    enforced_actions:
+      - bound_future_tool_output
+      - fresh_thin_context_delegation_only
+      - prohibit_full_history_delegation
+    # Also caps the rendered v1 status/resume packet appended as the literal
+    # final dynamic section of every fresh and continuation backend turn.
+    capsule_max_bytes: 4000
+    extreme_multiplier: 2.0
+    # Defaults are seeded from recent fleet p50/p90 bands and differ for
+    # simple, standard, and high-risk work. Repositories may override any
+    # positive threshold under profiles.<name> and task_profiles.<task_type>.
+  # Shadow-only repeated-tool/no-progress observations. These values are
+  # clamped by Symphony; they cannot enable interruption, retries, or blocking.
+  no_progress:
+    error_repeat_threshold: 3 # 2..100 consecutive identical terminal failures
+    success_repeat_threshold: 8 # 2..1000 identical successful completions
+    success_no_progress_turns: 2 # 1..100 unchanged post-turn boundaries
+    max_fingerprints: 32 # 1..32 live/persisted alert latches
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -36,29 +151,24 @@ codex:
     type: workspaceWrite
 ---
 
-You are working on a Linear ticket `{{ issue.identifier }}`
+# Repository workflow
+
+This workflow governs work in the Symphony repository for the issue described in the task context above.
+
+Symphony appends one host-owned `continuation.status_resume_packet` v1 section after all repository
+and dynamic guidance. Treat it as bounded resume evidence: observation timestamps/sources, current
+run/retry identity, repository/workpad hashes, budget, and exact-head attestation status. Do not
+reconstruct or persist its body in repository files. It may carry a bounded host-generated
+shadow no-progress warning. Reassess the evidence and approach instead of simply repeating the
+same operation; the warning is advisory and does not mean Symphony interrupted or failed the run.
 
 {% if attempt %}
-Continuation context:
+Retry context:
 
 - This is retry attempt #{{ attempt }} because the ticket is still in an active state.
 - Resume from the current workspace state instead of restarting from scratch.
 - Do not repeat already-completed investigation or validation unless needed for new code changes.
 - Do not end the turn while the issue remains in an active state unless you are blocked by missing required permissions/secrets.
-  {% endif %}
-
-Issue context:
-Identifier: {{ issue.identifier }}
-Title: {{ issue.title }}
-Current status: {{ issue.state }}
-Labels: {{ issue.labels }}
-URL: {{ issue.url }}
-
-Description:
-{% if issue.description %}
-{{ issue.description }}
-{% else %}
-No description provided.
 {% endif %}
 
 Instructions:
@@ -69,13 +179,16 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
-## Prerequisite: Linear MCP or `linear_graphql` tool is available
+## Linear tools
 
-The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.
+The Symphony-owned task context above is normally sufficient. Read its issue details, current Linear activity, and any annotated startup artifacts before acting. If the activity is truncated or newer live Linear activity would materially affect the work, use `linear_issue` with `operation: "get"`.
+If `needs-human-input` is present, reconcile the human response after the blocker into the workpad before any repository work, then remove the label only after consuming that response. Exception: when Symphony's host-owned authorization guidance says this issue's configured opt-in label authorizes a verified hook-injected bot/App identity, a prior request for separate bot-attribution authorization is stale; correct the workpad, remove `needs-human-input` when it represented only that claim, and continue without another human comment.
+Use `linear_issue` for the current workpad, labels, and workflow transitions. In particular, move an issue from `In Progress` to `In Review` or `Human Review` with `operation: "transition"` so Symphony can run the handoff gates. Use `linear_graphql` only when no typed operation fits; do not use native Linear MCP `save_issue`.
 
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.
+- Treat the Linear description as the original scope authority and later human-authored Linear comments as chronological amendments that may clarify or override earlier ticket text. The workpad and Symphony marker comments are runtime evidence, not scope amendments.
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
@@ -83,12 +196,13 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
+- Adjacent work belongs in the current candidate only when an explicit requested outcome or acceptance criterion cannot be satisfied correctly without it. Cleanup, consistency, abstraction, or likely future value is not enough.
 - When meaningful out-of-scope improvements are discovered during execution,
-  file a separate Linear issue instead of expanding scope. The follow-up issue
-  must include a clear title, description, and acceptance criteria, be placed in
-  `Backlog`, be assigned to the same project as the current issue, link the
-  current issue as `related`, and use `blockedBy` when the follow-up depends on
-  the current issue.
+  use the typed `linear_issue` `create_follow_up` operation as soon as the title,
+  description, acceptance criteria, and evidence are concrete. Do not implement
+  the follow-up in the current branch. Symphony creates or returns a deterministic
+  unassigned Backlog issue in the same project without automation labels and links
+  it as related, or as blocked by the current issue when `depends_on_current` is true.
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
@@ -107,6 +221,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
+- `Blocked` -> inactive; waiting for a human response recorded in a separate Linear comment. A human reactivates the issue by moving it to `In Progress` after replying.
 - `Human Review` -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
@@ -186,12 +301,14 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
+- If useful work can continue only after GitHub Actions recovers, PR checks change, a git ref advances, or this ticket's Linear activity changes, call Symphony's `wait_for` tool once and end the turn. Do not repeatedly poll an unchanged external condition; Symphony will release the agent slot and resume the issue after the condition changes. Cross-issue prerequisites belong in Linear's `blocks` relation; never park on a tracking follow-up created during the run. Never use `wait_for` for local CPU or memory pressure, another validation running, local process or port contention, a time delay, or a Symphony-owned handoff job; Symphony polls accepted handoff jobs itself. Continue useful work and allow independently bounded validations to overlap.
 - Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
-- If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
+- If a non-GitHub required tool is missing, required non-GitHub auth is unavailable, or a product decision is required, add `needs-human-input` and move the ticket to `Blocked` with a short blocker brief in the workpad that includes:
   - what is missing,
   - why it blocks required acceptance/validation,
   - exact human action needed to unblock.
-- Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
+- A `linear_issue` transition that moves an issue to `Blocked` must include a top-level `blocker` object with a concise `summary` and one of these `kind` values: `missing_required_tool`, `missing_authentication`, `missing_permission`, or `product_decision`. Raw `linear_graphql` workflow transitions are rejected. Symphony, reviewer, handoff, CI, and other operational failures are not valid blocker kinds; leave the issue active for orchestrator retry.
+- Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad. The human response belongs in a separate Linear comment; on redispatch, reconcile it into the workpad and remove `needs-human-input` before resuming.
 
 ## Step 2: Execution phase (Todo -> In Progress -> Human Review)
 
@@ -232,7 +349,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
 12. Only then move issue to `Human Review`.
-    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
+    - Exception: if blocked by missing required non-GitHub tools/auth or product input per the blocked-access escape hatch, move to `Blocked` with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.
@@ -278,11 +395,9 @@ Use this only when completion is blocked by missing required tools or missing au
 - Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.
 - If comment editing is unavailable in-session, use the update script. Only report blocked if both MCP editing and script-based editing are unavailable.
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
-- If out-of-scope improvements are found, create a separate Backlog issue rather
-  than expanding current scope, and include a clear
-  title/description/acceptance criteria, same-project assignment, a `related`
-  link to the current issue, and `blockedBy` when the follow-up depends on the
-  current issue.
+- If out-of-scope improvements are found, leave them out of this candidate and
+  create the separate issue through typed `linear_issue create_follow_up`; record
+  the returned identifier in the workpad.
 - Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
 - In `Human Review`, do not make changes; wait and poll.
 - If state is terminal (`Done`), do nothing and shut down.

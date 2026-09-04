@@ -316,6 +316,37 @@ defmodule Mix.Tasks.PrBody.CheckTest do
     end)
   end
 
+  test "passes when the body carries the symphony review markers" do
+    in_temp_repo(fn ->
+      write_template!(@template)
+
+      body =
+        @valid_body <>
+          "\n<!-- symphony:review:start -->\n## How to review\n\n🟢 Safe\n<!-- symphony:review:end -->\n"
+
+      File.write!("body.md", body)
+
+      output = capture_io(fn -> Check.run(["lint", "--file", "body.md"]) end)
+      assert output =~ "PR body format OK"
+    end)
+  end
+
+  test "still fails on non-symphony placeholder comments" do
+    in_temp_repo(fn ->
+      write_template!(@template)
+      File.write!("body.md", @valid_body <> "\n<!-- TODO fill this in -->\n")
+
+      error_output =
+        capture_io(:stderr, fn ->
+          assert_raise Mix.Error, ~r/PR body format invalid/, fn ->
+            Check.run(["lint", "--file", "body.md"])
+          end
+        end)
+
+      assert error_output =~ "still contains template placeholder comments"
+    end)
+  end
+
   defp in_temp_repo(fun) do
     unique = System.unique_integer([:positive, :monotonic])
     root = Path.join(System.tmp_dir!(), "validate-pr-body-task-test-#{unique}")

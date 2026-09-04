@@ -7,16 +7,122 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentBackend,
+    AgentFailure,
+    AgentRunner,
+    Cardinality,
+    Config,
+    DrainStore,
+    FleetEvent,
+    LogFile,
+    OrchestratorVersion,
+    PersistentWorker,
+    QuotaCircuitStore,
+    RepoConfig,
+    RepositoryScheduler,
+    ResumePacket,
+    Router,
+    RunManifest,
+    SessionTranscript,
+    ShutdownPolicyStore,
+    StatusDashboard,
+    Telemetry,
+    TokenAccounting,
+    Tracker,
+    WaitWatcher,
+    Workspace,
+    WorkspaceGc
+  }
+
+  alias SymphonyElixir.Github.ReviewerRequest
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.PersistentWorker.Registry, as: PersistentWorkerRegistry
+
+  # States we treat as "the agent handed off to a human reviewer" — the
+  # moment an issue lands in any of these, request the issue owner as PR
+  # reviewer. Lowercased here because we normalize before membership-check.
+  # Not configurable on purpose: every consumer repo uses the same Linear
+  # convention for these state names, so a hardcoded set keeps config flat.
+  @review_states_set MapSet.new([
+                       "human review",
+                       "in review",
+                       "merging",
+                       "ready to merge"
+                     ])
+
+  @doc """
+  True when `state_name` is a review/merge state — one where the human is
+  the actor and the repo prompt (`WORKFLOW.md`) forbids the agent from
+  modifying, merging, or transitioning the PR.
+
+  This is the single source of truth for "the agent's contract in this
+  state is to do nothing": it drives both the reviewer-request path
+  (`maybe_request_owner_review/1`) and the dispatch guard in
+  `candidate_issue?/3`, and is reused by `AgentRunner` to stop an in-flight
+  run that lands in one of these states. Case/whitespace-insensitive.
+  """
+  @spec review_state?(String.t()) :: boolean()
+  def review_state?(state_name) when is_binary(state_name) do
+    MapSet.member?(@review_states_set, normalize_issue_state(state_name))
+  end
+
+  def review_state?(_state_name), do: false
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @quota_probe_default_ms 300_000
+  @quota_probe_max_ms 1_800_000
+  @quota_resume_spacing_ms 100
+  # Fallback flood guard for issue warnings (routing / cardinality /
+  # version gates). The persistent `symphony:routing-warned` label is the
+  # primary idempotency marker, but if that label write itself fails
+  # (e.g. Linear rate limiting) the marker never lands — and without this
+  # the warning would be re-attempted, comment and all, on every poll. A
+  # write storm like that can exhaust the tracker's hourly API budget and
+  # block dispatch for every issue. So we refuse to re-attempt a warning
+  # for the same issue within this cooldown, and stamp the marker BEFORE
+  # posting the comment (see `emit_issue_warning/4`). One hour mirrors
+  # Linear's rate-limit window.
+  @warn_retry_cooldown_ms 3_600_000
+  # When a poll comes back rate-limited, ease off the next tick instead of
+  # hammering. Bounded so a stale/huge Retry-After can't wedge the loop.
+  @default_rate_limit_backoff_ms 60_000
+  @max_rate_limit_backoff_ms 300_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @recent_codex_events_limit 200
+  @recent_codex_transcript_blocks_limit 80
+  @no_progress_decisions ~w(none provisional alert suppressed_progress progress_unavailable reset)
+  @no_progress_kinds ~w(repeated_error repeated_success_no_progress detector_unavailable)
+  @no_progress_omission_codes ~w(
+    assessment_failed invalid_signal normalization_failed pending_evicted signal_evicted
+    start_missing_correlation start_missing_operation start_without_terminal
+    terminal_missing_operation terminal_unmatched
+  )
+  @no_progress_count_keys ~w(
+    active_warning_count completed_attempts alerts progress_suppressions progress_unavailable
+    fingerprint_evictions signal_evictions
+  )a
+  @persistent_checkpoint_interval_ms 1_000
+  # Dead-man's-switch heartbeat (audit §9.10). The orchestrator writes
+  # ~/.symphony/heartbeat every 60s with the current poll-loop state. A
+  # cron-driven check-heartbeat script reads the file and surfaces a local
+  # alert if the timestamp is stale. The interval is short enough that a
+  # 5-minute cron poll catches a hang within one cycle.
+  @heartbeat_interval_ms 60_000
+  @heartbeat_filename "heartbeat"
+  # Issue-state-driven worktree GC (T28). One pass at startup, then once
+  # every 24h. The GC asks Linear for issues that recently transitioned
+  # to a terminal state and runs `git worktree remove` (no --force) on
+  # each, preserving any worktree that still holds local changes a
+  # human added. See `SymphonyElixir.WorkspaceGc`.
+  @workspace_gc_interval_ms 86_400_000
   @empty_codex_totals %{
     input_tokens: 0,
+    cached_input_tokens: 0,
     output_tokens: 0,
+    reasoning_tokens: 0,
     total_tokens: 0,
     seconds_running: 0
   }
@@ -33,12 +139,36 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :poll_backoff_until_ms,
+      :drain_started_at,
+      :shutdown_policy,
+      draining: false,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
+      # issue_id => count of consecutive failed/stalled agent runs since the
+      # issue last completed a turn normally. Only genuine run failures (crash,
+      # stall, handoff-review timeout, spawn failure) bump it; capacity waits
+      # and transient tracker errors don't. When it exceeds agent.max_retries,
+      # human-actionable configuration failures are marked Blocked while
+      # operational failures remain active at capped backoff. Kept separate
+      # from `retry_attempts` (which drives backoff timing) on purpose.
+      failure_counts: %{},
+      # issue_id => monotonic ms of the last warning attempt. Fallback
+      # flood guard for the routing/cardinality/version gates when the
+      # persistent `symphony:routing-warned` marker can't be written.
+      warned_at: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      # "backend::account-scope" => latest provider usage/rate-limit snapshot.
+      # Account scope matters because remote workers can use different provider
+      # credentials even when they run the same backend.
+      backend_rate_limits: %{},
+      # "backend::account-scope" => provider/account quota circuit. Parked
+      # retries remain claimed but have no per-issue timer while unavailable.
+      quota_circuits: %{},
+      queued: %{}
     ]
   end
 
@@ -53,6 +183,10 @@ defmodule SymphonyElixir.Orchestrator do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
+    quota_circuits = QuotaCircuitStore.load()
+    drain_state = DrainStore.load()
+    shutdown_policy = ShutdownPolicyStore.load()
+
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
       max_concurrent_agents: config.agent.max_concurrent_agents,
@@ -60,59 +194,87 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      draining: drain_state.enabled,
+      drain_started_at: drain_state.started_at,
+      shutdown_policy: shutdown_policy,
       codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      backend_rate_limits: %{},
+      quota_circuits: quota_circuits,
+      claimed: MapSet.new(restored_quota_claims(quota_circuits) ++ restored_wait_claims())
     }
+
+    state = arm_all_quota_circuits(state)
 
     run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
+    schedule_heartbeat(0)
+    schedule_workspace_gc(0)
 
-    {:ok, state}
+    {:ok, state, {:continue, :adopt_persistent_workers}}
+  end
+
+  @impl true
+  def handle_continue(:adopt_persistent_workers, %State{} = state) do
+    {:noreply, maybe_adopt_persistent_workers(state)}
   end
 
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
-    state = refresh_runtime_config(state)
+    case refresh_runtime_config(state) do
+      {:ok, state} ->
+        {:noreply, begin_poll_check(state)}
 
-    state = %{
-      state
-      | poll_check_in_progress: true,
-        next_poll_due_at_ms: nil,
-        tick_timer_ref: nil,
-        tick_token: nil
-    }
-
-    notify_dashboard()
-    :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+      {:error, reason} ->
+        {:noreply, skip_poll_cycle_on_invalid_config(state, reason)}
+    end
   end
 
   def handle_info({:tick, _tick_token}, state), do: {:noreply, state}
 
   def handle_info(:tick, state) do
-    state = refresh_runtime_config(state)
+    case refresh_runtime_config(state) do
+      {:ok, state} ->
+        {:noreply, begin_poll_check(state)}
 
-    state = %{
-      state
-      | poll_check_in_progress: true,
-        next_poll_due_at_ms: nil,
-        tick_timer_ref: nil,
-        tick_token: nil
-    }
-
-    notify_dashboard()
-    :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+      {:error, reason} ->
+        {:noreply, skip_poll_cycle_on_invalid_config(state, reason)}
+    end
   end
 
   def handle_info(:run_poll_cycle, state) do
-    state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
-    state = %{state | poll_check_in_progress: false}
+    case refresh_runtime_config(state) do
+      {:ok, state} ->
+        state = maybe_dispatch(state)
+        state = schedule_tick(state, poll_delay_ms(state))
+        state = %{state | poll_check_in_progress: false, poll_backoff_until_ms: nil}
 
-    notify_dashboard()
+        notify_dashboard()
+        {:noreply, state}
+
+      {:error, reason} ->
+        {:noreply, skip_poll_cycle_on_invalid_config(state, reason)}
+    end
+  end
+
+  def handle_info(:write_heartbeat, state) do
+    write_heartbeat(state)
+    schedule_heartbeat(@heartbeat_interval_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:run_workspace_gc, state) do
+    unless workspace_gc_disabled?() do
+      try do
+        WorkspaceGc.run_pass()
+      rescue
+        error ->
+          Logger.warning("WorkspaceGc pass crashed: #{Exception.message(error)}")
+      end
+    end
+
+    schedule_workspace_gc(@workspace_gc_interval_ms)
     {:noreply, state}
   end
 
@@ -126,34 +288,50 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+        running_entry = mark_resume_packet_transition(running_entry, :outer_worker_exit)
+
+        SessionTranscript.finalize(
+          Map.get(running_entry, :codex_session_logs, []),
+          if(reason == :normal, do: :success, else: :failure)
+        )
+
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_normal_worker_exit(state, running_entry, issue_id, session_id)
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
+              failure = failure_from_exit(reason, running_entry)
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              metadata = %{
                 identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
+                issue: Map.get(running_entry, :issue),
+                run_id: Map.get(running_entry, :run_id),
+                parent_run_id: Map.get(running_entry, :parent_run_id),
+                retry_id: Map.get(running_entry, :retry_id),
+                error: failure_error(reason, running_entry, failure),
+                backend: failure.backend || Map.get(running_entry, :backend),
+                failure: failure,
                 worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+                workspace_path: Map.get(running_entry, :workspace_path),
+                resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
+                codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+                recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
+              }
+
+              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} failure_class=#{failure.class} reason=#{failure.message}; scheduling policy action")
+
+              handle_typed_run_failure(
+                state,
+                issue_id,
+                next_attempt,
+                metadata,
+                Map.get(running_entry, :quota_probe) == true
+              )
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -174,9 +352,63 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:backend, runtime_info[:backend])
+          |> maybe_put_runtime_value(:model, runtime_info[:model])
+          |> maybe_put_runtime_value(:reasoning_effort, runtime_info[:reasoning_effort])
+          |> maybe_put_runtime_value(:profile, runtime_info[:profile])
+          |> maybe_put_runtime_value(:task_type, runtime_info[:task_type])
+          |> maybe_put_runtime_value(:routing_confidence, runtime_info[:routing_confidence])
+          |> maybe_put_runtime_value(:budget_profile, runtime_info[:budget_profile])
+          |> maybe_put_runtime_value(:budget_mode, runtime_info[:budget_mode])
+          |> maybe_put_runtime_value(:budget_metrics, runtime_info[:budget_metrics])
+          |> maybe_put_runtime_value(:budget_transitions, runtime_info[:budget_transitions])
+          |> maybe_put_runtime_value(:repository_id, runtime_info[:repository_id])
+          |> maybe_put_runtime_value(:scheduling_paths, runtime_info[:scheduling_paths])
+          |> maybe_put_runtime_value(:scheduling_path_source, runtime_info[:scheduling_path_source])
+          |> maybe_put_runtime_value(:base_sha, runtime_info[:base_sha])
+          |> maybe_put_runtime_value(:base_age_seconds, runtime_info[:base_age_seconds])
+          |> maybe_put_runtime_value(:candidate_base_sha, runtime_info[:candidate_base_sha])
+          |> maybe_put_runtime_value(:workspace_dirty, runtime_info[:workspace_dirty])
+          |> maybe_put_runtime_value(
+            :resume_packet_ref,
+            ResumePacket.reference_from_runtime_info(runtime_info)
+          )
+          |> maybe_put_no_progress_summary(runtime_info)
+
+        issue = Map.get(updated_running_entry, :issue, %{})
+
+        Telemetry.emit(:lifecycle, %{
+          action: "runtime_resolved",
+          issue_id: Map.get(issue, :id),
+          issue_identifier: Map.get(issue, :identifier),
+          parent_issue_id: Map.get(issue, :parent_id),
+          run_id: Map.get(updated_running_entry, :run_id),
+          parent_run_id: Map.get(updated_running_entry, :parent_run_id),
+          retry_id: Map.get(updated_running_entry, :retry_id),
+          retry_attempt: Map.get(updated_running_entry, :retry_attempt, 0),
+          backend: Map.get(updated_running_entry, :backend),
+          model: Map.get(updated_running_entry, :model),
+          reasoning_effort: Map.get(updated_running_entry, :reasoning_effort),
+          worker_host: Map.get(updated_running_entry, :worker_host) || "local"
+        })
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
+  def handle_info(
+        {:worker_run_failure, issue_id, worker_pid, %AgentFailure{} = failure},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_pid(worker_pid) do
+    case Map.get(running, issue_id) do
+      %{pid: ^worker_pid} = running_entry ->
+        updated = Map.put(running_entry, :run_failure, failure)
+        {:noreply, %{state | running: Map.put(running, issue_id, updated)}}
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -190,11 +422,14 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        updated_running_entry = RepositoryScheduler.observe_plan(updated_running_entry, update)
+        updated_running_entry = persist_codex_update(updated_running_entry, update)
+        updated_running_entry = remember_rate_limit_update(updated_running_entry, update)
 
         state =
           state
           |> apply_codex_token_delta(token_delta)
-          |> apply_codex_rate_limits(update)
+          |> apply_backend_rate_limits(update, running_entry)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -202,6 +437,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+
+  def handle_info(
+        {:handoff_review_heartbeat, issue_id, worker_pid, review_job_id, %DateTime{} = timestamp},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_pid(worker_pid) and is_integer(review_job_id) do
+    case Map.get(running, issue_id) do
+      %{
+        pid: ^worker_pid,
+        lifecycle_state: :handoff_pending_review,
+        handoff_review_job_id: ^review_job_id
+      } = running_entry ->
+        updated_running_entry = Map.put(running_entry, :handoff_review_last_event_at, timestamp)
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
@@ -216,17 +471,263 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  def handle_info({:quota_probe_due, circuit_key, timer_token}, state)
+      when is_binary(circuit_key) and is_reference(timer_token) do
+    state = handle_quota_probe_due(state, circuit_key, timer_token)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:wait_entries_ready, entries}, %State{} = state) when is_list(entries) do
+    state = schedule_ready_wait_entries(state, entries)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
   end
 
+  defp transition_agent_lifecycle(
+         running_entry,
+         :handoff_pending_gate,
+         %{gate_job_id: gate_job_id, gate: gate}
+       )
+       when is_map(running_entry) and is_binary(gate_job_id) and is_map(gate) do
+    now = DateTime.utc_now()
+    issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+    session_id = running_entry_session_id(running_entry)
+
+    lifecycle_started_at =
+      if previous_state == :handoff_pending_gate,
+        do: Map.get(running_entry, :lifecycle_started_at, now),
+        else: now
+
+    unless unchanged_handoff_gate_update?(running_entry, gate_job_id, gate) do
+      Logger.info(
+        "Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=handoff_pending_gate gate_job_id=#{gate_job_id} status=#{Map.get(gate, :status)}"
+      )
+
+      emit_agent_lifecycle(running_entry, previous_state, :handoff_pending_gate, %{
+        gate_job_id: gate_job_id,
+        gate_job_identity: Map.get(gate, :exact_hash),
+        gate_status: Map.get(gate, :status),
+        gate_stage: gate_progress_value(gate, "stage")
+      })
+    end
+
+    running_entry
+    |> Map.put(:lifecycle_state, :handoff_pending_gate)
+    |> Map.put(:lifecycle_started_at, lifecycle_started_at)
+    |> Map.put(:handoff_gate_job_id, gate_job_id)
+    |> Map.put(:handoff_gate_state, gate)
+  end
+
+  defp transition_agent_lifecycle(running_entry, :waiting, %{request: request})
+       when is_map(running_entry) and is_map(request) do
+    now = DateTime.utc_now()
+    issue = Map.get(running_entry, :issue, %{})
+    previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+
+    Logger.info(
+      "Agent lifecycle transition: issue_id=#{Map.get(issue, :id)} issue_identifier=#{Map.get(issue, :identifier)} session_id=#{running_entry_session_id(running_entry)} from=#{previous_state} to=waiting condition_key=#{request.condition_key}"
+    )
+
+    emit_agent_lifecycle(running_entry, previous_state, :waiting, %{
+      condition_key: request.condition_key,
+      condition_type: get_in(request, [:condition, "type"]),
+      reason: request.reason
+    })
+
+    running_entry
+    |> Map.put(:lifecycle_state, :waiting)
+    |> Map.put(:lifecycle_started_at, now)
+    |> Map.put(:wait_request, request)
+  end
+
+  defp transition_agent_lifecycle(
+         running_entry,
+         :handoff_pending_review,
+         %{
+           timeout_ms: timeout_ms,
+           review_job_id: review_job_id,
+           review_key: review_key
+         }
+       )
+       when is_map(running_entry) and is_integer(timeout_ms) and timeout_ms > 0 and
+              is_integer(review_job_id) do
+    now = DateTime.utc_now()
+    issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+    session_id = running_entry_session_id(running_entry)
+
+    continuing_review? =
+      previous_state == :handoff_pending_review and
+        Map.get(running_entry, :handoff_review_job_id) == review_job_id
+
+    lifecycle_started_at =
+      if continuing_review?, do: Map.get(running_entry, :lifecycle_started_at, now), else: now
+
+    last_event_at =
+      if continuing_review?, do: Map.get(running_entry, :handoff_review_last_event_at, now), else: now
+
+    Logger.info(
+      "Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=handoff_pending_review review_job_id=#{review_job_id} review_key=#{inspect(review_key)} timeout_ms=#{timeout_ms}"
+    )
+
+    emit_agent_lifecycle(running_entry, previous_state, :handoff_pending_review, %{
+      review_job_id: review_job_id,
+      gate_job_identity: inspect(review_key),
+      timeout_ms: timeout_ms
+    })
+
+    running_entry
+    |> Map.put(:lifecycle_state, :handoff_pending_review)
+    |> Map.put(:lifecycle_started_at, lifecycle_started_at)
+    |> Map.put(:handoff_review_job_id, review_job_id)
+    |> Map.put(:handoff_review_key, review_key)
+    |> Map.put(:handoff_review_timeout_ms, timeout_ms)
+    |> Map.put(:handoff_review_last_event_at, last_event_at)
+  end
+
+  defp transition_agent_lifecycle(
+         %{lifecycle_state: :handoff_pending_gate} = running_entry,
+         :implementing,
+         metadata
+       )
+       when is_map(metadata) do
+    if Map.get(running_entry, :handoff_gate_job_id) == Map.get(metadata, :gate_job_id) do
+      now = DateTime.utc_now()
+      issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+      outcome = Map.get(metadata, :gate_outcome, :unknown)
+      session_id = running_entry_session_id(running_entry)
+
+      Logger.info("Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=implementing gate_outcome=#{outcome}")
+
+      emit_agent_lifecycle(running_entry, previous_state, :implementing, %{
+        gate_job_id: Map.get(metadata, :gate_job_id),
+        gate_outcome: outcome
+      })
+
+      running_entry
+      |> Map.drop([:handoff_gate_job_id, :handoff_gate_state])
+      |> Map.put(:lifecycle_state, :implementing)
+      |> Map.put(:lifecycle_started_at, now)
+    else
+      running_entry
+    end
+  end
+
+  defp transition_agent_lifecycle(running_entry, :implementing, %{review_job_id: review_job_id} = metadata)
+       when is_map(running_entry) and is_integer(review_job_id) do
+    if Map.get(running_entry, :handoff_review_job_id) == review_job_id do
+      now = DateTime.utc_now()
+      issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      previous_state = Map.get(running_entry, :lifecycle_state, :implementing)
+      outcome = Map.get(metadata, :review_outcome, :unknown)
+      session_id = running_entry_session_id(running_entry)
+
+      Logger.info("Agent lifecycle transition: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} from=#{previous_state} to=implementing review_outcome=#{outcome}")
+
+      emit_agent_lifecycle(running_entry, previous_state, :implementing, %{
+        review_job_id: Map.get(metadata, :review_job_id),
+        review_outcome: outcome
+      })
+
+      running_entry
+      |> Map.drop([
+        :handoff_review_job_id,
+        :handoff_review_key,
+        :handoff_review_timeout_ms,
+        :handoff_review_last_event_at
+      ])
+      |> Map.put(:lifecycle_state, :implementing)
+      |> Map.put(:lifecycle_started_at, now)
+      |> Map.put(:review_state, Map.get(metadata, :review_state))
+    else
+      running_entry
+    end
+  end
+
+  defp transition_agent_lifecycle(running_entry, _lifecycle_state, _metadata),
+    do: running_entry
+
+  defp unchanged_handoff_gate_update?(running_entry, gate_job_id, gate) do
+    previous_gate = Map.get(running_entry, :handoff_gate_state, %{})
+
+    Map.get(running_entry, :lifecycle_state) == :handoff_pending_gate and
+      Map.get(running_entry, :handoff_gate_job_id) == gate_job_id and
+      Map.get(previous_gate, :status) == Map.get(gate, :status) and
+      gate_progress_value(previous_gate, "stage") == gate_progress_value(gate, "stage") and
+      gate_progress_value(previous_gate, "completed") == gate_progress_value(gate, "completed")
+  end
+
+  defp gate_progress_value(gate, "stage") when is_map(gate) do
+    progress = Map.get(gate, :progress) || Map.get(gate, "progress") || %{}
+    Map.get(progress, "stage") || Map.get(progress, :stage)
+  end
+
+  defp gate_progress_value(gate, "completed") when is_map(gate) do
+    progress = Map.get(gate, :progress) || Map.get(gate, "progress") || %{}
+    Map.get(progress, "completed") || Map.get(progress, :completed)
+  end
+
+  defp emit_agent_lifecycle(running_entry, from, to, details) do
+    issue = Map.get(running_entry, :issue, %{})
+
+    Telemetry.emit(:lifecycle, %{
+      action: "transition",
+      issue_id: Map.get(issue, :id),
+      issue_identifier: Map.get(issue, :identifier),
+      parent_issue_id: Map.get(issue, :parent_id),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
+      retry_attempt: Map.get(running_entry, :retry_attempt, 0),
+      session_id: Map.get(running_entry, :session_id),
+      backend: Map.get(running_entry, :backend),
+      from_state: from,
+      state: to,
+      details: details
+    })
+
+    phase =
+      case to do
+        :handoff_pending_review -> "review"
+        :handoff_pending_gate -> "handoff_gate"
+        :waiting -> "waiting"
+        _ -> "implementation"
+      end
+
+    Telemetry.emit(:phase, %{
+      issue_identifier: Map.get(issue, :identifier),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
+      retry_attempt: Map.get(running_entry, :retry_attempt, 0),
+      session_id: Map.get(running_entry, :session_id),
+      phase: phase,
+      action: "transition"
+    })
+  end
+
+  defp maybe_dispatch(%State{draining: true} = state) do
+    state |> maybe_adopt_persistent_workers() |> reconcile_running_issues()
+  end
+
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+    state = state |> maybe_adopt_persistent_workers() |> reconcile_stalled_running_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      state = reconcile_running_issues_from_candidates(state, issues)
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -247,29 +748,51 @@ defmodule SymphonyElixir.Orchestrator do
 
         state
 
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+      {:error, {:rate_limited, retry_after_ms}} ->
+        Logger.warning("Linear rate limit hit during poll; backing off next tick. retry_after_ms=#{inspect(retry_after_ms)}")
 
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
-
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
-
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        arm_poll_backoff(state, retry_after_ms)
 
       {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
-        state
+        handle_poll_failure(reason, state)
     end
+  end
+
+  defp handle_poll_failure(reason, state) do
+    case AgentFailure.classify(reason) do
+      %AgentFailure{class: :rate_limited, retry_after_ms: retry_after_ms} ->
+        Logger.warning("Linear rate limit hit during poll; backing off next tick. retry_after_ms=#{inspect(retry_after_ms)}")
+
+        arm_poll_backoff(state, retry_after_ms)
+
+      _failure ->
+        handle_non_rate_limited_poll_failure(reason, state)
+    end
+  end
+
+  defp handle_non_rate_limited_poll_failure({:invalid_workflow_config, message}, state) do
+    Logger.error("Invalid WORKFLOW.md config: #{message}")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure({:missing_workflow_file, path, reason}, state) do
+    Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure(:workflow_front_matter_not_a_map, state) do
+    Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure({:workflow_parse_error, reason}, state) do
+    Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+    state
+  end
+
+  defp handle_non_rate_limited_poll_failure(reason, state) do
+    Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+    state
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -297,6 +820,83 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp reconcile_running_issues_from_candidates(%State{} = state, candidate_issues)
+       when is_list(candidate_issues) do
+    reconcile_running_issues_from_candidates(
+      state,
+      candidate_issues,
+      &Tracker.fetch_issue_states_by_ids/1
+    )
+  end
+
+  @doc false
+  @spec reconcile_running_issues_from_candidates_for_test(
+          term(),
+          [Issue.t()],
+          ([String.t()] -> {:ok, [Issue.t()]} | {:error, term()})
+        ) :: term()
+  def reconcile_running_issues_from_candidates_for_test(
+        %State{} = state,
+        candidate_issues,
+        issue_state_fetcher
+      )
+      when is_list(candidate_issues) and is_function(issue_state_fetcher, 1) do
+    reconcile_running_issues_from_candidates(state, candidate_issues, issue_state_fetcher)
+  end
+
+  defp reconcile_running_issues_from_candidates(
+         %State{} = state,
+         candidate_issues,
+         issue_state_fetcher
+       )
+       when is_list(candidate_issues) and is_function(issue_state_fetcher, 1) do
+    running_ids = Map.keys(state.running)
+    running_id_set = MapSet.new(running_ids)
+
+    visible_running_issues =
+      Enum.filter(candidate_issues, fn
+        %Issue{id: issue_id} when is_binary(issue_id) -> MapSet.member?(running_id_set, issue_id)
+        _issue -> false
+      end)
+
+    visible_running_ids =
+      visible_running_issues
+      |> Enum.map(& &1.id)
+      |> MapSet.new()
+
+    state =
+      reconcile_running_issue_states(
+        visible_running_issues,
+        state,
+        active_state_set(),
+        terminal_state_set()
+      )
+
+    missing_ids = Enum.reject(running_ids, &MapSet.member?(visible_running_ids, &1))
+
+    case missing_ids do
+      [] ->
+        state
+
+      ids ->
+        case issue_state_fetcher.(ids) do
+          {:ok, issues} ->
+            issues
+            |> reconcile_running_issue_states(
+              state,
+              active_state_set(),
+              terminal_state_set()
+            )
+            |> reconcile_missing_running_issue_ids(ids, issues)
+
+          {:error, reason} ->
+            Logger.debug("Failed to refresh running issues absent from candidate poll: #{inspect(reason)}; keeping active workers")
+
+            state
+        end
+    end
+  end
+
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
@@ -314,6 +914,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec choose_issues_for_test([Issue.t()], term()) :: term()
+  def choose_issues_for_test(issues, %State{} = state) when is_list(issues) do
+    choose_issues(issues, state)
+  end
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -328,9 +934,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec repository_schedule_for_test(Issue.t(), map(), map()) :: RepositoryScheduler.decision()
+  def repository_schedule_for_test(%Issue{} = issue, repo_config, running) do
+    RepositoryScheduler.decide(issue, repo_config, running)
+  end
+
+  @doc false
+  @spec implementation_slots_used_for_test(map()) :: non_neg_integer()
+  def implementation_slots_used_for_test(running) when is_map(running) do
+    implementation_slots_used(running)
+  end
+
+  @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec gate_routing_and_cardinality_for_test(Issue.t(), map(), MapSet.t()) :: term()
+  def gate_routing_and_cardinality_for_test(%Issue{} = issue, repo_config, %MapSet{} = active_states) do
+    gate_routing_and_cardinality(issue, repo_config, active_states)
+  end
+
+  @doc false
+  @spec emit_issue_warning_for_test(term(), Issue.t(), String.t(), term()) :: term()
+  def emit_issue_warning_for_test(%State{} = state, %Issue{} = issue, body, telemetry) do
+    emit_issue_warning(state, issue, body, telemetry)
+  end
+
+  @doc false
+  @spec ensure_observability_policy_for_test(map(), (-> map())) :: map()
+  def ensure_observability_policy_for_test(running_entry, resolver)
+      when is_map(running_entry) and is_function(resolver, 0) do
+    ensure_observability_policy(running_entry, resolver)
+  end
+
+  @doc false
+  @spec poll_delay_ms_for_test(term()) :: non_neg_integer()
+  def poll_delay_ms_for_test(%State{} = state), do: poll_delay_ms(state)
+
+  @doc false
+  @spec arm_poll_backoff_for_test(term(), term()) :: term()
+  def arm_poll_backoff_for_test(%State{} = state, retry_after_ms) do
+    arm_poll_backoff(state, retry_after_ms)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -362,11 +1009,26 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
+        maybe_request_owner_review(issue)
         terminate_running_issue(state, issue.id, false)
     end
   end
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  # Idempotent on the GitHub side (re-POSTing an already-requested reviewer
+  # is a no-op), so we do not persist "we already asked for this" — calling
+  # on every poll where the issue sits in a review state is fine.
+  defp maybe_request_owner_review(%Issue{state: state_name} = issue) when is_binary(state_name) do
+    if review_state?(state_name) do
+      mapping = Config.settings!().linear_to_github || []
+      ReviewerRequest.request_for_issue(issue, mapping)
+    else
+      :ok
+    end
+  end
+
+  defp maybe_request_owner_review(_issue), do: :ok
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -417,7 +1079,7 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         release_issue_claim(state, issue_id)
 
-      %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+      %{ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
@@ -425,9 +1087,7 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(identifier, worker_host)
         end
 
-        if is_pid(pid) do
-          terminate_task(pid)
-        end
+        stop_running_worker(running_entry)
 
         if is_reference(ref) do
           Process.demonitor(ref, [:flush])
@@ -437,7 +1097,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            failure_counts: Map.delete(state.failure_counts, issue_id)
         }
 
       _ ->
@@ -446,21 +1107,85 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
+    if map_size(state.running) == 0 do
+      state
+    else
+      now = DateTime.utc_now()
 
-    cond do
-      timeout_ms <= 0 ->
-        state
+      Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+        # UDPE-6952: resolve the stall timeout from the issue's RUNNING backend
+        # namespace. `running_entry.backend` is a name string ("codex"/"acp"/
+        # "claude_code"), or nil before the backend reports in — nil correctly
+        # falls back to codex.
+        timeout_ms = Config.backend_stall_timeout_ms(Map.get(running_entry, :backend))
+        reconcile_running_issue_timeout(state_acc, issue_id, running_entry, now, timeout_ms)
+      end)
+    end
+  end
 
-      map_size(state.running) == 0 ->
-        state
+  defp reconcile_running_issue_timeout(
+         state,
+         _issue_id,
+         %{lifecycle_state: :handoff_pending_gate},
+         _now,
+         _implementor_timeout_ms
+       ) do
+    state
+  end
 
-      true ->
-        now = DateTime.utc_now()
+  defp reconcile_running_issue_timeout(
+         state,
+         issue_id,
+         %{lifecycle_state: :handoff_pending_review} = running_entry,
+         now,
+         _implementor_timeout_ms
+       ) do
+    restart_timed_out_handoff_review(state, issue_id, running_entry, now)
+  end
 
-        Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-          restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
-        end)
+  defp reconcile_running_issue_timeout(state, issue_id, running_entry, now, timeout_ms) do
+    if timeout_ms > 0 do
+      restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
+    else
+      state
+    end
+  end
+
+  defp restart_timed_out_handoff_review(state, issue_id, running_entry, now) do
+    timeout_ms = Map.get(running_entry, :handoff_review_timeout_ms)
+    elapsed_ms = handoff_review_elapsed_ms(running_entry, now)
+
+    if is_integer(timeout_ms) and timeout_ms > 0 and is_integer(elapsed_ms) and
+         elapsed_ms > timeout_ms do
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      session_id = running_entry_session_id(running_entry)
+
+      Logger.warning(
+        "Handoff review timed out: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms} timeout_ms=#{timeout_ms}; clearing pending review and restarting with backoff"
+      )
+
+      next_attempt = next_retry_attempt_from_running(running_entry)
+
+      state
+      |> terminate_running_issue(issue_id, false)
+      |> schedule_failure_retry(issue_id, next_attempt, %{
+        identifier: identifier,
+        issue: Map.get(running_entry, :issue),
+        run_id: Map.get(running_entry, :run_id),
+        parent_run_id: Map.get(running_entry, :parent_run_id),
+        retry_id: Map.get(running_entry, :retry_id),
+        error: "handoff review timed out after #{elapsed_ms}ms without reviewer activity",
+        backend: Map.get(running_entry, :backend),
+        failure:
+          AgentFailure.classify(:handoff_review_timeout,
+            backend: Map.get(running_entry, :backend)
+          ),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        resume_packet_ref: Map.get(running_entry, :resume_packet_ref)
+      })
+    else
+      state
     end
   end
 
@@ -477,9 +1202,18 @@ defmodule SymphonyElixir.Orchestrator do
 
       state
       |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
+      |> schedule_failure_retry(issue_id, next_attempt, %{
         identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
+        issue: Map.get(running_entry, :issue),
+        run_id: Map.get(running_entry, :run_id),
+        parent_run_id: Map.get(running_entry, :parent_run_id),
+        retry_id: Map.get(running_entry, :retry_id),
+        error: "stalled for #{elapsed_ms}ms without codex activity",
+        backend: Map.get(running_entry, :backend),
+        failure: AgentFailure.classify(:stalled, backend: Map.get(running_entry, :backend)),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        resume_packet_ref: Map.get(running_entry, :resume_packet_ref)
       })
     else
       state
@@ -499,10 +1233,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    [
+      Map.get(running_entry, :last_codex_timestamp),
+      Map.get(running_entry, :lifecycle_started_at),
+      Map.get(running_entry, :started_at)
+    ]
+    |> Enum.filter(&match?(%DateTime{}, &1))
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
   end
 
-  defp last_activity_timestamp(_running_entry), do: nil
+  defp handoff_review_elapsed_ms(running_entry, now) do
+    running_entry
+    |> handoff_review_activity_timestamp()
+    |> case do
+      %DateTime{} = timestamp -> max(0, DateTime.diff(now, timestamp, :millisecond))
+      _ -> nil
+    end
+  end
+
+  defp handoff_review_activity_timestamp(running_entry) when is_map(running_entry) do
+    [
+      Map.get(running_entry, :handoff_review_last_event_at),
+      Map.get(running_entry, :lifecycle_started_at)
+    ]
+    |> Enum.filter(&match?(%DateTime{}, &1))
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
+  end
 
   defp terminate_task(pid) when is_pid(pid) do
     case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
@@ -514,35 +1270,408 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_task(_pid), do: :ok
+  defp stop_running_worker(%{pid: pid, persistent_worker_id: worker_id})
+       when is_pid(pid) and is_binary(worker_id) do
+    PersistentWorker.stop(pid)
+  end
+
+  defp stop_running_worker(%{pid: pid}) when is_pid(pid), do: terminate_task(pid)
+  defp stop_running_worker(_running_entry), do: :ok
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    repo_config = load_repo_config_or_default()
+
+    state = %{
+      state
+      | queued:
+          retain_queue_timestamps(
+            state.queued,
+            issues,
+            state,
+            active_states,
+            terminal_states
+          )
+    }
 
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
-      end
+      consider_issue_for_dispatch(issue, state_acc, repo_config, active_states, terminal_states)
     end)
   end
 
-  defp sort_issues_for_dispatch(issues) when is_list(issues) do
-    Enum.sort_by(issues, fn
-      %Issue{} = issue ->
-        {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+  defp consider_issue_for_dispatch(issue, state, repo_config, active_states, terminal_states) do
+    if eligible_issue_for_dispatch?(issue, state, active_states, terminal_states) do
+      issue
+      |> gate_routing_and_cardinality(repo_config, active_states)
+      |> apply_gate_decision(state, issue, repo_config)
+    else
+      state
+    end
+  end
+
+  defp apply_gate_decision(:pass, state, issue, repo_config) do
+    case RepositoryScheduler.decide(issue, repo_config, state.running) do
+      {:allow, decision} ->
+        if dispatch_capacity_available?(issue, state) do
+          state
+          |> allow_scheduling_dispatch(issue, decision)
+          |> dispatch_issue(issue)
+        else
+          queue_scheduling_decision(
+            state,
+            issue,
+            Map.put(decision, :reason, "orchestrator_capacity")
+          )
+        end
+
+      {:queue, decision} ->
+        queue_scheduling_decision(state, issue, decision)
+    end
+  end
+
+  defp apply_gate_decision(:skip_silent, state, _issue, _repo_config), do: state
+
+  defp apply_gate_decision({:skip_warn, body, telemetry}, state, issue, _repo_config) do
+    emit_issue_warning(state, issue, body, telemetry)
+  end
+
+  defp queue_scheduling_decision(%State{} = state, %Issue{} = issue, decision) do
+    now_ms = System.monotonic_time(:millisecond)
+    previous = Map.get(state.queued, issue.id)
+    queued_at_ms = (previous && previous.queued_at_ms) || now_ms
+
+    entry =
+      decision
+      |> Map.merge(%{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        state: issue.state,
+        priority: issue.priority,
+        priority_rank: Issue.dispatch_priority_rank(issue.priority),
+        created_at_key: issue_created_at_sort_key(issue),
+        queued_at_ms: queued_at_ms
+      })
+
+    if is_nil(previous) or queue_fingerprint(previous) != queue_fingerprint(entry) do
+      emit_scheduling_decision(issue, entry, "queue")
+    end
+
+    %{state | queued: Map.put(state.queued, issue.id, entry)}
+  end
+
+  defp emit_scheduling_decision(%Issue{} = issue, decision, action) do
+    Telemetry.emit(:scheduling, %{
+      action: action,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      repository: decision.repository_id || "default",
+      reason: decision.reason,
+      policy: decision.policy,
+      predicted_paths: decision.predicted_paths,
+      overlap_paths: decision.overlap_paths,
+      overlap_score: decision.overlap_score,
+      suggested_order: decision.suggested_order,
+      suggested_order_omitted: decision.suggested_order_omitted,
+      override: decision.override,
+      max_concurrent: decision.max_concurrent,
+      queue_time_ms: Map.get(decision, :queue_time_ms, 0)
+    })
+  end
+
+  defp queue_fingerprint(entry) do
+    {entry.reason, entry.overlap_paths, entry.suggested_order, entry.suggested_order_omitted, entry.override}
+  end
+
+  defp drop_queued(%State{} = state, issue_id), do: %{state | queued: Map.delete(state.queued, issue_id)}
+
+  defp maybe_add_queue_time(decision, %{queued_at_ms: queued_at_ms}) when is_integer(queued_at_ms) do
+    Map.put(decision, :queue_time_ms, max(0, System.monotonic_time(:millisecond) - queued_at_ms))
+  end
+
+  defp maybe_add_queue_time(decision, _entry), do: decision
+
+  defp allow_scheduling_dispatch(%State{} = state, %Issue{} = issue, decision) do
+    decision = maybe_add_queue_time(decision, state.queued[issue.id])
+    emit_scheduling_decision(issue, decision, "dispatch")
+    drop_queued(state, issue.id)
+  end
+
+  defp retain_queue_timestamps(queued, issues, state, active_states, terminal_states) do
+    eligible_ids =
+      issues
+      |> Enum.filter(fn
+        %Issue{} = issue ->
+          candidate_issue?(issue, active_states, terminal_states) and
+            !issue_blocked_by_non_terminal?(issue, terminal_states) and
+            (!MapSet.member?(state.claimed, issue.id) or Map.has_key?(state.retry_attempts, issue.id)) and
+            !Map.has_key?(state.running, issue.id)
+
+        _other ->
+          false
+      end)
+      |> Enum.map(& &1.id)
+      |> MapSet.new()
+
+    Map.filter(queued, fn {issue_id, _entry} -> MapSet.member?(eligible_ids, issue_id) end)
+  end
+
+  defp repository_id(%Issue{} = issue) do
+    case RepoConfig.load() do
+      {:ok, config} ->
+        case RepoConfig.match_repo(config, issue.labels) do
+          nil -> nil
+          repo -> repo.id
+        end
+
+      _error ->
+        nil
+    end
+  end
+
+  defp scheduling_paths(%Issue{} = issue) do
+    case RepoConfig.load() do
+      {:ok, config} -> RepositoryScheduler.predicted_paths(issue, RepoConfig.match_repo(config, issue.labels))
+      _error -> RepositoryScheduler.predicted_paths(issue, nil)
+    end
+  end
+
+  defp load_repo_config_or_default do
+    case RepoConfig.load() do
+      {:ok, config} ->
+        config
+
+      {:error, reason} ->
+        Logger.warning("Failed to load ~/.symphony/repos.yaml; using legacy single-repo mode: #{inspect(reason)}")
+        RepoConfig.empty()
+    end
+  end
+
+  # Apply the multi-repo routing and cardinality gates before dispatch.
+  # When repos.yaml is unconfigured (`source == :default`), we run in
+  # legacy single-repo mode and skip both gates — preserves backwards
+  # compat for hosts that have not yet migrated to the multi-repo driver.
+  #
+  # Each gate is a *pure decision*: it returns `:pass`, `:skip_silent`, or
+  # `{:skip_warn, body, {telemetry_event, meta}}`. Emitting the warning
+  # (the only side effect) is centralized in `emit_issue_warning/4` so the
+  # flood guard is applied uniformly. `with :pass <- ...` short-circuits on
+  # the first gate that skips.
+  defp gate_routing_and_cardinality(%Issue{} = _issue, %{source: :default}, _active_states), do: :pass
+
+  defp gate_routing_and_cardinality(%Issue{} = issue, %{} = repo_config, %MapSet{} = active_states) do
+    with :pass <- gate_orchestrator_version(issue),
+         :pass <- gate_routing(issue, repo_config, active_states) do
+      gate_cardinality(issue, repo_config)
+    end
+  end
+
+  defp gate_orchestrator_version(%Issue{} = issue) do
+    case OrchestratorVersion.check() do
+      :ok ->
+        :pass
+
+      {:incompatible, requirement, current_version} ->
+        body = OrchestratorVersion.incompatibility_comment(requirement, current_version)
+
+        {:skip_warn, body,
+         {:version_skip,
+          %{
+            issue_id: issue.id,
+            identifier: issue.identifier,
+            requirement: requirement,
+            current: current_version
+          }}}
+
+      {:invalid_requirement, requirement} ->
+        Logger.error("Ignoring invalid orchestrator_version_required in WORKFLOW.md: #{inspect(requirement)}")
+
+        :pass
+    end
+  end
+
+  defp gate_routing(%Issue{} = issue, %{} = repo_config, %MapSet{} = active_states) do
+    case Router.route(issue, repo_config) do
+      {:ok, _repo} ->
+        :pass
+
+      {:skip, :legacy_mode} ->
+        :pass
+
+      {:skip, reason, _ctx} = decision ->
+        if Router.should_warn?(decision, issue, active_states) do
+          body = Router.warning_comment(issue, decision, repo_config)
+
+          {:skip_warn, body, {:routing_skip, %{issue_id: issue.id, identifier: issue.identifier, reason: Atom.to_string(reason)}}}
+        else
+          :skip_silent
+        end
+    end
+  end
+
+  defp gate_cardinality(%Issue{} = issue, %{} = repo_config) do
+    case Cardinality.check(issue, repo_config) do
+      :ok ->
+        :pass
+
+      {:not_enforced, _} ->
+        :pass
+
+      {:violations, violations} ->
+        body = Cardinality.violation_comment(issue, violations)
+
+        {:skip_warn, body,
+         {:cardinality_skip,
+          %{
+            issue_id: issue.id,
+            identifier: issue.identifier,
+            violations: Enum.map(violations, &Atom.to_string/1)
+          }}}
+    end
+  end
+
+  # Flood-safe emitter shared by every gate warning. Two guards stop a
+  # warning from becoming a per-poll write storm when the marker write
+  # fails (the incident that motivated this):
+  #
+  #   1. Persistent — the `symphony:routing-warned` label. Once it lands,
+  #      `Router.already_warned?/1` suppresses the warning permanently,
+  #      across restarts.
+  #   2. In-memory fallback — a per-issue cooldown (`warned_at`). If the
+  #      label write keeps failing (e.g. Linear rate limiting) the marker
+  #      never lands, so this bounds re-attempts to once per cooldown
+  #      instead of once per 15s tick.
+  #
+  # The marker is stamped BEFORE the comment. If the stamp fails we post
+  # nothing and record the attempt, so a partial failure can never leave
+  # an un-suppressed comment that re-fires and re-comments next poll.
+  defp emit_issue_warning(%State{} = state, %Issue{} = issue, body, {event, meta})
+       when is_binary(body) do
+    cond do
+      Router.already_warned?(issue) ->
+        state
+
+      within_warn_cooldown?(state, issue) ->
+        state
+
+      true ->
+        state = record_warn_attempt(state, issue)
+
+        case Tracker.add_label(issue.id, Router.routing_warned_label()) do
+          :ok ->
+            _ = Tracker.create_comment(issue.id, body)
+            Telemetry.emit(event, meta)
+            Logger.info("Issue warning emitted (#{event}): #{issue_context(issue)}; routing-warned label applied")
+            state
+
+          {:error, reason} ->
+            Logger.warning("Deferring #{event} warning for #{issue_context(issue)}; marker label write failed: #{inspect(reason)}")
+
+            state
+        end
+    end
+  end
+
+  defp within_warn_cooldown?(%State{warned_at: warned_at}, %Issue{id: issue_id})
+       when is_map(warned_at) and is_binary(issue_id) do
+    case Map.get(warned_at, issue_id) do
+      last when is_integer(last) ->
+        System.monotonic_time(:millisecond) - last < warn_retry_cooldown_ms()
 
       _ ->
-        {priority_rank(nil), issue_created_at_sort_key(nil), ""}
-    end)
+        false
+    end
   end
 
-  defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
-  defp priority_rank(_priority), do: 5
+  defp within_warn_cooldown?(_state, _issue), do: false
+
+  defp record_warn_attempt(%State{warned_at: warned_at} = state, %Issue{id: issue_id})
+       when is_map(warned_at) and is_binary(issue_id) do
+    %{state | warned_at: Map.put(warned_at, issue_id, System.monotonic_time(:millisecond))}
+  end
+
+  defp record_warn_attempt(state, _issue), do: state
+
+  defp warn_retry_cooldown_ms do
+    Application.get_env(:symphony_elixir, :warn_retry_cooldown_ms, @warn_retry_cooldown_ms)
+  end
+
+  # Rate-limit backoff for the poll loop. `arm_poll_backoff/2` stamps a
+  # deadline on the state; `poll_delay_ms/1` extends the next tick to
+  # honor it (clamped to at least the normal interval). The deadline is a
+  # one-shot: `run_poll_cycle` clears it after scheduling, so a recovered
+  # budget resumes the normal cadence immediately.
+  defp arm_poll_backoff(%State{} = state, retry_after_ms) do
+    backoff = rate_limit_backoff_ms(retry_after_ms)
+    %{state | poll_backoff_until_ms: System.monotonic_time(:millisecond) + backoff}
+  end
+
+  defp rate_limit_backoff_ms(retry_after_ms) when is_integer(retry_after_ms) and retry_after_ms > 0 do
+    retry_after_ms
+    |> max(@default_rate_limit_backoff_ms)
+    |> min(@max_rate_limit_backoff_ms)
+  end
+
+  defp rate_limit_backoff_ms(_retry_after_ms), do: @default_rate_limit_backoff_ms
+
+  # Issue-specific retries can safely honor the full tracker hint. The poll
+  # loop remains capped so it can probe for recovery, but retrying the same
+  # issue early only spends more of the exhausted budget.
+  defp tracker_retry_delay_ms(retry_after_ms)
+       when is_integer(retry_after_ms) and retry_after_ms > 0,
+       do: max(retry_after_ms, @default_rate_limit_backoff_ms)
+
+  defp tracker_retry_delay_ms(_retry_after_ms), do: @default_rate_limit_backoff_ms
+
+  defp poll_delay_ms(%State{poll_backoff_until_ms: until, poll_interval_ms: interval})
+       when is_integer(until) do
+    max(interval, until - System.monotonic_time(:millisecond))
+  end
+
+  defp poll_delay_ms(%State{poll_interval_ms: interval}), do: interval
+
+  defp sort_issues_for_dispatch(issues) when is_list(issues) do
+    issues
+    |> Enum.sort_by(fn
+      %Issue{} = issue ->
+        {Issue.dispatch_priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+
+      _ ->
+        {Issue.dispatch_priority_rank(nil), issue_created_at_sort_key(nil), ""}
+    end)
+    |> dependency_stable_sort()
+  end
+
+  defp dependency_stable_sort(issues) do
+    ids =
+      MapSet.new(
+        Enum.flat_map(issues, fn
+          %Issue{id: id} when is_binary(id) -> [id]
+          _ -> []
+        end)
+      )
+
+    {sorted, remaining} =
+      Enum.reduce_while(1..max(length(issues), 1), {[], issues}, fn _pass, {sorted, remaining} ->
+        sorted_ids = MapSet.new(Enum.map(sorted, & &1.id))
+
+        {ready, blocked} =
+          Enum.split_with(remaining, fn issue ->
+            issue
+            |> Map.get(:blocked_by, [])
+            |> Enum.map(&Map.get(&1, :id))
+            |> Enum.filter(&MapSet.member?(ids, &1))
+            |> Enum.all?(&MapSet.member?(sorted_ids, &1))
+          end)
+
+        if ready == [], do: {:halt, {sorted, remaining}}, else: {:cont, {sorted ++ ready, blocked}}
+      end)
+
+    sorted ++ remaining
+  end
 
   defp issue_created_at_sort_key(%Issue{created_at: %DateTime{} = created_at}) do
     DateTime.to_unix(created_at, :microsecond)
@@ -553,20 +1682,31 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
+         %State{} = state,
+         active_states,
+         terminal_states
+       ) do
+    eligible_issue_for_dispatch?(issue, state, active_states, terminal_states) and
+      dispatch_capacity_available?(issue, state)
+  end
+
+  defp eligible_issue_for_dispatch?(
+         %Issue{} = issue,
          %State{running: running, claimed: claimed} = state,
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+    state.draining != true and
+      candidate_issue?(issue, active_states, terminal_states) and
+      !issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
-      available_slots(state) > 0 and
-      state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      backend_dispatch_available?(state, predicted_backend(issue))
   end
 
-  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp dispatch_capacity_available?(%Issue{} = issue, %State{} = state) do
+    dispatch_slots_available?(issue, state) and worker_slots_available?(state)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -580,8 +1720,9 @@ defmodule SymphonyElixir.Orchestrator do
     normalized_state = normalize_issue_state(issue_state)
 
     Enum.count(running, fn
-      {_id, %{issue: %Issue{state: state_name}}} ->
-        normalize_issue_state(state_name) == normalized_state
+      {_id, %{issue: %Issue{state: state_name}} = running_entry} ->
+        consumes_implementation_slot?(running_entry) and
+          normalize_issue_state(state_name) == normalized_state
 
       _ ->
         false
@@ -599,9 +1740,24 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        )
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
+    # Never dispatch an implementor to a review/merge state (Human
+    # Review, In Review, Merging, Ready to Merge). In those states the
+    # human is the actor and the repo prompt (WORKFLOW.md) forbids the
+    # agent from modifying/merging/transitioning the PR — humans merge.
+    # Symphony has no merge logic of its own, so an agent dispatched here
+    # can only no-op every turn: AgentRunner.do_run_codex_turns keeps
+    # continuing while the tracker state stays "active" and wastes every
+    # available turn before the next continuation session. This guard is
+    # authoritative regardless of
+    # tracker.active_states: even if a host's config lists such a state as
+    # active (the historical misconfiguration this fixes), we refuse to
+    # pick it up as implementor work. These states are instead serviced by
+    # the reviewer-request path (maybe_request_owner_review/1), which asks
+    # the issue owner to review the PR and never spawns an agent.
     issue_routable_to_worker?(issue) and
       active_issue_state?(state_name, active_states) and
-      !terminal_issue_state?(state_name, terminal_states)
+      !terminal_issue_state?(state_name, terminal_states) and
+      !review_state?(state_name)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
@@ -612,22 +1768,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp issue_routable_to_worker?(_issue), do: true
 
-  defp todo_issue_blocked_by_non_terminal?(
-         %Issue{state: issue_state, blocked_by: blockers},
-         terminal_states
-       )
-       when is_binary(issue_state) and is_list(blockers) do
-    normalize_issue_state(issue_state) == "todo" and
-      Enum.any?(blockers, fn
-        %{state: blocker_state} when is_binary(blocker_state) ->
-          !terminal_issue_state?(blocker_state, terminal_states)
+  defp issue_blocked_by_non_terminal?(%Issue{blocked_by: blockers}, terminal_states)
+       when is_list(blockers) do
+    Enum.any?(blockers, fn
+      %{state: blocker_state} when is_binary(blocker_state) ->
+        !terminal_issue_state?(blocker_state, terminal_states)
 
-        _ ->
-          true
-      end)
+      _ ->
+        true
+    end)
   end
 
-  defp todo_issue_blocked_by_non_terminal?(_issue, _terminal_states), do: false
+  defp issue_blocked_by_non_terminal?(_issue, _terminal_states), do: false
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -657,71 +1809,90 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, agent_opts \\ []) do
+    {_outcome, state} = dispatch_issue_outcome(state, issue, attempt, preferred_worker_host, agent_opts)
+    state
+  end
+
+  # Revalidates `issue` against the tracker immediately before dispatch and
+  # reports the outcome so callers can react to a skip/error.
+  #
+  # The fresh-poll path (`choose_issues`) calls `dispatch_issue/4` and discards
+  # the tag: the issue was never claimed there, so a skipped/failed
+  # revalidation is a harmless no-op. The retry/continuation path
+  # (`handle_active_retry`) calls this directly because it holds the issue's
+  # claim and has already consumed its retry entry — a silently-dropped
+  # skip/error there would strand the claim in `state.claimed` until the next
+  # restart (every poll is gated on `!MapSet.member?(claimed, issue.id)`), so it
+  # must release the claim or reschedule. See `dispatch_active_retry/4`.
+  defp dispatch_issue_outcome(%State{} = state, issue, attempt, preferred_worker_host, agent_opts) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        {:dispatched, do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, agent_opts)}
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
-        state
+        {:skip, state}
 
       {:skip, %Issue{} = refreshed_issue} ->
         Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
 
-        state
+        {:skip, state}
 
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        {:error, state}
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
-    recipient = self()
+  defp do_dispatch_issue(%State{draining: true} = state, _issue, _attempt, _preferred_worker_host, _agent_opts),
+    do: state
 
-    case select_worker_host(state, preferred_worker_host) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, agent_opts) do
+    recipient = self()
+    backend = predicted_backend(issue)
+
+    case select_worker_host_for_backend(state, preferred_worker_host, backend, issue.id) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, agent_opts)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
-         end) do
-      {:ok, pid} ->
-        ref = Process.monitor(pid)
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, agent_opts) do
+    proposed_identity = RunManifest.execution_identity(attempt, agent_opts)
+    runner_opts = Keyword.merge(agent_opts, Map.to_list(Map.delete(proposed_identity, :attempt)))
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+    case start_issue_worker(issue, attempt, recipient, worker_host, runner_opts) do
+      {:ok, pid, persistent_worker_id, identity, resume_packet_ref} ->
+        ref = Process.monitor(pid)
+        if Keyword.has_key?(agent_opts, :wait_resume_prompt), do: wait_watcher_acknowledge(issue.id)
+
+        Logger.info(
+          "Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} persistent_worker_id=#{persistent_worker_id || "none"} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+        )
 
         running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
-          })
+          Map.put(
+            state.running,
+            issue.id,
+            new_running_entry(
+              state,
+              issue,
+              worker_host,
+              %{
+                pid: pid,
+                ref: ref,
+                persistent_worker_id: persistent_worker_id,
+                started_at: DateTime.utc_now(),
+                identity: identity,
+                resume_packet_ref: resume_packet_ref
+              }
+            )
+          )
 
         %{
           state
@@ -734,12 +1905,212 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
-        schedule_issue_retry(state, issue.id, next_attempt, %{
+        schedule_failure_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
+          issue: issue,
+          run_id: proposed_identity.run_id,
+          parent_run_id: proposed_identity.parent_run_id,
+          retry_id: proposed_identity.retry_id,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          backend: predicted_backend(issue),
+          failure: AgentFailure.classify({:spawn_failed, reason}, backend: predicted_backend(issue)),
+          worker_host: worker_host,
+          resume_packet_ref: ResumePacket.normalize_reference(Keyword.get(agent_opts, :resume_packet_ref))
         })
     end
+  end
+
+  defp start_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
+    if PersistentWorker.enabled?() do
+      start_persistent_issue_worker(issue, attempt, recipient, worker_host, agent_opts)
+    else
+      start_in_process_issue_worker(issue, attempt, recipient, worker_host, agent_opts)
+    end
+  end
+
+  defp start_persistent_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
+    case PersistentWorker.start(issue, attempt, worker_host, recipient, agent_opts) do
+      {:ok, %{pid: pid, manifest: manifest, spec: spec}} ->
+        identity = persistent_worker_identity(manifest, spec)
+
+        {:ok, pid, manifest.worker_id, identity, manifest.resume_packet_ref}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp start_in_process_issue_worker(issue, attempt, recipient, worker_host, agent_opts) do
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           AgentRunner.run(
+             issue,
+             recipient,
+             Keyword.merge([attempt: attempt, worker_host: worker_host], agent_opts)
+           )
+         end) do
+      {:ok, pid} ->
+        {:ok, pid, nil, RunManifest.execution_identity(attempt, agent_opts), ResumePacket.normalize_reference(Keyword.get(agent_opts, :resume_packet_ref))}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp maybe_adopt_persistent_workers(%State{} = state) do
+    if PersistentWorker.enabled?() do
+      self()
+      |> PersistentWorker.attach_all(tracked_persistent_worker_ids(state))
+      |> Enum.reduce(state, &adopt_persistent_worker/2)
+    else
+      state
+    end
+  end
+
+  defp tracked_persistent_worker_ids(%State{} = state) do
+    state.running
+    |> Map.values()
+    |> Enum.flat_map(&persistent_worker_id_list/1)
+    |> MapSet.new()
+  end
+
+  defp persistent_worker_id_list(entry) do
+    case Map.get(entry, :persistent_worker_id) do
+      worker_id when is_binary(worker_id) -> [worker_id]
+      _other -> []
+    end
+  end
+
+  defp adopt_persistent_worker(
+         %{pid: pid, manifest: manifest, spec: %{issue: %Issue{} = issue} = spec},
+         %State{} = state
+       ) do
+    if Map.has_key?(state.running, issue.id) do
+      Logger.warning("Ignoring duplicate persistent worker worker_id=#{manifest.worker_id} #{issue_context(issue)}")
+      PersistentWorker.stop(pid)
+      state
+    else
+      ref = Process.monitor(pid)
+      started_at = parse_worker_started_at(manifest.started_at)
+
+      running_entry =
+        new_running_entry(
+          state,
+          issue,
+          manifest.worker_host,
+          %{
+            pid: pid,
+            ref: ref,
+            persistent_worker_id: manifest.worker_id,
+            started_at: started_at,
+            identity: persistent_worker_identity(manifest, spec),
+            workspace_path: manifest.workspace_path,
+            resume_packet_ref: manifest.resume_packet_ref
+          }
+        )
+        |> mark_resume_packet_transition(:restart_adopted)
+
+      _ = persist_adopted_resume_packet_ref(manifest, running_entry)
+
+      Logger.info("Reconnected persistent worker worker_id=#{manifest.worker_id} #{issue_context(issue)} pid=#{inspect(pid)}")
+
+      %{
+        state
+        | running: Map.put(state.running, issue.id, running_entry),
+          claimed: MapSet.put(state.claimed, issue.id),
+          retry_attempts: Map.delete(state.retry_attempts, issue.id)
+      }
+    end
+  end
+
+  defp parse_worker_started_at(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _other -> DateTime.utc_now()
+    end
+  end
+
+  defp parse_worker_started_at(_value), do: DateTime.utc_now()
+
+  defp persistent_worker_identity(manifest, spec) do
+    opts = Map.get(spec, :runner_opts, [])
+
+    opts =
+      opts
+      |> Keyword.put(:run_id, manifest.run_id || Keyword.get(opts, :run_id) || "legacy-worker-#{manifest.worker_id}")
+      |> Keyword.put(:parent_run_id, manifest.parent_run_id || Keyword.get(opts, :parent_run_id))
+      |> Keyword.put(:retry_id, manifest.retry_id || Keyword.get(opts, :retry_id))
+      |> Keyword.put(
+        :retry_attempt,
+        manifest.retry_attempt || Keyword.get(opts, :retry_attempt)
+      )
+
+    RunManifest.execution_identity(manifest.attempt, opts)
+  end
+
+  defp new_running_entry(state, issue, worker_host, worker) do
+    identity = worker.identity
+
+    %{
+      pid: worker.pid,
+      ref: worker.ref,
+      persistent_worker_id: worker.persistent_worker_id,
+      run_id: identity.run_id,
+      parent_run_id: identity.parent_run_id,
+      retry_id: identity.retry_id,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: worker_host,
+      workspace_path: Map.get(worker, :workspace_path),
+      backend: predicted_backend(issue),
+      model: nil,
+      reasoning_effort: nil,
+      profile: nil,
+      task_type: nil,
+      routing_confidence: nil,
+      budget_profile: nil,
+      budget_mode: nil,
+      budget_metrics: nil,
+      budget_transitions: [],
+      repository_id: repository_id(issue),
+      scheduling_paths: scheduling_paths(issue),
+      scheduling_path_source: "metadata",
+      base_sha: nil,
+      base_age_seconds: nil,
+      candidate_base_sha: nil,
+      workspace_dirty: nil,
+      resume_packet_ref: ResumePacket.normalize_reference(Map.get(worker, :resume_packet_ref)),
+      no_progress_summary: nil,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      recent_codex_events: [],
+      recent_codex_transcript_blocks: [],
+      codex_session_logs: [],
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_thread_token_high_waters: %{},
+      observability_policy: Config.observability_settings(),
+      codex_context_tokens: 0,
+      codex_context_window: nil,
+      turn_count: 0,
+      retry_attempt: identity.retry_attempt,
+      quota_probe:
+        quota_probe_issue?(
+          state,
+          predicted_backend(issue),
+          worker_host,
+          issue.id
+        ),
+      lifecycle_state: :implementing,
+      lifecycle_started_at: worker.started_at,
+      started_at: worker.started_at
+    }
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
@@ -762,51 +2133,474 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
+  defp park_completed_worker(%State{} = state, running_entry) do
+    running_entry = mark_resume_packet_transition(running_entry, :wait_parked)
+    issue = Map.get(running_entry, :issue)
+    request = Map.get(running_entry, :wait_request)
+
+    entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      issue: issue,
+      backend: Map.get(running_entry, :backend),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
+      codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+      recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, []),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
+      retry_attempt: Map.get(running_entry, :retry_attempt, 0),
+      priority: issue.priority,
+      created_at: issue.created_at,
+      request: request
+    }
+
+    case wait_watcher_park(entry) do
+      :ok ->
+        Logger.info("Agent work parked issue_id=#{issue.id} issue_identifier=#{issue.identifier} condition_key=#{request.condition_key}; agent slot released")
+
+        %{
+          state
+          | claimed: MapSet.put(state.claimed, issue.id),
+            retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            failure_counts: Map.delete(state.failure_counts, issue.id)
+        }
+
+      {:error, reason} ->
+        Logger.warning("Unable to persist agent wait for #{issue_context(issue)}: #{inspect(reason)}; falling back to normal continuation")
+
+        schedule_issue_retry(state, issue.id, 1, %{
+          identifier: issue.identifier,
+          issue: issue,
+          run_id: Map.get(running_entry, :run_id),
+          parent_run_id: Map.get(running_entry, :parent_run_id),
+          retry_id: Map.get(running_entry, :retry_id),
+          delay_type: :continuation,
+          backend: Map.get(running_entry, :backend),
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
+          resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
+          codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+          recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
+        })
+    end
+  end
+
+  defp handle_normal_worker_exit(state, %{lifecycle_state: :waiting} = running_entry, _issue_id, _session_id) do
+    park_completed_worker(state, running_entry)
+  end
+
+  defp handle_normal_worker_exit(state, running_entry, issue_id, session_id) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+    state
+    |> maybe_close_successful_quota_probe(running_entry)
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      issue: Map.get(running_entry, :issue),
+      run_id: Map.get(running_entry, :run_id),
+      parent_run_id: Map.get(running_entry, :parent_run_id),
+      retry_id: Map.get(running_entry, :retry_id),
+      delay_type: :continuation,
+      backend: Map.get(running_entry, :backend),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
+      codex_session_logs: Map.get(running_entry, :codex_session_logs, []),
+      recent_codex_transcript_blocks: Map.get(running_entry, :recent_codex_transcript_blocks, [])
+    })
+  end
+
+  defp schedule_ready_wait_entries(%State{} = state, entries) do
+    entries
+    |> Enum.sort_by(fn entry ->
+      created_at = Map.get(entry, :created_at)
+      issue = Map.get(entry, :issue)
+
+      created_at_key =
+        case issue do
+          %Issue{} -> issue_created_at_sort_key(issue)
+          _ -> datetime_sort_key(created_at)
+        end
+
+      {Issue.dispatch_priority_rank(entry.priority), created_at_key, entry.identifier || entry.issue_id}
+    end)
+    |> Enum.with_index()
+    |> Enum.reduce(state, fn {entry, index}, state_acc ->
+      cond do
+        Map.has_key?(state_acc.running, entry.issue_id) ->
+          _ = wait_watcher_acknowledge(entry.issue_id)
+          state_acc
+
+        Map.has_key?(state_acc.retry_attempts, entry.issue_id) ->
+          state_acc
+
+        true ->
+          state_acc
+          |> Map.update!(:claimed, &MapSet.put(&1, entry.issue_id))
+          |> schedule_issue_retry(entry.issue_id, 1, %{
+            identifier: entry.identifier,
+            title: entry.title,
+            issue: Map.get(entry, :issue),
+            run_id: Map.get(entry, :run_id),
+            parent_run_id: Map.get(entry, :parent_run_id),
+            retry_id: Map.get(entry, :retry_id),
+            delay_type: :continuation,
+            delay_ms_override: index * @quota_resume_spacing_ms,
+            backend: entry.backend,
+            worker_host: entry.worker_host,
+            workspace_path: entry.workspace_path,
+            resume_packet_ref: Map.get(entry, :resume_packet_ref),
+            codex_session_logs: Map.get(entry, :codex_session_logs, []),
+            recent_codex_transcript_blocks: Map.get(entry, :recent_codex_transcript_blocks, []),
+            wait_resume_prompt: entry.resume_prompt
+          })
+      end
+    end)
+  end
+
+  defp datetime_sort_key(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :microsecond)
+  defp datetime_sort_key(_datetime), do: 9_223_372_036_854_775_807
+
+  defp wait_snapshot(now) do
+    wait_watcher_snapshot()
+    |> Enum.map(fn entry ->
+      %{
+        issue_id: entry.issue_id,
+        identifier: entry.identifier,
+        title: entry.title,
+        status: entry.status,
+        reason: entry.request.reason,
+        condition: entry.request.condition,
+        condition_key: entry.request.condition_key,
+        backend: entry.backend,
+        run_id: Map.get(entry, :run_id),
+        parent_run_id: Map.get(entry, :parent_run_id),
+        retry_id: Map.get(entry, :retry_id),
+        retry_attempt: Map.get(entry, :retry_attempt, 0),
+        worker_host: entry.worker_host,
+        workspace_path: entry.workspace_path,
+        resume_packet_ref: Map.get(entry, :resume_packet_ref),
+        parked_at: entry.parked_at,
+        next_probe_at: entry.next_probe_at,
+        waiting_seconds: running_seconds(entry.parked_at, now),
+        probe_attempt: entry.probe_attempt,
+        last_observation: Map.get(entry, :last_observation),
+        last_error: Map.get(entry, :last_error),
+        codex_session_logs: Map.get(entry, :codex_session_logs, []),
+        recent_codex_transcript_blocks: Map.get(entry, :recent_codex_transcript_blocks, [])
+      }
+    end)
+  end
+
+  defp restored_wait_claims do
+    case Process.whereis(WaitWatcher) do
+      nil -> []
+      _pid -> WaitWatcher.issue_ids() |> MapSet.to_list()
+    end
+  catch
+    :exit, _reason -> []
+  end
+
+  defp wait_watcher_park(entry) do
+    case Process.whereis(WaitWatcher) do
+      nil -> {:error, :wait_watcher_unavailable}
+      _pid -> WaitWatcher.park(entry)
+    end
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp wait_watcher_snapshot do
+    case Process.whereis(WaitWatcher) do
+      nil -> []
+      _pid -> WaitWatcher.snapshot()
+    end
+  catch
+    :exit, _reason -> []
+  end
+
+  defp wait_watcher_acknowledge(issue_id) do
+    case Process.whereis(WaitWatcher) do
+      nil -> :ok
+      _pid -> WaitWatcher.acknowledge(issue_id)
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp wait_control_payload(entry, action) do
+    %{
+      action: action,
+      issue_id: entry.issue_id,
+      identifier: entry.identifier
+    }
+  end
+
+  defp quota_probe_control_payload(circuit) do
+    %{
+      action: "probe_scheduled",
+      backend: circuit.backend,
+      account_scope: circuit.account_scope,
+      worker_host: circuit.worker_host,
+      next_probe_at: circuit.next_probe_at,
+      parked_issue_count: length(circuit.parked)
+    }
+  end
+
   defp complete_issue(%State{} = state, issue_id) do
+    # A normal turn completion is the "made progress" signal that resets the
+    # consecutive-failure count, so only genuine stuck loops reach max_retries.
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        failure_counts: Map.delete(state.failure_counts, issue_id)
     }
   end
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
-    next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
-    delay_ms = retry_delay(next_attempt, metadata)
+    next_attempt = scheduled_attempt(attempt, previous_retry)
+    delay_ms = metadata[:delay_ms_override] || retry_delay(next_attempt, metadata)
+    retry_kind = metadata[:retry_kind] || Map.get(previous_retry, :retry_kind)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
+    retry_id = RunManifest.new_id()
+    previous_retry_id = metadata[:retry_id] || Map.get(previous_retry, :retry_id)
+    parent_run_id = metadata[:run_id] || metadata[:parent_run_id] || Map.get(previous_retry, :parent_run_id)
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
-    error = pick_retry_error(previous_retry, metadata)
+    title = pick_retry_title(previous_retry, metadata)
+    backend = metadata[:backend] || Map.get(previous_retry, :backend)
+    {error, failure_class} = retry_failure_details(retry_kind, previous_retry, metadata)
+
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    codex_session_logs = pick_retry_codex_session_logs(previous_retry, metadata)
+    recent_codex_transcript_blocks = pick_retry_codex_transcript_blocks(previous_retry, metadata)
+    wait_resume_prompt = pick_retry_wait_resume_prompt(previous_retry, metadata)
+    resume_packet_ref = pick_retry_resume_packet_ref(previous_retry, metadata)
 
-    if is_reference(old_timer) do
-      Process.cancel_timer(old_timer)
-    end
+    transition =
+      mark_resume_packet_transition(
+        %{
+          issue: metadata[:issue],
+          identifier: identifier,
+          run_id: metadata[:run_id],
+          parent_run_id: parent_run_id,
+          retry_id: previous_retry_id,
+          worker_host: worker_host,
+          workspace_path: workspace_path,
+          resume_packet_ref: resume_packet_ref
+        },
+        :retry_scheduled
+      )
+
+    resume_packet_ref = Map.get(transition, :resume_packet_ref)
+
+    cancel_retry_timer(old_timer)
 
     timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
+    log_scheduled_retry(retry_kind, issue_id, identifier, delay_ms, next_attempt, error)
 
-    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
-
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+    retry_entry = %{
+      attempt: next_attempt,
+      retry_id: retry_id,
+      previous_retry_id: previous_retry_id,
+      parent_run_id: parent_run_id,
+      timer_ref: timer_ref,
+      retry_token: retry_token,
+      due_at_ms: due_at_ms,
+      identifier: identifier,
+      title: title,
+      error: error,
+      backend: backend,
+      failure_class: failure_class,
+      worker_host: worker_host,
+      workspace_path: workspace_path,
+      codex_session_logs: codex_session_logs,
+      recent_codex_transcript_blocks: recent_codex_transcript_blocks,
+      wait_resume_prompt: wait_resume_prompt,
+      resume_packet_ref: resume_packet_ref,
+      retry_kind: retry_kind
+    }
 
     %{
       state
-      | retry_attempts:
-          Map.put(state.retry_attempts, issue_id, %{
-            attempt: next_attempt,
-            timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            identifier: identifier,
-            error: error,
-            worker_host: worker_host,
-            workspace_path: workspace_path
-          })
+      | retry_attempts: Map.put(state.retry_attempts, issue_id, retry_entry)
     }
+    |> maybe_emit_retry_policy(
+      issue_id,
+      metadata
+      |> Map.put(:retry_kind, retry_kind)
+      |> Map.put(:retry_id, retry_entry.retry_id)
+      |> Map.put(:previous_retry_id, retry_entry.previous_retry_id),
+      :scheduled,
+      next_attempt,
+      delay_ms
+    )
+  end
+
+  defp scheduled_attempt(attempt, _previous_retry) when is_integer(attempt), do: attempt
+  defp scheduled_attempt(_attempt, previous_retry), do: previous_retry.attempt + 1
+
+  defp retry_failure_details(:queue, _previous_retry, _metadata), do: {nil, nil}
+
+  defp retry_failure_details(_retry_kind, previous_retry, metadata) do
+    error = pick_retry_error(previous_retry, metadata)
+
+    failure_class =
+      metadata[:failure_class] || retry_failure_class(metadata[:failure]) ||
+        Map.get(previous_retry, :failure_class)
+
+    {error, failure_class}
+  end
+
+  defp cancel_retry_timer(timer_ref) when is_reference(timer_ref) do
+    Process.cancel_timer(timer_ref)
+  end
+
+  defp cancel_retry_timer(_timer_ref), do: false
+
+  defp log_scheduled_retry(:queue, issue_id, identifier, delay_ms, _attempt, _error) do
+    Logger.debug("Queued issue_id=#{issue_id} issue_identifier=#{identifier} for another capacity check in #{delay_ms}ms")
+  end
+
+  defp log_scheduled_retry(_retry_kind, issue_id, identifier, delay_ms, attempt, error) do
+    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+
+    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{attempt})#{error_suffix}")
+  end
+
+  defp maybe_emit_retry_policy(state, _issue_id, %{retry_kind: :queue}, _action, _attempt, _delay_ms),
+    do: state
+
+  defp maybe_emit_retry_policy(state, issue_id, metadata, action, attempt, delay_ms),
+    do: emit_retry_policy(state, issue_id, metadata, action, attempt, delay_ms)
+
+  # Schedule a retry for a *genuine* agent-run failure (crash, stall,
+  # handoff-review timeout, spawn failure), counting it against the
+  # `agent.max_retries` threshold. Beyond that threshold, only a classified
+  # configuration/authentication failure is treated as requiring human input.
+  # Operational failures remain claimed and retry at capped backoff, so a
+  # Symphony or dependency outage cannot semantically block the product issue.
+  # Capacity waits and transient tracker/refresh errors call
+  # `schedule_issue_retry` directly and never count here.
+  defp schedule_failure_retry(%State{} = state, issue_id, next_attempt, metadata)
+       when is_binary(issue_id) and is_map(metadata) do
+    {failures, state} = bump_failure_count(state, issue_id)
+    max_retries = max_retries_setting()
+
+    cond do
+      !is_integer(max_retries) or max_retries <= 0 or failures <= max_retries ->
+        schedule_issue_retry(state, issue_id, next_attempt, metadata)
+
+      retry_exhaustion_requires_human?(metadata) ->
+        give_up_retries_exhausted(state, issue_id, failures - 1, max_retries, metadata)
+
+      true ->
+        keep_operational_failure_in_backoff(state, issue_id, next_attempt, max_retries, metadata)
+    end
+  end
+
+  defp retry_failure_class(%AgentFailure{class: class}), do: class
+  defp retry_failure_class(_failure), do: nil
+
+  defp retry_exhaustion_requires_human?(%{
+         failure: %AgentFailure{class: :authentication_configuration}
+       }),
+       do: true
+
+  defp retry_exhaustion_requires_human?(_metadata), do: false
+
+  defp keep_operational_failure_in_backoff(state, issue_id, next_attempt, max_retries, metadata) do
+    identifier = metadata[:identifier] || issue_id
+    delay_ms = Config.settings!().agent.max_retry_backoff_ms
+
+    Logger.error(
+      "Operational retries reached agent.max_retries for issue_id=#{issue_id} issue_identifier=#{identifier}; keeping issue active at capped backoff=#{delay_ms}ms instead of marking Blocked"
+    )
+
+    state = %{
+      state
+      | failure_counts: Map.put(state.failure_counts, issue_id, max_retries)
+    }
+
+    schedule_issue_retry(
+      state,
+      issue_id,
+      next_attempt,
+      Map.put(metadata, :delay_ms_override, delay_ms)
+    )
+  end
+
+  defp give_up_retries_exhausted(%State{} = state, issue_id, retries, max_retries, metadata) do
+    identifier = metadata[:identifier] || issue_id
+
+    Logger.warning(
+      "Retries exhausted for issue_id=#{issue_id} issue_identifier=#{identifier} after #{retries} retries (max_retries=#{max_retries}); marking Blocked with :retries_exhausted and releasing claim"
+    )
+
+    spawn_human_action_block(giveup_issue(metadata, issue_id, identifier), %{
+      reason: :retries_exhausted,
+      retries: retries,
+      max_retries: max_retries,
+      workspace: metadata[:workspace_path],
+      error: metadata[:error]
+    })
+
+    state
+    |> drop_retry_attempt(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
+  # Mark a human-actionable failure Blocked off the GenServer loop. The Linear
+  # writes are network I/O and best-effort, so they must not block dispatch.
+  defp spawn_human_action_block(%Issue{} = issue, context) do
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           AgentRunner.mark_blocked_on_giveup(issue, context)
+         end) do
+      {:ok, _pid} ->
+        :ok
+
+      other ->
+        Logger.warning("Failed to spawn retries-exhausted Blocked transition for #{issue_context(issue)}: #{inspect(other)}")
+        # Fall back to a synchronous best-effort mark so the give-up isn't lost.
+        AgentRunner.mark_blocked_on_giveup(issue, context)
+    end
+  end
+
+  defp giveup_issue(metadata, issue_id, identifier) when is_map(metadata) do
+    case metadata[:issue] do
+      %Issue{} = issue -> issue
+      _ -> %Issue{id: issue_id, identifier: identifier, labels: []}
+    end
+  end
+
+  defp bump_failure_count(%State{failure_counts: failure_counts} = state, issue_id) do
+    count = Map.get(failure_counts, issue_id, 0) + 1
+    {count, %{state | failure_counts: Map.put(failure_counts, issue_id, count)}}
+  end
+
+  # Cancel any pending retry timer for the issue and drop its retry entry, so a
+  # give-up leaves nothing scheduled to re-dispatch it.
+  defp drop_retry_attempt(%State{retry_attempts: retry_attempts} = state, issue_id) do
+    case Map.get(retry_attempts, issue_id) do
+      %{timer_ref: ref} when is_reference(ref) -> Process.cancel_timer(ref)
+      _ -> :ok
+    end
+
+    %{state | retry_attempts: Map.delete(retry_attempts, issue_id)}
+  end
+
+  defp max_retries_setting do
+    Config.settings!().agent.max_retries
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -815,8 +2609,18 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          backend: Map.get(retry_entry, :backend),
+          failure_class: Map.get(retry_entry, :failure_class),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          codex_session_logs: Map.get(retry_entry, :codex_session_logs, []),
+          recent_codex_transcript_blocks: Map.get(retry_entry, :recent_codex_transcript_blocks, []),
+          wait_resume_prompt: Map.get(retry_entry, :wait_resume_prompt),
+          retry_kind: Map.get(retry_entry, :retry_kind),
+          retry_id: Map.get(retry_entry, :retry_id),
+          previous_retry_id: Map.get(retry_entry, :previous_retry_id),
+          parent_run_id: Map.get(retry_entry, :parent_run_id),
+          resume_packet_ref: Map.get(retry_entry, :resume_packet_ref)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -826,6 +2630,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_retry_issue(%State{draining: true} = state, issue_id, attempt, metadata) do
+    Logger.debug("Deferring retry while orchestrator is draining issue_id=#{issue_id}")
+
+    state =
+      schedule_issue_retry(
+        state,
+        issue_id,
+        attempt,
+        Map.put(metadata, :delay_ms_override, max(state.poll_interval_ms, 1_000))
+      )
+
+    retry = state.retry_attempts |> Map.fetch!(issue_id) |> Map.put(:drain_deferred, true)
+    {:noreply, %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, retry)}}
+  end
+
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
     case Tracker.fetch_candidate_issues() do
       {:ok, issues} ->
@@ -833,17 +2652,64 @@ defmodule SymphonyElixir.Orchestrator do
         |> find_issue_by_id(issue_id)
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
 
-      {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+      {:error, {:rate_limited, retry_after_ms} = reason} ->
+        handle_rate_limited_retry_poll(
+          state,
+          issue_id,
+          attempt,
+          metadata,
+          reason,
+          retry_after_ms
+        )
 
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-         )}
+      {:error, reason} ->
+        case AgentFailure.classify(reason) do
+          %AgentFailure{class: :rate_limited, retry_after_ms: retry_after_ms} ->
+            handle_rate_limited_retry_poll(
+              state,
+              issue_id,
+              attempt,
+              metadata,
+              reason,
+              retry_after_ms
+            )
+
+          _failure ->
+            Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+            {:noreply,
+             schedule_issue_retry(
+               state,
+               issue_id,
+               attempt + 1,
+               Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+             )}
+        end
     end
+  end
+
+  defp handle_rate_limited_retry_poll(
+         state,
+         issue_id,
+         attempt,
+         metadata,
+         reason,
+         retry_after_ms
+       ) do
+    Logger.warning("Retry poll rate-limited for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+    state = arm_poll_backoff(state, retry_after_ms)
+
+    {:noreply,
+     schedule_issue_retry(
+       state,
+       issue_id,
+       attempt + 1,
+       Map.merge(metadata, %{
+         error: "retry poll failed: #{inspect(reason)}",
+         delay_ms_override: tracker_retry_delay_ms(retry_after_ms)
+       })
+     )}
   end
 
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
@@ -854,7 +2720,7 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, finish_retry_without_dispatch(state, issue_id, metadata)}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -862,14 +2728,26 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
 
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, finish_retry_without_dispatch(state, issue_id, metadata)}
     end
   end
 
-  defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
+  defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
-    {:noreply, release_issue_claim(state, issue_id)}
+    {:noreply, finish_retry_without_dispatch(state, issue_id, metadata)}
   end
+
+  defp finish_retry_without_dispatch(state, issue_id, metadata) do
+    maybe_acknowledge_wait_resume(issue_id, metadata)
+    release_issue_claim(state, issue_id)
+  end
+
+  defp maybe_acknowledge_wait_resume(issue_id, %{wait_resume_prompt: prompt})
+       when is_binary(prompt) do
+    wait_watcher_acknowledge(issue_id)
+  end
+
+  defp maybe_acknowledge_wait_resume(_issue_id, _metadata), do: :ok
 
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
 
@@ -880,19 +2758,36 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
   defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
-      {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
+    if multi_repo_configured?() do
+      # In multi-repo mode (T24/T27), the issue-state-driven WorkspaceGc
+      # (T28) owns terminal-workspace cleanup — it uses a non-forcing
+      # `git worktree remove` to preserve any uncommitted work a human
+      # added. This legacy startup path uses `File.rm_rf` underneath,
+      # which is destructive, AND its underlying tracker query
+      # (`fetch_issues_by_states/1`) requires `project_slug` and so
+      # always fails under multi-repo. Skip silently.
+      :ok
+    else
+      case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
+        {:ok, issues} ->
+          Enum.each(issues, &cleanup_terminal_issue_workspace/1)
 
-          _ ->
-            :ok
-        end)
+        {:error, reason} ->
+          Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+      end
+    end
+  end
 
-      {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+  defp cleanup_terminal_issue_workspace(%Issue{identifier: identifier}) when is_binary(identifier) do
+    cleanup_issue_workspace(identifier)
+  end
+
+  defp cleanup_terminal_issue_workspace(_issue), do: :ok
+
+  defp multi_repo_configured? do
+    case RepoConfig.load() do
+      {:ok, %{linear: %{team_id: team_id}}} when is_binary(team_id) -> true
+      _ -> false
     end
   end
 
@@ -901,28 +2796,120 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
-         dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
-    else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
-
-      {:noreply,
-       schedule_issue_retry(
+    if backend_quota_blocked?(
          state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+         retry_backend(metadata, issue),
+         metadata[:worker_host]
+       ) do
+      Logger.info("Parking retry while backend quota circuit is open: #{issue_context(issue)} backend=#{retry_backend(metadata, issue)}")
+
+      maybe_acknowledge_wait_resume(issue.id, metadata)
+      metadata = Map.put(metadata, :issue, issue)
+
+      state =
+        state
+        |> emit_retry_policy(issue.id, metadata, :suppressed, attempt, nil)
+        |> park_issue_retry(issue.id, attempt, metadata)
+
+      {:noreply, state}
+    else
+      do_handle_active_retry(state, issue, attempt, metadata)
+    end
+  end
+
+  defp do_handle_active_retry(state, issue, attempt, metadata) do
+    scheduling = RepositoryScheduler.decide(issue, load_repo_config_or_default(), state.running)
+
+    cond do
+      !retry_candidate_issue?(issue, terminal_state_set()) ->
+        {:noreply, finish_retry_without_dispatch(state, issue.id, metadata)}
+
+      match?({:queue, _decision}, scheduling) ->
+        {:queue, decision} = scheduling
+        queued_state = queue_scheduling_decision(state, issue, decision)
+        schedule_queued_retry(queued_state, issue, attempt, metadata)
+
+      match?({:allow, _decision}, scheduling) and dispatch_slots_available?(issue, state) and
+          worker_slots_available?(state, metadata[:worker_host]) ->
+        {:allow, decision} = scheduling
+
+        state
+        |> allow_scheduling_dispatch(issue, decision)
+        |> dispatch_active_retry(issue, attempt, metadata)
+
+      true ->
+        {:allow, decision} = scheduling
+        capacity_decision = Map.put(decision, :reason, "orchestrator_capacity")
+        queued_state = queue_scheduling_decision(state, issue, capacity_decision)
+        schedule_queued_retry(queued_state, issue, attempt, metadata)
+    end
+  end
+
+  defp schedule_queued_retry(state, issue, attempt, metadata) do
+    {:noreply,
+     schedule_issue_retry(
+       state,
+       issue.id,
+       attempt,
+       Map.merge(metadata, %{
+         identifier: issue.identifier,
+         issue: issue,
+         delay_ms_override: max(state.poll_interval_ms, 1_000),
+         retry_kind: :queue
+       })
+     )}
+  end
+
+  # The issue's claim is held here and its retry entry has already been popped,
+  # so every dispatch outcome must leave it tracked somewhere or it strands in
+  # `state.claimed` until restart:
+  #
+  #   * `:dispatched` re-enters `running` (or reschedules on spawn failure) — keep state as-is.
+  #   * `:skip` — the issue is gone or no longer a candidate at revalidation
+  #     time; release the claim so a later poll can pick it up if it requalifies.
+  #   * `:error` — a transient tracker-refresh failure; keep the claim and
+  #     reschedule so the continuation check isn't lost.
+  defp dispatch_active_retry(state, issue, attempt, metadata) do
+    agent_opts =
+      case metadata[:wait_resume_prompt] do
+        prompt when is_binary(prompt) -> [wait_resume_prompt: prompt]
+        _ -> []
+      end
+      |> Keyword.put(:parent_run_id, metadata[:parent_run_id])
+      |> Keyword.put(:retry_id, metadata[:retry_id])
+      |> Keyword.put(:resume_packet_ref, metadata[:resume_packet_ref])
+
+    case dispatch_issue_outcome(state, issue, attempt, metadata[:worker_host], agent_opts) do
+      {:dispatched, state} ->
+        {:noreply, state}
+
+      {:skip, state} ->
+        Logger.info("Releasing claim after dispatch revalidation skip: #{issue_context(issue)}")
+        {:noreply, finish_retry_without_dispatch(state, issue.id, metadata)}
+
+      {:error, state} ->
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             error: "issue refresh failed during retry dispatch"
+           })
+         )}
     end
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+    # Releasing the claim means we're done working the issue for now (gone,
+    # terminal, left active states, or gave up), so drop its failure count too.
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        queued: Map.delete(state.queued, issue_id),
+        failure_counts: Map.delete(state.failure_counts, issue_id)
+    }
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -952,6 +2939,13 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:identifier] || Map.get(previous_retry, :identifier) || issue_id
   end
 
+  defp pick_retry_title(previous_retry, metadata) do
+    metadata[:title] || title_from_issue(metadata[:issue]) || Map.get(previous_retry, :title)
+  end
+
+  defp title_from_issue(%Issue{title: title}) when is_binary(title), do: title
+  defp title_from_issue(_issue), do: nil
+
   defp pick_retry_error(previous_retry, metadata) do
     metadata[:error] || Map.get(previous_retry, :error)
   end
@@ -964,11 +2958,217 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
   end
 
+  defp pick_retry_codex_session_logs(previous_retry, metadata) do
+    metadata[:codex_session_logs] || Map.get(previous_retry, :codex_session_logs) || []
+  end
+
+  defp pick_retry_codex_transcript_blocks(previous_retry, metadata) do
+    metadata[:recent_codex_transcript_blocks] ||
+      Map.get(previous_retry, :recent_codex_transcript_blocks) ||
+      []
+  end
+
+  defp pick_retry_wait_resume_prompt(previous_retry, metadata) do
+    metadata[:wait_resume_prompt] || Map.get(previous_retry, :wait_resume_prompt)
+  end
+
+  defp pick_retry_resume_packet_ref(previous_retry, metadata) do
+    ResumePacket.normalize_reference(metadata[:resume_packet_ref] || Map.get(previous_retry, :resume_packet_ref))
+  end
+
+  defp mark_resume_packet_transition(entry, boundary)
+       when is_map(entry) and (is_atom(boundary) or is_binary(boundary)) do
+    current_ref = ResumePacket.normalize_reference(Map.get(entry, :resume_packet_ref))
+    entry = Map.put(entry, :resume_packet_ref, current_ref)
+    boundary = to_string(boundary)
+    workspace = Map.get(entry, :workspace_path)
+
+    if is_binary(workspace) do
+      workspace
+      |> call_resume_packet_boundary_marker(boundary, Map.get(entry, :worker_host))
+      |> apply_resume_packet_boundary_result(entry, boundary, workspace)
+    else
+      entry
+    end
+  end
+
+  defp apply_resume_packet_boundary_result({:ok, packet}, entry, boundary, workspace)
+       when is_map(packet) do
+    relative_ref = Path.basename(Workspace.resume_packet_path(workspace))
+
+    case ResumePacket.reference(packet, relative_ref) do
+      %{} = reference -> Map.put(entry, :resume_packet_ref, reference)
+      nil -> resume_packet_boundary_failure(entry, boundary, :invalid_marked_packet)
+    end
+  end
+
+  defp apply_resume_packet_boundary_result({:ok, nil}, entry, boundary, _workspace),
+    do: resume_packet_boundary_failure(entry, boundary, :packet_unavailable)
+
+  defp apply_resume_packet_boundary_result({:error, reason}, entry, boundary, _workspace),
+    do: resume_packet_boundary_failure(entry, boundary, reason)
+
+  defp call_resume_packet_boundary_marker(workspace, boundary, worker_host) do
+    marker =
+      Application.get_env(
+        :symphony_elixir,
+        :resume_packet_boundary_marker,
+        &Workspace.mark_resume_packet_boundary/3
+      )
+
+    marker.(workspace, boundary, worker_host)
+  rescue
+    _error -> {:error, :marker_exception}
+  catch
+    _kind, _reason -> {:error, :marker_exit}
+  end
+
+  defp resume_packet_boundary_failure(entry, boundary, reason) do
+    issue = Map.get(entry, :issue) || %{}
+    issue_id = Map.get(issue, :id)
+    identifier = Map.get(issue, :identifier) || Map.get(entry, :identifier) || issue_id
+
+    Logger.warning(
+      "resume_packet boundary mark failed issue_id=#{issue_id || "n/a"} " <>
+        "issue_identifier=#{identifier || "n/a"} boundary=#{boundary} " <>
+        "reason_class=#{resume_packet_boundary_reason_class(reason)}"
+    )
+
+    Telemetry.emit(:resume_packet_error, %{
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      run_id: Map.get(entry, :run_id),
+      parent_run_id: Map.get(entry, :parent_run_id),
+      retry_id: Map.get(entry, :retry_id),
+      worker_host: Map.get(entry, :worker_host),
+      error_code: "resume_packet_boundary_mark_failed",
+      boundary: boundary
+    })
+
+    entry
+  end
+
+  defp resume_packet_boundary_reason_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp resume_packet_boundary_reason_class(reason) when is_tuple(reason) and tuple_size(reason) > 0,
+    do: reason |> elem(0) |> resume_packet_boundary_reason_class()
+
+  defp resume_packet_boundary_reason_class(_reason), do: "unknown"
+
+  defp persist_adopted_resume_packet_ref(manifest, running_entry) do
+    reference = Map.get(running_entry, :resume_packet_ref)
+
+    if reference != manifest.resume_packet_ref do
+      case PersistentWorkerRegistry.update(manifest, %{resume_packet_ref: reference}) do
+        {:ok, _manifest} ->
+          :ok
+
+        {:error, reason} ->
+          _ = resume_packet_boundary_failure(running_entry, "restart_adopted", reason)
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
     Map.put(running_entry, key, value)
   end
+
+  defp maybe_put_no_progress_summary(running_entry, runtime_info) do
+    case fetch_runtime_value(runtime_info, :no_progress_summary) do
+      :missing -> running_entry
+      {:ok, summary} -> maybe_store_no_progress_summary(running_entry, normalize_no_progress_summary(summary))
+    end
+  end
+
+  defp maybe_store_no_progress_summary(running_entry, {:ok, summary}),
+    do: Map.put(running_entry, :no_progress_summary, summary)
+
+  defp maybe_store_no_progress_summary(running_entry, :error), do: running_entry
+
+  defp normalize_no_progress_summary(summary) when is_map(summary) do
+    with 1 <- runtime_value(summary, :version),
+         "shadow" <- runtime_value(summary, :mode),
+         {:ok, counts} <- normalize_no_progress_counts(summary),
+         {:ok, decision} <- optional_enum(runtime_value(summary, :last_decision), @no_progress_decisions),
+         {:ok, kind} <- optional_enum(runtime_value(summary, :last_kind), @no_progress_kinds),
+         {:ok, fingerprint} <- optional_digest(runtime_value(summary, :last_fingerprint)),
+         {:ok, omissions} <- normalize_no_progress_omissions(runtime_value(summary, :omissions)) do
+      {:ok,
+       counts
+       |> Map.merge(%{
+         version: 1,
+         mode: "shadow",
+         last_decision: decision,
+         last_kind: kind,
+         last_fingerprint: fingerprint,
+         omissions: omissions
+       })}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp normalize_no_progress_summary(_summary), do: :error
+
+  defp normalize_no_progress_counts(summary) do
+    Enum.reduce_while(@no_progress_count_keys, {:ok, %{}}, fn key, {:ok, acc} ->
+      maximum = if key == :active_warning_count, do: 32, else: 1_000_000
+
+      case runtime_value(summary, key) do
+        value when is_integer(value) and value >= 0 and value <= maximum ->
+          {:cont, {:ok, Map.put(acc, key, value)}}
+
+        _invalid ->
+          {:halt, :error}
+      end
+    end)
+  end
+
+  defp normalize_no_progress_omissions(omissions) when is_map(omissions) and map_size(omissions) <= 12 do
+    Enum.reduce_while(omissions, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      key = if is_atom(key), do: Atom.to_string(key), else: key
+
+      if key in @no_progress_omission_codes and is_integer(value) and value >= 0 and value <= 1_000_000 do
+        {:cont, {:ok, Map.put(acc, key, value)}}
+      else
+        {:halt, :error}
+      end
+    end)
+  end
+
+  defp normalize_no_progress_omissions(_omissions), do: :error
+
+  defp optional_enum(nil, _allowed), do: {:ok, nil}
+  defp optional_enum(value, allowed) when is_atom(value), do: optional_enum(Atom.to_string(value), allowed)
+
+  defp optional_enum(value, allowed) when is_binary(value) do
+    if value in allowed, do: {:ok, value}, else: :error
+  end
+
+  defp optional_enum(_value, _allowed), do: :error
+
+  defp optional_digest(nil), do: {:ok, nil}
+
+  defp optional_digest(value) when is_binary(value) and byte_size(value) == 64 do
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, value), do: {:ok, value}, else: :error
+  end
+
+  defp optional_digest(_value), do: :error
+
+  defp fetch_runtime_value(map, key) do
+    cond do
+      Map.has_key?(map, key) -> {:ok, Map.get(map, key)}
+      Map.has_key?(map, Atom.to_string(key)) -> {:ok, Map.get(map, Atom.to_string(key))}
+      true -> :missing
+    end
+  end
+
+  defp runtime_value(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
     case Config.settings!().worker.ssh_hosts do
@@ -991,6 +3191,40 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp select_worker_host_for_backend(%State{} = state, preferred_worker_host, backend, issue_id) do
+    hosts = Config.settings!().worker.ssh_hosts
+    select_worker_host_for_backend(state, preferred_worker_host, backend, issue_id, hosts)
+  end
+
+  defp select_worker_host_for_backend(state, _preferred_worker_host, backend, issue_id, []) do
+    if backend_quota_dispatch_blocked?(state, backend, nil, issue_id),
+      do: :no_worker_capacity,
+      else: nil
+  end
+
+  defp select_worker_host_for_backend(state, preferred_worker_host, backend, issue_id, hosts)
+       when is_binary(preferred_worker_host) do
+    if preferred_worker_host in hosts and
+         worker_host_slots_available?(state, preferred_worker_host) and
+         !backend_quota_dispatch_blocked?(state, backend, preferred_worker_host, issue_id) do
+      preferred_worker_host
+    else
+      :no_worker_capacity
+    end
+  end
+
+  defp select_worker_host_for_backend(state, _preferred_worker_host, backend, issue_id, hosts) do
+    hosts
+    |> Enum.filter(fn host ->
+      worker_host_slots_available?(state, host) and
+        !backend_quota_dispatch_blocked?(state, backend, host, issue_id)
+    end)
+    |> case do
+      [] -> :no_worker_capacity
+      candidates -> least_loaded_worker_host(state, candidates)
+    end
+  end
+
   defp preferred_worker_host_available?(preferred_worker_host, hosts)
        when is_binary(preferred_worker_host) and is_list(hosts) do
     preferred_worker_host != "" and preferred_worker_host in hosts
@@ -1009,8 +3243,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_worker_host_count(running, worker_host) when is_map(running) and is_binary(worker_host) do
     Enum.count(running, fn
-      {_issue_id, %{worker_host: ^worker_host}} -> true
-      _ -> false
+      {_issue_id, %{worker_host: ^worker_host}} ->
+        true
+
+      _ ->
+        false
     end)
   end
 
@@ -1066,6 +3303,21 @@ defmodule SymphonyElixir.Orchestrator do
     )
   end
 
+  defp implementation_slots_used(running) when is_map(running) do
+    Enum.count(running, fn {_issue_id, running_entry} ->
+      consumes_implementation_slot?(running_entry)
+    end)
+  end
+
+  defp consumes_implementation_slot?(running_entry) when is_map(running_entry) do
+    Map.get(running_entry, :lifecycle_state, :implementing) not in [
+      :handoff_pending_gate,
+      :handoff_pending_review
+    ]
+  end
+
+  defp consumes_implementation_slot?(_running_entry), do: true
+
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do
     request_refresh(__MODULE__)
@@ -1075,6 +3327,63 @@ defmodule SymphonyElixir.Orchestrator do
   def request_refresh(server) do
     if Process.whereis(server) do
       GenServer.call(server, :request_refresh)
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Enable or cancel persistent drain mode without stopping active workers."
+  @spec set_drain_mode(boolean()) :: {:ok, map()} | {:error, term()} | :unavailable
+  def set_drain_mode(enabled), do: set_drain_mode(__MODULE__, enabled)
+
+  @doc false
+  @spec set_drain_mode(GenServer.server(), boolean()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_drain_mode(server, enabled) when is_boolean(enabled) do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:set_drain_mode, enabled})
+      catch
+        :exit, _reason -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Choose whether application shutdown preserves or terminates live workers."
+  @spec set_shutdown_policy(ShutdownPolicyStore.policy()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_shutdown_policy(policy), do: set_shutdown_policy(__MODULE__, policy)
+
+  @doc false
+  @spec set_shutdown_policy(GenServer.server(), ShutdownPolicyStore.policy()) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def set_shutdown_policy(server, policy) when policy in [:preserve_workers, :terminate_workers] do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:set_shutdown_policy, policy})
+      catch
+        :exit, _reason -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
+  @doc "Stop all workers currently tracked by the orchestrator before application shutdown."
+  @spec stop_all_workers() :: {:ok, non_neg_integer()} | :unavailable
+  def stop_all_workers, do: stop_all_workers(__MODULE__)
+
+  @doc false
+  @spec stop_all_workers(GenServer.server()) :: {:ok, non_neg_integer()} | :unavailable
+  def stop_all_workers(server) do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, :stop_all_workers, 30_000)
+      catch
+        :exit, _reason -> :unavailable
+      end
     else
       :unavailable
     end
@@ -1097,9 +3406,220 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Resume a parked issue immediately."
+  @spec resume_wait(String.t()) :: {:ok, map()} | {:error, :not_found} | :unavailable
+  def resume_wait(identifier), do: resume_wait(__MODULE__, identifier)
+
+  @spec resume_wait(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, :not_found} | :unavailable
+  def resume_wait(server, identifier), do: wait_control_call(server, {:resume_wait, identifier})
+
+  @doc "Cancel a parked condition and return the issue to normal scheduling."
+  @spec cancel_wait(String.t()) :: {:ok, map()} | {:error, :not_found} | :unavailable
+  def cancel_wait(identifier), do: cancel_wait(__MODULE__, identifier)
+
+  @spec cancel_wait(GenServer.server(), String.t()) ::
+          {:ok, map()} | {:error, :not_found} | :unavailable
+  def cancel_wait(server, identifier), do: wait_control_call(server, {:cancel_wait, identifier})
+
+  @doc "Schedule an immediate controlled probe for an open provider quota circuit."
+  @spec probe_quota(String.t(), String.t() | nil) ::
+          {:ok, map()} | {:error, :not_found | :probe_in_progress | :draining} | :unavailable
+  def probe_quota(backend, worker_host), do: probe_quota(__MODULE__, backend, worker_host)
+
+  @spec probe_quota(GenServer.server(), String.t(), String.t() | nil) ::
+          {:ok, map()} | {:error, :not_found | :probe_in_progress | :draining} | :unavailable
+  def probe_quota(server, backend, worker_host)
+      when is_binary(backend) and (is_binary(worker_host) or is_nil(worker_host)) do
+    wait_control_call(server, {:probe_quota, backend, worker_host})
+  end
+
+  defp wait_control_call(server, message) do
+    GenServer.call(server, message, 15_000)
+  catch
+    :exit, _ -> :unavailable
+  end
+
   @impl true
+  def handle_call(
+        {:persistent_worker_checkpoint, worker_id, seq, checkpoint},
+        {client_pid, _tag},
+        %State{} = state
+      )
+      when is_binary(worker_id) and is_integer(seq) and seq >= 0 and is_pid(client_pid) do
+    case running_entry_for_persistent_client(state, worker_id, client_pid) do
+      {issue_id, running_entry} ->
+        state = apply_persistent_checkpoint(state, issue_id, running_entry, seq, checkpoint)
+        notify_dashboard()
+        {:reply, :ok, state}
+
+      nil ->
+        {:reply, :stale_worker, state}
+    end
+  end
+
+  def handle_call(
+        {:persistent_worker_event, worker_id, seq, event},
+        {client_pid, _tag} = from,
+        %State{} = state
+      )
+      when is_binary(worker_id) and is_integer(seq) and seq > 0 and is_pid(client_pid) do
+    case running_entry_for_persistent_client(state, worker_id, client_pid) do
+      {issue_id, running_entry} ->
+        handle_persistent_worker_event(
+          state,
+          from,
+          client_pid,
+          issue_id,
+          running_entry,
+          seq,
+          event
+        )
+
+      nil ->
+        {:reply, :stale_worker, state}
+    end
+  end
+
+  def handle_call(
+        {:agent_lifecycle, issue_id, lifecycle_state, metadata},
+        {worker_pid, _tag},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_atom(lifecycle_state) and is_map(metadata) do
+    case Map.get(running, issue_id) do
+      %{pid: ^worker_pid} = running_entry ->
+        updated_running_entry =
+          transition_agent_lifecycle(running_entry, lifecycle_state, metadata)
+
+        notify_dashboard()
+
+        {:reply, :ok, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+      _ ->
+        {:reply, :stale_worker, state}
+    end
+  end
+
+  def handle_call({:set_drain_mode, enabled}, _from, %State{} = state)
+      when is_boolean(enabled) do
+    started_at = drain_started_at(state, enabled)
+
+    case DrainStore.persist(enabled, started_at) do
+      :ok ->
+        state = %{state | draining: enabled, drain_started_at: started_at}
+        state = if enabled, do: state, else: resume_from_drain(state)
+
+        Logger.info(
+          if(enabled,
+            do: "Orchestrator entered drain mode; active workers continue and new dispatch is paused",
+            else: "Orchestrator left drain mode; normal dispatch is resuming"
+          )
+        )
+
+        notify_dashboard()
+        {:reply, {:ok, drain_mode_payload(state)}, state}
+
+      {:error, reason} ->
+        Logger.warning("Unable to persist drain mode change: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:set_shutdown_policy, policy}, _from, %State{} = state)
+      when policy in [:preserve_workers, :terminate_workers] do
+    case ShutdownPolicyStore.persist(policy) do
+      :ok ->
+        state = %{state | shutdown_policy: policy}
+        Logger.info("Shutdown policy changed to #{policy}")
+        notify_dashboard()
+        {:reply, {:ok, drain_mode_payload(state)}, state}
+
+      {:error, reason} ->
+        Logger.warning("Unable to persist shutdown policy change: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:stop_all_workers, _from, %State{} = state) do
+    workers = Map.values(state.running)
+    Enum.each(workers, &stop_running_worker/1)
+    {:reply, {:ok, length(workers)}, %{state | draining: true}}
+  end
+
+  def handle_call({:resume_wait, identifier}, _from, %State{} = state)
+      when is_binary(identifier) do
+    case WaitWatcher.resume_now(identifier) do
+      {:ok, entry} ->
+        state = schedule_ready_wait_entries(state, [entry])
+        notify_dashboard()
+        {:reply, {:ok, wait_control_payload(entry, "resumed")}, state}
+
+      {:error, :not_found} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:cancel_wait, identifier}, _from, %State{} = state)
+      when is_binary(identifier) do
+    case WaitWatcher.cancel(identifier) do
+      {:ok, entry} ->
+        entry =
+          Map.put(
+            entry,
+            :resume_prompt,
+            "A human cancelled Symphony's parked wait. Re-check the external state once and continue from the existing workspace without restarting the old polling loop."
+          )
+
+        state = schedule_ready_wait_entries(state, [entry])
+        notify_dashboard()
+        {:reply, {:ok, wait_control_payload(entry, "cancelled")}, state}
+
+      {:error, :not_found} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:probe_quota, backend, worker_host}, _from, %State{} = state)
+      when is_binary(backend) and (is_binary(worker_host) or is_nil(worker_host)) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :open} when state.draining ->
+        {:reply, {:error, :draining}, state}
+
+      %{status: :open} = circuit ->
+        updated =
+          circuit
+          |> Map.delete(:drain_deferred)
+          |> Map.put(:next_probe_at, DateTime.utc_now())
+
+        state = put_quota_circuit(state, circuit_key, updated)
+        scheduled = Map.fetch!(state.quota_circuits, circuit_key)
+
+        Logger.info("Operator requested provider quota probe backend=#{backend} account_scope=#{scheduled.account_scope} parked_issues=#{length(scheduled.parked)}")
+
+        state = emit_quota_circuit(state, :manual_probe_requested, scheduled)
+        notify_dashboard()
+        {:reply, {:ok, quota_probe_control_payload(scheduled)}, state}
+
+      %{status: :probe} ->
+        {:reply, {:error, :probe_in_progress}, state}
+
+      _ ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
-    state = refresh_runtime_config(state)
+    # Non-raising on a transiently-invalid config: keep the last-good runtime
+    # values so a dashboard poll can't crash the orchestrator either (UDPE-6990).
+    state =
+      case refresh_runtime_config(state) do
+        {:ok, refreshed_state} -> refreshed_state
+        {:error, _reason} -> state
+      end
+
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
 
@@ -1108,44 +3628,107 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(fn {issue_id, metadata} ->
         %{
           issue_id: issue_id,
+          run_id: Map.get(metadata, :run_id),
+          parent_run_id: Map.get(metadata, :parent_run_id),
+          retry_id: Map.get(metadata, :retry_id),
+          retry_attempt: Map.get(metadata, :retry_attempt, 0),
           identifier: metadata.identifier,
+          title: metadata.issue.title,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
+          persistent_worker_id: Map.get(metadata, :persistent_worker_id),
           workspace_path: Map.get(metadata, :workspace_path),
+          backend: Map.get(metadata, :backend),
+          model: Map.get(metadata, :model),
+          reasoning_effort: Map.get(metadata, :reasoning_effort),
+          profile: Map.get(metadata, :profile),
+          task_type: Map.get(metadata, :task_type),
+          routing_confidence: Map.get(metadata, :routing_confidence),
+          budget_profile: Map.get(metadata, :budget_profile),
+          budget_mode: Map.get(metadata, :budget_mode),
+          budget_metrics: Map.get(metadata, :budget_metrics),
+          budget_transitions: Map.get(metadata, :budget_transitions, []),
+          repository_id: Map.get(metadata, :repository_id),
+          scheduling_paths: Map.get(metadata, :scheduling_paths, []),
+          scheduling_path_source: Map.get(metadata, :scheduling_path_source),
+          base_sha: Map.get(metadata, :base_sha),
+          base_age_seconds: Map.get(metadata, :base_age_seconds),
+          candidate_base_sha: Map.get(metadata, :candidate_base_sha),
+          workspace_dirty: Map.get(metadata, :workspace_dirty),
+          resume_packet_ref: Map.get(metadata, :resume_packet_ref),
+          no_progress_summary: Map.get(metadata, :no_progress_summary),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
+          codex_context_tokens: Map.get(metadata, :codex_context_tokens, 0),
+          codex_context_window: Map.get(metadata, :codex_context_window),
           turn_count: Map.get(metadata, :turn_count, 0),
+          lifecycle_state: Map.get(metadata, :lifecycle_state, :implementing),
+          lifecycle_started_at: Map.get(metadata, :lifecycle_started_at),
+          lifecycle_age_seconds: running_seconds(Map.get(metadata, :lifecycle_started_at), now),
+          handoff_gate: handoff_gate_snapshot(metadata, now),
+          handoff_review: handoff_review_snapshot(metadata, now),
+          review_state: Map.get(metadata, :review_state),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          recent_codex_events: Map.get(metadata, :recent_codex_events, []),
+          recent_codex_transcript_blocks: Map.get(metadata, :recent_codex_transcript_blocks, []),
+          codex_session_logs: Map.get(metadata, :codex_session_logs, []),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
 
     retrying =
       state.retry_attempts
+      |> Enum.reject(fn {_issue_id, retry} -> Map.get(retry, :retry_kind) == :queue end)
       |> Enum.map(fn {issue_id, %{attempt: attempt, due_at_ms: due_at_ms} = retry} ->
         %{
           issue_id: issue_id,
           attempt: attempt,
+          retry_id: Map.get(retry, :retry_id),
+          previous_retry_id: Map.get(retry, :previous_retry_id),
+          parent_run_id: Map.get(retry, :parent_run_id),
           due_in_ms: max(0, due_at_ms - now_ms),
+          status: :scheduled,
           identifier: Map.get(retry, :identifier),
+          title: Map.get(retry, :title),
           error: Map.get(retry, :error),
+          backend: Map.get(retry, :backend),
+          failure_class: Map.get(retry, :failure_class),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          resume_packet_ref: Map.get(retry, :resume_packet_ref),
+          codex_session_logs: Map.get(retry, :codex_session_logs, []),
+          recent_codex_transcript_blocks: Map.get(retry, :recent_codex_transcript_blocks, [])
         }
       end)
+
+    parked = quota_parked_snapshot(state.quota_circuits, now)
+    waiting = wait_snapshot(now)
+
+    queued =
+      state.queued
+      |> Map.values()
+      |> Enum.map(fn entry ->
+        Map.put(entry, :queue_time_ms, max(0, now_ms - entry.queued_at_ms))
+      end)
+      |> Enum.sort_by(&{&1.priority_rank, &1.created_at_key, &1.identifier})
 
     {:reply,
      %{
        running: running,
-       retrying: retrying,
+       queued: queued,
+       retrying: retrying ++ parked,
+       waiting: waiting,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       backend_usage: active_backend_usage(state),
+       quota_circuits: quota_circuit_snapshot(state.quota_circuits, now),
+       mode: drain_mode_payload(state),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1169,33 +3752,307 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  defp drain_started_at(%State{draining: true, drain_started_at: %DateTime{} = started_at}, true),
+    do: started_at
+
+  defp drain_started_at(_state, true), do: DateTime.utc_now()
+  defp drain_started_at(_state, false), do: nil
+
+  defp drain_mode_payload(%State{} = state) do
+    %{
+      draining: state.draining == true,
+      started_at: state.drain_started_at,
+      shutdown_policy: state.shutdown_policy || :preserve_workers
+    }
+  end
+
+  defp resume_from_drain(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    retry_attempts =
+      Map.new(state.retry_attempts, fn {issue_id, retry} ->
+        if Map.get(retry, :drain_deferred) do
+          if is_reference(retry.timer_ref), do: Process.cancel_timer(retry.timer_ref)
+          retry_token = make_ref()
+          timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, 0)
+
+          {issue_id,
+           retry
+           |> Map.delete(:drain_deferred)
+           |> Map.put(:retry_token, retry_token)
+           |> Map.put(:timer_ref, timer_ref)
+           |> Map.put(:due_at_ms, now_ms)}
+        else
+          {issue_id, retry}
+        end
+      end)
+
+    state = %{state | retry_attempts: retry_attempts}
+
+    state =
+      Enum.reduce(state.quota_circuits, state, fn
+        {circuit_key, %{drain_deferred: true} = circuit}, state_acc ->
+          updated =
+            circuit
+            |> Map.delete(:drain_deferred)
+            |> Map.put(:next_probe_at, DateTime.utc_now())
+
+          state_acc
+          |> Map.put(:quota_circuits, Map.put(state_acc.quota_circuits, circuit_key, updated))
+          |> arm_quota_circuit(circuit_key)
+
+        {_circuit_key, _circuit}, state_acc ->
+          state_acc
+      end)
+
+    schedule_tick(state, 0)
+  end
+
+  defp running_entry_for_persistent_client(%State{} = state, worker_id, client_pid) do
+    Enum.find_value(state.running, fn {issue_id, entry} ->
+      if Map.get(entry, :persistent_worker_id) == worker_id and Map.get(entry, :pid) == client_pid,
+        do: {issue_id, entry}
+    end)
+  end
+
+  defp handle_persistent_worker_event(
+         state,
+         from,
+         client_pid,
+         issue_id,
+         running_entry,
+         seq,
+         event
+       ) do
+    if seq <= Map.get(running_entry, :persistent_checkpoint_seq, 0) do
+      {:reply, {:ok, persistent_worker_checkpoint(running_entry)}, state}
+    else
+      event = normalize_persistent_worker_event(event, client_pid, running_entry)
+      state = dispatch_persistent_worker_event(event, from, state)
+      persistent_worker_event_reply(state, issue_id, seq)
+    end
+  end
+
+  defp persistent_worker_event_reply(state, issue_id, seq) do
+    case Map.get(state.running, issue_id) do
+      nil ->
+        {:reply, {:terminal, nil}, state}
+
+      running_entry ->
+        running_entry = Map.put(running_entry, :persistent_checkpoint_seq, seq)
+        {checkpoint, running_entry} = maybe_build_persistent_checkpoint(running_entry)
+        state = %{state | running: Map.put(state.running, issue_id, running_entry)}
+        {:reply, {:ok, checkpoint}, state}
+    end
+  end
+
+  defp apply_persistent_checkpoint(state, issue_id, running_entry, seq, checkpoint)
+       when is_map(checkpoint) do
+    if seq > Map.get(running_entry, :persistent_checkpoint_seq, 0) do
+      safe_checkpoint =
+        checkpoint
+        |> Map.drop([:pid, :ref, :persistent_worker_id])
+        |> normalize_checkpoint_resume_packet_ref()
+        |> preserve_adoption_resume_packet_ref(running_entry)
+
+      updated_entry =
+        running_entry
+        |> Map.merge(safe_checkpoint)
+        |> Map.put(:persistent_checkpoint_seq, seq)
+        |> Map.put(:persistent_last_checkpoint_at_ms, System.monotonic_time(:millisecond))
+
+      token_delta = %{
+        input_tokens:
+          Map.get(updated_entry, :codex_input_tokens, 0) -
+            Map.get(running_entry, :codex_input_tokens, 0),
+        output_tokens:
+          Map.get(updated_entry, :codex_output_tokens, 0) -
+            Map.get(running_entry, :codex_output_tokens, 0),
+        total_tokens:
+          Map.get(updated_entry, :codex_total_tokens, 0) -
+            Map.get(running_entry, :codex_total_tokens, 0)
+      }
+
+      state =
+        state
+        |> apply_codex_token_delta(token_delta)
+        |> restore_checkpoint_rate_limits(updated_entry)
+
+      %{state | running: Map.put(state.running, issue_id, updated_entry)}
+    else
+      state
+    end
+  end
+
+  defp apply_persistent_checkpoint(state, _issue_id, _running_entry, _seq, _checkpoint),
+    do: state
+
+  defp normalize_checkpoint_resume_packet_ref(checkpoint) do
+    if Map.has_key?(checkpoint, :resume_packet_ref) do
+      case ResumePacket.normalize_reference(Map.get(checkpoint, :resume_packet_ref)) do
+        %{} = reference -> Map.put(checkpoint, :resume_packet_ref, reference)
+        nil -> Map.delete(checkpoint, :resume_packet_ref)
+      end
+    else
+      checkpoint
+    end
+  end
+
+  defp preserve_adoption_resume_packet_ref(checkpoint, running_entry) do
+    case ResumePacket.normalize_reference(Map.get(running_entry, :resume_packet_ref)) do
+      %{boundary: "restart_adopted"} = reference -> Map.put(checkpoint, :resume_packet_ref, reference)
+      _reference -> checkpoint
+    end
+  end
+
+  defp remember_rate_limit_update(running_entry, update) do
+    if is_map(extract_rate_limits(update)) do
+      Map.put(running_entry, :last_rate_limit_update, update)
+    else
+      running_entry
+    end
+  end
+
+  defp restore_checkpoint_rate_limits(state, running_entry) do
+    case Map.get(running_entry, :last_rate_limit_update) do
+      %{} = update -> apply_backend_rate_limits(state, update, running_entry)
+      _other -> state
+    end
+  end
+
+  defp normalize_persistent_worker_event(
+         {:worker_run_failure, issue_id, _runner_pid, failure},
+         client_pid,
+         _running_entry
+       ),
+       do: {:worker_run_failure, issue_id, client_pid, failure}
+
+  defp normalize_persistent_worker_event(
+         {:handoff_review_heartbeat, issue_id, _runner_pid, review_job_id, timestamp},
+         client_pid,
+         _running_entry
+       ),
+       do: {:handoff_review_heartbeat, issue_id, client_pid, review_job_id, timestamp}
+
+  defp normalize_persistent_worker_event(
+         {:persistent_worker_completed, reason},
+         client_pid,
+         running_entry
+       ),
+       do: {:DOWN, running_entry.ref, :process, client_pid, reason}
+
+  defp normalize_persistent_worker_event(event, _client_pid, _running_entry), do: event
+
+  defp dispatch_persistent_worker_event(
+         {:agent_lifecycle, _issue_id, _lifecycle_state, _metadata} = event,
+         from,
+         state
+       ) do
+    case handle_call(event, from, state) do
+      {:reply, _reply, updated_state} -> updated_state
+    end
+  end
+
+  defp dispatch_persistent_worker_event(event, _from, state) do
+    case handle_info(event, state) do
+      {:noreply, updated_state} -> updated_state
+    end
+  end
+
+  defp persistent_worker_checkpoint(running_entry) do
+    Map.drop(running_entry, [
+      :pid,
+      :ref,
+      :persistent_worker_id,
+      :persistent_checkpoint_seq,
+      :persistent_last_checkpoint_at_ms
+    ])
+  end
+
+  defp maybe_build_persistent_checkpoint(running_entry) do
+    now_ms = System.monotonic_time(:millisecond)
+    last_checkpoint_ms = Map.get(running_entry, :persistent_last_checkpoint_at_ms)
+
+    if not is_integer(last_checkpoint_ms) or
+         now_ms - last_checkpoint_ms >= @persistent_checkpoint_interval_ms do
+      checkpoint = persistent_worker_checkpoint(running_entry)
+      {checkpoint, Map.put(running_entry, :persistent_last_checkpoint_at_ms, now_ms)}
+    else
+      {:unchanged, running_entry}
+    end
+  end
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
-    token_delta = extract_token_delta(running_entry, update)
+    running_entry = ensure_observability_policy(running_entry, &Config.observability_settings/0)
+    codex_message = summarize_codex_update(update)
+    resolved_session_id = session_id_for_update(running_entry.session_id, update)
+    parent_thread_id = parent_thread_from_session_id(resolved_session_id) || resolved_session_id
+
+    {thread_high_waters, token_observation} =
+      TokenAccounting.observe(
+        Map.get(running_entry, :codex_thread_token_high_waters, %{}),
+        update,
+        parent_thread_id
+      )
+
+    token_delta = token_delta_from_observation(token_observation)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
-    last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
-    last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
-    last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    {context_tokens, context_window} = extract_main_context(update, parent_thread_id)
+    prev_context_tokens = Map.get(running_entry, :codex_context_tokens, 0)
+    prev_context_window = Map.get(running_entry, :codex_context_window)
 
-    {
+    updated_entry =
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
-        session_id: session_id_for_update(running_entry.session_id, update),
+        last_codex_message: codex_message,
+        session_id: resolved_session_id,
+        model: model_for_update(Map.get(running_entry, :model), update),
+        reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
         last_codex_event: event,
+        recent_codex_events: append_recent_codex_event(Map.get(running_entry, :recent_codex_events, []), codex_message),
+        recent_codex_transcript_blocks:
+          append_recent_codex_transcript_block(
+            Map.get(running_entry, :recent_codex_transcript_blocks, []),
+            transcript_block_for_update(update, parent_thread_id)
+          ),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
-        codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
-        codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
-        codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_last_reported_input_tokens: codex_input_tokens + token_delta.input_tokens,
+        codex_last_reported_output_tokens: codex_output_tokens + token_delta.output_tokens,
+        codex_last_reported_total_tokens: codex_total_tokens + token_delta.total_tokens,
+        codex_thread_token_high_waters: thread_high_waters,
+        codex_context_tokens: positive_or_keep(context_tokens, prev_context_tokens),
+        codex_context_window: positive_or_keep(context_window, prev_context_window),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
+      })
+      |> FleetEvent.observe(update, token_observation)
+
+    {updated_entry, token_delta}
+  end
+
+  defp token_delta_from_observation(nil) do
+    %{
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_tokens: 0,
+      total_tokens: 0
+    }
+  end
+
+  defp token_delta_from_observation(%{accepted_delta: delta}) do
+    %{
+      input_tokens: delta.input_tokens,
+      cached_input_tokens: delta.cached_input_tokens,
+      output_tokens: delta.output_tokens,
+      reasoning_tokens: delta.reasoning_tokens,
+      total_tokens: delta.total_tokens
     }
   end
 
@@ -1216,6 +4073,20 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  # An agent that reports its real model on the wire (e.g. Claude Code's
+  # `system/init`) carries it on the `:session_started` event; prefer that over
+  # the configured model already recorded from `:worker_runtime_info`.
+  defp model_for_update(_existing, %{model: model}) when is_binary(model) and model != "",
+    do: model
+
+  defp model_for_update(existing, _update), do: existing
+
+  defp reasoning_effort_for_update(_existing, %{reasoning_effort: effort})
+       when is_binary(effort) and effort != "",
+       do: effort
+
+  defp reasoning_effort_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1238,9 +4109,897 @@ defmodule SymphonyElixir.Orchestrator do
   defp summarize_codex_update(update) do
     %{
       event: update[:event],
-      message: update[:payload] || update[:raw],
+      message: summarized_codex_message(update),
       timestamp: update[:timestamp]
     }
+  end
+
+  defp append_recent_codex_event(events, event) when is_list(events) and is_map(event) do
+    events
+    |> Kernel.++([event])
+    |> Enum.take(-@recent_codex_events_limit)
+  end
+
+  defp append_recent_codex_event(_events, event) when is_map(event), do: [event]
+
+  defp append_recent_codex_transcript_block(blocks, nil) when is_list(blocks), do: blocks
+
+  defp append_recent_codex_transcript_block(blocks, updates)
+       when is_list(blocks) and is_list(updates) do
+    Enum.reduce(updates, blocks, fn block, acc ->
+      append_recent_codex_transcript_block(acc, block)
+    end)
+  end
+
+  # ACP tool/output blocks carry a `tool_call_id`. ACP resends the cumulative
+  # state of a tool call on every `tool_call_update`, so replace the matching
+  # block in place (keeping its position and original timestamp) instead of
+  # appending a duplicate — otherwise arguments never fill in and cumulative
+  # output is concatenated into itself.
+  defp append_recent_codex_transcript_block(blocks, %{kind: kind, tool_call_id: id} = block)
+       when is_list(blocks) and is_binary(id) and kind in ["tool", "output"] do
+    blocks
+    |> upsert_keyed_transcript_block(kind, id, block)
+    |> Enum.take(-@recent_codex_transcript_blocks_limit)
+  end
+
+  defp append_recent_codex_transcript_block(blocks, %{kind: kind, item_id: id} = block)
+       when is_list(blocks) and is_binary(id) and
+              kind in ["agent", "command", "output", "reasoning"] do
+    blocks
+    |> upsert_item_transcript_block(kind, id, block)
+    |> Enum.take(-@recent_codex_transcript_blocks_limit)
+  end
+
+  defp append_recent_codex_transcript_block(blocks, %{kind: kind, text: text} = block)
+       when is_list(blocks) and is_binary(kind) and is_binary(text) do
+    thread_id = Map.get(block, :thread_id)
+
+    merged_blocks =
+      case Enum.reverse(blocks) do
+        [%{kind: ^kind, text: existing_text, thread_id: ^thread_id} = previous | rest]
+        when kind in ["agent", "output", "reasoning"] ->
+          Enum.reverse([%{previous | text: existing_text <> text} | rest])
+
+        reversed_blocks ->
+          Enum.reverse([block | reversed_blocks])
+      end
+
+    Enum.take(merged_blocks, -@recent_codex_transcript_blocks_limit)
+  end
+
+  defp append_recent_codex_transcript_block(_blocks, block) when is_map(block), do: [block]
+
+  defp upsert_keyed_transcript_block(blocks, kind, id, block) do
+    if Enum.any?(blocks, &keyed_transcript_block?(&1, kind, id, block.thread_id)) do
+      # Only the text changes between updates; the title/kind/timestamp are set
+      # once (by the initial `tool_call`) and kept — a later update that omits
+      # the title must not overwrite it with a generic placeholder.
+      Enum.map(blocks, &refresh_keyed_block(&1, kind, id, block.thread_id, block.text))
+    else
+      blocks ++ [block]
+    end
+  end
+
+  defp refresh_keyed_block(block, kind, id, thread_id, text) do
+    if keyed_transcript_block?(block, kind, id, thread_id),
+      do: %{block | text: text},
+      else: block
+  end
+
+  defp keyed_transcript_block?(
+         %{kind: kind, tool_call_id: id, thread_id: thread_id},
+         kind,
+         id,
+         thread_id
+       ),
+       do: true
+
+  defp keyed_transcript_block?(_block, _kind, _id, _thread_id), do: false
+
+  defp upsert_item_transcript_block(blocks, kind, id, block) do
+    if Enum.any?(blocks, &item_transcript_block?(&1, kind, id, block.thread_id)) do
+      Enum.map(blocks, &merge_item_transcript_block(&1, block))
+    else
+      blocks ++ [Map.delete(block, :replace_item_text)]
+    end
+  end
+
+  defp merge_item_transcript_block(existing, %{kind: kind, item_id: id} = incoming) do
+    if item_transcript_block?(existing, kind, id, incoming.thread_id) do
+      text =
+        if Map.get(incoming, :replace_item_text),
+          do: incoming.text,
+          else: existing.text <> incoming.text
+
+      %{existing | text: text}
+    else
+      existing
+    end
+  end
+
+  defp item_transcript_block?(
+         %{kind: kind, item_id: id, thread_id: thread_id},
+         kind,
+         id,
+         thread_id
+       ),
+       do: true
+
+  defp item_transcript_block?(_block, _kind, _id, _thread_id), do: false
+
+  defp transcript_block_for_update(%{payload: %{} = payload, timestamp: timestamp}, parent_thread_id) do
+    method = Map.get(payload, "method") || Map.get(payload, :method)
+    origin = transcript_origin(payload, parent_thread_id)
+
+    cond do
+      spec = text_block_spec(method) ->
+        {kind, paths} = spec
+        build_streamed_transcript_block(kind, timestamp, payload, paths, origin)
+
+      method == "codex/event/exec_command_begin" ->
+        build_streamed_transcript_block(
+          "command",
+          timestamp,
+          payload,
+          extract_transcript_command(payload),
+          origin
+        )
+
+      method == "item/tool/call" ->
+        build_transcript_tool_block(timestamp, payload, origin)
+
+      method in ["item/started", "item/completed"] ->
+        codex_item_transcript_blocks(method, timestamp, payload, origin)
+
+      method == "thread/compacted" ->
+        build_transcript_compaction_block(timestamp, payload, origin)
+
+      # Native ACP streaming notifications (Option B). The ACP backend forwards
+      # `session/update` verbatim; dispatch on the `update.sessionUpdate`
+      # discriminator so ACP-only data (tool kinds, plans) renders natively.
+      method == "session/update" ->
+        acp_transcript_block(timestamp, payload, origin)
+
+      true ->
+        nil
+    end
+  end
+
+  defp transcript_block_for_update(_update, _parent_thread_id), do: nil
+
+  # The streamed text-delta methods share one shape: a `kind` + the path list its
+  # text lives at. Grouping them keeps `transcript_block_for_update/2` flat.
+  defp text_block_spec(method) do
+    cond do
+      method in ["codex/event/agent_message_content_delta", "codex/event/agent_message_delta", "item/agentMessage/delta"] ->
+        {"agent", agent_text_paths()}
+
+      method in ["codex/event/exec_command_output_delta", "item/commandExecution/outputDelta"] ->
+        {"output", output_text_paths()}
+
+      method in reasoning_methods() ->
+        {"reasoning", reasoning_text_paths()}
+
+      true ->
+        nil
+    end
+  end
+
+  defp acp_transcript_block(timestamp, payload, origin) do
+    update = acp_update(payload)
+
+    case Map.get(update, "sessionUpdate") do
+      "agent_message_chunk" ->
+        build_transcript_block("agent", timestamp, acp_chunk_text(update), origin)
+
+      "agent_thought_chunk" ->
+        build_transcript_block("reasoning", timestamp, acp_chunk_text(update), origin)
+
+      "tool_call" ->
+        build_acp_tool_block(timestamp, update, origin)
+
+      "tool_call_update" ->
+        acp_tool_update_blocks(timestamp, update, origin)
+
+      "plan" ->
+        build_acp_plan_block(timestamp, update, origin)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp acp_update(payload) do
+    case string_path_value(payload, ["params", "update"]) do
+      %{} = update -> update
+      _ -> %{}
+    end
+  end
+
+  defp acp_chunk_text(update) when is_map(update), do: acp_content_text(Map.get(update, "content"))
+
+  # ACP content is a single `{type:"text", text:...}` block, a list of blocks, or
+  # a `{type:"content", content:{...}}` wrapper (tool-call output); pull the text
+  # out of whichever shape arrives.
+  defp acp_content_text(%{"content" => nested}), do: acp_content_text(nested)
+  defp acp_content_text(%{"text" => text}) when is_binary(text), do: text
+
+  defp acp_content_text(blocks) when is_list(blocks) do
+    blocks
+    |> Enum.map(&acp_content_text/1)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join("")
+  end
+
+  defp acp_content_text(_content), do: nil
+
+  defp build_acp_tool_block(timestamp, update, origin) do
+    Map.merge(
+      %{
+        kind: "tool",
+        at: iso8601(timestamp),
+        tool_call_id: acp_tool_call_id(update),
+        title: acp_tool_title(update),
+        text: normalize_transcript_text(acp_tool_arguments(update))
+      },
+      origin
+    )
+  end
+
+  # A `tool_call_update` carries the cumulative state of an in-flight tool call:
+  # its `rawInput` (arguments) fills in after the initial `tool_call` — which
+  # usually arrives with an empty `rawInput` — and its `content` grows as output
+  # streams. Emit a tool block to refresh the arguments and an output block for
+  # the latest output. Both are keyed on `toolCallId` (see
+  # `append_recent_codex_transcript_block/2`) so they update the existing blocks
+  # in place rather than appending a duplicate per streamed update.
+  defp acp_tool_update_blocks(timestamp, update, origin) do
+    [
+      acp_tool_args_block(timestamp, update, origin),
+      acp_tool_output_block(timestamp, update, origin)
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp acp_tool_args_block(timestamp, update, origin) do
+    case acp_tool_arguments(update) do
+      "" -> nil
+      _args -> build_acp_tool_block(timestamp, update, origin)
+    end
+  end
+
+  defp acp_tool_output_block(timestamp, update, origin) do
+    with text when is_binary(text) <- acp_chunk_text(update),
+         normalized when normalized != "" <- normalize_transcript_text(text) do
+      Map.merge(
+        %{kind: "output", at: iso8601(timestamp), tool_call_id: acp_tool_call_id(update), text: normalized},
+        origin
+      )
+    else
+      _ -> nil
+    end
+  end
+
+  defp acp_tool_call_id(update), do: presence(Map.get(update, "toolCallId"))
+
+  # Surface the ACP tool `kind` (read/edit/execute/think/…) alongside the
+  # human-readable `title`, which Codex tool calls don't carry.
+  defp acp_tool_title(update) do
+    kind = presence(Map.get(update, "kind"))
+    title = presence(Map.get(update, "title"))
+
+    cond do
+      kind && title -> "#{kind}: #{title}"
+      title -> title
+      kind -> kind
+      true -> "tool"
+    end
+  end
+
+  defp acp_tool_arguments(update) do
+    case Map.get(update, "rawInput") do
+      nil -> ""
+      input -> format_tool_arguments(input)
+    end
+  end
+
+  defp build_acp_plan_block(timestamp, update, origin) do
+    case acp_plan_text(update) do
+      "" -> nil
+      text -> Map.merge(%{kind: "plan", at: iso8601(timestamp), text: text}, origin)
+    end
+  end
+
+  # ACP `plan` updates are full snapshots of the agent's TODO list; render each
+  # as a markdown checklist keyed on entry `status`.
+  defp acp_plan_text(update) do
+    update
+    |> Map.get("entries", [])
+    |> List.wrap()
+    |> Enum.map(&acp_plan_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp acp_plan_entry(%{"content" => content} = entry) when is_binary(content) do
+    "#{acp_plan_marker(Map.get(entry, "status"))} #{String.trim(content)}"
+  end
+
+  defp acp_plan_entry(_entry), do: nil
+
+  defp acp_plan_marker("completed"), do: "- [x]"
+  defp acp_plan_marker("in_progress"), do: "- [~]"
+  defp acp_plan_marker(_status), do: "- [ ]"
+
+  defp presence(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp presence(_value), do: nil
+
+  defp build_streamed_transcript_block(kind, timestamp, payload, paths, origin)
+       when is_list(paths) do
+    build_streamed_transcript_block(
+      kind,
+      timestamp,
+      payload,
+      extract_transcript_text(payload, paths),
+      origin
+    )
+  end
+
+  defp build_streamed_transcript_block(kind, timestamp, payload, text, origin) do
+    build_item_transcript_block(kind, timestamp, text, codex_item_id(payload), origin)
+  end
+
+  defp build_item_transcript_block(kind, timestamp, text, item_id, origin) do
+    case build_transcript_block(kind, timestamp, text, origin) do
+      nil -> nil
+      block when is_binary(item_id) -> Map.put(block, :item_id, item_id)
+      block -> block
+    end
+  end
+
+  defp build_completed_item_transcript_block(kind, timestamp, text, item_id, origin) do
+    case build_item_transcript_block(kind, timestamp, text, item_id, origin) do
+      %{item_id: _item_id} = block -> Map.put(block, :replace_item_text, true)
+      block -> block
+    end
+  end
+
+  defp codex_item_id(payload) when is_map(payload) do
+    [
+      ["params", "itemId"],
+      ["params", "item_id"],
+      ["params", "callId"],
+      ["params", "call_id"],
+      ["params", "item", "id"],
+      ["params", "msg", "itemId"],
+      ["params", "msg", "item_id"],
+      ["params", "msg", "callId"],
+      ["params", "msg", "call_id"],
+      ["params", "msg", "id"],
+      ["params", "id"]
+    ]
+    |> Enum.find_value(fn path -> presence(string_path_value(payload, path)) end)
+  end
+
+  defp build_transcript_block(kind, timestamp, text, origin) when is_binary(kind) and is_binary(text) do
+    case normalize_transcript_text(text) do
+      "" -> nil
+      normalized -> Map.merge(%{kind: kind, at: iso8601(timestamp), text: normalized}, origin)
+    end
+  end
+
+  defp build_transcript_block(_kind, _timestamp, _text, _origin), do: nil
+
+  defp build_transcript_tool_block(timestamp, payload, origin) do
+    {name, args_text} = extract_transcript_tool(payload)
+    Map.merge(%{kind: "tool", at: iso8601(timestamp), title: name, text: normalize_transcript_text(args_text)}, origin)
+  end
+
+  # Codex reports each tool call's lifecycle as an `item/started` then an
+  # `item/completed` notification. The streamed deltas handled by
+  # `text_block_spec/1` cover the agent-message, reasoning and command *output*
+  # items, but the call itself — the command line, the file diff, the
+  # MCP/web-search/subagent invocation — only ever arrives inside these item
+  # events. Mirror `Presenter.codex_item_fragments/4` so the live ring buffer and
+  # the persisted transcript render identically. `dynamicToolCall` is skipped: it
+  # is the Symphony-provided tool dispatched via `item/tool/call` and already
+  # rendered by `build_transcript_tool_block/3`.
+  defp codex_item_transcript_blocks(method, timestamp, payload, origin) do
+    with %{} = item <- string_path_value(payload, ["params", "item"]),
+         type when is_binary(type) <- Map.get(item, "type") do
+      codex_item_transcript_block(method, type, timestamp, item, presence(Map.get(item, "id")), origin)
+    else
+      _ -> nil
+    end
+  end
+
+  defp codex_item_transcript_block("item/started", "commandExecution", timestamp, item, id, origin),
+    do: build_item_transcript_block("command", timestamp, codex_item_command_text(item), id, origin)
+
+  defp codex_item_transcript_block("item/started", "fileChange", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, codex_item_file_change_title(item), codex_item_file_change_text(item), origin)
+
+  defp codex_item_transcript_block("item/started", "collabAgentToolCall", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, codex_item_collab_title(item), codex_item_collab_text(item), origin)
+
+  defp codex_item_transcript_block("item/started", "webSearch", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, "web_search", presence(Map.get(item, "query")), origin)
+
+  defp codex_item_transcript_block("item/started", "mcpToolCall", timestamp, item, id, origin),
+    do: codex_item_tool_block(timestamp, id, codex_item_mcp_title(item), codex_item_mcp_args_text(item), origin)
+
+  defp codex_item_transcript_block("item/completed", "mcpToolCall", timestamp, item, id, origin),
+    do: codex_item_mcp_output_block(timestamp, id, item, origin)
+
+  defp codex_item_transcript_block("item/completed", "agentMessage", timestamp, item, id, origin),
+    do:
+      build_completed_item_transcript_block(
+        "agent",
+        timestamp,
+        Map.get(item, "text"),
+        id,
+        origin
+      )
+
+  defp codex_item_transcript_block("item/completed", "commandExecution", timestamp, item, id, origin) do
+    [
+      build_completed_item_transcript_block(
+        "command",
+        timestamp,
+        codex_item_command_text(item),
+        id,
+        origin
+      ),
+      build_completed_item_transcript_block(
+        "output",
+        timestamp,
+        Map.get(item, "aggregatedOutput"),
+        id,
+        origin
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp codex_item_transcript_block(_method, _type, _timestamp, _item, _id, _origin), do: nil
+
+  defp codex_item_tool_block(timestamp, id, title, text, origin) do
+    block = Map.merge(%{kind: "tool", at: iso8601(timestamp), title: title, text: normalize_transcript_text(text || "")}, origin)
+    if is_binary(id), do: Map.put(block, :tool_call_id, id), else: block
+  end
+
+  defp codex_item_command_text(item) do
+    case Map.get(item, "command") do
+      command when is_binary(command) -> "$ #{String.trim(command)}"
+      _ -> nil
+    end
+  end
+
+  defp codex_item_file_change_title(item) do
+    case codex_item_file_change_paths(item) do
+      [] -> "edit"
+      [path] -> "edit: #{Path.basename(path)}"
+      paths -> "edit: #{length(paths)} files"
+    end
+  end
+
+  defp codex_item_file_change_paths(item) do
+    item
+    |> Map.get("changes", [])
+    |> List.wrap()
+    |> Enum.map(&Map.get(&1, "path"))
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp codex_item_file_change_text(item) do
+    item
+    |> Map.get("changes", [])
+    |> List.wrap()
+    |> Enum.map(&codex_item_file_change_entry/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
+    |> truncate_tool_text()
+  end
+
+  defp codex_item_file_change_entry(%{"path" => path} = change) when is_binary(path) do
+    case Map.get(change, "diff") do
+      diff when is_binary(diff) -> "#{path}\n#{diff}"
+      _ -> path
+    end
+  end
+
+  defp codex_item_file_change_entry(_change), do: nil
+
+  defp codex_item_collab_title(item), do: presence(Map.get(item, "tool")) || "agent"
+
+  defp codex_item_collab_text(item) do
+    case presence(Map.get(item, "prompt")) do
+      nil -> nil
+      prompt -> truncate_tool_text(prompt)
+    end
+  end
+
+  defp codex_item_mcp_title(item) do
+    tool = presence(Map.get(item, "tool")) || "tool"
+
+    case presence(Map.get(item, "server")) do
+      nil -> tool
+      server -> "#{server}: #{tool}"
+    end
+  end
+
+  defp codex_item_mcp_args_text(item) do
+    case Map.get(item, "arguments") do
+      nil -> ""
+      arguments -> format_tool_arguments(arguments)
+    end
+  end
+
+  defp codex_item_mcp_output_block(timestamp, id, item, origin) do
+    with text when is_binary(text) and text != "" <- codex_item_mcp_result_text(item),
+         block when is_map(block) <- build_transcript_block("output", timestamp, truncate_tool_text(text), origin) do
+      if is_binary(id), do: Map.put(block, :tool_call_id, id), else: block
+    else
+      _ -> nil
+    end
+  end
+
+  defp codex_item_mcp_result_text(item) do
+    case codex_item_mcp_error_text(item) do
+      nil -> item |> Map.get("result") |> codex_item_mcp_content_text()
+      error -> "Error: #{error}"
+    end
+  end
+
+  defp codex_item_mcp_error_text(item) do
+    case Map.get(item, "error") do
+      error when is_binary(error) -> presence(error)
+      %{} = error -> presence(inspect(error))
+      _ -> nil
+    end
+  end
+
+  defp codex_item_mcp_content_text(%{"content" => content}), do: acp_content_text(content)
+  defp codex_item_mcp_content_text(_result), do: nil
+
+  defp build_transcript_compaction_block(timestamp, payload, origin) do
+    Map.merge(
+      %{
+        kind: "compaction",
+        at: iso8601(timestamp),
+        text: compaction_transcript_text(payload)
+      },
+      origin
+    )
+  end
+
+  defp compaction_transcript_text(payload) when is_map(payload) do
+    case string_path_value(payload, ["params", "turnId"]) || string_path_value(payload, ["params", "turn_id"]) do
+      turn_id when is_binary(turn_id) and byte_size(turn_id) >= 8 ->
+        "Context compacted for turn #{short_identifier(turn_id)}."
+
+      _ ->
+        "Context compacted."
+    end
+  end
+
+  defp short_identifier(identifier) when is_binary(identifier) and byte_size(identifier) > 8,
+    do: binary_part(identifier, 0, 8)
+
+  defp short_identifier(identifier) when is_binary(identifier), do: identifier
+
+  # Each Codex event carries the thread it belongs to (`params.threadId`); the
+  # session's own thread is the first UUID of `session_id` (`"<thread>-<turn>"`).
+  # An event from any other thread is a multiplexed subagent turn.
+  defp transcript_origin(payload, parent_thread_id) do
+    event_thread_id = event_thread_id(payload)
+    %{thread_id: event_thread_id, subagent: subagent_thread?(event_thread_id, parent_thread_id)}
+  end
+
+  defp event_thread_id(payload) when is_map(payload) do
+    string_path_value(payload, ["params", "threadId"]) || string_path_value(payload, ["params", "thread_id"])
+  end
+
+  defp subagent_thread?(event_thread_id, parent_thread_id)
+       when is_binary(event_thread_id) and is_binary(parent_thread_id),
+       do: event_thread_id != parent_thread_id
+
+  defp subagent_thread?(_event_thread_id, _parent_thread_id), do: false
+
+  # session_id is "<thread-uuid>-<turn-uuid>"; each UUID is a fixed 36 chars, so
+  # the parent thread is the leading 36 characters followed by the joining "-".
+  defp parent_thread_from_session_id(session_id)
+       when is_binary(session_id) and byte_size(session_id) >= 73 do
+    if binary_part(session_id, 36, 1) == "-", do: binary_part(session_id, 0, 36), else: nil
+  end
+
+  defp parent_thread_from_session_id(_session_id), do: nil
+
+  defp agent_text_paths do
+    [
+      ["params", "msg", "content"],
+      ["params", "msg", "delta"],
+      ["params", "delta"],
+      ["params", "text"],
+      ["params", "content"]
+    ]
+  end
+
+  defp output_text_paths do
+    [
+      ["params", "msg", "content"],
+      ["params", "msg", "delta"],
+      ["params", "delta"],
+      ["params", "output"],
+      ["params", "content"]
+    ]
+  end
+
+  defp reasoning_methods do
+    [
+      "codex/event/agent_reasoning_delta",
+      "codex/event/reasoning_content_delta",
+      "codex/event/agent_reasoning",
+      "item/reasoning/textDelta",
+      "item/reasoning/summaryTextDelta"
+    ]
+  end
+
+  defp reasoning_text_paths do
+    [
+      ["params", "textDelta"],
+      ["params", "summaryText"],
+      ["params", "delta"],
+      ["params", "msg", "content"],
+      ["params", "text"],
+      ["params", "content"]
+    ]
+  end
+
+  defp extract_transcript_text(payload, paths) when is_map(payload) and is_list(paths) do
+    Enum.find_value(paths, fn path ->
+      case string_path_value(payload, path) do
+        text when is_binary(text) -> text
+        _ -> nil
+      end
+    end)
+  end
+
+  defp extract_transcript_command(payload) when is_map(payload) do
+    [
+      ["params", "msg", "command"],
+      ["params", "command"],
+      ["params", "cmd"]
+    ]
+    |> Enum.find_value(fn path ->
+      case string_path_value(payload, path) do
+        command when is_binary(command) -> "$ #{String.trim(command)}"
+        _ -> nil
+      end
+    end)
+  end
+
+  defp extract_transcript_tool(payload) when is_map(payload) do
+    name =
+      string_path_value(payload, ["params", "tool"]) ||
+        string_path_value(payload, ["params", "name"]) ||
+        "tool"
+
+    args_text =
+      case string_path_value(payload, ["params", "arguments"]) do
+        nil -> ""
+        args -> format_tool_arguments(args)
+      end
+
+    {to_string(name), args_text}
+  end
+
+  defp format_tool_arguments(args) when is_binary(args), do: truncate_tool_text(args)
+  defp format_tool_arguments(args) when is_map(args) and map_size(args) == 0, do: ""
+
+  defp format_tool_arguments(args),
+    do: args |> inspect(pretty: true, limit: :infinity, width: 100) |> truncate_tool_text()
+
+  @max_tool_argument_chars 4_000
+  defp truncate_tool_text(text) when is_binary(text) do
+    if String.length(text) > @max_tool_argument_chars do
+      String.slice(text, 0, @max_tool_argument_chars) <> "\n… [truncated]"
+    else
+      text
+    end
+  end
+
+  defp normalize_transcript_text(text) when is_binary(text) do
+    text
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
+    |> String.replace(~r/\x1B\[[0-9;]*[A-Za-z]/, "")
+    |> String.replace(~r/\x1B./, "")
+    |> String.replace(~r/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/, "")
+  end
+
+  defp string_path_value(value, []), do: value
+
+  defp string_path_value(map, [key | rest]) when is_map(map) and is_binary(key) do
+    case Map.get(map, key) do
+      nil -> nil
+      nested -> string_path_value(nested, rest)
+    end
+  end
+
+  defp string_path_value(_map, _path), do: nil
+
+  defp persist_codex_update(running_entry, update) when is_map(running_entry) and is_map(update) do
+    case session_log_for_update(running_entry, update) do
+      {:ok, updated_entry, log_entry} ->
+        case SessionTranscript.persist(
+               log_entry,
+               codex_session_log_record(updated_entry, update),
+               updated_entry.observability_policy
+             ) do
+          {:ok, updated_log_entry} ->
+            put_session_log_entry(updated_entry, updated_log_entry)
+
+          {:error, reason} ->
+            Logger.warning(
+              "Failed to write Codex transcript issue_id=#{updated_entry.issue.id} issue_identifier=#{updated_entry.identifier} session_id=#{updated_entry.session_id || "n/a"} path=#{log_entry.path} reason=#{inspect(reason)}"
+            )
+
+            updated_entry
+        end
+
+      :skip ->
+        running_entry
+    end
+  end
+
+  defp ensure_observability_policy(running_entry, resolver) do
+    if Map.has_key?(running_entry, :observability_policy) do
+      running_entry
+    else
+      Map.put(running_entry, :observability_policy, resolver.())
+    end
+  end
+
+  defp session_log_for_update(running_entry, update) do
+    session_id = Map.get(running_entry, :session_id)
+
+    if is_binary(session_id) and String.trim(session_id) != "" do
+      timestamp = update[:timestamp] || DateTime.utc_now()
+      log_entry = existing_or_new_session_log(running_entry, session_id, timestamp)
+      updated_log_entry = refresh_session_log_entry(log_entry, running_entry, timestamp)
+      {:ok, put_session_log_entry(running_entry, updated_log_entry), updated_log_entry}
+    else
+      :skip
+    end
+  end
+
+  defp existing_or_new_session_log(running_entry, session_id, timestamp) do
+    Enum.find(Map.get(running_entry, :codex_session_logs, []), fn
+      %{session_id: ^session_id} -> true
+      _ -> false
+    end) ||
+      %{
+        session_id: session_id,
+        path: codex_session_log_path(running_entry.identifier, session_id),
+        started_at: timestamp
+      }
+  end
+
+  defp refresh_session_log_entry(log_entry, running_entry, timestamp) do
+    log_entry
+    |> Map.put(:started_at, Map.get(log_entry, :started_at, timestamp))
+    |> Map.put(:last_event_at, timestamp)
+    |> maybe_put_runtime_value(:worker_host, Map.get(running_entry, :worker_host))
+    |> maybe_put_runtime_value(:workspace_path, Map.get(running_entry, :workspace_path))
+  end
+
+  defp put_session_log_entry(running_entry, %{session_id: session_id} = log_entry) when is_binary(session_id) do
+    session_logs =
+      running_entry
+      |> Map.get(:codex_session_logs, [])
+      |> Enum.reject(fn
+        %{session_id: ^session_id} -> true
+        _ -> false
+      end)
+      |> Kernel.++([log_entry])
+
+    Map.put(running_entry, :codex_session_logs, session_logs)
+  end
+
+  defp put_session_log_entry(running_entry, _log_entry), do: running_entry
+
+  defp codex_session_log_path(issue_identifier, session_id)
+       when is_binary(issue_identifier) and is_binary(session_id) do
+    file_name =
+      "#{sanitize_session_log_component(issue_identifier)}--#{sanitize_session_log_component(session_id)}.ndjson"
+
+    codex_session_logs_dir()
+    |> Path.join(file_name)
+    |> Path.expand()
+  end
+
+  defp codex_session_logs_dir do
+    :symphony_elixir
+    |> Application.get_env(:log_file, LogFile.default_log_file())
+    |> Path.expand()
+    |> Path.dirname()
+    |> Path.join("codex_sessions")
+  end
+
+  defp sanitize_session_log_component(value) when is_binary(value) do
+    value
+    |> String.replace(~r/[^A-Za-z0-9._-]/, "_")
+    |> String.trim("_")
+    |> case do
+      "" -> "session"
+      sanitized -> sanitized
+    end
+  end
+
+  defp codex_session_log_record(running_entry, update) when is_map(running_entry) and is_map(update) do
+    %{
+      at: iso8601(update[:timestamp]),
+      event: update[:event] |> to_string(),
+      issue_id: running_entry.issue.id,
+      issue_identifier: running_entry.identifier,
+      session_id: Map.get(running_entry, :session_id),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      codex_app_server_pid: Map.get(running_entry, :codex_app_server_pid),
+      summary:
+        StatusDashboard.humanize_codex_message(%{
+          event: update[:event],
+          message: summarized_codex_message(update)
+        }),
+      payload: update[:payload],
+      raw: update[:raw],
+      details: json_safe_value(update[:details]),
+      thread_id: update[:thread_id],
+      turn_id: update[:turn_id],
+      decision: update[:decision],
+      answer: update[:answer],
+      reason: json_safe_value(update[:reason])
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp json_safe_value(nil), do: nil
+  defp json_safe_value(%DateTime{} = value), do: iso8601(value)
+  defp json_safe_value(value) when is_binary(value) or is_number(value) or is_boolean(value), do: value
+  defp json_safe_value(value) when is_atom(value), do: Atom.to_string(value)
+  defp json_safe_value(value) when is_list(value), do: Enum.map(value, &json_safe_value/1)
+
+  defp json_safe_value(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, nested_value} -> {to_string(key), json_safe_value(nested_value)} end)
+    |> Map.new()
+  end
+
+  defp json_safe_value(value), do: inspect(value)
+
+  defp iso8601(%DateTime{} = timestamp), do: DateTime.to_iso8601(timestamp)
+  defp iso8601(_timestamp), do: nil
+
+  defp summarized_codex_message(update) when is_map(update) do
+    update[:payload] ||
+      update[:raw] ||
+      update
+      |> Map.take([:session_id, :thread_id, :turn_id, :reason, :decision, :answer])
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Map.new()
+      |> case do
+        empty when map_size(empty) == 0 -> nil
+        metadata -> metadata
+      end
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
@@ -1262,6 +5021,52 @@ defmodule SymphonyElixir.Orchestrator do
   defp schedule_poll_cycle_start do
     :timer.send_after(@poll_transition_render_delay_ms, self(), :run_poll_cycle)
     :ok
+  end
+
+  defp schedule_heartbeat(delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    Process.send_after(self(), :write_heartbeat, delay_ms)
+    :ok
+  end
+
+  defp schedule_workspace_gc(delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    Process.send_after(self(), :run_workspace_gc, delay_ms)
+    :ok
+  end
+
+  defp workspace_gc_disabled? do
+    System.get_env("SYMPHONY_WORKSPACE_GC_DISABLED") == "1" or
+      Application.get_env(:symphony_elixir, :workspace_gc_disabled, false) == true
+  end
+
+  defp write_heartbeat(%State{} = state) do
+    path = heartbeat_path()
+
+    body =
+      Jason.encode!(%{
+        ts: DateTime.to_iso8601(DateTime.utc_now()),
+        running: map_size(state.running),
+        claimed: MapSet.size(state.claimed),
+        completed_recent: MapSet.size(state.completed),
+        poll_check_in_progress: state.poll_check_in_progress,
+        poll_interval_ms: state.poll_interval_ms
+      })
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(path, body <> "\n") do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning("Orchestrator could not write heartbeat to #{path}: #{inspect(reason)}")
+        :error
+    end
+  end
+
+  defp heartbeat_path do
+    base =
+      System.get_env("SYMPHONY_HEARTBEAT_DIR") ||
+        Path.join(System.user_home!(), ".symphony")
+
+    Path.join(base, @heartbeat_filename)
   end
 
   defp next_poll_in_ms(nil, _now_ms), do: nil
@@ -1291,25 +5096,838 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | codex_totals: codex_totals}
   end
 
-  defp record_session_completion_totals(state, _running_entry), do: state
-
-  defp refresh_runtime_config(%State{} = state) do
-    config = Config.settings!()
-
-    %{
+  # Shared body for a valid-config tick: flip the loop into "checking now…",
+  # clear the fired tick timer, and hand off to the poll cycle.
+  defp begin_poll_check(%State{} = state) do
+    state = %{
       state
-      | poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: config.agent.max_concurrent_agents
+      | poll_check_in_progress: true,
+        next_poll_due_at_ms: nil,
+        tick_timer_ref: nil,
+        tick_token: nil
     }
+
+    notify_dashboard()
+    :ok = schedule_poll_cycle_start()
+    state
+  end
+
+  # Transiently-invalid config on the polled path (UDPE-6990): log a warning
+  # and skip this cycle instead of letting `Config.settings!/0` crash the
+  # GenServer. Keep the last-good `poll_interval_ms`/`max_concurrent_agents`
+  # already in state, reschedule the next tick, and mark the loop idle so
+  # polling resumes on its own the moment the config parses again.
+  defp skip_poll_cycle_on_invalid_config(%State{} = state, reason) do
+    Logger.warning(
+      "Skipping poll cycle; WORKFLOW.md config is currently invalid: #{Config.describe_error(reason)}. Keeping last-good poll_interval_ms=#{state.poll_interval_ms} max_concurrent_agents=#{state.max_concurrent_agents}; retrying next tick"
+    )
+
+    state = schedule_tick(state, poll_delay_ms(state))
+    state = %{state | poll_check_in_progress: false, poll_backoff_until_ms: nil}
+
+    notify_dashboard()
+    state
+  end
+
+  # Resolve live config at the poll boundary WITHOUT raising. A momentarily-
+  # invalid WORKFLOW.md/host config (a half-saved edit, or a write in flight)
+  # makes `Config.settings/0` return `{:error, reason}` where `settings!/0`
+  # would raise `ArgumentError`. Returning the error lets the caller keep the
+  # last-good `poll_interval_ms`/`max_concurrent_agents` already in state and
+  # skip the cycle, so a transient bad config can't crash the GenServer and —
+  # via the supervisor's restart intensity — take the whole app down
+  # (UDPE-6990).
+  defp refresh_runtime_config(%State{} = state) do
+    case Config.settings() do
+      {:ok, config} ->
+        {:ok,
+         %{
+           state
+           | poll_interval_ms: config.polling.interval_ms,
+             max_concurrent_agents: config.agent.max_concurrent_agents
+         }}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+      !issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)
+  end
+
+  defp failure_from_exit(_reason, %{run_failure: %AgentFailure{} = failure}), do: failure
+
+  defp failure_from_exit(reason, running_entry) do
+    AgentFailure.classify(reason, backend: Map.get(running_entry, :backend))
+  end
+
+  defp failure_error(_reason, %{run_failure: %AgentFailure{}}, %AgentFailure{} = failure),
+    do: failure.message
+
+  defp failure_error(reason, _running_entry, _failure), do: "agent exited: #{inspect(reason)}"
+
+  defp handle_typed_run_failure(
+         state,
+         issue_id,
+         next_attempt,
+         %{failure: %AgentFailure{class: :usage_quota_limit, trusted: true}} = metadata,
+         _probe?
+       ) do
+    open_quota_circuit_and_park(state, issue_id, next_attempt, metadata)
+  end
+
+  defp handle_typed_run_failure(
+         state,
+         issue_id,
+         next_attempt,
+         %{failure: %AgentFailure{class: :review_configuration}} = metadata,
+         false
+       ) do
+    stop_for_review_configuration(state, issue_id, next_attempt, metadata)
+  end
+
+  defp handle_typed_run_failure(state, issue_id, next_attempt, metadata, true) do
+    handle_failed_quota_probe(state, issue_id, next_attempt, metadata)
+  end
+
+  defp handle_typed_run_failure(state, issue_id, next_attempt, metadata, false) do
+    schedule_failure_retry(state, issue_id, next_attempt, metadata)
+  end
+
+  defp stop_for_review_configuration(%State{} = state, issue_id, attempt, metadata) do
+    identifier = metadata[:identifier] || issue_id
+
+    Logger.warning("Non-retryable review configuration failure for issue_id=#{issue_id} issue_identifier=#{identifier}; marking Blocked and releasing claim")
+
+    spawn_human_action_block(giveup_issue(metadata, issue_id, identifier), %{
+      reason: :review_configuration,
+      workspace: metadata[:workspace_path],
+      error: metadata[:error]
+    })
+
+    state
+    |> emit_retry_policy(issue_id, metadata, :blocked, attempt, nil)
+    |> drop_retry_attempt(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
+  defp open_quota_circuit_and_park(
+         %State{} = state,
+         issue_id,
+         next_attempt,
+         %{failure: %AgentFailure{} = failure} = metadata
+       ) do
+    backend = quota_failure_backend(failure, metadata)
+    worker_host = metadata[:worker_host]
+    circuit_key = quota_circuit_key(backend, worker_host)
+    now = DateTime.utc_now()
+    next_probe_at = quota_probe_at(failure, backend, now)
+    previous = Map.get(state.quota_circuits, circuit_key)
+
+    circuit =
+      quota_circuit_from_failure(
+        state,
+        previous,
+        failure,
+        backend,
+        worker_host,
+        now,
+        next_probe_at
+      )
+
+    state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
+
+    action = if previous, do: :refreshed, else: :opened
+
+    Logger.warning("Opening provider quota circuit backend=#{backend} account_scope=#{circuit.account_scope} next_probe_at=#{DateTime.to_iso8601(circuit.next_probe_at)} issue_id=#{issue_id}")
+
+    state
+    |> emit_quota_circuit(action, circuit)
+    |> park_issue_retry(issue_id, next_attempt, metadata)
+  end
+
+  defp quota_failure_backend(%AgentFailure{backend: backend}, _metadata) when is_binary(backend),
+    do: backend
+
+  defp quota_failure_backend(_failure, %{backend: backend}) when is_binary(backend), do: backend
+  defp quota_failure_backend(_failure, _metadata), do: "codex"
+
+  defp quota_circuit_from_failure(
+         state,
+         previous,
+         failure,
+         backend,
+         worker_host,
+         now,
+         next_probe_at
+       ) do
+    %{
+      backend: backend,
+      account_scope: quota_account_scope(worker_host),
+      worker_host: worker_host,
+      provider_limit_id: quota_provider_limit_id(state.codex_rate_limits),
+      status: :open,
+      reason: failure.message,
+      opened_at: previous_value(previous, :opened_at, now),
+      reset_at: later_datetime(previous_value(previous, :reset_at), failure.reset_at),
+      next_probe_at: later_datetime(previous_value(previous, :next_probe_at), next_probe_at),
+      probe_issue_id: nil,
+      parked: previous_value(previous, :parked, []),
+      timer_ref: previous_value(previous, :timer_ref),
+      timer_token: nil
+    }
+  end
+
+  defp previous_value(previous, key, fallback \\ nil)
+  defp previous_value(previous, key, fallback) when is_map(previous), do: Map.get(previous, key, fallback)
+  defp previous_value(_previous, _key, fallback), do: fallback
+
+  defp handle_failed_quota_probe(%State{} = state, issue_id, next_attempt, metadata) do
+    backend = metadata[:backend] || "codex"
+    circuit_key = quota_circuit_key(backend, metadata[:worker_host])
+    state = reopen_quota_circuit(state, circuit_key, metadata[:error])
+    {failures, state} = bump_failure_count(state, issue_id)
+    max_retries = max_retries_setting()
+
+    if is_integer(max_retries) and max_retries > 0 and failures > max_retries and
+         retry_exhaustion_requires_human?(metadata) do
+      give_up_retries_exhausted(state, issue_id, failures - 1, max_retries, metadata)
+    else
+      state =
+        if is_integer(max_retries) and max_retries > 0 and failures > max_retries do
+          %{state | failure_counts: Map.put(state.failure_counts, issue_id, max_retries)}
+        else
+          state
+        end
+
+      park_issue_retry(state, issue_id, next_attempt, metadata)
+    end
+  end
+
+  defp reopen_quota_circuit(%State{} = state, circuit_key, reason) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        next_probe_at = fallback_quota_probe_at(circuit.backend, DateTime.utc_now())
+
+        updated = %{
+          circuit
+          | status: :open,
+            reason: reason || circuit.reason,
+            next_probe_at: next_probe_at,
+            probe_issue_id: nil,
+            timer_ref: nil,
+            timer_token: nil
+        }
+
+        state
+        |> put_quota_circuit(circuit_key, updated)
+        |> emit_quota_circuit(:probe_failed, updated)
+
+      _ ->
+        state
+    end
+  end
+
+  defp park_issue_retry(%State{} = state, issue_id, attempt, metadata) do
+    backend = metadata[:backend] || retry_backend(metadata, metadata[:issue])
+    circuit_key = quota_circuit_key(backend, metadata[:worker_host])
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        state = drop_retry_attempt(state, issue_id)
+        parked_at = DateTime.utc_now()
+
+        metadata =
+          metadata
+          |> Map.put_new(:identifier, issue_id)
+          |> mark_resume_packet_transition(:quota_parked)
+
+        parked_entry = quota_parked_entry(issue_id, attempt, metadata, circuit, backend, parked_at)
+
+        parked =
+          circuit.parked
+          |> Enum.reject(&(&1.issue_id == issue_id))
+          |> Kernel.++([parked_entry])
+
+        updated = %{circuit | parked: parked, status: :open, probe_issue_id: nil}
+
+        state
+        |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
+        |> put_quota_circuit(circuit_key, updated)
+        |> emit_retry_policy(
+          issue_id,
+          Map.merge(metadata, %{
+            retry_id: parked_entry.retry_id,
+            previous_retry_id: parked_entry.previous_retry_id
+          }),
+          :parked,
+          parked_entry.attempt,
+          nil
+        )
+
+      _ ->
+        schedule_issue_retry(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp quota_parked_entry(issue_id, attempt, metadata, circuit, backend, parked_at) do
+    {retry_id, previous_retry_id} = quota_parked_retry_lineage(metadata)
+
+    %{
+      issue_id: issue_id,
+      identifier: metadata[:identifier] || issue_identifier(metadata[:issue]) || issue_id,
+      title: metadata[:title] || title_from_issue(metadata[:issue]),
+      attempt: max(normalize_retry_attempt(attempt), 1),
+      retry_id: retry_id,
+      previous_retry_id: previous_retry_id,
+      parent_run_id: metadata[:run_id] || metadata[:parent_run_id],
+      error: metadata[:error] || circuit.reason,
+      backend: backend,
+      failure_class: metadata[:failure_class] || retry_failure_class(metadata[:failure]),
+      worker_host: metadata[:worker_host],
+      workspace_path: metadata[:workspace_path],
+      resume_packet_ref: ResumePacket.normalize_reference(metadata[:resume_packet_ref]),
+      parked_at: parked_at
+    }
+  end
+
+  defp quota_parked_retry_lineage(%{run_id: run_id} = metadata) when is_binary(run_id) do
+    {RunManifest.new_id(), metadata[:retry_id] || metadata[:previous_retry_id]}
+  end
+
+  defp quota_parked_retry_lineage(metadata) do
+    {metadata[:retry_id] || RunManifest.new_id(), metadata[:previous_retry_id]}
+  end
+
+  defp handle_quota_probe_due(%State{} = state, circuit_key, timer_token) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :open, timer_token: ^timer_token} = circuit ->
+        circuit = %{circuit | timer_ref: nil, timer_token: nil}
+        state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
+
+        cond do
+          state.draining ->
+            state
+            |> defer_quota_probe(circuit_key)
+            |> mark_quota_probe_drain_deferred(circuit_key)
+
+          available_slots(state) > 0 and
+              quota_probe_slot_available?(state, circuit.worker_host) ->
+            start_quota_probe(state, circuit_key)
+
+          true ->
+            defer_quota_probe(state, circuit_key)
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp start_quota_probe(%State{} = state, circuit_key) do
+    circuit = Map.fetch!(state.quota_circuits, circuit_key)
+
+    case Tracker.fetch_candidate_issues() do
+      {:ok, issues} ->
+        case select_quota_probe_issue(state, circuit_key, issues) do
+          {%Issue{} = issue, parked_entry} ->
+            begin_quota_probe(state, circuit_key, issue, parked_entry)
+
+          nil ->
+            defer_quota_probe(state, circuit_key)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Quota probe candidate lookup failed backend=#{circuit.backend} account_scope=#{circuit.account_scope}: #{inspect(reason)}")
+        defer_quota_probe(state, circuit_key)
+    end
+  end
+
+  defp select_quota_probe_issue(%State{} = state, circuit_key, issues) when is_list(issues) do
+    circuit = Map.fetch!(state.quota_circuits, circuit_key)
+
+    select_parked_probe(circuit.parked, issues, circuit.backend) ||
+      select_new_probe(issues, state, circuit.backend)
+  end
+
+  defp select_parked_probe(parked, issues, backend) do
+    Enum.find_value(parked, fn entry ->
+      issues
+      |> find_issue_by_id(entry.issue_id)
+      |> eligible_probe_tuple(entry, backend)
+    end)
+  end
+
+  defp select_new_probe(issues, state, backend) do
+    issues
+    |> sort_issues_for_dispatch()
+    |> Enum.find(&eligible_new_probe?(&1, state, backend))
+    |> eligible_probe_tuple(nil, backend)
+  end
+
+  defp eligible_new_probe?(%Issue{} = issue, state, backend) do
+    eligible_probe_issue?(issue, backend) and !Map.has_key?(state.running, issue.id) and
+      !MapSet.member?(state.claimed, issue.id)
+  end
+
+  defp eligible_new_probe?(_issue, _state, _backend), do: false
+
+  defp eligible_probe_tuple(%Issue{} = issue, entry, backend) do
+    if eligible_probe_issue?(issue, backend), do: {issue, entry}
+  end
+
+  defp eligible_probe_tuple(_issue, _entry, _backend), do: nil
+
+  defp eligible_probe_issue?(%Issue{} = issue, backend) do
+    retry_candidate_issue?(issue, terminal_state_set()) and predicted_backend(issue) == backend
+  end
+
+  defp begin_quota_probe(%State{} = state, circuit_key, issue, parked_entry) do
+    circuit = Map.fetch!(state.quota_circuits, circuit_key)
+    backend = circuit.backend
+    parked = Enum.reject(circuit.parked, &(&1.issue_id == issue.id))
+
+    updated = %{
+      circuit
+      | status: :probe,
+        probe_issue_id: issue.id,
+        parked: parked,
+        timer_ref: nil,
+        timer_token: nil
+    }
+
+    {attempt, preferred_worker_host, agent_opts} = quota_probe_dispatch(circuit, parked_entry)
+
+    state = put_quota_circuit(state, circuit_key, updated)
+
+    {_outcome, dispatched_state} =
+      dispatch_issue_outcome(state, issue, attempt, preferred_worker_host, agent_opts)
+
+    if Map.has_key?(dispatched_state.running, issue.id) do
+      Logger.info("Started controlled provider quota probe backend=#{backend} issue_id=#{issue.id} issue_identifier=#{issue.identifier}")
+
+      dispatched_state
+      |> emit_retry_policy(
+        issue.id,
+        Map.merge(
+          %{
+            identifier: issue.identifier,
+            backend: backend,
+            failure_class: :usage_quota_limit
+          },
+          quota_probe_lineage(parked_entry)
+        ),
+        :probed,
+        attempt || 1,
+        nil
+      )
+      |> emit_quota_circuit(:probe_started, updated)
+    else
+      metadata = %{
+        identifier: issue.identifier,
+        title: issue.title,
+        issue: issue,
+        backend: backend,
+        worker_host: preferred_worker_host,
+        error: "quota probe could not be dispatched"
+      }
+
+      dispatched_state
+      |> drop_retry_attempt(issue.id)
+      |> reopen_quota_circuit(circuit_key, metadata.error)
+      |> park_issue_retry(issue.id, attempt || 1, metadata)
+    end
+  end
+
+  defp quota_probe_dispatch(circuit, nil), do: {nil, circuit.worker_host, []}
+
+  defp quota_probe_dispatch(circuit, parked_entry) do
+    opts = [
+      parent_run_id: Map.get(parked_entry, :parent_run_id),
+      retry_id: Map.get(parked_entry, :retry_id),
+      resume_packet_ref: Map.get(parked_entry, :resume_packet_ref)
+    ]
+
+    {parked_entry.attempt, parked_entry.worker_host || circuit.worker_host, opts}
+  end
+
+  defp quota_probe_lineage(nil), do: %{}
+
+  defp quota_probe_lineage(parked_entry) do
+    %{
+      parent_run_id: Map.get(parked_entry, :parent_run_id),
+      retry_id: Map.get(parked_entry, :retry_id)
+    }
+  end
+
+  defp defer_quota_probe(%State{} = state, circuit_key) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        delay_ms = max(state.poll_interval_ms || 1_000, 1_000)
+        updated = %{circuit | next_probe_at: DateTime.add(DateTime.utc_now(), delay_ms, :millisecond)}
+        put_quota_circuit(state, circuit_key, updated)
+
+      _ ->
+        state
+    end
+  end
+
+  defp mark_quota_probe_drain_deferred(%State{} = state, circuit_key) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{} = circuit ->
+        updated = Map.put(circuit, :drain_deferred, true)
+        %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, updated)}
+
+      _other ->
+        state
+    end
+  end
+
+  defp maybe_close_successful_quota_probe(%State{} = state, running_entry) do
+    backend = Map.get(running_entry, :backend)
+    circuit_key = quota_circuit_key(backend, Map.get(running_entry, :worker_host))
+    issue_id = running_entry |> Map.get(:issue, %{}) |> Map.get(:id)
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :probe, probe_issue_id: ^issue_id} ->
+        close_quota_circuit(state, circuit_key, :successful_probe)
+
+      _ ->
+        state
+    end
+  end
+
+  defp close_quota_circuit(%State{} = state, circuit_key, recovery_reason) do
+    case Map.pop(state.quota_circuits, circuit_key) do
+      {nil, _circuits} ->
+        state
+
+      {circuit, remaining_circuits} ->
+        cancel_circuit_timer(circuit)
+        state = %{state | quota_circuits: remaining_circuits}
+        QuotaCircuitStore.save(remaining_circuits)
+
+        Logger.info("Closing provider quota circuit backend=#{circuit.backend} account_scope=#{circuit.account_scope} recovery=#{recovery_reason} parked_issues=#{length(circuit.parked)}")
+
+        state
+        |> emit_quota_circuit(:closed, circuit, recovery_reason)
+        |> resume_parked_retries(circuit.parked)
+    end
+  end
+
+  defp resume_parked_retries(%State{} = state, parked) when is_list(parked) do
+    parked
+    |> Enum.sort_by(&DateTime.to_unix(&1.parked_at, :microsecond))
+    |> Enum.with_index()
+    |> Enum.reduce(state, fn {entry, index}, state_acc ->
+      schedule_issue_retry(state_acc, entry.issue_id, entry.attempt, %{
+        identifier: entry.identifier,
+        title: entry.title,
+        error: entry.error,
+        backend: entry.backend,
+        failure_class: Map.get(entry, :failure_class),
+        worker_host: entry.worker_host,
+        workspace_path: entry.workspace_path,
+        resume_packet_ref: Map.get(entry, :resume_packet_ref),
+        retry_id: Map.get(entry, :retry_id),
+        previous_retry_id: Map.get(entry, :previous_retry_id),
+        parent_run_id: Map.get(entry, :parent_run_id),
+        delay_ms_override: (index + 1) * @quota_resume_spacing_ms,
+        circuit_recovery: true
+      })
+    end)
+  end
+
+  defp put_quota_circuit(%State{} = state, circuit_key, circuit) do
+    state = %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, circuit)}
+    state = arm_quota_circuit(state, circuit_key)
+    QuotaCircuitStore.save(state.quota_circuits)
+    state
+  end
+
+  defp arm_all_quota_circuits(%State{} = state) do
+    Enum.reduce(Map.keys(state.quota_circuits), state, &arm_quota_circuit(&2, &1))
+  end
+
+  defp arm_quota_circuit(%State{} = state, circuit_key) do
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :open, next_probe_at: %DateTime{} = next_probe_at} = circuit ->
+        cancel_circuit_timer(circuit)
+        timer_token = make_ref()
+        delay_ms = max(0, DateTime.diff(next_probe_at, DateTime.utc_now(), :millisecond))
+        timer_ref = Process.send_after(self(), {:quota_probe_due, circuit_key, timer_token}, delay_ms)
+        updated = %{circuit | timer_ref: timer_ref, timer_token: timer_token}
+        %{state | quota_circuits: Map.put(state.quota_circuits, circuit_key, updated)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp cancel_circuit_timer(%{timer_ref: timer_ref}) when is_reference(timer_ref),
+    do: Process.cancel_timer(timer_ref)
+
+  defp cancel_circuit_timer(_circuit), do: :ok
+
+  defp quota_probe_at(%AgentFailure{reset_at: %DateTime{} = reset_at}, _backend, now) do
+    if DateTime.compare(reset_at, now) == :gt, do: reset_at, else: fallback_quota_probe_at("codex", now)
+  end
+
+  defp quota_probe_at(_failure, backend, now), do: fallback_quota_probe_at(backend, now)
+
+  defp fallback_quota_probe_at(backend, now) do
+    base_ms = min(@quota_probe_default_ms, @quota_probe_max_ms)
+    jitter_ms = :erlang.phash2({backend, DateTime.to_unix(now, :second)}, max(div(base_ms, 10), 1))
+    DateTime.add(now, base_ms + jitter_ms, :millisecond)
+  end
+
+  defp later_datetime(%DateTime{} = left, %DateTime{} = right) do
+    if DateTime.compare(left, right) == :lt, do: right, else: left
+  end
+
+  defp later_datetime(%DateTime{} = datetime, _other), do: datetime
+  defp later_datetime(_other, %DateTime{} = datetime), do: datetime
+  defp later_datetime(_left, _right), do: nil
+
+  defp backend_quota_blocked?(%State{} = state, backend, worker_host) when is_binary(backend) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    match?(
+      %{status: status} when status in [:open, :probe],
+      Map.get(state.quota_circuits, circuit_key)
+    )
+  end
+
+  defp backend_quota_blocked?(_state, _backend, _worker_host), do: false
+
+  defp backend_quota_dispatch_blocked?(%State{} = state, backend, worker_host, issue_id) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :probe, probe_issue_id: ^issue_id} -> false
+      %{status: status} when status in [:open, :probe] -> true
+      _ -> false
+    end
+  end
+
+  defp backend_dispatch_available?(%State{} = state, backend) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        !backend_quota_blocked?(state, backend, nil)
+
+      hosts ->
+        Enum.any?(hosts, fn host ->
+          worker_host_slots_available?(state, host) and
+            !backend_quota_blocked?(state, backend, host)
+        end)
+    end
+  end
+
+  defp quota_probe_slot_available?(%State{} = state, nil) do
+    Config.settings!().worker.ssh_hosts == [] and worker_slots_available?(state)
+  end
+
+  defp quota_probe_slot_available?(%State{} = state, worker_host) when is_binary(worker_host) do
+    worker_host_slots_available?(state, worker_host)
+  end
+
+  defp predicted_backend(%Issue{} = issue) do
+    {backend, _overrides} = AgentBackend.resolve_for_issue(issue)
+    AgentBackend.backend_name(backend)
+  end
+
+  defp retry_backend(metadata, %Issue{} = issue), do: metadata[:backend] || predicted_backend(issue)
+  defp retry_backend(metadata, _issue), do: metadata[:backend] || "codex"
+
+  defp quota_probe_issue?(%State{} = state, backend, worker_host, issue_id) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    match?(
+      %{status: :probe, probe_issue_id: ^issue_id},
+      Map.get(state.quota_circuits, circuit_key)
+    )
+  end
+
+  defp restored_quota_claims(circuits) when is_map(circuits) do
+    circuits
+    |> Enum.flat_map(fn {_backend, circuit} -> Enum.map(circuit.parked, & &1.issue_id) end)
+  end
+
+  defp quota_circuit_key(backend, worker_host) when is_binary(backend) do
+    backend <> "::" <> quota_account_scope(worker_host)
+  end
+
+  defp quota_circuit_key(_backend, worker_host), do: "unknown::" <> quota_account_scope(worker_host)
+
+  defp quota_account_scope(worker_host) when is_binary(worker_host), do: "worker:#{worker_host}"
+  defp quota_account_scope(_worker_host), do: "local"
+
+  defp active_backend_usage(%State{} = state) do
+    state.running
+    |> Map.values()
+    |> Enum.group_by(fn entry ->
+      backend = Map.get(entry, :backend) || "unknown"
+      worker_host = Map.get(entry, :worker_host)
+      {backend, quota_account_scope(worker_host)}
+    end)
+    |> Enum.map(fn {{backend, account_scope}, entries} ->
+      worker_host = entries |> List.first() |> Map.get(:worker_host)
+      key = quota_circuit_key(backend, worker_host)
+
+      usage_snapshot =
+        Map.get(state.backend_rate_limits, key) ||
+          legacy_codex_usage_snapshot(state, backend, account_scope, worker_host)
+
+      %{
+        backend: backend,
+        account_scope: account_scope,
+        worker_host: worker_host,
+        running_agents: length(entries),
+        rate_limits: usage_snapshot && usage_snapshot.rate_limits,
+        updated_at: usage_snapshot && usage_snapshot.updated_at
+      }
+    end)
+    |> Enum.sort_by(&{&1.backend, &1.account_scope})
+  end
+
+  defp legacy_codex_usage_snapshot(%State{codex_rate_limits: rate_limits}, "codex", "local", worker_host)
+       when is_map(rate_limits) do
+    %{
+      backend: "codex",
+      account_scope: "local",
+      worker_host: worker_host,
+      rate_limits: rate_limits,
+      updated_at: nil
+    }
+  end
+
+  defp legacy_codex_usage_snapshot(_state, _backend, _account_scope, _worker_host), do: nil
+
+  defp quota_provider_limit_id(rate_limits) when is_map(rate_limits) do
+    Map.get(rate_limits, "limitId") || Map.get(rate_limits, :limitId) ||
+      Map.get(rate_limits, "limit_id") || Map.get(rate_limits, :limit_id) || "default"
+  end
+
+  defp quota_provider_limit_id(_rate_limits), do: nil
+
+  defp issue_identifier(%Issue{identifier: identifier}), do: identifier
+  defp issue_identifier(_issue), do: nil
+
+  defp quota_parked_snapshot(circuits, now) when is_map(circuits) do
+    Enum.flat_map(circuits, fn {_backend, circuit} ->
+      due_in_ms = max(0, DateTime.diff(circuit.next_probe_at, now, :millisecond))
+
+      Enum.map(circuit.parked, fn entry ->
+        %{
+          issue_id: entry.issue_id,
+          attempt: entry.attempt,
+          retry_id: Map.get(entry, :retry_id),
+          previous_retry_id: Map.get(entry, :previous_retry_id),
+          parent_run_id: Map.get(entry, :parent_run_id),
+          due_in_ms: due_in_ms,
+          status: :parked,
+          identifier: entry.identifier,
+          title: entry.title,
+          error: entry.error,
+          backend: entry.backend,
+          failure_class: Map.get(entry, :failure_class),
+          worker_host: entry.worker_host,
+          workspace_path: entry.workspace_path,
+          resume_packet_ref: Map.get(entry, :resume_packet_ref),
+          codex_session_logs: [],
+          recent_codex_transcript_blocks: []
+        }
+      end)
+    end)
+  end
+
+  defp quota_circuit_snapshot(circuits, now) when is_map(circuits) do
+    circuits
+    |> Map.values()
+    |> Enum.sort_by(&{&1.backend, &1.account_scope})
+    |> Enum.map(fn circuit ->
+      %{
+        backend: circuit.backend,
+        account_scope: circuit.account_scope,
+        worker_host: circuit.worker_host,
+        provider_limit_id: circuit.provider_limit_id,
+        state: circuit.status,
+        reason: circuit.reason,
+        opened_at: circuit.opened_at,
+        reset_at: circuit.reset_at,
+        next_probe_at: circuit.next_probe_at,
+        next_probe_in_ms: max(0, DateTime.diff(circuit.next_probe_at, now, :millisecond)),
+        probe_issue_id: circuit.probe_issue_id,
+        parked_issue_count: length(circuit.parked)
+      }
+    end)
+  end
+
+  defp emit_retry_policy(%State{} = state, issue_id, metadata, action, attempt, delay_ms) do
+    failure_class = metadata[:failure_class] || retry_failure_class(metadata[:failure])
+    issue = metadata[:issue] || %{}
+
+    Telemetry.emit(:retry_policy, %{
+      issue_id: issue_id,
+      issue_identifier: metadata[:identifier],
+      parent_issue_id: Map.get(issue, :parent_id),
+      run_id: metadata[:run_id] || metadata[:parent_run_id],
+      parent_run_id: metadata[:parent_run_id],
+      retry_id: metadata[:retry_id],
+      previous_retry_id: metadata[:previous_retry_id],
+      retry_attempt: attempt,
+      repository: repository_for_issue(issue),
+      backend: metadata[:backend],
+      failure_class: failure_class && Atom.to_string(failure_class),
+      action: Atom.to_string(action),
+      attempt: attempt,
+      delay_ms: delay_ms,
+      retry_scheduled: action == :scheduled,
+      retry_parked: action == :parked,
+      retry_suppressed: action == :suppressed,
+      circuit_probe: action == :probed
+    })
+
+    state
+  end
+
+  defp repository_for_issue(%Issue{labels: labels}) when is_list(labels) do
+    Enum.find_value(labels, fn
+      "repo:" <> name -> name
+      _label -> nil
+    end) || "default"
+  end
+
+  defp repository_for_issue(_issue), do: "default"
+
+  defp emit_quota_circuit(%State{} = state, action, circuit, recovery_reason \\ nil) do
+    Telemetry.emit(:quota_circuit, %{
+      action: Atom.to_string(action),
+      backend: circuit.backend,
+      account_scope: circuit.account_scope,
+      worker_host: circuit.worker_host,
+      provider_limit_id: circuit.provider_limit_id,
+      reason: circuit.reason,
+      recovery_reason: recovery_reason && Atom.to_string(recovery_reason),
+      opened_at: DateTime.to_iso8601(circuit.opened_at),
+      reset_at: circuit.reset_at && DateTime.to_iso8601(circuit.reset_at),
+      next_probe_at: circuit.next_probe_at && DateTime.to_iso8601(circuit.next_probe_at),
+      parked_issue_count: length(circuit.parked)
+    })
+
+    state
+  end
+
+  @doc false
+  @spec quota_probe_at_for_test(AgentFailure.t(), String.t(), DateTime.t()) :: DateTime.t()
+  def quota_probe_at_for_test(%AgentFailure{} = failure, backend, %DateTime{} = now) do
+    quota_probe_at(failure, backend, now)
   end
 
   defp apply_codex_token_delta(
@@ -1322,21 +5940,66 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_token_delta(state, _token_delta), do: state
 
-  defp apply_codex_rate_limits(%State{} = state, update) when is_map(update) do
+  defp apply_backend_rate_limits(%State{} = state, update, running_entry)
+       when is_map(update) and is_map(running_entry) do
     case extract_rate_limits(update) do
       %{} = rate_limits ->
-        %{state | codex_rate_limits: rate_limits}
+        backend = Map.get(running_entry, :backend) || "codex"
+        worker_host = Map.get(running_entry, :worker_host)
+        circuit_key = quota_circuit_key(backend, worker_host)
+
+        usage_snapshot = %{
+          backend: backend,
+          account_scope: quota_account_scope(worker_host),
+          worker_host: worker_host,
+          rate_limits: rate_limits,
+          updated_at: Map.get(update, :timestamp) || DateTime.utc_now()
+        }
+
+        state = %{
+          state
+          | codex_rate_limits: if(backend == "codex", do: rate_limits, else: state.codex_rate_limits),
+            backend_rate_limits: Map.put(Map.get(state, :backend_rate_limits, %{}), circuit_key, usage_snapshot)
+        }
+
+        if AgentFailure.recovered_rate_limits?(rate_limits) and
+             recovered_update_after_open?(state, circuit_key, update) do
+          close_quota_circuit(state, circuit_key, :authoritative_rate_limit_update)
+        else
+          state
+        end
 
       _ ->
         state
     end
   end
 
-  defp apply_codex_rate_limits(state, _update), do: state
+  defp apply_backend_rate_limits(state, _update, _running_entry), do: state
+
+  defp recovered_update_after_open?(%State{} = state, circuit_key, update) do
+    case {Map.get(state.quota_circuits, circuit_key), Map.get(update, :timestamp)} do
+      {%{opened_at: %DateTime{} = opened_at}, %DateTime{} = updated_at} ->
+        DateTime.compare(updated_at, opened_at) in [:eq, :gt]
+
+      {nil, _updated_at} ->
+        true
+
+      _ ->
+        false
+    end
+  end
 
   defp apply_token_delta(codex_totals, token_delta) do
     input_tokens = Map.get(codex_totals, :input_tokens, 0) + token_delta.input_tokens
+
+    cached_input_tokens =
+      Map.get(codex_totals, :cached_input_tokens, 0) + Map.get(token_delta, :cached_input_tokens, 0)
+
     output_tokens = Map.get(codex_totals, :output_tokens, 0) + token_delta.output_tokens
+
+    reasoning_tokens =
+      Map.get(codex_totals, :reasoning_tokens, 0) + Map.get(token_delta, :reasoning_tokens, 0)
+
     total_tokens = Map.get(codex_totals, :total_tokens, 0) + token_delta.total_tokens
 
     seconds_running =
@@ -1344,79 +6007,12 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       input_tokens: max(0, input_tokens),
+      cached_input_tokens: max(0, cached_input_tokens),
       output_tokens: max(0, output_tokens),
+      reasoning_tokens: max(0, reasoning_tokens),
       total_tokens: max(0, total_tokens),
       seconds_running: max(0, seconds_running)
     }
-  end
-
-  defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
-    running_entry = running_entry || %{}
-    usage = extract_token_usage(update)
-
-    {
-      compute_token_delta(
-        running_entry,
-        :input,
-        usage,
-        :codex_last_reported_input_tokens
-      ),
-      compute_token_delta(
-        running_entry,
-        :output,
-        usage,
-        :codex_last_reported_output_tokens
-      ),
-      compute_token_delta(
-        running_entry,
-        :total,
-        usage,
-        :codex_last_reported_total_tokens
-      )
-    }
-    |> Tuple.to_list()
-    |> then(fn [input, output, total] ->
-      %{
-        input_tokens: input.delta,
-        output_tokens: output.delta,
-        total_tokens: total.delta,
-        input_reported: input.reported,
-        output_reported: output.reported,
-        total_reported: total.reported
-      }
-    end)
-  end
-
-  defp compute_token_delta(running_entry, token_key, usage, reported_key) do
-    next_total = get_token_usage(usage, token_key)
-    prev_reported = Map.get(running_entry, reported_key, 0)
-
-    delta =
-      if is_integer(next_total) and next_total >= prev_reported do
-        next_total - prev_reported
-      else
-        0
-      end
-
-    %{
-      delta: max(delta, 0),
-      reported: if(is_integer(next_total), do: next_total, else: prev_reported)
-    }
-  end
-
-  defp extract_token_usage(update) do
-    payloads = [
-      update[:usage],
-      Map.get(update, "usage"),
-      Map.get(update, :usage),
-      update[:payload],
-      Map.get(update, "payload"),
-      update
-    ]
-
-    Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
-      Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
-      %{}
   end
 
   defp extract_rate_limits(update) do
@@ -1428,41 +6024,108 @@ defmodule SymphonyElixir.Orchestrator do
       rate_limits_from_payload(update)
   end
 
-  defp absolute_token_usage_from_payload(payload) when is_map(payload) do
-    absolute_paths = [
-      ["params", "msg", "payload", "info", "total_token_usage"],
-      [:params, :msg, :payload, :info, :total_token_usage],
-      ["params", "msg", "info", "total_token_usage"],
-      [:params, :msg, :info, :total_token_usage],
-      ["params", "tokenUsage", "total"],
-      [:params, :tokenUsage, :total],
-      ["tokenUsage", "total"],
-      [:tokenUsage, :total]
-    ]
+  # Current context occupancy of the *main* agent thread: the input (prompt) size
+  # of the most recent request, divided later against the model context window.
+  # Unlike the accumulated token totals (cumulative thread spend), this is a
+  # momentary reading — it tracks up as context grows and down after compaction.
+  # `last_token_usage`/`tokenUsage.last` is the only non-cumulative signal Codex
+  # gives us; subagent threads are excluded so the gauge reflects the main agent.
+  defp extract_main_context(update, parent_thread_id) do
+    payload = update[:payload] || Map.get(update, "payload") || Map.get(update, :payload)
 
-    explicit_map_at_paths(payload, absolute_paths)
-  end
-
-  defp absolute_token_usage_from_payload(_payload), do: nil
-
-  defp turn_completed_usage_from_payload(payload) when is_map(payload) do
-    method = Map.get(payload, "method") || Map.get(payload, :method)
-
-    if method in ["turn/completed", :turn_completed] do
-      direct =
-        Map.get(payload, "usage") ||
-          Map.get(payload, :usage) ||
-          map_at_path(payload, ["params", "usage"]) ||
-          map_at_path(payload, [:params, :usage])
-
-      if is_map(direct) and integer_token_map?(direct), do: direct
+    if main_thread_update?(payload, parent_thread_id) do
+      {extract_context_tokens(update), extract_context_window(update)}
+    else
+      {nil, nil}
     end
   end
 
-  defp turn_completed_usage_from_payload(_payload), do: nil
+  defp main_thread_update?(payload, parent_thread_id) when is_map(payload),
+    do: not subagent_thread?(event_thread_id(payload), parent_thread_id)
+
+  defp main_thread_update?(_payload, _parent_thread_id), do: false
+
+  defp extract_context_tokens(update) do
+    case find_map_at_paths(context_payload_roots(update), last_usage_paths()) do
+      last when is_map(last) -> get_token_usage(last, :input)
+      _ -> nil
+    end
+  end
+
+  defp extract_context_window(update) do
+    roots = context_payload_roots(update)
+
+    Enum.find_value(roots, fn root ->
+      Enum.find_value(context_window_paths(), fn path -> integer_like(map_at_path(root, path)) end)
+    end)
+  end
+
+  defp context_payload_roots(update) do
+    [
+      update[:payload],
+      Map.get(update, "payload"),
+      Map.get(update, :payload),
+      update[:usage],
+      Map.get(update, "usage"),
+      update
+    ]
+    |> Enum.filter(&is_map/1)
+  end
+
+  defp find_map_at_paths(roots, paths) do
+    Enum.find_value(roots, fn root ->
+      Enum.find_value(paths, &map_at_path_if_map(root, &1))
+    end)
+  end
+
+  defp map_at_path_if_map(root, path) do
+    case map_at_path(root, path) do
+      value when is_map(value) -> value
+      _ -> nil
+    end
+  end
+
+  defp last_usage_paths do
+    [
+      ["params", "msg", "payload", "info", "last_token_usage"],
+      [:params, :msg, :payload, :info, :last_token_usage],
+      ["params", "msg", "info", "last_token_usage"],
+      [:params, :msg, :info, :last_token_usage],
+      ["params", "tokenUsage", "last"],
+      [:params, :tokenUsage, :last],
+      ["tokenUsage", "last"],
+      [:tokenUsage, :last]
+    ]
+  end
+
+  defp context_window_paths do
+    [
+      ["params", "msg", "payload", "info", "model_context_window"],
+      [:params, :msg, :payload, :info, :model_context_window],
+      ["params", "msg", "info", "model_context_window"],
+      [:params, :msg, :info, :model_context_window],
+      ["params", "tokenUsage", "model_context_window"],
+      [:params, :tokenUsage, :model_context_window],
+      ["params", "tokenUsage", "modelContextWindow"],
+      [:params, :tokenUsage, :modelContextWindow],
+      ["tokenUsage", "model_context_window"],
+      [:tokenUsage, :model_context_window],
+      ["tokenUsage", "modelContextWindow"],
+      [:tokenUsage, :modelContextWindow],
+      ["model_context_window"],
+      [:model_context_window],
+      ["modelContextWindow"],
+      [:modelContextWindow]
+    ]
+  end
+
+  defp positive_or_keep(value, _fallback) when is_integer(value) and value > 0, do: value
+  defp positive_or_keep(_value, fallback), do: fallback
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
-    direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
+    direct =
+      Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits) ||
+        Map.get(payload, "rateLimits") || Map.get(payload, :rateLimits)
 
     cond do
       rate_limits_map?(direct) ->
@@ -1511,32 +6174,35 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp rate_limits_map?(payload) when is_map(payload) do
-    limit_id =
-      Map.get(payload, "limit_id") ||
-        Map.get(payload, :limit_id) ||
-        Map.get(payload, "limit_name") ||
-        Map.get(payload, :limit_name)
-
-    has_buckets =
-      Enum.any?(
-        ["primary", :primary, "secondary", :secondary, "credits", :credits],
-        &Map.has_key?(payload, &1)
-      )
-
-    !is_nil(limit_id) and has_buckets
+    codex_rate_limits_map?(payload) or claude_rate_limits_map?(payload)
   end
 
   defp rate_limits_map?(_payload), do: false
 
-  defp explicit_map_at_paths(payload, paths) when is_map(payload) and is_list(paths) do
-    Enum.find_value(paths, fn path ->
-      value = map_at_path(payload, path)
+  defp codex_rate_limits_map?(payload) do
+    has_limit_id =
+      Map.get(payload, "limit_id") ||
+        Map.get(payload, :limit_id) ||
+        Map.get(payload, "limitId") ||
+        Map.get(payload, :limitId) ||
+        Map.get(payload, "limit_name") ||
+        Map.get(payload, :limit_name) ||
+        Map.get(payload, "limitName") ||
+        Map.get(payload, :limitName)
 
-      if is_map(value) and integer_token_map?(value), do: value
-    end)
+    has_limit_id != nil and
+      Enum.any?(
+        ["primary", :primary, "secondary", :secondary, "credits", :credits],
+        &Map.has_key?(payload, &1)
+      )
   end
 
-  defp explicit_map_at_paths(_payload, _paths), do: nil
+  defp claude_rate_limits_map?(payload) do
+    Enum.any?(
+      ["five_hour", :five_hour, "seven_day", :seven_day],
+      &Map.has_key?(payload, &1)
+    )
+  end
 
   defp map_at_path(payload, path) when is_map(payload) and is_list(path) do
     Enum.reduce_while(path, payload, fn key, acc ->
@@ -1549,37 +6215,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp map_at_path(_payload, _path), do: nil
-
-  defp integer_token_map?(payload) do
-    token_fields = [
-      :input_tokens,
-      :output_tokens,
-      :total_tokens,
-      :prompt_tokens,
-      :completion_tokens,
-      :inputTokens,
-      :outputTokens,
-      :totalTokens,
-      :promptTokens,
-      :completionTokens,
-      "input_tokens",
-      "output_tokens",
-      "total_tokens",
-      "prompt_tokens",
-      "completion_tokens",
-      "inputTokens",
-      "outputTokens",
-      "totalTokens",
-      "promptTokens",
-      "completionTokens"
-    ]
-
-    token_fields
-    |> Enum.any?(fn field ->
-      value = payload_get(payload, field)
-      !is_nil(integer_like(value))
-    end)
-  end
 
   defp get_token_usage(usage, :input),
     do:
@@ -1595,45 +6230,14 @@ defmodule SymphonyElixir.Orchestrator do
         :inputTokens
       ])
 
-  defp get_token_usage(usage, :output),
-    do:
-      payload_get(usage, [
-        "output_tokens",
-        "completion_tokens",
-        :output_tokens,
-        :completion_tokens,
-        :output,
-        :completion,
-        "outputTokens",
-        :outputTokens,
-        "completionTokens",
-        :completionTokens
-      ])
-
-  defp get_token_usage(usage, :total),
-    do:
-      payload_get(usage, [
-        "total_tokens",
-        "total",
-        :total_tokens,
-        :total,
-        "totalTokens",
-        :totalTokens
-      ])
-
   defp payload_get(payload, fields) when is_list(fields) do
     Enum.find_value(fields, fn field -> map_integer_value(payload, field) end)
   end
 
-  defp payload_get(payload, field), do: map_integer_value(payload, field)
-
   defp map_integer_value(payload, field) do
-    if is_map(payload) do
-      value = Map.get(payload, field)
-      integer_like(value)
-    else
-      nil
-    end
+    payload
+    |> Map.get(field)
+    |> integer_like()
   end
 
   defp running_seconds(%DateTime{} = started_at, %DateTime{} = now) do
@@ -1641,6 +6245,45 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp running_seconds(_started_at, _now), do: 0
+
+  defp handoff_gate_snapshot(metadata, now) do
+    case Map.get(metadata, :handoff_gate_state) do
+      gate when is_map(gate) ->
+        Map.put(
+          gate,
+          :pending_age_seconds,
+          running_seconds(Map.get(metadata, :lifecycle_started_at), now)
+        )
+
+      _gate ->
+        nil
+    end
+  end
+
+  defp handoff_review_snapshot(
+         %{lifecycle_state: :handoff_pending_review} = metadata,
+         now
+       ) do
+    heartbeat_at = Map.get(metadata, :handoff_review_last_event_at)
+
+    %{
+      status: :running,
+      job_id: Map.get(metadata, :handoff_review_job_id),
+      review_key: inspect(Map.get(metadata, :handoff_review_key)),
+      timeout_ms: Map.get(metadata, :handoff_review_timeout_ms),
+      started_at: Map.get(metadata, :lifecycle_started_at),
+      heartbeat_at: heartbeat_at,
+      heartbeat_age_ms: datetime_age_ms(heartbeat_at, now),
+      pending_age_seconds: running_seconds(Map.get(metadata, :lifecycle_started_at), now)
+    }
+  end
+
+  defp handoff_review_snapshot(_metadata, _now), do: nil
+
+  defp datetime_age_ms(%DateTime{} = timestamp, %DateTime{} = now),
+    do: max(0, DateTime.diff(now, timestamp, :millisecond))
+
+  defp datetime_age_ms(_timestamp, _now), do: nil
 
   defp integer_like(value) when is_integer(value) and value >= 0, do: value
 

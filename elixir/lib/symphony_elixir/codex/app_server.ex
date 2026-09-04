@@ -3,21 +3,60 @@ defmodule SymphonyElixir.Codex.AppServer do
   Minimal client for the Codex app-server JSON-RPC 2.0 stream over stdio.
   """
 
+  @behaviour SymphonyElixir.AgentBackend
+
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{AgentTransport, Codex.DynamicTool, Config, GitHubAuth, PathSafety, SSH, Telemetry, TestWorkerBudget}
+  alias SymphonyElixir.Codex.InterruptionClassifier
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @interruption_log_bytes 500
+  @post_completion_audit_attempts 80
+  @post_completion_audit_sleep_ms 25
+  @interruption_markers [
+    "<turn_aborted>",
+    "aborted by user",
+    "interrupted by user",
+    "turn_aborted",
+    "turn/aborted",
+    "turn/interrupted"
+  ]
+  # Methods that end a turn. A terminal event whose turn id differs from the
+  # turn we started belongs to a subagent thread multiplexed onto the same
+  # app-server connection — see `handle_incoming/7`.
+  @turn_terminal_methods [
+    "turn/completed",
+    "turn/failed",
+    "turn/cancelled",
+    "turn/aborted",
+    "turn/interrupted"
+  ]
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @linear_save_issue_denial_tool "save issue"
+  @source_env_pattern ~r/(?:^|[\s;&|('"])(?:\.|source)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/
+  # Same vars the Claude/ACP paths scrub; the agent reaches Linear only through
+  # the gated dynamic tool, which holds the token server-side. Unlike those
+  # backends, `codex app-server` inherits the parent env, so without this scrub
+  # the agent could curl Linear directly and bypass the handoff gate.
+  @linear_credential_env_vars [
+    ~c"LINEAR_API_KEY",
+    ~c"LINEAR_TOKEN",
+    ~c"LINEAR_API_TOKEN",
+    ~c"LINEAR_ACCESS_TOKEN"
+  ]
 
   @type session :: %{
           port: port(),
           metadata: map(),
+          model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
+          thread_path: Path.t() | nil,
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
@@ -39,19 +78,30 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    overrides = Keyword.get(opts, :overrides, %{})
+    thread_options = thread_options(opts, overrides)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
+         :ok <- prepare_sourced_env_files(expanded_workspace, worker_host),
+         {:ok, github_env} <- GitHubAuth.port_env(expanded_workspace, worker_host: worker_host),
+         {:ok, port} <-
+           start_port(expanded_workspace, worker_host, Keyword.get(opts, :issue_context_file), github_env) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread} <-
+             do_start_session(port, expanded_workspace, session_policies, thread_options) do
+        thread_id = Map.fetch!(thread, :id)
+
         {:ok,
          %{
            port: port,
            metadata: metadata,
+           model: Map.get(thread, :model),
+           reasoning_effort: Map.get(thread_options, :reasoning_effort) || Map.get(thread, :reasoning_effort),
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: session_policies.approval_policy == "never",
+           thread_path: Map.get(thread, :path),
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -73,8 +123,11 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: metadata,
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
+          model: model,
+          reasoning_effort: reasoning_effort,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          thread_path: thread_path,
           workspace: workspace
         },
         prompt,
@@ -88,7 +141,24 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    effective_reasoning_effort =
+      non_blank_turn_override(opts, :reasoning_effort) || reasoning_effort
+
+    turn_options = %{
+      reasoning_effort: effective_reasoning_effort,
+      output_schema: Keyword.get(opts, :output_schema)
+    }
+
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           workspace,
+           approval_policy,
+           turn_sandbox_policy,
+           turn_options
+         ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -99,22 +169,36 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            model: model,
+            reasoning_effort: effective_reasoning_effort
           },
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
-          {:ok, result} ->
-            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+        timeout_ms = Keyword.get(opts, :turn_timeout_ms, Config.settings!().codex.turn_timeout_ms)
+        timeout_mode = Keyword.get(opts, :turn_timeout_mode, :absolute)
 
-            {:ok,
-             %{
-               result: result,
-               session_id: session_id,
-               thread_id: thread_id,
-               turn_id: turn_id
-             }}
+        case await_turn_completion(
+               port,
+               on_message,
+               turn_id,
+               tool_executor,
+               auto_approve_requests,
+               timeout_ms,
+               timeout_mode
+             ) do
+          {:ok, result} ->
+            handle_turn_success(
+              result,
+              thread_path,
+              thread_id,
+              turn_id,
+              session_id,
+              issue,
+              on_message,
+              metadata
+            )
 
           {:error, reason} ->
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
@@ -135,6 +219,45 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:error, reason} ->
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+        {:error, reason}
+    end
+  end
+
+  defp handle_turn_success(
+         result,
+         thread_path,
+         thread_id,
+         turn_id,
+         session_id,
+         issue,
+         on_message,
+         metadata
+       ) do
+    case post_completion_turn_audit(thread_path, turn_id) do
+      :ok ->
+        Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+
+        {:ok,
+         %{
+           result: result,
+           session_id: session_id,
+           thread_id: thread_id,
+           turn_id: turn_id
+         }}
+
+      {:error, reason} ->
+        Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+
+        emit_message(
+          on_message,
+          :turn_ended_with_error,
+          %{
+            session_id: session_id,
+            reason: reason
+          },
+          metadata
+        )
+
         {:error, reason}
     end
   end
@@ -186,7 +309,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil) do
+  defp start_port(workspace, nil, issue_context_file, github_env) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -199,9 +322,15 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist(AgentTransport.with_pre_command(Config.settings!().codex.command))],
             cd: String.to_charlist(workspace),
-            line: @port_line_bytes
+            line: @port_line_bytes,
+            # Mark this process as the inner agent so consumer-repo hooks can
+            # tell "Symphony is running me as the agent" from "Symphony is
+            # running me as an outer hook". UDP's before-handoff Stop hook
+            # reads both vars and skips when SYMPHONY_RUN=1 AND SYMPHONY_AGENT=1.
+            # See docs/symphony.md in the consumer repo.
+            env: merge_port_env(agent_env(issue_context_file), github_env)
           ]
         )
 
@@ -209,17 +338,164 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
+  defp start_port(workspace, worker_host, issue_context_file, github_env) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, issue_context_file, github_env)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp remote_launch_command(workspace) when is_binary(workspace) do
+  defp agent_env(issue_context_file) do
+    base =
+      [
+        {~c"SYMPHONY_RUN", ~c"1"},
+        {~c"SYMPHONY_AGENT", ~c"1"}
+      ] ++ TestWorkerBudget.port_env() ++ issue_context_env(issue_context_file)
+
+    if Config.settings!().codex.withhold_linear_credentials do
+      # A `false` value tells Port.open's `env:` option to unset the variable in
+      # the child, so the agent cannot inherit Linear creds and bypass the gate.
+      base ++ Enum.map(@linear_credential_env_vars, &{&1, false})
+    else
+      base
+    end
+  end
+
+  defp prepare_sourced_env_files(workspace, nil) when is_binary(workspace) do
+    # Sanitize `.env` files sourced by either the codex command or the global
+    # `agent.pre_command` (when pre_command is unset this is the codex command
+    # alone — byte-for-byte unchanged).
+    [Config.settings!().codex.command, AgentTransport.pre_command()]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.flat_map(&sourced_env_files(&1, workspace))
+    |> Enum.uniq()
+    |> Enum.each(&sanitize_sourced_env_file(&1, workspace))
+
+    :ok
+  end
+
+  defp prepare_sourced_env_files(_workspace, worker_host) when is_binary(worker_host), do: :ok
+
+  defp sourced_env_files(command, workspace) when is_binary(command) and is_binary(workspace) do
+    @source_env_pattern
+    |> Regex.scan(command)
+    |> Enum.map(fn [_match | captures] -> Enum.find(captures, &(&1 != "")) end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.filter(&String.ends_with?(&1, ".env"))
+    |> Enum.map(&Path.expand(&1, workspace))
+    |> Enum.uniq()
+    |> Enum.filter(&workspace_file?(&1, workspace))
+  end
+
+  defp sanitize_sourced_env_file(path, workspace) do
+    with true <- File.regular?(path),
+         {:ok, content} <- File.read(path),
+         {:ok, sanitized_content, removed_count} <- sanitize_shell_env_content(content),
+         true <- sanitized_content != content,
+         :ok <- File.write(path, sanitized_content) do
+      Logger.warning("Sanitized sourced env file before Codex startup workspace=#{workspace} path=#{path} removed_lines=#{removed_count}")
+    else
+      _ -> :ok
+    end
+  end
+
+  defp sanitize_shell_env_content(content) when is_binary(content) do
+    lines = String.split(content, "\n", trim: false)
+
+    {sanitized_lines, removed_count, assignment_count} =
+      Enum.reduce(lines, {[], 0, 0}, fn line, {kept, removed, assignments} ->
+        cond do
+          shell_env_assignment_line?(line) ->
+            {[line | kept], removed, assignments + 1}
+
+          shell_env_ignored_line?(line) ->
+            {[line | kept], removed, assignments}
+
+          true ->
+            {kept, removed + 1, assignments}
+        end
+      end)
+
+    if removed_count > 0 and assignment_count > 0 do
+      {:ok, sanitized_lines |> Enum.reverse() |> Enum.join("\n"), removed_count}
+    else
+      :skip
+    end
+  end
+
+  defp shell_env_assignment_line?(line) when is_binary(line) do
+    String.match?(line, ~r/^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=/)
+  end
+
+  defp shell_env_ignored_line?(line) when is_binary(line) do
+    trimmed = String.trim_leading(line)
+    trimmed == "" or String.starts_with?(trimmed, "#")
+  end
+
+  defp workspace_file?(path, workspace) do
+    with {:ok, canonical_path} <- PathSafety.canonicalize(path),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace) do
+      String.starts_with?(canonical_path <> "/", canonical_workspace <> "/")
+    else
+      _ -> false
+    end
+  end
+
+  defp remote_launch_command(workspace, issue_context_file, github_env) when is_binary(workspace) do
+    # SSH does not forward our local env, so the inner-agent markers have to
+    # be inlined into the remote shell command. Matches `agent_env/0` for the
+    # local Port.open path.
+    #
+    # SSH does not carry our local `{var, false}` scrub either, and the remote
+    # worker host may itself have Linear creds in its shell env that
+    # `codex app-server` would inherit. Prepend an `unset` step (mirroring the
+    # local scrub) so remote runs can't bypass the gate. When withholding is
+    # off the command is byte-for-byte unchanged from today.
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      remote_unset_linear_credentials(),
+      "export SYMPHONY_RUN=1",
+      "export SYMPHONY_AGENT=1",
+      TestWorkerBudget.shell_export(),
+      remote_issue_context_export(issue_context_file),
+      remote_env_exports(github_env),
+      AgentTransport.with_pre_command("exec #{Config.settings!().codex.command}")
     ]
+    |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
+  end
+
+  defp remote_unset_linear_credentials do
+    if Config.settings!().codex.withhold_linear_credentials do
+      vars = Enum.map_join(@linear_credential_env_vars, " ", &to_string/1)
+      "unset #{vars}"
+    end
+  end
+
+  defp issue_context_env(path) when is_binary(path) and path != "" do
+    [{~c"SYMPHONY_ISSUE_CONTEXT_FILE", String.to_charlist(path)}]
+  end
+
+  defp issue_context_env(_path), do: []
+
+  defp remote_issue_context_export(path) when is_binary(path) and path != "" do
+    "export SYMPHONY_ISSUE_CONTEXT_FILE=#{shell_escape(path)}"
+  end
+
+  defp remote_issue_context_export(_path), do: nil
+
+  defp remote_env_exports([]), do: nil
+
+  defp remote_env_exports(env) when is_list(env) do
+    Enum.map_join(env, " && ", fn
+      {name, false} -> "unset #{to_string(name)}"
+      {name, value} -> "export #{to_string(name)}=#{shell_escape(to_string(value))}"
+    end)
+  end
+
+  defp merge_port_env(base, overrides) do
+    base
+    |> Map.new()
+    |> Map.merge(Map.new(overrides))
+    |> Map.to_list()
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -270,30 +546,52 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, thread_options) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_thread(port, workspace, session_policies, thread_options)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         thread_options
+       ) do
+    params =
+      %{
+        "approvalPolicy" => approval_policy,
+        "sandbox" => thread_sandbox,
+        "cwd" => workspace
+      }
+      |> put_dynamic_tools(thread_options.dynamic_tools)
+      |> put_optional("config", thread_options.config)
+      |> put_optional("model", thread_options.model)
+      |> put_optional("ephemeral", thread_options.ephemeral)
+      |> put_optional("baseInstructions", thread_options.base_instructions)
+      |> put_optional("developerInstructions", thread_options.developer_instructions)
+
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
-      }
+      "params" => params
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
+      {:ok, %{"thread" => thread_payload} = response} ->
         case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
+          %{"id" => thread_id} ->
+            {:ok,
+             %{
+               id: thread_id,
+               path: Map.get(thread_payload, "path"),
+               model: Map.get(response, "model"),
+               reasoning_effort: Map.get(response, "reasoningEffort")
+             }}
+
+          _ ->
+            {:error, {:invalid_thread_payload, thread_payload}}
         end
 
       other ->
@@ -301,11 +599,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-    send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
-      "params" => %{
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         workspace,
+         approval_policy,
+         turn_sandbox_policy,
+         turn_options
+       ) do
+    params =
+      %{
         "threadId" => thread_id,
         "input" => [
           %{
@@ -318,6 +623,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
+      |> put_optional("effort", turn_options.reasoning_effort)
+      |> put_optional("outputSchema", turn_options.output_schema)
+
+    send_message(port, %{
+      "method" => "turn/start",
+      "id" => @turn_start_id,
+      "params" => params
     })
 
     case await_response(port, @turn_start_id) do
@@ -326,28 +638,124 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         turn_id,
+         tool_executor,
+         auto_approve_requests,
+         timeout_ms,
+         timeout_mode
+       ) do
+    timeout_state = turn_timeout_state(timeout_ms, timeout_mode)
+
     receive_loop(
       port,
       on_message,
-      Config.settings!().codex.turn_timeout_ms,
+      turn_id,
+      timeout_state,
       "",
       tool_executor,
       auto_approve_requests
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp thread_options(opts, overrides) do
+    %{
+      model: non_blank_override(overrides, :model),
+      reasoning_effort: non_blank_override(overrides, :reasoning_effort),
+      dynamic_tools: Keyword.get(opts, :dynamic_tools, true),
+      config: thread_config(opts),
+      ephemeral: Keyword.get(opts, :ephemeral),
+      base_instructions: Keyword.get(opts, :base_instructions),
+      developer_instructions: Keyword.get(opts, :developer_instructions)
+    }
+  end
+
+  defp non_blank_turn_override(opts, key) do
+    case Keyword.get(opts, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _value ->
+        nil
+    end
+  end
+
+  defp thread_config(opts) do
+    configured =
+      opts
+      |> Keyword.get(:thread_config, %{})
+      |> Map.put("mcp_servers.linear.enabled", false)
+
+    case AgentTransport.pre_command() do
+      nil ->
+        configured
+
+      _pre_command ->
+        # Codex shell snapshots source the user's shell profile after the app
+        # server inherits `agent.pre_command`'s environment. A profile can
+        # reorder PATH and hide a workspace-local shim that the pre-command
+        # deliberately prepended (for example UDP's GitHub-App `gh` shim).
+        # Without the snapshot, Codex's ordinary login shell preserves the
+        # launch environment, including that PATH ordering.
+        Map.put(configured, "features.shell_snapshot", false)
+    end
+  end
+
+  defp non_blank_override(overrides, key) when is_map(overrides) do
+    case Map.get(overrides, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _value ->
+        nil
+    end
+  end
+
+  defp non_blank_override(_overrides, _key), do: nil
+
+  defp put_dynamic_tools(params, true),
+    do: Map.put(params, "dynamicTools", DynamicTool.tool_specs())
+
+  defp put_dynamic_tools(params, tools) when is_list(tools),
+    do: Map.put(params, "dynamicTools", tools)
+
+  defp put_dynamic_tools(params, _disabled), do: params
+
+  defp put_optional(params, _key, nil), do: params
+  defp put_optional(params, key, value), do: Map.put(params, key, value)
+
+  # `turn_id` is the id of the turn this loop started (`turn/start` response).
+  # Subagents spawned by the agent run as child threads multiplexed onto the
+  # same app-server connection, so their `turn/{completed,failed,cancelled}`
+  # notifications arrive here too. We only terminate on a terminal event for
+  # *our* turn — see `handle_incoming/7` — so the first subagent to finish is
+  # not mistaken for the parent turn completing.
+  defp receive_loop(port, on_message, turn_id, deadline_ms, pending_line, tool_executor, auto_approve_requests) do
+    deadline_ms = refresh_idle_timeout(deadline_ms)
+    # Normal turns use an absolute monotonic deadline. Callers that explicitly
+    # select idle mode refresh it after every event. Zero disables the optional
+    # cap; the orchestrator still has its independent stall watchdog.
+    remaining_ms = remaining_timeout(deadline_ms)
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, turn_id, complete_line, deadline_ms, tool_executor, auto_approve_requests)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
           port,
           on_message,
-          timeout_ms,
+          turn_id,
+          deadline_ms,
           pending_line <> to_string(chunk),
           tool_executor,
           auto_approve_requests
@@ -356,20 +764,98 @@ defmodule SymphonyElixir.Codex.AppServer do
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
-        {:error, :turn_timeout}
+      remaining_ms ->
+        {:error, timeout_reason(deadline_ms)}
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
-    payload_string = to_string(data)
+  defp turn_timeout_state(timeout_ms, mode)
+       when is_integer(timeout_ms) and timeout_ms > 0 and mode in [:absolute, :idle] do
+    {mode, timeout_ms, optional_deadline(timeout_ms)}
+  end
 
-    case Jason.decode(payload_string) do
+  defp turn_timeout_state(_timeout_ms, _mode), do: {:disabled, 0, nil}
+
+  defp refresh_idle_timeout({:idle, timeout_ms, _deadline_ms}),
+    do: {:idle, timeout_ms, optional_deadline(timeout_ms)}
+
+  defp refresh_idle_timeout(timeout_state), do: timeout_state
+
+  defp timeout_reason({:idle, _timeout_ms, _deadline_ms}), do: :turn_stalled
+  defp timeout_reason(_timeout_state), do: :turn_timeout
+
+  defp optional_deadline(timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0,
+    do: System.monotonic_time(:millisecond) + timeout_ms
+
+  defp optional_deadline(_timeout_ms), do: nil
+
+  defp remaining_timeout({_mode, _timeout_ms, nil}), do: :infinity
+
+  defp remaining_timeout({_mode, _timeout_ms, deadline_ms}),
+    do: max(0, deadline_ms - System.monotonic_time(:millisecond))
+
+  defp handle_incoming(port, on_message, turn_id, data, timeout_ms, tool_executor, auto_approve_requests) do
+    payload_string = to_string(data)
+    decoded = Jason.decode(payload_string)
+
+    if foreign_turn_terminal_event?(decoded, turn_id) do
+      # A subagent thread finished on the shared connection. Stream it for
+      # observability, but keep waiting for our own turn rather than tearing the
+      # session down on the first subagent to complete.
+      handle_foreign_turn_event(decoded, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests)
+    else
+      dispatch_incoming(decoded, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests)
+    end
+  end
+
+  # A turn-terminal event whose turn id differs from the one we started: it
+  # belongs to a subagent thread on the shared connection, not our turn.
+  defp foreign_turn_terminal_event?(
+         {:ok, %{"method" => method, "params" => %{"turn" => %{"id" => event_turn_id}}}},
+         turn_id
+       )
+       when is_binary(turn_id) and is_binary(event_turn_id) do
+    event_turn_id != turn_id and method in @turn_terminal_methods
+  end
+
+  defp foreign_turn_terminal_event?(_decoded, _turn_id), do: false
+
+  # NOTE: only *terminal* foreign-turn events are routed here. A subagent's
+  # non-terminal events (agent-message/tool/output deltas) flow through the normal
+  # `dispatch_incoming/8` path, but each carries its own `params.threadId`. The
+  # observability transcript pipeline (Orchestrator/Presenter) distinguishes
+  # subagent turns by comparing that thread to the session's parent thread (the
+  # leading UUID of `session_id`), so no extra tagging is needed here.
+  defp handle_foreign_turn_event({:ok, payload}, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests) do
+    method = Map.get(payload, "method")
+    event_turn_id = get_in(payload, ["params", "turn", "id"])
+
+    Logger.debug("Codex foreign-turn #{method} ignored (subagent) turn_id=#{event_turn_id} parent_turn_id=#{turn_id}")
+
+    emit_message(
+      on_message,
+      :subagent_turn_event,
+      %{payload: payload, raw: payload_string, method: method, turn_id: event_turn_id},
+      metadata_from_message(port, payload)
+    )
+
+    receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
+  end
+
+  defp dispatch_incoming(decoded, payload_string, port, on_message, turn_id, timeout_ms, tool_executor, auto_approve_requests) do
+    case decoded do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        handle_turn_completed(on_message, payload, payload_string, port)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
+        maybe_emit_interruption_signal(
+          on_message,
+          "turn/failed",
+          payload,
+          payload_string,
+          metadata_from_message(port, payload)
+        )
+
         emit_turn_event(
           on_message,
           :turn_failed,
@@ -382,6 +868,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_failed, Map.get(payload, "params")}}
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
+        maybe_emit_interruption_signal(
+          on_message,
+          "turn/cancelled",
+          payload,
+          payload_string,
+          metadata_from_message(port, payload)
+        )
+
         emit_turn_event(
           on_message,
           :turn_cancelled,
@@ -398,9 +892,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         handle_turn_method(
           port,
           on_message,
+          turn_id,
           payload,
           payload_string,
-          method,
           timeout_ms,
           tool_executor,
           auto_approve_requests
@@ -417,7 +911,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,7 +928,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
     end
   end
 
@@ -451,16 +945,42 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
+  defp handle_turn_completed(on_message, payload, payload_string, port) do
+    metadata = metadata_from_message(port, payload)
+    maybe_emit_interruption_signal(on_message, "turn/completed", payload, payload_string, metadata)
+
+    case abnormal_turn_completion_reason(payload) do
+      nil ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
+
+      reason ->
+        emit_message(
+          on_message,
+          :turn_completed_abnormally,
+          %{
+            payload: payload,
+            raw: payload_string,
+            details: reason
+          },
+          metadata
+        )
+
+        {:error, {:turn_completed_abnormally, reason}}
+    end
+  end
+
   defp handle_turn_method(
          port,
          on_message,
+         turn_id,
          payload,
          payload_string,
-         method,
          timeout_ms,
          tool_executor,
          auto_approve_requests
        ) do
+    method = Map.get(payload, "method")
     metadata = metadata_from_message(port, payload)
 
     case maybe_handle_approval_request(
@@ -484,7 +1004,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
 
       :approval_required ->
         emit_message(
@@ -497,30 +1017,139 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:approval_required, payload}}
 
       :unhandled ->
-        if needs_input?(method, payload) do
-          emit_message(
-            on_message,
-            :turn_input_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
-
-          {:error, {:turn_input_required, payload}}
-        else
-          emit_message(
-            on_message,
-            :notification,
-            %{
-              payload: payload,
-              raw: payload_string
-            },
-            metadata
-          )
-
-          Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-        end
+        handle_unhandled_turn_method(%{
+          port: port,
+          on_message: on_message,
+          turn_id: turn_id,
+          payload: payload,
+          payload_string: payload_string,
+          method: method,
+          metadata: metadata,
+          timeout_ms: timeout_ms,
+          tool_executor: tool_executor,
+          auto_approve_requests: auto_approve_requests
+        })
     end
+  end
+
+  defp handle_unhandled_turn_method(
+         %{
+           method: method,
+           payload: payload,
+           on_message: on_message,
+           payload_string: payload_string,
+           metadata: metadata
+         } = context
+       ) do
+    if needs_input?(method, payload) do
+      emit_message(
+        on_message,
+        :turn_input_required,
+        %{payload: payload, raw: payload_string},
+        metadata
+      )
+
+      {:error, {:turn_input_required, payload}}
+    else
+      handle_unhandled_notification(context)
+    end
+  end
+
+  defp handle_unhandled_notification(%{
+         port: port,
+         on_message: on_message,
+         turn_id: turn_id,
+         payload: payload,
+         payload_string: payload_string,
+         method: method,
+         metadata: metadata,
+         timeout_ms: timeout_ms,
+         tool_executor: tool_executor,
+         auto_approve_requests: auto_approve_requests
+       }) do
+    case maybe_emit_interruption_signal(on_message, method, payload, payload_string, metadata) do
+      {:interrupted, details} ->
+        {:error, {:turn_interruption_signal, details}}
+
+      :ok ->
+        emit_message(
+          on_message,
+          :notification,
+          %{
+            payload: payload,
+            raw: payload_string
+          },
+          metadata
+        )
+
+        if benign_notification_debug?(), do: Logger.debug("Codex notification: #{inspect(method)}")
+        receive_loop(port, on_message, turn_id, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp maybe_emit_interruption_signal(on_message, method, payload, payload_string, metadata) do
+    if classification = InterruptionClassifier.classify(method, payload) do
+      summary = interruption_summary(method, payload_string)
+      Logger.warning("Codex interruption signal method=#{inspect(method)} summary=#{summary}")
+
+      emit_message(
+        on_message,
+        :turn_interruption_signal,
+        %{
+          payload: payload,
+          raw: payload_string,
+          classification: classification,
+          summary: summary
+        },
+        metadata
+      )
+
+      {:interrupted, %{method: method, summary: summary, payload: payload, classification: classification}}
+    else
+      :ok
+    end
+  end
+
+  defp abnormal_turn_completion_reason(payload) when is_map(payload) do
+    status_type = InterruptionClassifier.turn_status_type(payload)
+
+    if InterruptionClassifier.abnormal_turn_status?(status_type) do
+      %{
+        status_type: status_type,
+        status: InterruptionClassifier.turn_status(payload),
+        turn: map_at_path(payload, ["params", "turn"]) || map_at_path(payload, [:params, :turn])
+      }
+    end
+  end
+
+  defp interruption_summary(method, payload_string) do
+    excerpt =
+      payload_string
+      |> interruption_excerpt()
+      |> String.replace(~r/\s+/, " ")
+      |> String.slice(0, @interruption_log_bytes)
+
+    "#{method}: #{excerpt}"
+  end
+
+  defp interruption_excerpt(payload_string) do
+    normalized_payload = String.downcase(payload_string)
+
+    case interruption_marker_match(normalized_payload) do
+      {index, _length} ->
+        start = max(index - 120, 0)
+        String.slice(payload_string, start, @interruption_log_bytes)
+
+      nil ->
+        String.slice(payload_string, 0, @interruption_log_bytes)
+    end
+  end
+
+  defp interruption_marker_match(normalized_payload) do
+    Enum.find_value(@interruption_markers, fn marker ->
+      match = :binary.match(normalized_payload, marker)
+      if match == :nomatch, do: nil, else: match
+    end)
   end
 
   defp maybe_handle_approval_request(
@@ -575,7 +1204,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ -> :tool_call_failed
       end
 
-    emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
+    emit_message(
+      on_message,
+      event,
+      %{
+        payload: payload,
+        raw: payload_string,
+        details: %{result: observable_dynamic_tool_result(result)}
+      },
+      metadata
+    )
 
     :approved
   end
@@ -707,6 +1345,21 @@ defmodule SymphonyElixir.Codex.AppServer do
     }
   end
 
+  defp observable_dynamic_tool_result(result) do
+    result
+    |> Map.take(["success", "output"])
+    |> Map.update("output", nil, &decode_dynamic_tool_output/1)
+  end
+
+  defp decode_dynamic_tool_output(output) when is_binary(output) do
+    case Jason.decode(output) do
+      {:ok, decoded} -> decoded
+      {:error, _reason} -> output
+    end
+  end
+
+  defp decode_dynamic_tool_output(output), do: output
+
   defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
   defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)
 
@@ -812,20 +1465,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
-    answers =
-      Enum.reduce_while(questions, %{}, fn question, acc ->
+    result =
+      Enum.reduce_while(questions, {%{}, []}, fn question, {answer_acc, decision_acc} ->
         case tool_request_user_input_approval_answer(question) do
-          {:ok, question_id, answer_label} ->
-            {:cont, Map.put(acc, question_id, %{"answers" => [answer_label]})}
+          {:ok, question_id, answer_label, decision} ->
+            answers = Map.put(answer_acc, question_id, %{"answers" => [answer_label]})
+            {:cont, {answers, [decision | decision_acc]}}
 
           :error ->
             {:halt, :error}
         end
       end)
 
-    case answers do
+    case result do
       :error -> :error
-      answer_map when map_size(answer_map) > 0 -> {:ok, answer_map, "Approve this Session"}
+      {answer_map, decisions} when map_size(answer_map) > 0 -> {:ok, answer_map, approval_decision(decisions)}
       _ -> :error
     end
   end
@@ -885,15 +1539,46 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tool_request_user_input_question_id(_question), do: :error
 
-  defp tool_request_user_input_approval_answer(%{"id" => question_id, "options" => options})
+  defp tool_request_user_input_approval_answer(%{"id" => question_id, "options" => options} = question)
        when is_binary(question_id) and is_list(options) do
-    case tool_request_user_input_approval_option_label(options) do
-      nil -> :error
-      answer_label -> {:ok, question_id, answer_label}
+    if deny_linear_save_issue_request?(question) do
+      case tool_request_user_input_deny_option_label(options) do
+        nil -> :error
+        answer_label -> {:ok, question_id, answer_label, answer_label}
+      end
+    else
+      case tool_request_user_input_approval_option_label(options) do
+        nil -> :error
+        answer_label -> {:ok, question_id, answer_label, answer_label}
+      end
     end
   end
 
   defp tool_request_user_input_approval_answer(_question), do: :error
+
+  defp approval_decision(decisions) do
+    if Enum.any?(decisions, &(&1 == "Deny")), do: "Deny", else: "Approve this Session"
+  end
+
+  defp deny_linear_save_issue_request?(%{"question" => question, "options" => options})
+       when is_binary(question) and is_list(options) do
+    normalized_question =
+      question
+      |> String.downcase()
+      |> String.replace(~r/\s+/, " ")
+
+    String.contains?(normalized_question, "linear mcp server") and
+      String.contains?(normalized_question, @linear_save_issue_denial_tool) and
+      is_binary(tool_request_user_input_deny_option_label(options))
+  end
+
+  defp deny_linear_save_issue_request?(_question), do: false
+
+  defp tool_request_user_input_deny_option_label(options) do
+    options
+    |> Enum.map(&tool_request_user_input_option_label/1)
+    |> Enum.find(&(&1 == "Deny"))
+  end
 
   defp tool_request_user_input_approval_option_label(options) do
     options
@@ -974,16 +1659,85 @@ defmodule SymphonyElixir.Codex.AppServer do
       if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
         Logger.warning("Codex #{stream_label} output: #{text}")
       else
-        Logger.debug("Codex #{stream_label} output: #{text}")
+        maybe_log_benign_stream("Codex", stream_label, text)
       end
     end
   end
+
+  defp maybe_log_benign_stream(backend, stream_label, text) do
+    if benign_notification_debug?(), do: Logger.debug("#{backend} #{stream_label} output: #{text}")
+  end
+
+  defp benign_notification_debug?, do: Telemetry.benign_notification_debug?()
 
   defp protocol_message_candidate?(data) do
     data
     |> to_string()
     |> String.trim_leading()
     |> String.starts_with?("{")
+  end
+
+  defp post_completion_turn_audit(thread_path, turn_id) when is_binary(thread_path) and is_binary(turn_id) do
+    case find_session_turn_aborted(thread_path, turn_id, @post_completion_audit_attempts) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, payload} ->
+        {:error, {:turn_aborted, payload}}
+
+      {:error, reason} ->
+        Logger.debug("Codex session post-completion audit skipped path=#{thread_path} reason=#{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp post_completion_turn_audit(_thread_path, _turn_id), do: :ok
+
+  defp find_session_turn_aborted(thread_path, turn_id, attempts_left) do
+    cond do
+      File.regular?(thread_path) ->
+        thread_path
+        |> read_session_turn_aborted(turn_id)
+        |> maybe_retry_session_turn_aborted(thread_path, turn_id, attempts_left)
+
+      attempts_left > 0 ->
+        Process.sleep(@post_completion_audit_sleep_ms)
+        find_session_turn_aborted(thread_path, turn_id, attempts_left - 1)
+
+      true ->
+        {:error, :session_log_unavailable}
+    end
+  rescue
+    error -> {:error, {error.__struct__, Exception.message(error)}}
+  end
+
+  defp read_session_turn_aborted(thread_path, turn_id) do
+    with {:ok, contents} <- File.read(thread_path) do
+      payload =
+        contents
+        |> String.split("\n", trim: true)
+        |> Enum.find_value(&decode_turn_aborted_event(&1, turn_id))
+
+      {:ok, payload}
+    end
+  end
+
+  defp maybe_retry_session_turn_aborted({:ok, nil}, thread_path, turn_id, attempts_left)
+       when attempts_left > 0 do
+    Process.sleep(@post_completion_audit_sleep_ms)
+    find_session_turn_aborted(thread_path, turn_id, attempts_left - 1)
+  end
+
+  defp maybe_retry_session_turn_aborted(result, _thread_path, _turn_id, _attempts_left), do: result
+
+  defp decode_turn_aborted_event(line, turn_id) do
+    case Jason.decode(line) do
+      {:ok, %{"type" => "event_msg", "payload" => %{"type" => "turn_aborted", "turn_id" => ^turn_id} = payload}} ->
+        payload
+
+      _ ->
+        nil
+    end
   end
 
   defp issue_context(%{id: issue_id, identifier: identifier}) do
@@ -1026,6 +1780,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp map_at_path(payload, keys) when is_map(payload) and is_list(keys) do
+    Enum.reduce_while(keys, payload, fn key, acc ->
+      case acc do
+        map when is_map(map) -> {:cont, Map.get(map, key)}
+        _ -> {:halt, nil}
+      end
+    end)
+  end
+
+  defp map_at_path(_payload, _keys), do: nil
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

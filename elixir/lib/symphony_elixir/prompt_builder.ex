@@ -3,26 +3,57 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{Config, PromptSection, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
   @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
+    build_section(issue, opts).content
+  end
+
+  @doc "Render the repository workflow as a provenance-aware prompt section."
+  @spec build_section(SymphonyElixir.Linear.Issue.t(), keyword()) :: PromptSection.t()
+  def build_section(issue, opts \\ []) do
+    # When AgentRunner has loaded a per-repo workflow (multi-repo dispatch,
+    # T27), it threads the consumer's WORKFLOW.md through as
+    # `:per_repo_workflow`. That workflow's `prompt_template` wins so the
+    # agent sees the repo-specific instructions (UDP's "in a fresh clone
+    # of udp-dashboard-v2…") rather than the generic host prompt.
+    source =
+      case Keyword.get(opts, :per_repo_workflow) do
+        %{prompt_template: pt} = wf when is_binary(pt) ->
+          {:ok, wf}
+
+        _ ->
+          Workflow.current()
+      end
+
     template =
-      Workflow.current()
+      source
       |> prompt_template!()
       |> parse_template!()
 
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
+    content =
+      template
+      |> Solid.render!(
+        %{
+          "attempt" => Keyword.get(opts, :attempt),
+          "issue" => issue |> Map.from_struct() |> to_solid_map()
+        },
+        @render_opts
+      )
+      |> IO.iodata_to_binary()
+
+    PromptSection.new(
+      id: "repository.workflow",
+      type: :repository_rules,
+      source: Keyword.get(opts, :workflow_source, "repository:WORKFLOW.md"),
+      version: "workflow-template/v1",
+      content: content,
+      reusable: true,
+      ownership: :repository
     )
-    |> IO.iodata_to_binary()
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)

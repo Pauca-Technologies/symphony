@@ -37,7 +37,8 @@ Important boundary:
 
 - Symphony is a scheduler/runner and tracker reader.
 - Ticket writes (state transitions, comments, PR links) are typically performed by the coding agent
-  using tools available in the workflow/runtime environment.
+  using tools available in the workflow/runtime environment. An opted-in exact-head review policy
+  MAY ask Symphony to persist deterministic follow-up issues emitted by a validated verdict.
 - A successful run can end at a workflow-defined handoff state (for example `Human Review`), not
   necessarily `Done`.
 
@@ -53,15 +54,17 @@ Important boundary:
 - Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
 - Expose operator-visible observability (at minimum structured logs).
 - Support tracker/filesystem-driven restart recovery without requiring a persistent database; exact
-  in-memory scheduler state is not restored.
+  in-memory scheduler state is not restored. Implementations MAY additionally preserve live runs in
+  reconnectable worker processes.
 
 ### 2.2 Non-Goals
 
 - Rich web UI or multi-tenant control plane.
 - Prescribing a specific dashboard or terminal UI implementation.
 - General-purpose workflow engine or distributed job scheduler.
-- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
-  workflow prompt and agent tooling.)
+- General built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in
+  the workflow prompt and agent tooling; narrowly scoped, repository-opted-in review lifecycle and
+  follow-up persistence are allowed.)
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
 - Mandating a single default approval, sandbox, or operator-confirmation posture for all
   implementations.
@@ -140,8 +143,9 @@ Symphony is easiest to port when kept in these layers:
 - Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
+- GitHub CLI plus host-owned GitHub App credentials for repository authentication.
 - Coding-agent executable that supports the targeted Codex app-server mode.
-- Host environment authentication for the issue tracker and coding agent.
+- Host environment authentication for the issue tracker, coding agent, and GitHub App.
 
 ## 4. Core Domain Model
 
@@ -175,6 +179,13 @@ Fields:
     - `state` (string or null)
 - `created_at` (timestamp or null)
 - `updated_at` (timestamp or null)
+- `comments` (list of normalized comment records)
+  - Bounded activity captured immediately before an outer agent dispatch.
+  - Each record contains `id`, `body`, `author_id`, `author_name`, `created_at`, and `updated_at`.
+- `comments_truncated` (boolean)
+  - True when older comments exist outside the captured activity window.
+  - A structured scope reviewer must retrieve the omitted activity before making an authoritative
+    decision; an unavailable retrieval is an infrastructure outcome, not an approval.
 
 #### 4.1.2 Workflow Definition
 
@@ -216,8 +227,13 @@ Fields (logical):
 
 - `issue_id`
 - `issue_identifier`
+- `run_id` (opaque identifier unique to this worker execution attempt)
+- `parent_run_id` (prior attempt's `run_id`, or null when there is no retry lineage)
+- `retry_id` (the retry scheduling decision that launched this attempt, or null)
+- `retry_attempt` (integer, `0` for an initial attempt and `>=1` for retries/continuations)
 - `attempt` (integer or null, `null` for first run, `>=1` for retries/continuation)
 - `workspace_path`
+- `resume_packet_ref` (OPTIONAL compact reference to the latest trusted status/resume packet)
 - `started_at`
 - `status`
 - `error` (OPTIONAL)
@@ -253,9 +269,13 @@ Fields:
 - `issue_id`
 - `identifier` (best-effort human ID for status surfaces/logs)
 - `attempt` (integer, 1-based for retry queue)
+- `retry_id` (opaque identifier unique to this scheduling decision)
+- `previous_retry_id` (the replaced/rescheduled decision, or null)
+- `parent_run_id` (the worker attempt whose outcome caused the retry)
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
+- `resume_packet_ref` (OPTIONAL compact reference retained across retry scheduling)
 
 #### 4.1.8 Orchestrator Runtime State
 
@@ -271,6 +291,34 @@ Fields:
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
+
+#### 4.1.9 Status/Resume Packet
+
+One versioned, bounded, host-owned summary of the evidence needed to resume an issue/run lineage.
+Version 1 is integrity-checked with a canonical SHA-256 identity and is limited to 16,384 encoded
+bytes. Its logical fields are:
+
+- packet version/id/digest and `previous_packet_id`
+- issue and current run/retry identity
+- boundary reason and timestamp
+- turn position
+- repository/base/HEAD/dirty/changed-path and bounded diff-count observations
+- workpad marker/id/update time and hash-only checklist summary
+- exact-head gate/review/check attestations
+- current budget summary
+- bounded structured shadow no-progress warnings/latches, bounded host error codes, evidence references, unavailable
+  fields, and compaction metadata
+
+Each observation records its own `source` and `captured_at`. Fresh host observations take
+precedence. A carried observation retains its original timestamp and is relabeled
+`persisted:<previous_packet_id>`; a lightweight lifecycle boundary changes only packet lineage and
+the boundary timestamp/source. No prompt, diff, workpad body, command output, credential, or token
+is stored in the packet. Validation, check, and attestation names/statuses MAY be included only as
+bounded, sanitized, single-line structured labels; raw command-output bodies remain excluded.
+
+Runtime state and durable retry/wait/quota/persistent-worker records carry only a compact reference:
+packet id, SHA-256, trusted sidecar basename, boundary, and bounded evidence references. Readers
+MUST accept legacy records where this reference is absent.
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -355,9 +403,14 @@ Fields:
 - `api_key` (string)
   - MAY be a literal token or `$VAR_NAME`.
   - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
+  - Repository hooks and coding-agent children MUST NOT inherit the tracker credential or common
+    `LINEAR_*TOKEN` aliases; tracker access remains owned by Symphony's gated client.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
+  - May be a literal slug or `$VAR_NAME`.
+  - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_PROJECT_SLUG`.
+  - If `$VAR_NAME` resolves to an empty string, treat the slug as missing.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
@@ -388,10 +441,29 @@ Fields:
 - `after_create` (multiline shell script string, OPTIONAL)
   - Runs only when a workspace directory is newly created.
   - Failure aborts workspace creation.
+- `session_start` (multiline shell script string, OPTIONAL)
+  - Runs before each fresh or resumed coding-agent session after workspace preparation and before
+    launching the coding agent.
+  - Failure is logged and surfaced in the first-turn task context but does not abort the current
+    attempt.
+  - Implementations SHOULD surface generated Markdown links under `docs/agent-workpad/<branch>/` to
+    the first turn as annotated startup artifacts.
+  - A repository MAY describe those artifacts by emitting a one-line JSON object containing an
+    `artifacts` array. Each entry contains a repository-relative `path` under
+    `docs/agent-workpad/` and a short `description`. Implementations MUST reject paths outside that
+    root and SHOULD retain path-only discovery for hooks that do not emit this metadata.
 - `before_run` (multiline shell script string, OPTIONAL)
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
   - Failure aborts the current attempt.
+- `before_handoff` (multiline shell script string, OPTIONAL)
+  - Runs before an agent-driven Linear status transition from `In Progress` to a review handoff
+    state such as `In Review`.
+  - Failure cancels the status transition and feeds hook remediation into the next agent turn.
+- `before_handoff_timeout_ms` (integer, OPTIONAL)
+  - Overrides `hooks.timeout_ms` for each initial or polling invocation of `before_handoff`.
+- `before_handoff_stale_ms` (integer, OPTIONAL, default `120000`)
+  - Maximum accepted heartbeat age for an asynchronous pending handoff gate.
 - `after_run` (multiline shell script string, OPTIONAL)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
@@ -412,6 +484,19 @@ Fields:
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
+- `test_worker_limit` (positive integer, OPTIONAL extension)
+  - Default: `2`.
+  - Bounds test-runner worker processes inside each agent; it MUST NOT reduce agent-slot concurrency.
+  - The effective value SHOULD be exposed as `SYMPHONY_TEST_WORKER_LIMIT` and in first-turn runtime
+    guidance with runner-supported options.
+  - Lifecycle hooks that perform validation SHOULD inherit the same effective value.
+- `heavy_validation_limit` (positive integer, OPTIONAL extension)
+  - Default: `2`.
+  - This is independent of both agent concurrency and per-command test-worker fan-out.
+  - The effective value SHOULD be exposed as `SYMPHONY_HEAVY_VALIDATION_LIMIT` to every supported
+    agent backend and lifecycle hook so repository harnesses can enforce a host-wide admission
+    budget for CPU-heavy validation across worktrees.
+  - Invalid values fail configuration validation.
 - `max_turns` (positive integer)
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
@@ -423,6 +508,39 @@ Fields:
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
+- `routing` (object, OPTIONAL extension for routed repository workflows)
+  - Allows a repository to select a Codex execution profile from the nature of each issue instead
+    of using one repository-wide model.
+  - `classifier` is REQUIRED and contains `backend` (currently `codex`), `model`,
+    `reasoning_effort`, and an optional positive `timeout_ms`. The classifier SHOULD be ephemeral,
+    schema-constrained, limited to a bounded issue snapshot, and run without repository project
+    instructions or implementation-agent dynamic tools. Issue content MUST be treated as untrusted
+    data. Its structured result SHOULD include the execution profile, task class, confidence,
+    risk, complexity, ambiguity, and bounded reasons.
+  - `profiles` is a REQUIRED non-empty map from profile name to `backend`, `model`,
+    `reasoning_effort`, and classifier-facing `description`. This extension currently supports the
+    `codex` backend.
+  - `default_profile` MUST name a configured profile.
+  - `fallback_profile` MAY name a configured quality fallback and defaults to `default_profile`.
+  - Supported reasoning-effort names are `none`, `low`, `medium`, `high`, `xhigh`, and `max`.
+  - A classifier failure SHOULD select `fallback_profile`, not silently use a weaker model.
+  - Implementations MAY promote high risk, complexity, or ambiguity to `fallback_profile` even when
+    the classifier proposed another profile.
+  - A single exact `agent:<profile>` issue label MAY bypass classification. Multiple matching
+    profile labels SHOULD select `fallback_profile`.
+  - Host/operator label presets MAY take precedence over repository-owned routing profiles.
+  - The selected model MUST be applied to Codex `thread/start`, and the selected reasoning effort
+    MUST be applied to each Codex `turn/start`; routing MUST NOT be observational-only when enabled.
+- `efficiency` (object, OPTIONAL extension)
+  - Defines telemetry-driven soft-budget and review-routing policy as specified in Section 13.7.
+  - `mode` is `off`, `shadow` (default), or `enforce`; `capsule_max_bytes` MUST be bounded to a
+    safe positive range, and `extreme_multiplier` MUST be at least `1.0`.
+  - `task_profiles` maps supported task classifier values to names in the non-empty `profiles` map.
+    Profiles define positive token/time/byte/lens/iteration thresholds, optional reviewer model and
+    reasoning effort, an explicit `allow_overage` policy, and requested risk-relevant lens names.
+  - One exact valid `budget:<profile>` issue label MAY override the derived budget. A present invalid
+    budget label or more than one distinct valid budget profile MUST select the high-risk profile
+    and retain override provenance for operator inspection.
 
 #### 5.3.6 `codex` (object)
 
@@ -446,8 +564,9 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
-- `turn_timeout_ms` (integer)
-  - Default: `3600000` (1 hour)
+- `turn_timeout_ms` (non-negative integer)
+  - Default: `0` (disabled)
+  - A positive value enables an absolute wall-clock ceiling for one turn.
 - `read_timeout_ms` (integer)
   - Default: `5000`
 - `stall_timeout_ms` (integer)
@@ -456,7 +575,8 @@ fields locally if they want stricter startup checks.
 
 ### 5.4 Prompt Template Contract
 
-The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
+The Markdown body of `WORKFLOW.md` is the repository workflow prompt template. The host-owned task
+context supplies issue details and tracker activity independently of this template.
 
 Rendering requirements:
 
@@ -573,17 +693,23 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.kind`: string, REQUIRED, currently `linear`
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
-- `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.project_slug`: string or `$VAR`, REQUIRED when `tracker.kind=linear`, canonical env `LINEAR_PROJECT_SLUG`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
+- `hooks.session_start`: shell script or null
 - `hooks.before_run`: shell script or null
+- `hooks.before_handoff`: shell script or null
+- `hooks.before_handoff_timeout_ms`: positive integer or null; falls back to `hooks.timeout_ms`
+- `hooks.before_handoff_stale_ms`: positive integer, default `120000`
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
+- `agent.test_worker_limit`: positive integer, default `2` (OPTIONAL extension)
+- `agent.heavy_validation_limit`: positive integer, default `2` (OPTIONAL extension)
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
@@ -591,7 +717,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
-- `codex.turn_timeout_ms`: integer, default `3600000`
+- `codex.turn_timeout_ms`: non-negative integer, default `0` (disabled)
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
 
@@ -610,7 +736,7 @@ claim state.
 
 2. `Claimed`
    - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
+   - In practice, claimed issues are `Running`, `RetryQueued`, or `Waiting`.
 
 3. `Running`
    - Worker task exists and the issue is tracked in `running` map.
@@ -618,7 +744,12 @@ claim state.
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
 
-5. `Released`
+5. `Waiting`
+   - Worker is not running and consumes no agent slot.
+   - A durable, non-LLM watcher owns a typed external condition and resumes the issue through the
+     normal priority/concurrency scheduler after that condition changes.
+
+6. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -629,12 +760,39 @@ Important nuance:
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
-- The first turn SHOULD use the full rendered task prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
+- Reaching `agent.max_turns` ends the current worker session without changing tracker state or
+  applying a human-input label. The normal-exit continuation check decides whether to start a new
+  worker session.
+- The first turn SHOULD use typed prompt sections with stable semantic IDs, source identity,
+  renderer version, content hash, and byte/token estimates. The canonical task sections own issue
+  details and current tracker activity, followed by the rendered repository workflow rules.
+- When an issue carries the host-configured tracker opt-in label, a host-owned constraint SHOULD
+  make explicit that bot or App credentials installed by trusted startup hooks are authorized for
+  that unattended run. After the agent verifies the injected identity, stale workpad claims that
+  bot attribution still needs a separate human authorization MUST NOT cause a Blocked transition;
+  missing, invalid, or insufficient credentials remain valid blockers after in-session recovery.
+- Exact issue prose repeated by the repository workflow MAY be suppressed when the canonical task
+  section is present. Formatting-only equivalent rules MAY be suppressed only when ownership and
+  precedence are explicit. Similar or ambiguous safety, tenant/auth, validation, acceptance, and
+  handoff text MUST be preserved and diagnosed; generic fuzzy instruction deletion is forbidden.
+- Continuation turns SHOULD send a bounded resume capsule to the existing thread, reference
+  unchanged static section versions/hashes, and include only changed current candidate metadata and
+  current unresolved findings rather than completed remediation history.
+- Each turn SHOULD emit prompt observability with the prompt kind, character and byte counts,
+  symbolic included-section names, and per-section provenance, size, hash, reuse, and suppression
+  decisions. Durable observability MUST NOT contain raw prompt content. An optional, disabled-by-
+  default incident debug rendering MAY expose the final composed prompt in logs only when bounded,
+  provenance-delimited, and protected by configured secret-field redaction.
+- Compact continuation guidance applies only while reusing the same live backend thread. The first
+  turn of a newly started backend session SHOULD retain the full task context and repository
+  workflow unless that backend has restored verified prior-thread context; a retry attempt alone is
+  not proof of restored context.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
+- If the worker successfully requests a typed external wait, normal exit parks the issue instead
+  of scheduling the short continuation retry. The workspace is retained and the claim remains
+  held so ordinary tracker polling cannot create a duplicate worker.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -707,7 +865,7 @@ Tick sequence:
 1. Reconcile running issues.
 2. Run dispatch preflight validation.
 3. Fetch candidate issues from tracker using active states.
-4. Sort issues by dispatch priority.
+4. Sort issues by dependencies and dispatch priority.
 5. Dispatch eligible issues while slots remain.
 6. Notify observability/status consumers of state changes.
 
@@ -724,40 +882,76 @@ An issue is dispatch-eligible only if all are true:
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
-- Blocker rule for `Todo` state passes:
-  - If the issue state is `Todo`, do not dispatch when any blocker is non-terminal.
+- No blocker is non-terminal. This dependency rule applies to every active
+  state, including continuations already in progress.
 
 Sorting order (stable intent):
 
-1. `priority` ascending (1..4 are preferred; null/unknown sorts last)
-2. `created_at` oldest first
-3. `identifier` lexicographic tie-breaker
+1. Dependencies before dependents (cycles retain the deterministic fallback
+   order and MUST NOT deadlock dispatch)
+2. `priority` ascending (1 Urgent, 2 High, 3 Medium, 4 Low; 0/null/unknown sorts last)
+3. `created_at` oldest first
+4. `identifier` lexicographic tie-breaker
 
 ### 8.3 Concurrency Control
 
-Global limit:
+Global worker limit:
 
 - `available_slots = max(max_concurrent_agents - running_count, 0)`
+- `running_count` includes `handoff_pending_gate` and `handoff_pending_review` entries because their
+  worker VMs and validation/reviewer children still consume host resources. Those lifecycles remain
+  excluded from per-state and per-repository implementation counts because no coding-agent
+  implementation turn is in progress.
 
 Per-state limit:
 
 - `max_concurrent_agents_by_state[state]` if present (state key normalized)
 - otherwise fallback to global limit
 
-The runtime counts issues by their current tracked state in the `running` map.
+The runtime counts implementing issues by their current tracked state in the `running` map.
+
+Repository-aware extension:
+
+- A configured `repos[].max_concurrent` is an additional implementation ceiling. Detached handoff
+  entries do not consume it, but remain repository/path reservations for overlap decisions.
+- `overlap_policy` is `serialize` (default), `advisory`, or `off`;
+  `overlap_threshold` defaults to `0.5`.
+- Signals progress from repository identity and issue label/path hints, through
+  initial-plan paths, to the actual changed-file manifest. Stronger signals
+  replace weaker ones.
+- `serialize` queues overlap at or above the threshold and permits disjoint or
+  unknown-path work while repository capacity remains. A configured operator
+  override label bypasses overlap serialization, never the hard ceiling.
+- Queue order is deterministic and dependency/human priority remains
+  authoritative. Queue entries expose reason, bounded overlap paths, base age,
+  queue time, and suggested order.
+- Reservations are derived from live `running` workers, not durable leases.
+  Terminal, stalled, blocked, or missing workers release them; after restart no
+  stale reservation is restored.
 
 ### 8.4 Retry and Backoff
 
 Retry entry creation:
 
 - Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, and new timer handle.
+- Create a fresh `retry_id`; retain the replaced decision as `previous_retry_id` and the source
+  worker as `parent_run_id`.
+- Store `attempt`, `identifier`, `error`, lineage, `due_at_ms`, and new timer handle.
+- A dispatched retry MUST create a fresh `run_id` distinct from `parent_run_id` and carry the
+  triggering `retry_id` into its run events.
 
 Backoff formula:
 
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+- `agent.max_retries` is the threshold for terminal treatment, not proof that a product issue needs
+  human input. Classified operational/infrastructure failures MUST keep the issue active and retry
+  at capped backoff after crossing the threshold. An implementation MAY move an issue to `Blocked`
+  only for a failure class that explicitly requires human action, such as invalid authentication or
+  workflow configuration. A deterministic review packet that cannot satisfy the repository's hard
+  byte bound SHOULD be classified as non-retryable workflow configuration and may be moved to
+  `Blocked` immediately rather than rerunning the unchanged packet construction.
 
 Retry handling behavior:
 
@@ -782,11 +976,109 @@ Reconciliation runs every tick and has two parts.
 
 Part A: Stall detection
 
-- For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
-  - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
-- If `stall_timeout_ms <= 0`, skip stall detection entirely.
+- Each running issue has a lifecycle state. Normal agent work uses `implementing`; any in-flight
+  shell gate (including a synchronous initial invocation) uses `handoff_pending_gate`, and an
+  accepted deferred handoff review uses
+  `handoff_pending_review`. Both pending states remain in the running/claimed sets.
+- For `implementing`, compute `elapsed_ms` since the newest of:
+  - `last_codex_timestamp` if any event has been seen,
+  - the current lifecycle state's start time, or
+  - `started_at`.
+- If implementor `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `stall_timeout_ms <= 0`, skip implementor stall detection; pending reviews retain their
+  reviewer-specific hard timeout.
+- For `handoff_pending_review`, do not apply the implementor activity clock and do not dispatch a
+  replacement implementor. Convert reviewer events into a minimal heartbeat, scoped to the current
+  worker and review job, that refreshes `last_codex_timestamp` without altering session/token
+  accounting. Refresh the reviewer-specific timeout when progress arrives. If reviewer inactivity
+  exceeds that timeout, terminate the attempt visibly without immediately repeating an identical
+  full-timeout reviewer turn.
+- For `handoff_pending_gate`, do not apply the implementor activity clock, failure retry, or
+  max-turn accounting and do not dispatch a replacement implementor. A synchronous invocation
+  remains governed by the hook invocation timeout. Poll a durable asynchronous gate by job ID
+  without starting a coding-agent turn. Status surfaces MUST expose the available job and candidate
+  identity, pending age, heartbeat age/time, progress stage, and next-poll delay.
+- When stopping a local persistent worker, implementations SHOULD terminate both its captured
+  descendants and reparented processes that are scoped to the exact issue workspace and carry the
+  trusted `SYMPHONY_RUN=1` marker. Process identity checks MUST prevent recycled-PID or unrelated
+  workspace processes from being targeted.
+- Persist the captured tracker mutation and pending gate identity outside the agent-writable
+  workspace. Persist the mutation before the initial asynchronous hook invocation as a starting
+  handoff intent. If that invocation ends with infrastructure failure before returning a job ID,
+  revalidate the configured base before retrying the hook from the durable intent. Changes to the
+  repository workflow, reviewer workflow, or repository-relative scripts referenced by the configured
+  hook are handoff-runtime overlap even when product-code paths are disjoint; clear the starting intent
+  and return remediation to the coding agent so it can refresh the branch. Otherwise retry the hook
+  before starting a coding-agent session. After process
+  restart, reattach to an existing job before starting a coding-agent session.
+  Repeated requests for the same candidate MUST coalesce. A changed candidate cancels or
+  supersedes the old request; when an authenticated poll returns a live pending replacement job,
+  the orchestrator MUST durably adopt and continue polling that replacement before starting a
+  coding-agent turn. A stale pass MUST NOT authorize the mutation. Lifecycle completion MUST close
+  the job identity the orchestrator owns even when a terminal response reports a superseding job.
+- A pending review is keyed to the issue and reviewed PR head. Repeated requests while that job is
+  pending coalesce into the existing review. The reviewer MUST run before the expensive
+  `before_handoff` hook. Only exact-head approval may start that hook; request changes MUST NOT start
+  it. Persist the approval identity with subsequent asynchronous gate state so restart recovery does
+  not rerun an already completed review. Re-resolve the PR head after the gate passes and before
+  applying the captured tracker transition; if it changed, clear pending state and require a fresh
+  review.
+- A repository MAY opt into a managed draft PR lifecycle. In that mode, Symphony MUST return an
+  existing PR to draft before an implementation turn and MUST keep it draft during exact-head
+  review. Only a validated approval may move the same head to ready-for-review before the expensive
+  handoff gate; a head or state mismatch is an infrastructure failure and withholds handoff.
+- Each reviewer attempt MUST start a fresh thread that does not inherit the implementor transcript.
+  Its only task context is a bounded, versioned packet for the exact candidate. The packet records
+  project/repository and PR identity, resolved base/head SHAs and fingerprint, issue outcome and
+  acceptance/non-goals, changed-file/stat manifest, authoritative full-diff commands, applicable
+  repository rules, risk/lens rationale, exact-head attestations, prior unresolved findings with
+  their reviewed SHA, prior approved inspection and attestation coverage, implementation
+  risks/skipped proof/evidence, PR-body attachment links, and a bounded follow-up delta.
+- Packet size and reviewer tool-output/timeout settings are repository-configurable with a
+  deterministic hard bound and compaction order. Compaction MUST NOT remove access to the complete
+  meaningful diff or applicable security/tenant/auth rules. Budget pressure is handled by explicit
+  synthesis or a non-approval outcome, never silent candidate reduction. Reviewer attempts use one
+  turn; delegated lenses start without parent transcript and receive only their packet slice.
+  The selected reviewer backend/model MUST enforce its actual context window over the final
+  rendered prompt (repository workflow, packet, and runtime/verdict guards); Symphony MUST NOT
+  reject it using an estimated token-to-byte conversion. Successful reviewer tool responses over
+  their configured byte limit MUST compact both
+  duplicate text fields with original-size and narrow-query/raw-artifact recovery metadata; failure
+  responses MUST remain intact. Reproducible delta-stat prose MUST also be independently bounded.
+- Follow-up reviews receive prior open findings plus the prior-head-to-current-head delta. A
+  high-risk follow-up MUST perform a final complete base-to-head diff pass. Verdict evidence records
+  the packet id, exact reviewed head, inspected scope, and attestations reused versus rerun.
+- Each review attempt MUST write only to an attempt-scoped staging path. The orchestrator MUST read
+  and validate that staged output only after the reviewer session completes, then atomically publish
+  it to the configured canonical verdict path. A crash, timeout, partial write, malformed verdict,
+  or interim placeholder MUST leave no authoritative verdict. A `request_changes` verdict MUST
+  contain at least one blocking-severity finding with a concrete failing state, violated criterion,
+  or missing regression test; minor and advisory observations MAY accompany approval.
+- A repository MAY provide bounded structured human review direction in the verdict. Symphony MUST
+  validate its shape and render no more than three repository-relative file/line questions and two
+  URL- or command-backed verification items into one managed PR-body section. When PR identity is
+  available, file targets SHOULD link to the exact reviewed head. Effort tiers and lens policy are
+  machine metadata and SHOULD NOT expand the human-facing section. Legacy string guidance MAY be
+  accepted during migration only when flattened and deterministically bounded.
+- A repository MAY require a structured scope contract in candidate verdicts. When enabled, the
+  original issue description plus chronological non-runtime issue comments form the amended scope;
+  later comments may override earlier text. The verdict MUST classify necessary dependencies and
+  out-of-scope changes, MUST NOT approve while out-of-scope changes remain, and MAY emit fully
+  specified follow-up candidates. The packet MUST carry a stable digest of the complete amended
+  scope so a downstream gate can reject a verdict after that authority changes. Symphony MAY
+  persist those follow-ups only after exact-head verdict validation and MUST make retries
+  idempotent.
+- Parent reviewer and lens threads are attributed independently in telemetry, including packet/head,
+  token usage, duration, model, reasoning effort, outcome, and finding count.
+- Reviewer request-changes or timeout clears pending state. Request-changes returns control to the
+  implementor. Only an authoritative `approved` verdict for the exact pinned candidate head may
+  apply the captured tracker transition. Missing/malformed verdicts, reviewer infrastructure or
+  session failures, and an exhausted review budget are explicit non-approval outcomes; they retain
+  findings and escalation evidence and withhold the captured transition for human resolution.
+  A reviewer MAY report `infrastructure_unavailable` for reviewer-side tool, authentication,
+  network, or provider failures, including inability to authenticate to private evidence. That
+  verdict MUST include a failure reason and resume condition, MUST NOT be represented as a candidate
+  `request_changes`, and MUST NOT consume a substantive review iteration.
 
 Part B: Tracker state refresh
 
@@ -823,6 +1115,10 @@ Workspace persistence:
 
 - Workspaces are reused across runs for the same issue.
 - Successful runs do not auto-delete workspaces.
+- The latest status/resume packet is stored outside the agent-writable workspace beside the trusted
+  issue-context file. Local writes MUST be atomic and owner-only (`0600`). Its basename MUST be a
+  single safe `<workspace_key>.json.resume-packet.json` component. Removing the owned issue context
+  and workspace MUST also remove this sidecar; legacy cleanup MUST tolerate its absence.
 
 ### 9.2 Workspace Creation and Reuse
 
@@ -863,7 +1159,9 @@ Failure handling:
 Supported hooks:
 
 - `hooks.after_create`
+- `hooks.session_start`
 - `hooks.before_run`
+- `hooks.before_handoff`
 - `hooks.after_run`
 - `hooks.before_remove`
 
@@ -873,17 +1171,158 @@ Execution contract:
   `cwd`.
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
-- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
-- Log hook start, failures, and timeouts.
+- Set `SYMPHONY_RUN=1` and expose the current task snapshot path as
+  `SYMPHONY_ISSUE_CONTEXT_FILE` to issue lifecycle hooks. The versioned JSON snapshot MUST be
+  written outside the agent-writable workspace, MUST NOT contain tracker credentials, and SHOULD
+  be refreshed from the same normalized issue and comment activity used to assemble the first turn
+  before session startup and before `hooks.before_handoff`.
+- Expose `SYMPHONY_SHARED_CACHE_DIR` as a host-owned sibling of the issue workspaces. Consumer
+  repositories MAY use it only for privacy-bounded caches with explicit immutable identity keys;
+  one run MUST NOT inspect, stop, or reap another run through this directory.
+- Durable job polls MUST reuse `hooks.before_handoff` with `SYMPHONY_HANDOFF_GATE_PROTOCOL=1` and
+  `SYMPHONY_HANDOFF_GATE_JOB_ID`, without repeated GitHub credential preparation or issue-context
+  refresh. Protocol-aware commands SHOULD branch to the durable-job read before normal hook setup.
+- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. `before_handoff` may override each
+  invocation with `hooks.before_handoff_timeout_ms`.
+- On timeout, worker stop, or worker exit, terminate the hook's external descendant processes before
+  releasing the worker so commands cannot survive as orphaned process trees.
+- Log hook start, failures, and timeouts. Repeated asynchronous pending/running polls SHOULD log at
+  debug level and SHOULD emit lifecycle transitions only when status or meaningful progress changes.
+- Emit `gate.before_handoff` telemetry when `before_handoff` fires, including the per-gate
+  pass/fail breakdown parsed from hook JSON output when available.
+- Invoke `before_handoff` with `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. A protocol version 1 report
+  includes `jobId`, `status`, `identity.candidateHash`, and `identity.exactHash`.
+  `identity.prNumber` MUST be either a positive JSON integer or its canonical decimal-string
+  representation (for example `1854`; no sign, whitespace, or leading zeroes). Readers MUST accept
+  both representations during rolling deployment. Pending/running
+  reports additionally include `heartbeatAt`, `heartbeatAgeMs`, `nextPollMs`, and
+  `progress.stage`; they exit `3`. Passed reports exit `0`; failed/invalidated reports exit `2`;
+  infrastructure errors exit `1`. Polls set `SYMPHONY_HANDOFF_GATE_JOB_ID` and MUST attach to the
+  named job rather than starting another underlying gate. Pending polls SHOULD use only the durable
+  gate artifact; tracker state MUST be revalidated when the gate becomes terminal and immediately
+  before applying handoff or remediation. The normal orchestrator reconciliation remains responsible
+  for stopping workers whose issues leave active states while a gate is pending.
+- Before the initial protocol-aware invocation, durably record the original tracker mutation. On
+  pre-job infrastructure failure, preserve that intent and retry the hook without a model turn. On
+  pending/running, replace the intent with the durable job identity, end the active model turn, and
+  poll without a model turn. Transient tracker refresh failures while starting/recovering a durable
+  gate or validating a terminal result MUST preserve that intent and gate identity and SHOULD retry
+  internally by honoring `Retry-After` or using capped exponential backoff;
+  they MUST NOT return the issue to an implementor turn. Apply the mutation only after a passed
+  report is revalidated for the exact current candidate. Failed or invalidated terminal results
+  clear pending state and resume the implementor once with bounded remediation. Infrastructure
+  terminal results clear pending state, fail the worker attempt with a typed infrastructure failure,
+  and use orchestrator backoff without consuming an implementor remediation turn.
+- For a routed repository with a configured base branch, fetch and revalidate
+  that base on the local or SSH worker host that owns the worktree immediately
+  before `hooks.before_handoff`. Compute the
+  candidate manifest and paths changed between the candidate's merge base and
+  the current remote base. Irrelevant advances MUST NOT block. Overlapping
+  advances MUST block before the shell hook and any automated review, report
+  compact remediation, and count the expensive gates avoided. Required git
+  evidence failures fail closed. Symphony MUST NOT automatically rebase,
+  reset, stash, or discard a dirty worktree. The exact passing decision MAY be
+  passed to the immediately following review attempt, but a later handoff
+  attempt MUST fetch again.
+
+Version 1 readers used this issue-only shape. Implementations adding comment activity SHOULD emit
+version 2 while accepting version 1 during rolling deployment. Nullable fields remain present.
+
+```json
+{
+  "version": 1,
+  "capturedAt": "2026-07-28T09:30:00Z",
+  "issue": {
+    "id": "issue-uuid",
+    "identifier": "ENG-123",
+    "title": "Short summary",
+    "description": "Rendered task scope",
+    "url": "https://linear.app/example/issue/ENG-123",
+    "state": "In Progress",
+    "labels": ["repo:example"],
+    "updatedAt": "2026-07-28T09:29:00Z"
+  }
+}
+```
+
+Version 2 adds bounded comment activity to `issue`:
+
+```json
+{
+  "version": 2,
+  "capturedAt": "2026-07-29T10:01:00Z",
+  "issue": {
+    "id": "issue-uuid",
+    "identifier": "ENG-123",
+    "title": "Short summary",
+    "description": "Rendered task scope",
+    "url": "https://linear.app/example/issue/ENG-123",
+    "state": "In Progress",
+    "labels": ["repo:example", "needs-human-input"],
+    "comments": [
+      {
+        "id": "comment-uuid",
+        "body": "Decision: use option B.",
+        "author": {"id": "user-uuid", "name": "Product owner"},
+        "createdAt": "2026-07-29T10:00:00Z",
+        "updatedAt": "2026-07-29T10:00:00Z"
+      }
+    ],
+    "commentsTruncated": false,
+    "updatedAt": "2026-07-29T10:00:00Z"
+  }
+}
+```
+
+The same environment variable SHOULD be passed to the inner agent process so repository-owned
+commands run by the agent can consume the snapshot. Tracker credentials remain server-side; live
+tracker reads and writes use an explicitly exposed client-side tool when the implementation offers
+one.
 
 Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
+- `session_start` failure or timeout is logged, emitted as telemetry, and surfaced as advisory
+  context; it is not fatal to the current run attempt.
 - `before_run` failure or timeout is fatal to the current run attempt.
+- A legacy or protocol-declared validation failure from `before_handoff` cancels the attempted
+  tracker state transition and provides remediation to the next agent turn. Protocol verification,
+  timeout, and infrastructure failures cancel the transition and fail the worker attempt for
+  orchestrator backoff instead. A valid protocol pending/running result is neither a failure nor a
+  timeout and does not consume a retry or coding-agent turn.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 
-### 9.5 Safety Invariants
+### 9.5 GitHub App Authentication
+
+Symphony's production execution profile assumes that every routed checkout is hosted on GitHub.
+GitHub App authentication is therefore a required host capability, not an OPTIONAL workflow mode
+or a repository-owned token-minting hook.
+
+Runtime contract:
+
+- GitHub App authentication MUST be implemented by an independently installable CLI that does not
+  require Symphony or a consumer repository's runtime dependencies. Symphony MUST consume a
+  versioned machine contract with separate string-valued `set` and name-only `unset` collections;
+  it MUST NOT parse shell activation output.
+- The host provides `GITHUB_APP_ID` and either `GITHUB_APP_PRIVATE_KEY_FILE` or
+  `GITHUB_APP_PRIVATE_KEY`. `GITHUB_APP_INSTALLATION_ID` MAY pin an installation; otherwise
+  the standalone CLI resolves the installation for the current `owner/repo`.
+- Before a routed repository lifecycle hook or coding-agent backend starts, Symphony MUST derive
+  the repository identity and resolve a valid installation token through that CLI, then inject the
+  returned isolated GitHub environment. Failure is fatal to the current attempt and MUST retain a
+  typed authentication classification.
+- Installation tokens MUST NOT be exported in the general hook/agent environment or a sourced
+  environment file. A standalone-CLI-owned `gh` shim MAY inject the token only into the actual `gh`
+  child and MUST refresh it before expiration. On-disk token state MUST use owner-only permissions
+  and MUST be excluded from Git staging in the worktree.
+- The standalone CLI MUST support interactive activation, restoration, one-command `gh` execution,
+  and credential/installation preflight without a running or installed Symphony service.
+- Repository hooks MUST NOT mint GitHub App tokens or construct a bot authentication environment.
+- A routed repository's `after_create` result MUST be observed. A non-zero exit or timeout aborts
+  the attempt before agent startup.
+
+### 9.6 Safety Invariants
 
 This is the most important portability constraint.
 
@@ -902,6 +1341,16 @@ Invariant 3: Workspace key is sanitized.
 
 - Only `[A-Za-z0-9._-]` allowed in workspace directory names.
 - Replace all other characters with `_`.
+
+Invariant 4: Status/resume persistence remains host-owned and best effort.
+
+- Packet collection and sidecar I/O MUST use the validated issue workspace and its owning local or
+  SSH worker, never the Symphony source-repository cwd.
+- Malformed, unknown-version, oversized, absent, or unreadable packets MUST NOT block dispatch,
+  retry, wait/quota parking, or restart adoption. Emit only a bounded diagnostic/error code and
+  continue with an available prior compact reference.
+- Lifecycle transitions MAY mark only the existing sidecar. They MUST NOT run Git, workpad/tracker,
+  gate, or review collection.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
@@ -931,6 +1380,8 @@ Subprocess launch parameters:
 Notes:
 
 - The default command is `codex app-server`.
+- When `agent.pre_command` is configured, implementations MAY disable Codex shell snapshots for the
+  thread so a shell-profile reload cannot override environment changes made by the pre-command.
 - Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
   using fields supported by the targeted Codex app-server version.
 
@@ -950,9 +1401,22 @@ client to:
 - Create or resume a coding-agent thread according to the targeted protocol.
 - Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
   targeted protocol accepts cwd.
-- Start the first turn with the rendered issue prompt.
+- Start the first turn with a canonical host-owned task context containing the normalized issue
+  details.
+- Fetch a bounded, most-recently-updated issue-comment window immediately before each outer agent
+  dispatch and place it immediately after the issue details as required issue activity. If this
+  required read fails, fail the worker attempt so the orchestrator can retry rather than starting
+  with incomplete input.
+- Mark truncated activity explicitly so the workflow can request older comments through an
+  available live tracker tool only when necessary.
+- Place annotated Markdown artifacts produced by `session_start` after current tracker activity,
+  then place the rendered repository workflow after the complete task context. Hook stdout SHOULD
+  remain diagnostic output rather than prompt content.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
+- Append exactly one `continuation.status_resume_packet` section to every fresh or continuation
+  turn. It MUST be the literal final dynamic section and expose the packet protocol version and
+  section hash through ordinary prompt provenance.
 - Supply the implementation's documented approval and sandbox policy using fields supported by the
   targeted protocol.
 - Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
@@ -1047,11 +1511,29 @@ Unsupported dynamic tool calls:
 Optional client-side tool extension:
 
 - An implementation MAY expose a limited set of client-side tools to the app-server session.
-- Current standardized optional tool: `linear_graphql`.
+- Current standardized optional tools: `linear_issue`, `linear_graphql`, and `wait_for`.
 - If implemented, supported tools SHOULD be advertised to the app-server session during startup
   using the protocol mechanism supported by the targeted Codex app-server version.
 - Unsupported tool names SHOULD still return a failure result using the targeted protocol and
   continue the session.
+
+`linear_issue` extension contract:
+
+- Purpose: perform common operations on the current Symphony-owned issue without requiring the
+  coding agent to construct Linear GraphQL.
+- The tool MUST derive the issue identity from host-owned session context. It MUST NOT accept an
+  arbitrary issue ID from the coding agent.
+- Standard operations are `get`, `update_workpad`, `add_label`, `remove_label`,
+  `create_follow_up`, and `transition`.
+- `update_workpad` MUST update the existing comment whose trimmed body starts with
+  `## Codex Workpad`, or create it if absent.
+- `create_follow_up` MUST create or return an idempotent issue derived from the host-owned current
+  issue and typed title, description, acceptance criteria, evidence, and dependency input. The
+  repository policy determines project/state/assignment/label defaults; the operation MUST NOT let
+  the coding agent supply an arbitrary source issue ID.
+- Review-state transitions MUST pass through the `before_handoff` and automated-review gates.
+- A transition to `Blocked` MUST require a structured human blocker.
+- Implementations MAY expose `linear_graphql` for operations with no typed form.
 
 `linear_graphql` extension contract:
 
@@ -1074,6 +1556,9 @@ Optional client-side tool extension:
 - `variables` is OPTIONAL and, when present, MUST be a JSON object.
 - Implementations MAY additionally accept a raw GraphQL query string as shorthand input.
 - Execute one GraphQL operation per tool call.
+- When host-owned current-issue context is present, the tool MUST reject raw `issueUpdate`
+  workflow-state transitions and direct the coding agent to the typed `linear_issue` `transition`
+  operation. The raw extension remains available only for operations without a typed equivalent.
 - If the provided document contains multiple operations, reject the tool call as invalid input.
 - `operationName` selection is intentionally out of scope for this extension.
 - Reuse the configured Linear endpoint and auth from the active Symphony workflow/runtime config; do
@@ -1085,6 +1570,46 @@ Optional client-side tool extension:
   - invalid input, missing auth, or transport failure -> `success=false` with an error payload
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
+
+`wait_for` extension contract:
+
+- Purpose: stop spending model turns while useful work is blocked only on an external state change.
+- The request MUST include a non-empty reason and one typed condition. Standard condition types are
+  GitHub Actions component recovery, GitHub PR-check state changes, git-ref SHA changes, Linear
+  issue/comment changes.
+- Implementations MUST reject clock-only waits. Agents MUST NOT park for local resource pressure,
+  another validation, local process/port contention, or an elapsed-time backoff; independently
+  bounded validations may overlap across agents.
+- Standard condition types include GitHub Actions recovery, all PR-check changes, one named
+  PR-check change, a PR gate settling to pass/fail, git-ref SHA changes, and current-issue Linear
+  state/comment changes. Cross-issue prerequisites MUST use tracker dependency relations rather
+  than a parked wait. Implementations MUST reject new cross-issue Linear waits and SHOULD resume
+  persisted legacy cross-issue waits once during upgrade.
+- The coding agent MUST identify only the typed target and desired event. The implementation MUST
+  capture the initial external observation before accepting the wait and MUST reject agent-supplied
+  observation or baseline fields.
+- The watcher MUST compare later observations with the server-captured baseline and MUST NOT resume
+  merely because it observed the same value again. A recovery or gate-settled condition that is
+  already satisfied MUST be rejected instead of parked. GitHub PR-check observations SHOULD include
+  the PR head, base, open/draft state, mergeability, merge-state status, and review decision so a
+  material PR change wakes work even when the specifically watched check remains unchanged. The
+  captured baseline MUST survive persistence and restart; implementations MAY recover a missing
+  legacy baseline from the last unchanged observation.
+- A successful tool call records the request in the worker lifecycle. The agent SHOULD end its turn;
+  on normal worker exit, the orchestrator retains the workspace and claim, persists the wait, and
+  releases the agent slot.
+- Probes MUST run outside coding-agent/model sessions. Identical condition keys SHOULD share one
+  probe, with bounded exponential backoff for unchanged or failed probes. On watcher startup,
+  persisted waiting entries SHOULD become immediately due so a restart or deployment revalidates
+  their external state instead of preserving an obsolete pre-restart backoff deadline. After an
+  unchanged observation that identifies GitHub PR checks as pending, the next-probe delay SHOULD
+  not exceed one minute; failed probes SHOULD retain exponential backoff rather than using that
+  active-check interval.
+- A changed condition MUST re-enter the normal priority, dependency, capacity, and concurrency
+  scheduler exactly once with a compact prompt describing the state change. Durable ready state
+  SHOULD remain until a replacement worker has actually started.
+- Operators SHOULD be able to resume immediately or cancel the external condition. Cancelling a
+  wait returns the still-active issue to normal scheduling; it does not abandon the tracker issue.
 
 User-input-required policy:
 
@@ -1099,7 +1624,8 @@ User-input-required policy:
 Timeouts:
 
 - `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: total turn stream timeout
+- `codex.turn_timeout_ms`: optional absolute wall-clock turn timeout; `0` disables it and streamed
+  activity MUST NOT reset a positive value
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):
@@ -1121,10 +1647,11 @@ The `Agent Runner` wraps workspace + prompt + app-server client.
 Behavior:
 
 1. Create/reuse workspace for issue.
-2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
-5. On any error, fail the worker attempt (the orchestrator will retry).
+2. Preflight GitHub App authentication for the checked-out repository.
+3. Build prompt from workflow template.
+4. Start app-server session with the prepared GitHub CLI environment.
+5. Forward app-server events to orchestrator.
+6. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note:
 
@@ -1145,6 +1672,15 @@ An implementation MUST support these tracker adapter operations:
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
+4. `fetch_issue_comments(issue_id)`
+   - Used once immediately before an outer agent dispatch to assemble required issue activity.
+   - Returns normalized comments plus a truncation marker.
+
+5. `create_follow_up(source_issue, attributes)` when advertised by the runtime
+   - Create or return an idempotent typed follow-up using repository/runtime policy.
+   - Preserve source linkage without making the follow-up eligible for automation unless policy
+     explicitly requests that behavior.
+
 ### 11.2 Query Semantics (Linear)
 
 Linear-specific requirements for `tracker.kind == "linear"`:
@@ -1155,6 +1691,8 @@ Linear-specific requirements for `tracker.kind == "linear"`:
 - `tracker.project_slug` maps to Linear project `slugId`
 - Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
 - Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
+- Issue-comment query requests at most `50` comments ordered by `updatedAt`, then presents the
+  captured window chronologically in the first turn.
 - Pagination REQUIRED for candidate issues
 - Page size default: `50`
 - Network timeout: `30000 ms`
@@ -1219,6 +1757,20 @@ Inputs to prompt rendering:
 - normalized `issue` object
 - OPTIONAL `attempt` integer (retry/continuation metadata)
 
+The first turn is assembled in this order:
+
+1. A canonical host-owned task context containing normalized issue details.
+2. The normalized comment activity fetched immediately before dispatch.
+3. Annotated Markdown startup artifacts produced by `session_start`, when present.
+4. The rendered repository workflow template.
+5. Any host-owned handoff-tool guidance.
+6. The versioned status/resume packet as the literal final dynamic section.
+
+Repository templates do not need to reconstruct issue details, activity, or startup-artifact
+meaning. Later in-worker turns retain the original task context and use the live tracker tool only
+for newer or omitted context. Continuation turns also append the current status/resume packet as
+their literal final dynamic section, after efficiency, activity, wait, gate, and review context.
+
 ### 12.2 Rendering Rules
 
 - Render with strict variable checking.
@@ -1234,6 +1786,13 @@ instructions for:
 - first run (`attempt` null or absent)
 - continuation run after a successful prior session
 - retry after error/timeout/stall
+
+The packet presented to turn 1 SHOULD reuse the repository manifest already collected during
+startup. After each handled backend turn result, including handled errors and terminal results, the
+worker SHOULD perform at most one expensive repository refresh, persist the resulting packet, and
+reuse it as the next continuation input. It MUST NOT make another repository/workpad collection
+immediately before that continuation. Workpad observations SHOULD come from already-fetched issue
+activity rather than a packet-specific tracker request.
 
 ### 12.4 Failure Semantics
 
@@ -1280,13 +1839,25 @@ SHOULD return:
 
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
+- each running row SHOULD expose the actual coding-agent backend and model when known
+- when issue-aware routing is enabled, each running row SHOULD expose the selected reasoning effort
+  and profile
 - `retrying` (list of retry queue rows)
+- `waiting` (list of durable external-condition wait rows)
 - `codex_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
+- `backend_usage` (active backend/account rows, if available)
+  - Include the backend, account scope, running-session count, snapshot timestamp, and latest
+    provider rate-limit payload.
+  - Keep distinct account scopes separate because remote workers may use different credentials.
+  - Human-readable dashboards SHOULD identify 5-hour and weekly windows by their reported duration
+    rather than assuming provider bucket order.
+  - Backends that do not report account-limit usage SHOULD remain visible with usage marked
+    unavailable; the absence of provider data MUST NOT be presented as zero usage.
 
 RECOMMENDED snapshot error modes:
 
@@ -1312,7 +1883,15 @@ Token accounting rules:
 - Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
 - Extract input/output/total token counts leniently from common field names within the selected
   payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
+- For absolute totals, track a high-water mark per actual backend thread, not merely per issue,
+  run, or parent session. Accept only the positive difference from that thread's prior high water.
+  Repeated or out-of-order snapshots MUST NOT be summed, and an interrupted/incomplete thread MUST
+  retain its latest valid cumulative totals.
+- Parent and delegated thread totals MUST reconcile to issue/session/fleet totals without counting
+  a delegated snapshot as part of the parent's cumulative counter.
+- Preserve input, cached input, output, reasoning, total, current-context, and context-window
+  meanings as distinct fields. Cached input and reasoning are dimensions of provider usage and
+  MUST NOT be added to a provider `total_tokens` value a second time.
 - Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
   way.
 - Accumulate aggregate totals in orchestrator state.
@@ -1332,7 +1911,261 @@ Rate-limit tracking:
 - Track the latest rate-limit payload seen in any agent update.
 - Any human-readable presentation of rate-limit data is implementation-defined.
 
-### 13.6 Humanized Agent Event Summaries (OPTIONAL)
+### 13.6 Compact Fleet Events and Session Retention
+
+Implementations SHOULD maintain a compact, versioned analytics stream independent of humanized
+transcripts. The stable event vocabulary SHOULD cover run/session/thread/turn lifecycle, prompt
+size and injected-section hashes, token high waters and accepted deltas, phase transitions, tool
+boundaries/outcomes/output size/artifact references, typed failure/retry/circuit decisions,
+gate/attestation/review identity and reuse, lease lifecycle, base-drift/overlap decisions, and
+available handoff/CI/reopen/blocking-finding/merge/revert quality outcomes.
+
+Every worker execution attempt SHOULD have a unique opaque `run_id`. Lifecycle, fleet, budget,
+review, wait, retry, and failure events for that attempt SHOULD preserve it alongside the existing
+issue/session/thread/turn dimensions and numeric retry attempt. Retry attempts SHOULD also expose
+`parent_run_id`, the triggering `retry_id`, and, when a scheduling decision is replaced,
+`previous_retry_id`.
+
+After backend/model routing is resolved and before the first coding-agent turn, the worker SHOULD
+emit exactly one versioned `run_manifest`. The manifest SHOULD include, where available, the
+non-secret Symphony version and source SHA, repository/base/candidate SHAs and dirty state,
+workflow and prompt-template provenance hashes, resolved backend/model/reasoning/profile, task and
+risk classification, budget policy, sandbox/approval policy, and review policy. It MUST NOT include
+raw prompts, hook commands, environment variables, credentials, or tokens. A `config_digest` SHOULD
+hash a canonical serialization of the manifest's non-secret effective configuration, including the
+workflow and prompt-template identities so a template change produces a different digest. Dynamic
+per-turn section hashes are emitted by the prompt event after composition and SHOULD be referenced
+from the pre-turn manifest rather than guessed early. Readers MUST continue accepting older
+telemetry and persisted worker/wait/circuit records without these fields.
+
+The worker SHOULD maintain one latest version 1 status/resume packet per issue/run lineage. The
+persisted packet is capped at 16,384 bytes; its prompt rendering is additionally capped by
+`agent.efficiency.capsule_max_bytes`. Repository observations use a bounded changed-path set and
+tracked `git diff --numstat` only: report paths considered/omitted and binary files explicitly,
+never claim line counts for binary content, and mark counts partial or unavailable when untracked
+files or malformed/probe-failed rows prevent a complete result. A prior gate/review attestation is
+current only when a known current HEAD matches its evidence SHA; otherwise mark it stale or
+unavailable.
+
+The existing startup repository-manifest snapshot is reused for turn 1. After each handled backend
+turn, at most one post-turn repository refresh becomes the persisted input for the next
+continuation. Thus N handled turns perform N+1 repository snapshots in production (the existing
+startup snapshot plus N post-turn refreshes), with no extra packet-specific pre-turn probe.
+Lifecycle-only packet marks use the standard boundaries `outer_worker_exit`, `retry_scheduled`,
+`wait_parked`, `quota_parked`, and `restart_adopted` and preserve observation timestamps/sources.
+Failures are best effort and emit bounded codes without changing the underlying
+retry/wait/quota/adoption decision. Runtime and telemetry events carry only the compact packet
+id/hash/trusted relative reference/boundary/evidence references, never the packet body.
+Implementations MAY use the existing per-run tool/budget collector to produce bounded shadow-only
+no-progress observations. The detector MUST NOT add a process, poller, reaper, Git/Linear request,
+validation, or per-tool repository probe, and MUST NOT interrupt, retry, block, park, or otherwise
+change worker lifecycle policy. Its only workflow settings are bounded thresholds/caps; effective
+values SHOULD participate in run-manifest configuration identity.
+
+Only safe terminal tool attempts count. Backend wrappers SHOULD normalize to a coarse operation
+class plus deterministic canonical/redacted/bounded argument and result-class identity. Raw
+arguments/output, secrets, call/thread IDs, URLs with credentials, external tool names, and
+canonical preimage text MUST NOT be persisted or emitted. Starts, streaming output, unmatched
+terminals without sufficient safe identity, and one long-running call MUST NOT count as repetition.
+Pending/correlation state and retained fingerprints MUST be deterministically capped.
+
+Repeated terminal errors MAY qualify at their configured consecutive threshold. Repeated successful
+attempts require a separately configured higher repetition threshold plus consecutive known
+no-progress turn boundaries and MUST NOT be labeled as errors. At the existing safe post-turn
+boundary, progress MUST be derived only from already-held before/after repository observations,
+already-fetched workpad identity/schema-marker/update-time/hash, and current accepted exact-head
+evidence. A changed comparable channel suppresses the candidate and resets a latched episode; all
+comparable channels
+unchanged establishes known no-progress; no comparable channels means unavailable and MUST NOT
+produce a warning. Emit at most one alert per fingerprint episode until observed progress resets it.
+
+The existing `no_progress_warnings` packet observation owns the bounded pending warning and minimal
+latched fingerprint state. A warning is appended through the one literal-tail resume-packet section,
+not a second prompt section or store. The next handled backend turn consumes and clears an old
+pending warning while optionally replacing it with a new one. If the process crashes before the
+post-turn refresh, retry/restart may redeliver the persisted warning; delivery is therefore
+at-least-once across crashes, not exactly-once. Lifecycle boundary marks MUST preserve warning state.
+
+Versioned compact loop telemetry SHOULD distinguish alerts, candidates suppressed by observed
+progress, qualified candidates whose progress was unavailable, and actual latched resets. It MUST
+remain shadow-labeled and contain only fixed enums, bounded counts/omission codes, digest/warning
+identifiers, and progress-channel states. Live state MAY expose a validated compact active-warning
+summary. Historical views MAY aggregate valid versioned shadow events and SHOULD deduplicate
+replayed alerts by warning identifier. Malformed/legacy events and summaries MUST be ignored without
+overwriting the last valid live summary or crashing readers.
+
+Compact reporting SHOULD provide fleet, repository, issue, parent/delegated-thread, phase,
+failure-class, tool, review, and percentile views. At minimum it SHOULD include p50/p90 token and
+duration, delegation share, gate reuse, retries by failure class, tool output bytes, and quality
+guardrails. Reports MUST reconstruct token totals from each actual thread's cumulative high water,
+never by summing repeated absolute snapshots. Percentiles SHOULD use conventional nearest-rank
+semantics so small samples do not understate their upper tail.
+
+Session persistence SHOULD coalesce high-frequency streaming/token notifications or maintain an
+equivalent bounded analytics index. Existing NDJSON readers SHOULD remain compatible or receive a
+migration path. Selectively retained raw traces MAY be compressed, but protocol/security/
+correctness failures MUST retain enough redacted evidence for diagnosis. Operators MUST have a
+documented temporary raw-trace/debug escape hatch. When raw originals are valid structured
+documents, retention SHOULD preserve their complete recursively redacted shape rather than apply
+the compact fleet-event string bound; unparseable originals SHOULD retain safe size/hash metadata
+instead of opaque content. Operator-configured redaction names SHOULD extend a mandatory credential
+baseline rather than permit an empty/custom list to disable baseline privacy protection.
+
+Compact lifecycle/error analytics SHOULD support rolling 7- and 30-day analysis. Retention policy
+MUST define durations, sampling, privacy, recursive secret-field redaction, and cleanup. Destructive
+session-log cleanup SHOULD be dry-run by default, require explicit apply intent, report selected and
+reclaimed bytes, and protect active session paths. Benign
+per-notification debug logs SHOULD be disabled by default so lifecycle/error history is not rotated
+away by streaming chatter.
+
+Historical harness evaluation MUST keep worker transport/lifecycle completion distinct from task
+delivery. A normal `run_end` means only that a worker attempt ended normally; it MUST NOT imply
+material repository progress, an accepted handoff, CI success, human approval, or a merged change.
+Where these states cannot be derived safely, implementations SHOULD emit a versioned
+`task_outcome` event with an explicit `stage`, `status`, and authority indicator. The standard stages
+are `material_progress`, `exact_head_handoff`, `ci`, `human_review`, and `pull_request`; applicable
+statuses include `recorded`, `accepted`, `passed`, `failed`, `merged`, `reopened`, and `reverted`.
+Missing task-outcome evidence is `unknown`, not success or failure. Legacy quality events MAY be
+normalized through an explicit documented mapping, but legacy handoff evidence without exact-head
+identity MUST remain distinguishable from verified acceptance.
+
+Material-progress evidence SHOULD compare repository state immediately before and after the agent
+turn, including handled error returns when the workspace is preserved. A content comparison MAY use
+only non-secret cryptographic fingerprints of tracked, staged, and untracked worktree state. Such
+collection MUST be bounded and MUST distinguish an unavailable probe from a changed result; a probe
+failure or an unchanged dirty flag MUST NOT itself record progress. Exact-head handoff acceptance
+MUST be emitted only from the authoritative gate transition that verified the candidate. Downstream
+CI, human-review, merge, reopen, and revert states MUST NOT be inferred from worker exit or tracker
+terminal state. Delivery evidence SHOULD correlate by exact/candidate/reviewed/head SHA when
+available, then by `run_id`, with conservative legacy issue/date fallback.
+
+An implementation that exposes a historical evaluation cockpit SHOULD offer exact selectable 7-
+and 30-day views, clamped to configured retention, and cap files, event rows, rendered runs, and
+per-issue detail. It SHOULD filter by repository, task family, model, prompt version, and
+`config_digest`, preserving those selections in the URL. Historical issue lookup MAY fall back to
+retained compact telemetry after an issue leaves live orchestrator memory, but MUST label that view
+as historical and MUST NOT expose live controls or claim transcript availability. Cost and
+cost-per-accepted-handoff MUST remain unavailable unless explicit numeric cost telemetry exists.
+For compatibility, machine reports MAY retain a legacy `completion_rate` field, but human-readable
+surfaces SHOULD label it as worker-run completion.
+Valid version 1 shadow `no_progress_loop` evidence MAY be shown as a separate compact group of
+alerts, progress suppressions, unavailable progress decisions, resets, and fixed kind/result/tool
+class breakdowns. Replayed warnings SHOULD be deduplicated by valid warning identifier. Historical
+issue fallback MAY preserve only those fixed loop fields in its bounded recent-event summaries and
+MUST NOT expose raw tool identity, arguments, output, call IDs, or thread IDs from detector state.
+
+An implementation MAY provide an operator-run offline projection from retained compact telemetry to
+candidate regression fixtures. Such a projection MUST use a fixed event/field allowlist and MUST NOT
+ingest raw protocol/session transcripts by default, prompt or workpad bodies, tool arguments/output,
+arbitrary user content, credentials, or free-form failure/review prose. Selection, deduplication,
+clustering, sampling, candidate identity, and evidence references MUST be deterministic and bounded.
+Readers MUST enforce file, row, source-byte, expanded-byte, line, and output-corpus caps while
+streaming, including compressed input, and SHOULD retain complete decoded rows observed before a
+limit. Malformed, legacy, partial, unsafe, or unsupported input MUST fail closed per row or produce a
+bounded diagnostic without turning a partial valid corpus into authoritative evidence.
+
+Generated corpora MUST remain `pending_review`, and generated assertions MUST be proposals or
+unknowns rather than authoritative expected outcomes. Export MUST be explicit, use an existing
+operator-owned private staging directory outside the source tree, write private files atomically
+without replacing a conflicting deterministic name, and leave staging retention/cleanup to the
+operator. Symphony MUST NOT provide an automatic approve/promote path. An accepted regression
+fixture requires explicit current-policy external human or independent review metadata and fixed
+reviewed assertions. That metadata is process evidence, not a cryptographic identity or signature.
+Offline accepted-fixture verification MUST replay and integrity-check the generated safe evidence
+core, reject pending corpora, and remain bounded and deterministic. Candidate mining MUST NOT add a
+runtime process, poller, reaper, ticket mutation, or automatic fixture commit.
+
+An implementation MAY support an explicitly opted-in controlled experiment whose only version 1
+treatment variable is the Codex per-turn reasoning effort. The host-owned master mode MUST default
+and fail closed to `off`; repositories MAY declare one strict versioned manifest containing a
+control arm, at most three variants, bounded integer weights, eligible repositories/task families,
+and an exact opt-in label. Assignment MUST be deterministic and may be created only for a genuinely
+fresh task before its first backend turn. A task that begins disabled or ineligible MUST NOT join on
+a later continuation or retry. The persisted assignment remains authoritative across continuation,
+retry, wait, quota, and restart boundaries. Manifest/route/identity drift MUST permanently suspend
+and contaminate the assignment rather than reassign the same task.
+
+The host switch MUST be rechecked fail-closed immediately before every backend turn. Turning it off
+does not interrupt an active turn, but at the next turn boundary it permanently suspends both
+exposed and unexposed assignments and applies the baseline effort thereafter; re-enabling MUST NOT
+resume that task. The compact assignment MUST live only inside the existing trusted resume packet,
+MUST NOT create another store/process/poller/reaper, and MUST be removed before visible-packet
+compaction and prompt rendering so otherwise-identical prompt bytes and section hashes are
+independent of arm or suspension state. Assignment persistence and evaluation MUST add no Git,
+Linear, validation, or source-repository working-directory operation.
+
+An actually experiment-controlled turn SHOULD emit a versioned `experiment_exposure` with a stable
+logical ID derived from assignment and `run_id`; one run has one logical exposure and a retry is a
+new run exposure, never an independent repeated trial. A permanent suspension SHOULD likewise have
+a stable logical ID. Physical JSONL delivery MAY be at-least-once across a crash, so consumers MUST
+deduplicate equal IDs and treat conflicting duplicates as contamination. Events and runtime state
+MUST contain only fixed enums, bounded IDs/digests/counts, run/retry lineage, and the fixed
+assignment reason; labels, issue content, prompts, transcripts, tool arguments/output, workpad
+bodies, and arbitrary user/repository content are forbidden.
+
+Offline evaluation SHOULD use exact bounded 7- or 30-day compact-telemetry windows and join valid
+exposures to same-run versioned manifests and authoritative outcomes. Cohorts MUST be separated by
+experiment version, repository, and task family. Missing/conflicting manifests, cross-arm/config
+units, stratum conflicts, and suspensions are contaminated and excluded from comparable
+denominators. Reports MAY show raw worker-completion, task-outcome, exact-head/post-handoff,
+duration, token-high-water, and explicit-cost denominators plus descriptive treatment-minus-control
+deltas. They MUST NOT claim causality or significance. Pairing and Pass@k/Pass^k MUST remain
+explicitly unavailable without a genuine repeated-trial protocol; retries MUST NOT be relabeled as
+trials. Symphony supplies no experiment promotion or approval path. Before any operator routing
+decision, a human MUST independently verify the reviewed manifest, retention/window boundaries,
+workspace security, contamination, and material outcome evidence.
+
+### 13.7 Telemetry-Driven Soft Budgets and Routing
+
+Repository workflows MAY configure `agent.efficiency` with `mode` (`off`, `shadow`, or `enforce`),
+a bounded allowlist of low-risk actions enforced while otherwise in shadow mode, a bounded
+resume-capsule size, an extreme-outlier multiplier, task-type-to-budget-profile mappings, and
+per-profile thresholds. Implementations SHOULD provide distinct simple, standard, and high-risk
+defaults derived from recent fleet percentiles rather than one global ceiling. Required dimensions
+include issue/run total, parent/delegated and per-thread high waters, per-turn growth, uncached/cached
+input, prompt/review-packet/tool-output bytes, elapsed phase time, requested reviewer lenses, and
+review iterations.
+
+The execution classifier SHOULD report one of `simple_direct`, `ui`, `security_tenant`,
+`data_schema`, `concurrency_liveness`, or `broad_architecture`, together with confidence, bounded
+input metadata, result/reasons, and override provenance. Missing/low-confidence telemetry and
+security, tenant, schema, concurrency, or broad-architecture signals MUST fail toward a quality
+fallback. Operators MAY override execution routing with an exact `agent:<profile>` label and budget
+routing with one exact valid `budget:<profile>` label. A present invalid budget label or more than
+one distinct valid budget profile MUST fail toward the high-risk budget with inspectable
+provenance.
+
+Soft-budget accounting MUST use actual parent/delegated thread cumulative high waters and survive
+continuation turns. A threshold identity is latched for the run: duplicate or out-of-order absolute
+usage notifications MUST NOT produce repeated warning prompts or transitions. Callback accounting
+SHOULD normalize and coalesce cumulative signals without retaining full protocol events in the
+runner mailbox, and a continuation-boundary snapshot MUST include callbacks begun before the turn
+returned. Tool-output bytes MUST come from terminal tool events rather than streaming deltas.
+`shadow` records the same proposed decisions/transitions without changing agent prompts, except for
+explicitly allowlisted output bounding and thin-context/no-full-history delegation actions. Other
+actions, including review reductions, MUST remain observational in shadow mode. `enforce` applies a
+one-shot, bounded strategy capsule at a safe continuation boundary. Strategies MAY compact
+parent state, require fresh thin-context delegation/review, reuse exact-head gate evidence,
+constrain future tool output, select risk-relevant reviewer lenses/model/reasoning, synthesize open
+findings, or escalate an extreme outlier with a complete resume packet.
+
+Budgets are never completion or approval criteria. Reaching one MUST NOT mark work complete, approve
+a review, skip required security/tenant validation, reduce mandatory high-risk lenses/evidence, or
+suppress unresolved findings. A high-risk policy MAY explicitly allow overage while preserving or
+strengthening reviewer effort, packet capacity, lens coverage, and iteration count. Compact reports
+SHOULD compare rolling tokens, time, review findings, CI/human outcomes, and extreme outliers, and
+expose classifier/budget decisions and applied versus shadow transitions.
+
+In `enforce` mode, an implementation MAY refine a standard reviewer route to the configured simple
+profile after constructing a complete exact-candidate diff manifest. Such refinement MUST be
+conservative and deterministic: it MUST NOT apply to explicit budget overrides, quality-fallback or
+high-risk profiles, high-risk task classes, missing/incomplete manifests, repository-control paths,
+production paths, binary changes, or candidates beyond the implementation's documented file/line
+bounds. It MUST retain exact-head approval plus mandatory correctness and test-evidence lenses, MUST
+affect reviewer routing only rather than the implementor's run budget, and SHOULD emit inspectable
+telemetry containing the original/effective profiles and candidate classification.
+
+### 13.8 Humanized Agent Event Summaries (OPTIONAL)
 
 Humanized summaries of raw agent protocol events are OPTIONAL.
 
@@ -1341,7 +2174,7 @@ If implemented:
 - Treat them as observability-only output.
 - Do not make orchestrator logic depend on humanized strings.
 
-### 13.7 OPTIONAL HTTP Server Extension
+### 13.9 OPTIONAL HTTP Server Extension
 
 This section defines an OPTIONAL HTTP interface for observability and operational control.
 
@@ -1375,8 +2208,14 @@ Enablement (extension):
 - Host a human-readable dashboard at `/`.
 - The returned document SHOULD depict the current state of the system (for example active sessions,
   retry delays, token consumption, runtime totals, recent events, and health/error indicators).
+- Implementations MAY coalesce change notifications and show a bounded, incrementally updated
+  transcript window in the live dashboard, provided an explicit operational-debugging path remains
+  available for the complete persisted transcript.
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
   consumes the JSON API below.
+- An implementation MAY host a bounded historical harness-evaluation view at `/history`. Such a
+  view SHOULD follow the outcome, retention, filtering, cost, and historical-detail semantics in
+  Section 13.6 and remain usable when the live orchestrator snapshot is unavailable.
 
 #### 13.7.2 JSON REST API (`/api/v1/*`)
 
@@ -1394,8 +2233,21 @@ Minimum endpoints:
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
         "running": 2,
+        "queued": 1,
         "retrying": 1
       },
+      "queued": [
+        {
+          "issue_identifier": "MT-651",
+          "repository": "dashboard-v2",
+          "reason": "path_overlap",
+          "queue_time_ms": 12000,
+          "base_age_seconds": 90,
+          "overlap_paths": ["app/auth/policy.ts"],
+          "suggested_order": ["MT-649", "MT-651"],
+          "suggested_order_omitted": 0
+        }
+      ],
       "running": [
         {
           "issue_id": "abc123",
@@ -1504,6 +2356,26 @@ Minimum endpoints:
     }
     ```
 
+- `POST /api/v1/drain` (extension)
+  - Persists drain mode and pauses new dispatch, retry execution, and provider probes without
+    stopping live workers.
+- `POST /api/v1/resume` (extension)
+  - Cancels drain mode and schedules an immediate tracker poll.
+- `POST /api/v1/shutdown-policy/preserve` (extension)
+  - Persists the policy that graceful application shutdown, including Ctrl+C, leaves detached
+    workers running for reconnection.
+- `POST /api/v1/shutdown-policy/terminate` (extension)
+  - Persists the policy that graceful application shutdown stops tracked workers and their owned
+    subprocess trees before exiting.
+- `POST /api/v1/waits/:issue_identifier/resume` (extension)
+  - Wakes one parked issue without waiting for its next probe.
+- `POST /api/v1/waits/:issue_identifier/cancel` (extension)
+  - Cancels the external wait and returns the active issue to normal scheduling.
+- `POST /api/v1/quota-circuits/probe` (extension)
+  - Accepts `{"backend":"codex","worker_host":null}` and schedules an immediate, controlled
+    one-issue probe for that backend/account circuit. A successful probe releases the remaining
+    parked issues in FIFO order; a failed probe reopens the circuit without fanning out work.
+
 API design notes:
 
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
@@ -1557,7 +2429,8 @@ API design notes:
   - Continue reconciliation where possible.
 
 - Worker failures:
-  - Convert to retries with exponential backoff.
+  - Convert operational failures to retries with exponential backoff.
+  - Surface deterministic, human-actionable review-configuration failures without retrying them.
 
 - Tracker candidate-fetch failures:
   - Skip this tick.
@@ -1572,24 +2445,49 @@ API design notes:
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
-Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
-process restart.
+The baseline design is intentionally in-memory for scheduler state. Restart recovery means a
+conforming service can resume useful operation by polling tracker state and reusing preserved
+workspaces; retry timers are not required to survive.
+
+The Elixir implementation additionally launches each live run in a detached worker BEAM. The
+worker owns the backend process and stdio port and exposes an authenticated loopback channel. The
+orchestrator owns a replaceable relay, acknowledges ordered events with a bounded runtime
+checkpoint, and reconnects after restart. This preserves an in-flight coding-agent process without
+requiring a database or attempting to reattach an Erlang port from a new VM.
 
 After restart:
 
 - No retry timers are restored from prior process memory.
-- No running sessions are assumed recoverable.
-- Service recovers by:
+- Durable external-condition waits and ready wake-ups MAY be restored independently of the general
+  retry queue. Restored waits retain their claims and resume through the normal scheduler.
+- A baseline implementation MAY assume no running sessions are recoverable and recover by:
   - startup terminal workspace cleanup
   - fresh polling of active issues
   - re-dispatching eligible work
+- A reconnectable-worker implementation SHOULD adopt authenticated live workers before dispatch,
+  claim their issue ids, restore their last acknowledged runtime checkpoint, and replay later
+  events. It MUST liveness-check records marked active before adoption. A dead record SHOULD be
+  reclaimed without replacing an existing retry deadline; an unreachable worker record must not
+  authorize duplicate concurrent work or indefinitely postpone recovery.
+- A reconnectable-worker implementation MUST NOT delete a discovery record while its exact worker
+  process is still live. A live completed worker SHOULD be reattached so its terminal event can be
+  acknowledged through the normal relay lifecycle. A live record already marked stopping SHOULD
+  have its identity-checked process tree terminated before the record is removed.
+- An implementation MAY reconcile a manifestless worker whose command names an immutable run spec
+  beneath the configured registry. It MUST capture and revalidate the OS process start identity
+  before terminating that process tree and MUST NOT use a broad process-name match.
+- Stopping a detached worker SHOULD terminate agent-owned external descendants while preserving the
+  worker VM's runtime helpers long enough to record terminal state and exit normally.
 
 ### 14.4 Operator Intervention Points
 
 Operators can control behavior by:
 
+- Enabling persisted drain mode to pause new work while live workers continue, then cancelling it
+  to resume normal dispatch.
+- Selecting a persisted shutdown policy independently of drain mode. A reconnecting restart
+  preserves workers; a full shutdown terminates workers and their owned subprocess trees.
+- Resuming one parked wait immediately or cancelling its external condition from the dashboard/API.
 - Editing `WORKFLOW.md` (prompt and most runtime settings).
 - `WORKFLOW.md` changes are detected and re-applied automatically without restart according to
   Section 6.2.
@@ -1787,6 +2685,8 @@ function dispatch_issue(issue, state, attempt):
     last_codex_message: null,
     last_codex_event: null,
     last_codex_timestamp: null,
+    lifecycle_state: implementing,
+    lifecycle_started_at: now_utc(),
     codex_input_tokens: 0,
     codex_output_tokens: 0,
     codex_total_tokens: 0,
@@ -1809,6 +2709,12 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   workspace = workspace_manager.create_for_issue(issue.identifier)
   if workspace failed:
     fail_worker("workspace error")
+
+  github_auth = github_app_auth.prepare(workspace.path)
+  if github_auth failed:
+    fail_worker("github authentication configuration error")
+
+  run_hook_best_effort("session_start", workspace.path)
 
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
@@ -1958,11 +2864,22 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   implementation policy)
 - OPTIONAL workspace population/synchronization errors are surfaced
 - `after_create` hook runs only on new workspace creation
+- `session_start` hook runs before each fresh or resumed agent session; failures are non-fatal and
+  are represented in canonical first-turn task context plus `gate.session_start` telemetry
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
+- GitHub App authentication is prepared before routed lifecycle hooks and every agent backend
+- Missing credentials, an inaccessible installation, or token minting failure aborts the attempt
+  with a typed authentication classification
+- Prepared hook/agent environments contain the standalone-CLI-owned `gh` shim and repository identity,
+  but no `GH_TOKEN` or `GITHUB_TOKEN`
+- Installation-token cache files use owner-only permissions, and `.artifacts` is excluded from
+  local Git staging
+- Interactive activation and restoration reuse the production CLI without installing or running
+  Symphony
 
 ### 17.3 Issue Tracker Client
 
@@ -1990,6 +2907,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
+- Pending handoff review suppresses implementor stall detection and redispatch
+- Pending handoff review uses reviewer-specific heartbeat/timeout handling
+- Stale reviewer worker/job events do not mutate a newer running entry
+- Repeated handoff requests coalesce while the same review is pending
+- A changed PR head withholds the reviewed handoff until a fresh review runs
 - Slot exhaustion requeues retries with explicit error reason
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
@@ -2021,9 +2943,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - the tool is advertised to the session
   - valid `query` / `variables` inputs execute against configured Linear auth
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
+  - raw current-issue workflow transitions fail with typed-transition remediation
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
-
+  - session observability records retain normalized tool result details so deferred handoffs and
+    failure categories remain distinguishable
+- If the `linear_issue` client-side tool extension is implemented:
+  - the tool is advertised to the session
+  - it is scoped to the host-owned current issue
+  - typed workpad, label, activity, and transition operations return structured results
+  - review and blocked-state transitions preserve the required handoff and blocker gates
+  - accepted deferred handoff reviews produce `success=true` with structured end-turn instructions
 ### 17.6 Observability
 
 - Validation failures are operator-visible
@@ -2090,13 +3020,14 @@ Use the same validation profiles as Section 17:
 
 - HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
-  app-server session using configured Symphony auth.
-- TODO: Persist retry queue and session metadata across process restarts.
+- `linear_issue` exposes host-scoped typed current-issue operations, with `linear_graphql` retained
+  as a fallback for operations without a typed form.
+- TODO: Persist the general retry queue across process restarts. Live detached workers already
+  retain their current session metadata in the Elixir implementation.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
+- TODO: Expand first-class tracker APIs only when a repeated operation cannot fit the scoped
+  `linear_issue` contract.
 - TODO: Add pluggable issue tracker adapters beyond Linear.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
@@ -2139,7 +3070,8 @@ Extension config:
 - Implementations MAY prefer the previously used host on retries when that host is still
   available.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
-  hosts.
+  hosts. Every live worker assigned to the host counts, including pending handoff-gate and review
+  lifecycles.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
 - Implementations MAY fail over to another host when the original host is unavailable before work

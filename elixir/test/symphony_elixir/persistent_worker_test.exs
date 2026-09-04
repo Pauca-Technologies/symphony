@@ -1,0 +1,550 @@
+defmodule SymphonyElixir.PersistentWorkerTest do
+  use SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.PersistentWorker
+  alias SymphonyElixir.PersistentWorker.{Client, Registry, Server}
+  alias SymphonyElixir.ResumePacket
+
+  defmodule RelayTarget do
+    use GenServer
+
+    def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid)
+
+    @impl true
+    def init(test_pid), do: {:ok, %{test_pid: test_pid, checkpoint: nil}}
+
+    @impl true
+    def handle_call(
+          {:persistent_worker_checkpoint, worker_id, seq, checkpoint},
+          _from,
+          state
+        ) do
+      send(state.test_pid, {:checkpoint, self(), worker_id, seq, checkpoint})
+      {:reply, :ok, %{state | checkpoint: checkpoint}}
+    end
+
+    def handle_call({:persistent_worker_event, worker_id, seq, event}, _from, state) do
+      send(state.test_pid, {:event, self(), worker_id, seq, event})
+
+      case event do
+        {:persistent_worker_completed, _reason} ->
+          {:reply, {:terminal, state.checkpoint}, state}
+
+        _other ->
+          checkpoint = %{last_seq: seq, last_event: event}
+          {:reply, {:ok, checkpoint}, %{state | checkpoint: checkpoint}}
+      end
+    end
+  end
+
+  test "registry creates one private discoverable record per issue" do
+    issue = issue("registry")
+    packet = ResumePacket.build(%{boundary_reason: :retry_scheduled})
+    packet_ref = ResumePacket.reference(packet, "registry.json.resume-packet.json")
+
+    assert {:ok, manifest} = Registry.prepare(issue, 2, "worker-a", resume_packet_ref: packet_ref)
+    assert manifest.attempt == 2
+    assert manifest.worker_host == "worker-a"
+    assert manifest.resume_packet_ref == packet_ref
+    assert {:existing, %{worker_id: worker_id}} = Registry.prepare(issue, 3, nil)
+    assert worker_id == manifest.worker_id
+
+    assert {:ok, spec} = Registry.load_spec(manifest)
+    assert spec.issue == issue
+    assert spec.attempt == 2
+    assert spec.runner_opts[:resume_packet_ref] == packet_ref
+    assert [listed] = Registry.list()
+    assert listed.worker_id == manifest.worker_id
+
+    assert {:ok, updated} = Registry.update(manifest, %{port: 12_345, os_pid: 987, status: "running"})
+    assert updated.port == 12_345
+    assert updated.os_pid == 987
+    assert updated.status == "running"
+
+    assert :ok = Registry.cleanup(updated, updated.worker_id)
+    assert Registry.list() == []
+  end
+
+  test "registry reads manifests written before run lineage fields existed" do
+    issue = issue("legacy-run-lineage")
+
+    assert {:ok, manifest} =
+             Registry.prepare(issue, 2, nil,
+               run_id: "run-new",
+               parent_run_id: "run-parent",
+               retry_id: "retry-new"
+             )
+
+    legacy_payload =
+      manifest.manifest_path
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.drop(~w(run_id parent_run_id retry_id retry_attempt workspace_path resume_packet_ref))
+
+    File.write!(manifest.manifest_path, Jason.encode!(legacy_payload))
+
+    assert {:ok, restored} = Registry.load_manifest(manifest.manifest_path)
+    assert restored.run_id == nil
+    assert restored.parent_run_id == nil
+    assert restored.retry_id == nil
+    assert restored.retry_attempt == nil
+    assert restored.workspace_path == nil
+    assert restored.resume_packet_ref == nil
+    assert restored.attempt == 2
+    assert restored.worker_id == manifest.worker_id
+  end
+
+  test "completed records are reclaimed instead of reattached as failed workers" do
+    issue = issue("completed-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, completed} = Registry.update(manifest, %{status: "completed"})
+
+    assert {:ok, replacement} = Registry.prepare(issue, 2, nil)
+    refute replacement.worker_id == completed.worker_id
+    assert replacement.attempt == 2
+
+    assert {:ok, _completed_replacement} = Registry.update(replacement, %{status: "completed"})
+    assert PersistentWorker.attach_all(self()) == []
+    assert Registry.list() == []
+  end
+
+  test "a live completed worker is reattached so its terminal event can be acknowledged" do
+    issue = issue("completed-live-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, spec} = Registry.load_spec(manifest)
+    {:ok, server} = Server.start_link(spec, runner_fun: fn _recipient -> :ok end)
+    server_ref = Process.monitor(server)
+
+    assert_eventually(fn ->
+      match?([%{status: "completed"}], Registry.list())
+    end)
+
+    Application.put_env(
+      :symphony_elixir,
+      :persistent_worker_liveness_check,
+      fn candidate -> candidate.worker_id == manifest.worker_id and Process.alive?(server) end
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_liveness_check)
+    end)
+
+    {:ok, target} = RelayTarget.start_link(self())
+    assert [%{manifest: %{worker_id: worker_id}}] = PersistentWorker.attach_all(target)
+    assert worker_id == manifest.worker_id
+
+    assert_receive {:event, ^target, ^worker_id, 1, {:persistent_worker_completed, :normal}},
+                   5_000
+
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 5_000
+    assert Registry.list() == []
+  end
+
+  test "stopping records are terminated before their registry entry is removed" do
+    issue = issue("stopping-live-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, stopping} = Registry.update(manifest, %{status: "stopping", os_pid: 12_345})
+    {:ok, liveness_calls} = Agent.start_link(fn -> 0 end)
+    identity = %{pid: 12_345, ppid: 1, start_time: "100", name: "beam.smp"}
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :persistent_worker_liveness_check, fn candidate ->
+      if candidate.worker_id == stopping.worker_id do
+        Agent.get_and_update(liveness_calls, fn calls -> {calls == 0, calls + 1} end)
+      else
+        false
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_process_snapshotter, fn 12_345 ->
+      send(test_pid, :stopping_worker_snapshotted)
+      [identity]
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_identity_terminator, fn identities, _timeout ->
+      send(test_pid, {:stopping_worker_terminated, identities})
+      :ok
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_liveness_check)
+      Application.delete_env(:symphony_elixir, :persistent_worker_process_snapshotter)
+      Application.delete_env(:symphony_elixir, :persistent_worker_identity_terminator)
+    end)
+
+    assert PersistentWorker.attach_all(self()) == []
+    assert_receive :stopping_worker_snapshotted
+    assert_receive {:stopping_worker_terminated, [^identity]}
+    assert Registry.list() == []
+  end
+
+  test "a launched worker record is preserved when relay startup fails" do
+    issue = issue("relay-start-failure")
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :persistent_worker_launcher, fn manifest ->
+      send(test_pid, {:worker_launch_attempted, manifest.worker_id})
+      :ok
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_client_starter, fn _manifest, _orchestrator ->
+      {:error, :relay_unavailable}
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_launcher)
+      Application.delete_env(:symphony_elixir, :persistent_worker_client_starter)
+    end)
+
+    assert {:error, :relay_unavailable} = PersistentWorker.start(issue, 1, nil, self())
+    assert_receive {:worker_launch_attempted, worker_id}
+    assert [%{worker_id: ^worker_id}] = Registry.list()
+  end
+
+  test "startup reaps an unregistered worker only through its captured process identity" do
+    test_pid = self()
+    identity = %{pid: 23_456, ppid: 1, start_time: "200", name: "beam.smp"}
+
+    Application.put_env(:symphony_elixir, :persistent_worker_orphan_scanner, fn ->
+      [%{pid: 23_456, spec_path: "/tmp/workers/orphan/run.term"}]
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_process_snapshotter, fn 23_456 ->
+      send(test_pid, :unregistered_worker_snapshotted)
+      [identity]
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_worker_identity_terminator, fn identities, _timeout ->
+      send(test_pid, {:unregistered_worker_terminated, identities})
+      :ok
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_orphan_scanner)
+      Application.delete_env(:symphony_elixir, :persistent_worker_process_snapshotter)
+      Application.delete_env(:symphony_elixir, :persistent_worker_identity_terminator)
+    end)
+
+    assert PersistentWorker.attach_all(self()) == []
+    assert_receive :unregistered_worker_snapshotted
+    assert_receive {:unregistered_worker_terminated, [^identity]}
+  end
+
+  test "dead running records are reclaimed before adoption" do
+    issue = issue("dead-record")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+
+    assert {:ok, dead} =
+             Registry.update(manifest, %{
+               status: "running",
+               os_pid: 2_147_483_647,
+               port: 65_535
+             })
+
+    refute Registry.worker_alive?(dead)
+    assert PersistentWorker.attach_all(self()) == []
+    assert Registry.list() == []
+  end
+
+  test "detached server keeps the run alive and replays its checkpoint to a replacement relay" do
+    test_pid = self()
+    issue = issue("reconnect")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, spec} = Registry.load_spec(manifest)
+
+    packet = ResumePacket.build(%{boundary_reason: :turn_start})
+
+    packet_runtime = %{
+      workspace_path: "/tmp/reconnected-workspace",
+      resume_packet_id: packet["packet_id"],
+      resume_packet_sha256: packet["packet_sha256"],
+      resume_packet_ref: "reconnected.json.resume-packet.json",
+      resume_packet_boundary: "turn_start",
+      resume_packet_evidence_refs: []
+    }
+
+    runner_fun = fn recipient ->
+      send(test_pid, {:runner_started, self(), recipient})
+
+      send(
+        recipient,
+        {:worker_runtime_info, issue.id, packet_runtime}
+      )
+
+      receive do
+        :finish -> :ok
+      end
+    end
+
+    {:ok, server} = Server.start_link(spec, runner_fun: runner_fun)
+    server_ref = Process.monitor(server)
+    assert_receive {:runner_started, runner_pid, ^server}
+
+    {:ok, first_target} = RelayTarget.start_link(self())
+    first_client = spawn(fn -> Client.run(manifest, first_target) end)
+
+    assert_receive {:checkpoint, ^first_target, worker_id, 0, nil}, 5_000
+
+    assert_receive {:event, ^first_target, ^worker_id, 1, {:worker_runtime_info, issue_id, ^packet_runtime}},
+                   5_000
+
+    assert issue_id == issue.id
+
+    assert_eventually(fn ->
+      case Registry.list() do
+        [%{workspace_path: "/tmp/reconnected-workspace", resume_packet_ref: reference}] ->
+          reference == ResumePacket.reference(packet, "reconnected.json.resume-packet.json")
+
+        _other ->
+          false
+      end
+    end)
+
+    GenServer.stop(first_target)
+    assert_eventually(fn -> not Process.alive?(first_client) end)
+    assert Process.alive?(server)
+    assert Process.alive?(runner_pid)
+
+    {:ok, second_target} = RelayTarget.start_link(self())
+    second_client = spawn(fn -> Client.run(manifest, second_target) end)
+
+    assert_receive {:checkpoint, ^second_target, ^worker_id, 1, %{last_seq: 1, last_event: {:worker_runtime_info, ^issue_id, _runtime}}},
+                   5_000
+
+    send(runner_pid, :finish)
+
+    assert_receive {:event, ^second_target, ^worker_id, 2, {:persistent_worker_completed, :normal}},
+                   5_000
+
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 5_000
+    assert_eventually(fn -> not Process.alive?(second_client) end)
+    assert Registry.list() == []
+  end
+
+  test "a replacement orchestrator adopts the same live worker after restart" do
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, Orchestrator)
+
+    on_exit(fn ->
+      Application.put_env(:symphony_elixir, :persistent_workers_enabled, false)
+
+      unless Process.whereis(Orchestrator) do
+        _ = Supervisor.restart_child(SymphonyElixir.Supervisor, Orchestrator)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :persistent_workers_enabled, true)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", poll_interval_ms: 1_000)
+
+    issue = issue("orchestrator-adoption")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    packet = ResumePacket.build(%{identity: %{run_id: "run-initial-adoption"}, boundary_reason: :turn_start})
+    packet_ref = ResumePacket.reference(packet, "adoption.json.resume-packet.json")
+
+    assert {:ok, manifest} =
+             Registry.prepare(issue, nil, nil,
+               run_id: "run-initial-adoption",
+               retry_attempt: 0,
+               resume_packet_ref: packet_ref
+             )
+
+    assert {:ok, manifest} =
+             Registry.update(manifest, %{workspace_path: "/tmp/adoption-workspace"})
+
+    assert manifest.attempt == 1
+    assert manifest.retry_attempt == 0
+    assert {:ok, spec} = Registry.load_spec(manifest)
+    test_pid = self()
+    {:ok, packet_state} = Agent.start_link(fn -> packet end)
+
+    Application.put_env(:symphony_elixir, :resume_packet_boundary_marker, fn workspace, boundary, worker_host ->
+      send(test_pid, {:adoption_packet_boundary, workspace, boundary, worker_host})
+
+      Agent.get_and_update(packet_state, fn current ->
+        {:ok, marked} = ResumePacket.mark_boundary(current, boundary)
+        {{:ok, marked}, marked}
+      end)
+    end)
+
+    runner_fun = fn recipient ->
+      send(test_pid, {:adoption_runner_started, self(), recipient})
+
+      receive do
+        :finish -> :ok
+      end
+    end
+
+    {:ok, server} = Server.start_link(spec, runner_fun: runner_fun)
+    server_ref = Process.monitor(server)
+    assert_receive {:adoption_runner_started, runner_pid, ^server}
+
+    Application.put_env(
+      :symphony_elixir,
+      :persistent_worker_liveness_check,
+      fn candidate -> candidate.worker_id == manifest.worker_id end
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :persistent_worker_liveness_check)
+      Application.delete_env(:symphony_elixir, :resume_packet_boundary_marker)
+      if Process.alive?(packet_state), do: Agent.stop(packet_state)
+    end)
+
+    first_name = :persistent_adoption_first
+    {:ok, first} = Orchestrator.start_link(name: first_name)
+
+    assert_eventually(fn ->
+      case Orchestrator.snapshot(first_name, 1_000) do
+        %{
+          running: [
+            %{
+              issue_id: issue_id,
+              run_id: run_id,
+              retry_attempt: 0,
+              resume_packet_ref: %{boundary: "restart_adopted"}
+            }
+          ]
+        } ->
+          issue_id == issue.id and run_id == "run-initial-adoption"
+
+        _other ->
+          false
+      end
+    end)
+
+    assert_receive {:adoption_packet_boundary, "/tmp/adoption-workspace", "restart_adopted", nil}
+
+    GenServer.stop(first)
+    assert Process.alive?(runner_pid)
+    assert Process.alive?(server)
+
+    second_name = :persistent_adoption_second
+    {:ok, second} = Orchestrator.start_link(name: second_name)
+
+    assert_eventually(fn ->
+      case Orchestrator.snapshot(second_name, 1_000) do
+        %{
+          running: [
+            %{
+              issue_id: issue_id,
+              run_id: run_id,
+              retry_attempt: 0,
+              resume_packet_ref: %{boundary: "restart_adopted"}
+            }
+          ]
+        } ->
+          issue_id == issue.id and run_id == "run-initial-adoption"
+
+        _other ->
+          false
+      end
+    end)
+
+    assert_receive {:adoption_packet_boundary, "/tmp/adoption-workspace", "restart_adopted", nil}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    send(runner_pid, :finish)
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 5_000
+    if Process.alive?(second), do: GenServer.stop(second)
+  end
+
+  test "stopping a detached worker terminates its external child processes" do
+    test_pid = self()
+    issue = issue("stop-descendants")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, spec} = Registry.load_spec(manifest)
+
+    runner_fun = fn _recipient ->
+      receive do
+        :never -> :ok
+      end
+    end
+
+    process_terminator = fn ->
+      send(test_pid, :worker_descendants_terminated)
+      :ok
+    end
+
+    {:ok, server} =
+      Server.start_link(spec,
+        runner_fun: runner_fun,
+        process_terminator: process_terminator
+      )
+
+    server_ref = Process.monitor(server)
+    assert {:ok, _attachment} = GenServer.call(server, {:attach, self(), spec.auth_token})
+
+    GenServer.cast(server, {:stop, self()})
+
+    assert_receive :worker_descendants_terminated, 1_000
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 1_000
+    assert Registry.list() == []
+  end
+
+  test "default descendant cleanup preserves Erlang runtime helpers" do
+    test_pid = self()
+    issue = issue("runtime-helper-cleanup")
+    assert {:ok, manifest} = Registry.prepare(issue, 1, nil)
+    assert {:ok, spec} = Registry.load_spec(manifest)
+
+    identities = [
+      %{pid: 100, ppid: 1, start_time: "1", name: "beam.smp"},
+      %{pid: 101, ppid: 100, start_time: "2", name: "erl_child_setup"},
+      %{pid: 102, ppid: 101, start_time: "3", name: "inet_gethost"},
+      %{pid: 103, ppid: 101, start_time: "4", name: "sh"},
+      %{pid: 104, ppid: 103, start_time: "5", name: "node"}
+    ]
+
+    runner_fun = fn _recipient ->
+      receive do
+        :never -> :ok
+      end
+    end
+
+    identity_terminator = fn selected ->
+      send(test_pid, {:worker_processes_terminated, selected})
+      :ok
+    end
+
+    {:ok, server} =
+      Server.start_link(spec,
+        runner_fun: runner_fun,
+        process_snapshotter: fn -> identities end,
+        identity_terminator: identity_terminator
+      )
+
+    server_ref = Process.monitor(server)
+    assert {:ok, _attachment} = GenServer.call(server, {:attach, self(), spec.auth_token})
+
+    GenServer.cast(server, {:stop, self()})
+
+    assert_receive {:worker_processes_terminated, selected}, 1_000
+    assert Enum.map(selected, & &1.pid) == [103, 104]
+    assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 1_000
+    assert Registry.list() == []
+  end
+
+  defp issue(suffix) do
+    %Issue{
+      id: "persistent-worker-#{suffix}",
+      identifier: "PW-#{suffix}",
+      title: "Persistent worker #{suffix}",
+      description: "Keep this run alive",
+      state: "In Progress",
+      labels: []
+    }
+  end
+
+  defp assert_eventually(fun, attempts \\ 100)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      assert true
+    else
+      Process.sleep(20)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+end

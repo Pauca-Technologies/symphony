@@ -30,6 +30,21 @@ defmodule SymphonyElixir.SpecsCheckTest do
     assert SpecsCheck.missing_public_specs([dir]) == []
   end
 
+  test "accepts @spec before default argument declarations" do
+    dir = create_tmp_dir()
+
+    write_module!(dir, "sample.ex", """
+    defmodule Sample do
+      @spec ok(term(), term() | nil) :: term()
+      def ok(arg, default \\\\ nil)
+
+      def ok(arg, _default), do: arg
+    end
+    """)
+
+    assert SpecsCheck.missing_public_specs([dir]) == []
+  end
+
   test "allows defp without @spec" do
     dir = create_tmp_dir()
 

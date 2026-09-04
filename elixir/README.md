@@ -20,8 +20,98 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
-During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+During agent sessions, Symphony owns a canonical first-turn task context. It contains the issue's
+identifier, title, state, labels, URL, attachment URLs, and description followed by a bounded, most-recently-updated
+Linear comment window fetched immediately before each outer dispatch. The current workpad and human
+unblock decisions are therefore deterministic task input. Any Markdown files produced by
+`hooks.session_start` appear next in an annotated startup-artifact section, followed by the rendered
+repository workflow. A truncation marker tells the agent when an older focused lookup may still be
+required. If the comment read fails, the worker attempt fails and retries rather than starting with
+incomplete context.
+
+Symphony writes the same issue and comment snapshot outside the agent-writable workspace and exposes
+its path as `SYMPHONY_ISSUE_CONTEXT_FILE` to lifecycle hooks and the agent process. Version 2 adds
+`issue.comments` and `issue.commentsTruncated`; the file never contains a Linear credential.
+Consumer-repository scripts can therefore use current task context without receiving that
+credential. Hook processes also receive `SYMPHONY_SHARED_CACHE_DIR`, a host-owned sibling of the
+issue workspaces for consumer caches whose keys and privacy contract are repository-defined. Later
+turns receive only comments added or updated since the previous turn. Equivalent
+repeated automated-review outcomes for the same candidate are collapsed, while human comments and
+the single workpad remain verbatim. The typed `linear_issue` tool handles current-issue reads,
+workpad updates, labels, transitions, and deterministic same-project Backlog follow-ups for
+out-of-scope discoveries; `linear_graphql` remains available for uncommon operations
+that have no typed form, but rejects raw workflow transitions while a Symphony issue is active.
+All current-issue transitions therefore pass through the typed policy and handoff gates. Symphony
+disables the native Linear MCP in managed Codex sessions because its writes cannot run
+`hooks.before_handoff` or the automated review gate.
+
+`hooks.before_handoff` may implement the version 1 asynchronous gate protocol. Symphony sets
+`SYMPHONY_HANDOFF_GATE_PROTOCOL=1`; a `pending` or `running` report exits `3` and supplies a durable
+job ID, exact candidate identity, heartbeat, progress, and next-poll delay. Before the initial hook
+invocation, Symphony persists the captured Linear mutation outside the agent-writable worktree. If
+that invocation is interrupted or has an infrastructure failure before returning a job ID, the next
+worker attempt retries the hook directly without opening another model session. Once a job exists,
+Symphony closes the active model turn and polls with `SYMPHONY_HANDOFF_GATE_JOB_ID` without consuming
+model turns or tokens. Only a `passed`
+report for the original candidate can release the mutation. Failed and invalidated outcomes resume
+the implementor once with compact remediation. Stale-heartbeat, malformed-protocol, and other
+infrastructure outcomes fail the worker attempt and enter orchestrator backoff without consuming
+more model turns or changing the issue to `Blocked`. A restart reattaches to the persisted job
+rather than starting a duplicate gate. Poll-only invocations reuse `hooks.before_handoff` with the
+durable job ID while skipping repeated GitHub credential preparation and issue-context refresh; the
+repository command should branch to its cheap job-status read before normal handoff setup.
+
+When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
+`In Progress` to review-state handoffs. The handoff tool call records the requested Linear
+mutation, the active implementor turn closes, and Symphony runs the reviewer before starting the
+expensive `before_handoff` hook. A request-changes verdict therefore avoids that final validation
+entirely. An accepted deferred review returns a successful `deferred_review_started` tool result
+with explicit instructions to end the turn without retrying the mutation. Exact-head approval is
+persisted with a subsequent asynchronous handoff job, survives restart, and is rechecked after the
+gate passes; a changed head requires a fresh review. If the Linear issue has an attached GitHub PR
+URL, the review gate uses that PR directly for the managed review section; otherwise it falls back to
+the current workspace branch's PR. Repositories may return a structured `review_direction` with up
+to three file/line questions and two evidence or verification items. Symphony renders those as
+exact-head links in one compact managed PR section; reviewer effort and lens policy remain in
+telemetry and verdict artifacts. Legacy string guidance is accepted during rollout but flattened
+and capped instead of copied as arbitrary Markdown.
+
+Each pass starts a fresh, ephemeral reviewer thread with no implementor transcript or canonical
+issue-context file. Symphony gives it a versioned JSON packet pinned to the resolved base and head
+SHAs and a diff fingerprint. The packet carries the compact issue contract, changed-file manifest,
+area-specific repository rules, risk/lens rationale, exact-head validation attestations, prior open
+findings with their reviewed SHA, prior approved inspection/attestation coverage, PR-body attachment
+links, and a bounded follow-up delta. Packet
+compaction never removes the commands for reading the authoritative full diff or the applicable
+security/tenant/auth rule paths. High-risk follow-ups
+must finish with another complete base-to-head pass.
+
+Opted-in review workflows can require structured scope and a managed draft PR lifecycle. Scope starts
+with the Linear description and applies later human-authored comments as chronological amendments;
+workpad, integration-authored activity, and Symphony marker comments are excluded. If the bounded
+snapshot omits older comments, the reviewer retrieves that activity with its read-only Linear access
+before deciding. The reviewer identifies necessary dependencies, out-of-scope candidate changes, and
+separate follow-ups. Symphony validates and persists follow-ups before accepting the verdict, using
+deterministic Linear IDs so retries do not duplicate issues. The packet carries a stable digest of
+the complete amended scope so downstream gates reject approval after the scope snapshot changes.
+Before every implementation or feedback turn Symphony keeps the PR draft. After exact-head
+approval it marks that same head ready and only then starts the repository's final CI/landability
+gate; any draft-state or head mismatch withholds handoff.
+
+The reviewer is fail-safe. It writes to an attempt-scoped staging path; Symphony publishes the
+canonical verdict with one atomic rename only after the reviewer session completes and the output
+passes identity and evidence validation. A failed, timed-out, partial, or malformed attempt never
+publishes authoritative output. Its terminal outcomes are `approved`, `request_changes`,
+`automation_inconclusive`, `infrastructure_unavailable`, and
+`budget_exhausted_with_findings`. Only `approved` for the exact pinned candidate SHA may apply the
+captured Linear mutation. Missing or malformed verdicts, reviewer timeout/crash/tool/auth failures,
+and unresolved findings at the iteration limit remain visibly unapproved. A reviewer may explicitly
+report `infrastructure_unavailable` when authenticated private evidence cannot be inspected; that
+outcome consumes no substantive request-changes iteration and must include a failure reason and
+resume condition. Symphony posts a
+marker-delimited, note-once escalation containing the candidate SHA, passes attempted, failure
+reason, severity counts, findings, and resume condition; the runtime API and dashboard expose the
+same review state.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -34,8 +124,9 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
+   - The `linear` skill should prefer `linear_issue` for the current workpad, labels, activity, and
+     state; all workflow transitions must use its typed `transition` operation. It can use
+     `linear_graphql` for uncommon operations such as uploads.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
@@ -65,6 +156,10 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+`mix build` creates the internal `bin/symphony.escript`; start Symphony through the committed
+`bin/symphony` launcher as shown above. The launcher converts terminal Ctrl+C into a graceful
+application stop so the selected worker shutdown policy runs before the VM exits.
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:
@@ -79,6 +174,61 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
+
+## GitHub App authentication
+
+Every Symphony run targets a GitHub repository, so GitHub App authentication is a mandatory host
+capability rather than a repository hook. The independently maintained
+[`udp-gh`](https://github.com/Pauca-Technologies/udp-gh) CLI owns repository discovery, JWT signing,
+installation-token caching, and the refreshing `gh` shim.
+Symphony invokes `udp-gh prepare --cwd <workspace>`, validates its versioned token-free JSON
+contract, and injects the returned environment into lifecycle hooks and agent backends. A preflight
+failure aborts the attempt as `authentication_configuration`; it is never deferred until the first
+`gh` command or reported as a generic agent-process exit.
+
+Configure the service environment with:
+
+- `GITHUB_APP_ID`
+- either `GITHUB_APP_PRIVATE_KEY_FILE` or `GITHUB_APP_PRIVATE_KEY` (escaped `\\n` newlines are
+  accepted for inline keys)
+- optionally `GITHUB_APP_INSTALLATION_ID`; when omitted, `udp-gh` resolves the installation for the
+  current repository
+- optionally `UDP_AGENT_COMMIT_NAME` and `UDP_AGENT_COMMIT_EMAIL`; when both are present `udp-gh`
+  exports matching Git author and committer identity
+
+Install `udp-gh` on the service `PATH`, or place it beside `bin/symphony.escript`. It is a static
+executable with no Symphony, Elixir, Node.js, or repository-package runtime dependency:
+
+```bash
+git clone git@github.com:Pauca-Technologies/udp-gh.git
+make -C udp-gh install PREFIX="$HOME/.local"
+```
+
+Installation tokens are cached per worktree under `.artifacts/udp-gh/` with mode `0600`. The
+injected `gh` shim refreshes tokens before their one-hour expiry, so long sessions do not depend on
+a startup token remaining valid. Tokens are passed only to the real `gh` child; they are not
+exported into the general hook or agent shell. Any inherited `GH_TOKEN`, `GITHUB_TOKEN`, or
+enterprise equivalent is explicitly removed so an operator's login cannot override the App
+identity.
+
+Interactive use requires only the installed `udp-gh` executable, not Symphony:
+
+```bash
+# Validate credentials and the App installation for the current checkout.
+udp-gh check
+
+# Activate the bot identity in an interactive shell, then restore prior values.
+eval "$(udp-gh on)"
+gh auth status
+eval "$(udp-gh off)"
+
+# Or run one App-authenticated GitHub CLI command without changing this shell.
+udp-gh gh pr list
+```
+
+`udp-gh` adds `/.artifacts/` to the checkout's local Git exclude so auth state cannot be
+accidentally staged in repositories that do not globally ignore that directory. It does not create
+or source a shell `session.env`; machine consumers receive explicit `set` and `unset` collections.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
@@ -95,6 +245,12 @@ workspace:
 hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
+  session_start: |
+    scripts/hooks/session-start.sh
+  before_handoff: |
+    scripts/hooks/before-handoff.sh
+  before_handoff_timeout_ms: 60000
+  before_handoff_stale_ms: 120000
 agent:
   max_concurrent_agents: 10
   max_turns: 20
@@ -110,6 +266,61 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- Symphony composes the first turn from typed, hashed sections. The host-owned Task context is
+  authoritative for issue details and current activity; an exact or formatting-equivalent copy of
+  the issue description rendered by the repository template is replaced with a reference to that
+  canonical section. Similar or distinct repository rules are preserved and reported as ambiguous
+  overlap rather than being deleted heuristically. Continuations reuse version/hash identities in
+  a bounded capsule and include changed current candidate metadata plus only current open findings.
+- When an issue carries the host-configured Linear opt-in label, the host-owned constraints state
+  that repository-hook-injected bot/App credentials are authorized for that unattended run. A
+  verified injected bot identity resolves a stale GitHub-attribution blocker without requiring a
+  second human comment or personal `gh` login; genuinely missing or insufficient credentials can
+  still block after in-session recovery is exhausted.
+- In multi-repository mode, each `repos[]` entry in host-owned
+  `~/.symphony/config.yml` has a repository concurrency and overlap policy:
+
+  ```yaml
+  repos:
+    - id: udp-dashboard-v2
+      label: repo:dashboard-v2
+      repo_url: git@github.com:example/udp-dashboard-v2.git
+      base_branch: develop
+      max_concurrent: 3
+      overlap_policy: serialize       # serialize | advisory | off
+      overlap_threshold: 0.5          # (0, 1]
+      scheduling_override_label: symphony:overlap-override
+      path_hints:
+        area:auth: [app/auth/**, test/auth/**]
+        component:billing: [app/billing/**]
+  ```
+
+  Symphony starts with issue `path:<repo-relative-path>` labels and configured
+  label hints, upgrades predictions from backend plan updates, then replaces
+  them with the actual git changed-file manifest. `serialize` queues candidates
+  whose overlap meets the threshold while allowing disjoint work up to
+  `max_concurrent`; the override label bypasses overlap serialization but never
+  the repository ceiling. Dependency order is enforced for every active state,
+  then Linear priority (Urgent, High, Medium, Low, and finally unprioritized),
+  creation time, and identifier provide deterministic fairness. Reservations exist only for live
+  workers, so terminal, stalled, or blocked work releases them and a restart cannot resurrect a
+  stale lease.
+- For a routed worktree, Symphony fetches and compares the configured base on
+  the local or SSH worker that owns it immediately before `before_handoff`. An
+  advance blocks before final validation or automated review, even when its
+  changed paths do not overlap the candidate, so exact-head review and later
+  gates always use a candidate that contains the same current base. Symphony
+  returns compact remediation and never rebases, resets, or stashes; a
+  dirty worktree is preserved for deliberate agent judgment. The exact passing
+  decision is handed to the immediately following review gate so it is not
+  fetched twice, while every later handoff attempt performs a new fetch.
+- On redispatch, a routed worktree is reset to the latest pushed issue branch
+  (or the configured base when no issue branch exists). Symphony first saves
+  tracked local changes under `symphony/rescue/*`. If an interrupted rebase,
+  merge, cherry-pick, or revert left unmerged files, Symphony captures their
+  exact working-tree contents with a temporary index, quits the stale Git
+  operation, and then resets. If either preservation or operation cleanup
+  fails, Symphony leaves the worktree untouched and fails the attempt.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -121,13 +332,429 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
-- If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
-  identifier, title, and body.
+  The first turn receives the canonical task context followed by the rendered repository workflow;
+  later turns on the same live thread receive
+  only compact continuation guidance plus any actionable handoff or reviewer findings. Symphony
+  records prompt character/byte counts and included section names without storing raw prompt text.
+  It also records SHA-256 hashes for the complete prompt and each injected section, allowing prompt
+  reuse/duplication analysis without retaining task or workflow prose.
+  Every fresh and continuation turn ends with exactly one versioned
+  `continuation.status_resume_packet` section. The packet is a bounded host-owned summary of issue
+  and run lineage, repository state, workpad checklist hashes, current budget, and exact-head
+  gate/review evidence; it never includes prompt, diff, workpad, command-output, credential, or
+  token bodies. Sanitized bounded single-line validation/check/attestation labels may be retained,
+  but raw command output is not. The persisted v1 JSON is capped at 16,384 bytes, while its literal
+  prompt-tail rendering uses `agent.efficiency.capsule_max_bytes` (default 4,000). Prompt telemetry
+  records the section version/hash/bytes but only carries the packet id/hash/trusted relative
+  reference, boundary, and bounded evidence references.
+  The first packet reuses the repository manifest already collected during startup. Each handled
+  backend result, including terminal and handled-error results, performs at most one post-turn
+  repository refresh and persists it for the next continuation. Production therefore performs N+1
+  repository snapshots for N handled turns: the existing startup snapshot plus N post-turn
+  refreshes. Symphony does not add a packet-specific pre-turn probe or Linear request. Diff counts
+  cover at most 50 changed paths using tracked `git diff --numstat`; omitted paths, binary files,
+  malformed rows, and untracked-file partiality are explicit. Persisted verification is current
+  only when a known HEAD matches its evidence SHA.
+  The latest packet lives in the host-owned `.symphony-context` sibling directory as
+  `<workspace>.json.resume-packet.json`, is atomically written with local mode `0600`, and is removed
+  with the owned issue context/workspace. Lifecycle transitions mark the existing packet without
+  Git or tracker collection using `outer_worker_exit`, `retry_scheduled`, `wait_parked`,
+  `quota_parked`, and `restart_adopted`. Missing, corrupt, oversized, unknown-version, or unreadable
+  legacy sidecars are non-blocking and produce bounded diagnostics. At the safe post-turn boundary,
+  Symphony can add one structured shadow-only `no_progress_warnings` item after repeated identical
+  terminal tool results when comparable repository, workpad, and exact-head evidence shows no
+  change. A long-running call, starts, streaming output, unmatched terminals, harmless distinct
+  reads, and progress-unavailable turns do not produce a warning. The next backend turn consumes the
+  warning from the same literal packet tail; a handled result clears the delivered warning, while a
+  crash before refresh permits at-least-once delivery on retry/restart. Latches remain bounded to 32
+  fingerprints. This observation never interrupts, retries, blocks, or changes wait/stall policy.
+  A newly started backend thread still receives the full first-turn prompt, including on retries,
+  because it cannot safely rely on context retained by a previous process. Reaching `max_turns`
+  ends only that worker session; it does not change the Linear state or add `needs-human-input`.
+- Agents can call Symphony's typed `wait_for` tool when useful work is blocked only on an external
+  state change: GitHub Actions recovery, all PR-check changes, one named PR-check change, a PR gate
+  settling to pass/fail, a git ref advancing, or the current Linear issue's state/comment activity. Symphony observes
+  the initial value itself; agent-supplied observations are rejected. The worker then exits cleanly
+  and releases its concurrency slot while
+  a non-LLM watcher persists the wait in `~/.symphony/waits.json`. Identical conditions share one
+  probe with bounded exponential backoff. Restored waits retain their server-captured baseline (or
+  recover it from their last unchanged observation for legacy state) and receive one immediate probe
+  when Symphony starts instead of carrying a pre-restart backoff deadline forward. When the condition changes, the issue re-enters the
+  normal priority/concurrency scheduler with a compact state-change prompt. The terminal dashboard
+  exposes a dedicated Waiting count and row section; the web dashboard adds an above-the-fold
+  Waiting badge linked to the detailed rows plus **Resume now** and **Cancel wait**. Cancelling the
+  wait returns the issue to normal scheduling rather than abandoning the assigned Linear issue.
+  A GitHub Actions recovery wait wakes when the Actions component becomes operational or when every
+  active incident affecting Actions formally reaches the `monitoring`/`resolved` phase, allowing one
+  controlled retry as soon as GitHub reports mitigation rather than waiting for the component badge.
+  The tool rejects clock waits and must not be used for local resource pressure, another validation,
+  local process/port contention, or a Symphony-owned handoff gate; Symphony persists and polls
+  accepted handoff jobs itself. Independently bounded validations are allowed to overlap.
+  Cross-issue prerequisites use Linear's `blocks` relation instead of a parked wait. New cross-issue
+  waits are rejected, and restored legacy cross-issue waits are resumed once during upgrade so an
+  unowned tracking follow-up cannot strand otherwise deliverable work.
+  PR-check waits treat GitHub's terminal `SKIPPED` checks as neutral, so passed checks plus intentional
+  skips resolve to `pass` instead of remaining parked as `pending`. They also wake when the PR's
+  head, base, open/draft state, mergeability, merge-state status, or review decision changes, because
+  any of those changes can make a previously watched check insufficient or require remediation.
+  While an unchanged PR observation still contains pending checks (or checks have not appeared yet),
+  watcher polling is capped at 60 seconds; probe failures retain exponential backoff so a GitHub
+  outage does not create a request loop.
+- Every Linear caller shares one host-wide rate-limit cooldown, including calls from detached
+  persistent-worker BEAM VMs. A rate-limit response publishes an atomic deadline shard under
+  `~/.symphony/linear-rate-limit/` and pauses polling, workpad/label writes, and agent tool requests
+  together, honoring a longer `Retry-After` hint when Linear supplies one instead of letting
+  concurrent callers immediately refill the limit. A normal dispatch tick reuses its candidate
+  snapshot to reconcile visible running issues and performs an additional by-ID lookup only for
+  running issues absent from that snapshot.
+- Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
+  or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
+  deterministic review configuration, provider rate limits, provider usage/quota limits, and
+  handoff/reviewer/gate failures. The local JSONL telemetry records the failure class and
+  retry-policy action (`scheduled`, `suppressed`, `parked`, `probed`, or `blocked`) rather than
+  requiring operators to parse exception text. A retry blocked
+  by an open circuit emits `suppressed` immediately before it enters the persistent parked queue.
+  Deterministic review-configuration failures are moved to `Blocked` immediately instead of
+  retrying unchanged input. When other failures cross `agent.max_retries`, operational failures
+  remain active at capped backoff; only classified authentication/configuration failures are
+  automatically moved to `Blocked` for human action.
+- Agent-requested transitions to `Blocked` require a structured blocker kind and summary. The
+  accepted kinds are missing required tool, authentication, permission, or product decision;
+  Symphony, reviewer, handoff, CI, and other operational failures remain active for retry.
+- An authoritative Codex `usageLimitExceeded` result opens a Codex account quota circuit. The
+  account boundary is the execution credential boundary (`local` or the specific SSH worker host),
+  so a circuit on one worker does not suppress the same backend on a worker using another account.
+  Symphony parks already-claimed retries without incrementing `failure_counts`, suppresses new
+  Codex work, and continues dispatching issues explicitly routed to other backends. At the provider reset time
+  (or a bounded fallback deadline when no usable reset is supplied), exactly one parked issue is
+  admitted as a probe. A successful probe or a newer rate-limit update that positively reports
+  available capacity closes the circuit and releases parked issues in FIFO order. Ambiguous errors
+  never open the circuit and continue through the normal bounded per-issue retry path. When an
+  operator adds usage before the reported reset time, **Check usage now** on the dashboard (or
+  `POST /api/v1/quota-circuits/probe` with `{"backend":"codex"}`) schedules that same one-issue
+  controlled probe immediately; it never releases the parked queue without a successful probe.
+- Active quota circuits are checkpointed to `~/.symphony/quota-circuits.json`. This deliberately
+  small snapshot preserves outage deadlines and parked issue order across an orchestrator restart;
+  it does not persist the general retry queue. Circuit state, reset/probe deadlines, account scope,
+  and parked counts are exposed by the runtime API and status dashboard.
+- Each dispatched issue runs in a detached, authenticated worker BEAM registered under
+  `~/.symphony/workers`. That worker owns the backend process and its stdio port; the main
+  orchestrator owns only a reconnecting relay. Restarting or crashing the orchestrator therefore
+  preserves active Codex, ACP, and Claude Code sessions, including remote sessions reached through
+  SSH. A replacement orchestrator adopts the workers and replays their latest acknowledged runtime
+  checkpoint plus any events produced while disconnected. Completed records are reclaimed rather
+  than adopted. Records marked active are also liveness-checked before adoption; dead records are
+  removed without replacing an already-scheduled retry, so a crashed worker cannot indefinitely
+  postpone its own retry. Per-worker logs live under `~/.symphony/worker-logs`. Worker BEAMs use a
+  small scheduler pool because model and repository work runs in external processes.
+- Eligible issues and continuations that cannot run because the global, per-state, repository, or
+  worker-host capacity is occupied remain visible in the scheduling queue. Capacity checks use the
+  normal polling cadence and do not increment retry attempts or emit agent-failure telemetry.
+- Drain mode pauses new candidate dispatch, retries, and quota probes without stopping active
+  workers. Its state is saved in `~/.symphony/drain-state.json`, so it remains active through the
+  restart it is intended to protect. Enable it with `POST /api/v1/drain` or the dashboard button;
+  cancel it with `POST /api/v1/resume` or **Cancel drain**. Cancelling schedules an immediate poll.
+- The independent shutdown policy controls what Ctrl+C does to active workers. The default,
+  `preserve_workers`, leaves detached agents running for reconnection. Select `terminate_workers`
+  to stop tracked workers and their subprocess trees before Symphony exits. The choice is saved in
+  `~/.symphony/shutdown-policy.json` and can be changed from the dashboard or with
+  `POST /api/v1/shutdown-policy/preserve` and `POST /api/v1/shutdown-policy/terminate`. Changing this
+  policy does not enable or cancel drain mode.
+- Backend turn wall-clock ceilings are disabled by default (`codex.turn_timeout_ms: 0` and
+  `prompt_timeout_ms: 0` for ACP/Claude Code), so an active agent may work for multiple hours.
+  The separate five-minute `stall_timeout_ms` watchdog remains enabled and is refreshed by backend
+  activity. Set a positive turn/prompt timeout only when an operator wants an additional absolute
+  ceiling; streamed activity does not reset that opt-in ceiling.
+- `agent.backend` selects the coding-agent backend: `codex` (default, the Codex app-server described
+  above), `acp` (the Agent Client Protocol, e.g. `opencode acp`), or `claude_code` (native Claude Code
+  `claude -p` stream-json). All backends honor the same handoff gate and observability transcript.
+  See [docs/acp.md](docs/acp.md) for the ACP setup and the `acp` config block, and
+  [docs/claude-code.md](docs/claude-code.md) for the Claude Code setup and the `claude_code` config
+  block. Both alternative backends share the same local-only gate / non-intercepted `fs`/`terminal`
+  limitations as ACP.
+- `agent.pre_command` remains available for non-authentication, host-wide shell preparation. It runs
+  (joined with `&&`) in the per-issue workspace cwd before every backend process. GitHub App auth
+  does not belong here: Symphony injects the validated `udp-gh` environment natively. Any `.env`
+  file a custom pre-command sources is sanitized before launch. For Codex, Symphony disables the
+  per-thread shell snapshot when a pre-command is configured so a profile reload cannot undo
+  intentional `PATH` changes.
+- `agent.test_worker_limit` (default `2`) bounds test-runner fan-out inside each agent without
+  changing `agent.max_concurrent_agents`. Every backend receives
+  `SYMPHONY_TEST_WORKER_LIMIT`; the first-turn prompt directs agents to pass
+  [`--maxWorkers=<limit>`](https://vitest.dev/config/maxworkers) to Vitest and
+  [`--workers=<limit>`](https://playwright.dev/docs/test-parallel#limit-workers) to Playwright (or
+  read the neutral variable from repository runner config). The same neutral limit is exported to
+  outer lifecycle hooks such as `before_handoff`, so detached validation cannot silently regain the
+  host's full CPU count.
+- `agent.heavy_validation_limit` (default `2`) is exported as
+  `SYMPHONY_HEAVY_VALIDATION_LIMIT` to agents and lifecycle hooks so repository harnesses can admit
+  CPU-heavy validation across worktrees independently of per-command test worker fan-out.
+- In-flight `before_handoff` validation (including a synchronous initial hook invocation) and
+  detached `handoff_pending_gate` / `handoff_pending_review` lifecycles keep their issue claim,
+  global worker slot, per-host worker slot, and path-overlap reservation. They release per-state and
+  per-repository implementation capacity because no implementor turn is active, but the worker VM
+  and its validation/reviewer children still count toward the host safety ceiling. Disjoint
+  implementation can continue only while global and host worker capacity remains.
+- `agent.label_presets` chooses the backend (and model) **per task** from the issue's Linear labels,
+  overriding the global `agent.backend` for matching issues. It is an ordered list; the first preset
+  whose `label` is present on the issue wins (positional precedence — list order, first match), and
+  an unmatched issue falls through to `agent.backend`. Each preset has `label` (a Linear label name,
+  matched exactly — see the label-group note below), `backend` (`codex` | `acp` | `claude_code`), and an optional `model` (passed to
+  the chosen backend — Codex `thread/start`, `OPENCODE_CONFIG_CONTENT` for ACP/OpenCode, or `--model`
+  for Claude Code). Resolution happens once at run start, so a relabel takes
+  effect on the next run. Example:
+  ```yaml
+  agent:
+    backend: codex            # default for unmatched issues
+    label_presets:
+      - label: "agent:fast"
+        backend: acp
+        model: opencode/north-mini-code-free
+      - label: "agent:deep"
+        backend: claude_code
+        model: opus
+  ```
+  In multi-repo mode, a routed repository can instead define issue-aware Codex execution profiles
+  under `agent.routing` in its own `WORKFLOW.md`. The block requires a small classifier model,
+  `default_profile`, `fallback_profile`, and a non-empty `profiles` map. Each profile supplies a
+  Codex model, reasoning effort (`none` | `low` | `medium` | `high` | `xhigh` | `max`), and a concise
+  description used by the classifier. Example:
+
+  ```yaml
+  agent:
+    routing:
+      classifier:
+        backend: codex
+        model: gpt-5.6-luna
+        reasoning_effort: max
+        timeout_ms: 120000
+      default_profile: standard
+      fallback_profile: deep
+      profiles:
+        standard:
+          backend: codex
+          model: gpt-5.6-sol
+          reasoning_effort: high
+          description: Clear, bounded work with a straightforward validation path.
+        deep:
+          backend: codex
+          model: gpt-5.6-sol
+          reasoning_effort: xhigh
+          description: Risky, cross-cutting, ambiguous, or architecture-sensitive work.
+  ```
+
+  For an unlabelled issue, Symphony runs an ephemeral structured classifier turn over a bounded
+  issue snapshot, with Symphony dynamic tools disabled and repository project-doc loading set to
+  zero bytes. A classifier result with high risk, complexity, or ambiguity is promoted to
+  `fallback_profile`; a classifier failure also fails closed to that profile. A single
+  `agent:<profile>` issue label bypasses classification, while multiple matching profile labels use
+  the fallback. Existing host `agent.label_presets` remain the highest-precedence override. Routing
+  is active directly. The classifier also records a task class (`simple_direct`, `ui`,
+  `security_tenant`, `data_schema`, `concurrency_liveness`, or `broad_architecture`), confidence,
+  bounded input metadata, reasons, and override provenance for efficiency routing.
+
+  Soft fleet budgets live separately under repository-owned `agent.efficiency`. They default to
+  `shadow`, so proposed transitions are observable before prompts change. A repository may allowlist
+  the three low-risk context/output-hygiene actions shown below while remaining in shadow mode;
+  review-depth and quality-sensitive transitions remain observational. `enforce` applies each
+  threshold transition once at the next continuation boundary; `off` retains the decision record
+  without transition enforcement. Defaults use distinct simple/standard/high-risk profiles seeded
+  from recent fleet percentile bands, and every positive threshold is overrideable:
+
+  ```yaml
+  agent:
+    efficiency:
+      mode: shadow                 # off | shadow | enforce
+      enforced_actions:
+        - bound_future_tool_output
+        - fresh_thin_context_delegation_only
+        - prohibit_full_history_delegation
+      capsule_max_bytes: 4000
+      extreme_multiplier: 2.0
+      task_profiles:
+        simple_direct: simple
+        ui: standard
+        security_tenant: high_risk
+        data_schema: high_risk
+        concurrency_liveness: high_risk
+        broad_architecture: high_risk
+      profiles:
+        simple:
+          total_tokens: 250000
+          delegated_tokens: 75000
+          per_thread_tokens: 150000
+          per_turn_growth_tokens: 100000
+          uncached_input_tokens: 125000
+          cached_input_tokens: 500000
+          tool_output_bytes: 250000
+          elapsed_phase_ms: 900000
+          review_packet_bytes: 32000
+          reviewer_lenses: 2
+          review_iterations: 2
+          reviewer_reasoning_effort: medium
+          review_lenses: [correctness, test_evidence]
+  ```
+
+  `budget:<profile>` is the explicit per-issue budget override. A typo/unknown profile or multiple
+  valid budget profiles fails toward `high_risk` with inspectable provenance. Token state is
+  reconstructed from actual parent/delegated thread high waters and remains live across continuation
+  turns. Backend callbacks coalesce their small cumulative signals directly into a bounded collector;
+  full protocol events never accumulate in the runner's budget mailbox, and a turn-boundary barrier
+  includes callbacks that began before the backend returned. Tool bytes count terminal Codex, ACP,
+  and Claude tool results, not streaming deltas. A crossing emits one compact `budget_transition`;
+  enforce mode adds one bounded resume capsule directing future work toward thin-context delegation,
+  exact-head artifact reuse, bounded tool output, and open-finding synthesis. Extreme outliers get a
+  complete-resume-packet escalation. None of these transitions can approve a review, mark work
+  complete, skip required security validation, or suppress findings. High-risk profiles may exceed
+  their budgets explicitly while preserving or strengthening reviewer effort, lens coverage, packet
+  capacity, and iteration count.
+
+  In `enforce` mode, review routing gets one conservative exact-candidate refinement after the
+  handoff packet reads the real diff. A standard review uses the repository's simple reviewer
+  profile only when the complete local manifest contains at most 12 files and 600 changed lines,
+  every path is documentation or a test, and no repository-control path such as `AGENTS.md`,
+  `WORKFLOW.md`, `WORKFLOW_REVIEW.md`, `.github/`, or `.codex/` changed. Explicit budget labels,
+  quality fallbacks, high-risk task classes, production changes, broad candidates, binary changes,
+  and missing/incomplete local manifests never take this route. The refinement changes reviewer
+  model/reasoning, packet bound, iteration bound, and optional lenses only; it does not alter the
+  implementor's run budget or waive exact-head approval and required correctness/test-evidence
+  lenses. A `review_routing_decision` telemetry event records each applied refinement.
+
+  The observability dashboard surfaces the **actual** backend, model, reasoning effort, and selected
+  profile each run is using. Its "Agent" column in the running-issues list and "Agent" card on the
+  issue detail page take values from the resolved backend module and the model handed to (or
+  reported by) the running agent, rather than re-deriving them from issue labels. The model is the
+  live resolved one where the agent reports it (Codex's `thread/start` response and Claude Code's
+  `system/init`) and the configured/override value otherwise.
+  Repository scheduling waits are exposed separately with queue reason, bounded overlap paths,
+  queue time, base age, bounded suggested order plus its omitted count, policy, and override state. Running entries expose their
+  repository, path source/manifest, candidate/current base SHAs, base age, and dirty flag. Fleet
+  telemetry reports overlap decisions, queue time, rebase/conflict rate, stale versus
+  overlapping base drift, and expensive gates avoided.
+- **Label groups.** A Linear label nested in a label *group* (e.g. the leaf `opencode:kimi2.7` under
+  group `agent`) is flattened to `<group>:<leaf>` (`agent:opencode:kimi2.7`) before matching — Symphony
+  fetches the label's `parent` and joins them. So `label_presets` and repo-routing labels are written
+  in the **`group:leaf`** form. Ungrouped (flat) labels keep their bare name. A grouped label and a
+  legacy flat label with the same qualified name (e.g. group `repo`/`udp-dashboard-v2` vs a flat
+  `repo:udp-dashboard-v2`) collapse to one entry, so you can migrate issues onto the grouped label
+  without changing config.
+- If the Markdown body is blank, Symphony uses a default repository workflow prompt. The canonical
+  task context supplies the issue details independently of that template.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- GitHub App auth is prepared before routed repository hooks and injected into `after_create`,
+  `session_start`, `before_run`, `before_handoff`, and `after_run`. Repositories do not need to mint
+  tokens or construct a bot environment. A non-zero routed `after_create` result is fatal and is
+  returned unchanged instead of allowing agent startup to continue.
+- Use `hooks.session_start` to run non-blocking repo-local startup discovery before every fresh or
+  resumed Codex session. Symphony captures generated Markdown links under
+  `docs/agent-workpad/<branch>/` and annotates them in the startup-artifact section of the canonical
+  first-turn task context. Raw hook stdout is retained for diagnostics and is not copied into the
+  prompt. A hook can own the meaning of its artifacts by emitting a one-line JSON report with an
+  `artifacts` array of `path` and `description` objects; paths must remain under
+  `docs/agent-workpad/`. Hooks without that report retain path-only discovery as a compatibility
+  fallback.
+  The hook emits `[:symphony_elixir, :gate, :session_start]` telemetry with total duration and any
+  per-script timings reported by the hook output.
+- Use `hooks.before_handoff` to run a repo-local gate before an agent moves a Linear issue from
+  `In Progress` to a review handoff state such as `In Review`. A non-zero exit blocks the status
+  transition and the parsed gate remediation is included in the next agent turn. Symphony marks
+  the issue `handoff_pending_gate` before invoking even a legacy synchronous hook, so a long valid
+  hook uses its configured hook timeout instead of the coding-agent stall timeout.
+  Protocol-aware hooks receive `SYMPHONY_HANDOFF_GATE_PROTOCOL=1`. Exit `3` with a version 1
+  `pending`/`running` JSON report to defer the mutation; subsequent lightweight polls reuse
+  `before_handoff` with `SYMPHONY_HANDOFF_GATE_JOB_ID` and skip GitHub auth preparation and
+  issue-context refresh. The hook should read that job before normal setup. Symphony durably records
+  the attempted mutation before the initial invocation too, so an infrastructure failure before job
+  creation retries the hook without starting another model session. Pending durable-gate polls read
+  only the local gate artifact; Symphony revalidates the tracker state when starting/recovering a job
+  and once a poll becomes terminal, immediately before applying handoff or remediation. Transient
+  tracker refresh failures honor Retry-After or use bounded exponential backoff and preserve the gate, candidate,
+  and review approval; they do not return the issue to an implementor turn. Before a fresh invocation or a
+  durable pre-job retry, base-drift validation treats `WORKFLOW.md`, `WORKFLOW_REVIEW.md`, and
+  repository-relative scripts referenced by the configured hook as runtime dependencies. If the base
+  changed one of them, Symphony clears the stale intent and asks the agent to refresh the branch instead
+  of repeatedly executing an obsolete hook. Configure the invocation deadline with
+  `before_handoff_timeout_ms` and the maximum accepted heartbeat age with
+  `before_handoff_stale_ms`. The runtime APIs expose job/candidate identity, pending age,
+  heartbeat age, progress stage, and next-poll delay while the issue is `handoff_pending_gate`.
+  A terminal infrastructure/protocol verification result ends the worker attempt and uses
+  orchestrator backoff rather than asking the implementor to repair platform infrastructure.
+- If the target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that reviewer after the
+  implementor turn that requested the handoff has closed and before starting the expensive
+  `before_handoff` hook. It applies the captured Linear transition only after an authoritative
+  approval for the exact candidate SHA and a passing final hook. The approval identity is persisted
+  with asynchronous gate state and revalidated after the hook passes. Request changes,
+  inconclusive automation and review-budget exhaustion withhold the transition and preserve the
+  latest evidence for human resolution. Reviewer infrastructure failures end the worker attempt
+  and use orchestrator backoff without consuming remediation turns. A packet that cannot satisfy
+  its configured deterministic byte bound is a non-retryable review-configuration failure.
+  The issue remains claimed in a distinct `handoff_pending_review` lifecycle while that reviewer
+  runs, so the completed implementor is not mistaken for a stalled turn. Reviewer events emit a
+  minimal, job-scoped heartbeat that refreshes worker activity without replacing implementor
+  session, last-agent event, or token accounting. Snapshots and the observability UI expose the
+  separate reviewer job, phase age, heartbeat time, and heartbeat age instead of making an old
+  implementor message look current. The reviewer deadline is an inactivity timeout refreshed by progress;
+  a silent reviewer is timed out with a review-specific log and is not immediately repeated for the
+  same full deadline.
+  Symphony also pins the reviewed PR head and rechecks it before starting final validation and again
+  before applying the transition, so a push during review or validation requires a fresh handoff
+  review.
+  When a worker is stopped or exits, Symphony terminates its external descendant processes before
+  discarding the worker, preventing hook and validation commands from being orphaned while
+  preserving the worker BEAM's own runtime helpers until the VM exits normally. For local
+  workspaces it also reclaims reparented/detached
+  processes whose cwd remains inside that exact issue workspace and whose environment carries
+  `SYMPHONY_RUN=1`; this covers durable validation jobs that are no longer descendants of the worker
+  BEAM without targeting unrelated host processes.
+  Non-timeout reviewer session/verdict failures receive one bounded retry and are then latched for
+  that candidate during the current orchestration run; budget exhaustion is likewise latched and never
+  spawns another reviewer in that run. To recover, repair reviewer tool/auth/runtime or verdict
+  production, then start a fresh orchestration run (or attach/update the candidate head). For
+  `budget_exhausted_with_findings`, a human must explicitly resolve or accept the recorded findings;
+  Symphony never converts the cost limit into automated approval.
+- Configure bounded review evidence and execution in the `review` front matter of the target
+  repository's `WORKFLOW_REVIEW.md`:
+
+  ```yaml
+  review:
+    max_iterations: 3
+    verdict_path: .artifacts/symphony-review/verdict.json
+    packet_path: .artifacts/symphony-review/packet.v1.json
+    packet_max_bytes: 48000
+    turn_budget: 1
+    turn_timeout_ms: 900000
+    tool_output_max_bytes: 4000
+    model: gpt-5.5
+    reasoning_effort: high
+    require_pr: true
+  ```
+
+  Symphony clamps unsafe values and always enforces one Codex turn per fresh reviewer attempt.
+  `packet_max_bytes` deterministically bounds the reproducible evidence packet, while the selected
+  Codex model enforces its actual context window over the complete rendered prompt. Symphony does
+  not guess token usage from UTF-8 byte length; legacy `context_budget_tokens` entries are ignored.
+  Successful reviewer dynamic-tool responses larger than
+  `tool_output_max_bytes` are replaced in both response text fields with a bounded preview plus the
+  original size and narrow-query/raw-artifact recovery instructions. Failure responses remain
+  intact so diagnostics are never hidden.
+  The verdict must report the packet's exact `reviewed_sha`, a non-empty `inspected` list, and
+  `attestations.reused` / `attestations.rerun`; missing or stale candidate evidence is
+  `automation_inconclusive`. `request_changes` is reserved for candidate defects or proof gaps the
+  implementor can fix and must include a blocking-severity finding with a concrete `failing_state`,
+  `violated_criterion`, or `missing_regression_test`. Minor observations may accompany approval and
+  are not blockers. Reviewer output is staged per attempt and published atomically only after the
+  reviewer completes and Symphony validates it. Reviewer-side tool/auth/network/provider failures use
+  `infrastructure_unavailable` with `failure_reason` and `resume_condition`, consume no substantive
+  review iteration, and enter orchestrator backoff. Parent reviewer and delegated lens threads emit independent local
+  telemetry with packet/head identity, tokens, duration, model, reasoning effort, and findings.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+  Symphony retains that credential in its own tracker processes but removes it and the common
+  `LINEAR_*TOKEN` variants from every local or remote repository hook. Hooks receive the trusted
+  issue-context file and must not bypass Symphony's rate-limit and mutation gates.
+- `tracker.project_slug` reads from `LINEAR_PROJECT_SLUG` when unset or when value is `$LINEAR_PROJECT_SLUG`.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -136,11 +763,16 @@ Notes:
 ```yaml
 tracker:
   api_key: $LINEAR_API_KEY
+  project_slug: $LINEAR_PROJECT_SLUG
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
+  session_start: |
+    if [ -x scripts/hooks/session-start.sh ]; then
+      scripts/hooks/session-start.sh
+    fi
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
 ```
@@ -150,15 +782,129 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- Live dashboard change notifications are coalesced into short update windows. Issue pages seed a
+  bounded tail of the active transcript and parse only appended NDJSON bytes on later updates, so a
+  high-volume protocol stream cannot make every connected browser repeatedly load and render the
+  complete session. The issue JSON endpoint remains the explicit full-history view.
+- Session transcripts are written as compact, renderer-compatible NDJSON under
+  `./log/codex_sessions` by default, or under `<logs-root>/log/codex_sessions` when `--logs-root`
+  is set. Streaming text and tool-output chunks are bounded and coalesced by stream/tool identity;
+  cumulative token notifications are omitted, cumulative ACP tool updates keep their latest merged
+  state, and terminal Codex items replace their partial records. Terminal items, lifecycle, tools,
+  errors, and other semantic records remain. The issue JSON endpoint includes the current
+  known transcript paths for that issue. Existing NDJSON files and readers remain supported.
+- A redacted gzip raw sidecar (`*.raw.ndjson.gz`) is staged while a session runs. By default it is
+  retained for failed sessions and a deterministic 1% success sample, then pruned after seven days.
+  Set `observability.raw_trace_debug: true` (or `raw_trace_policy: all`) temporarily for an incident;
+  restore the default after diagnosis. `raw_trace_policy: none` disables successful-session
+  retention, while `sampled` retains successful sessions at `raw_trace_sample_rate`. Failure traces
+  are always retained for the configured window. Valid original protocol documents remain complete
+  after recursive redaction (including provider-only fields); invalid originals retain only byte
+  count/hash metadata. Raw traces never bypass `observability.redact_fields`, whose defaults cover
+  authorization/token/cookie keys plus password, secret, client-secret, private-key, and API-key
+  variants. Configured `redact_fields` extend these mandatory defaults and separator-insensitive
+  matching covers snake_case, kebab-case, and camelCase spellings. The policy is snapshotted once
+  per dispatched run, so a workflow reload applies to
+  subsequent runs without reparsing configuration for every notification.
+- Compact fleet events live in `~/.symphony/telemetry/<YYYY-MM-DD>.jsonl` for at least 30 days.
+  Every worker attempt has a fresh `run_id`; retries retain `parent_run_id`, a distinct scheduling
+  `retry_id`, and the numeric retry attempt without replacing issue/session/thread/turn dimensions.
+  After routing and before the first backend turn, Symphony emits exactly one versioned
+  `run_manifest` containing non-secret repository/workflow/prompt hashes and resolved
+  backend/model/effort/task/risk/budget/sandbox/approval/review policy. Its `config_digest` hashes a
+  canonical non-secret configuration including the workflow/reviewer-template identities, so a
+  prompt-template change changes the digest. The manifest points to the per-turn `prompt_built`
+  event for dynamic injected-section hashes that only exist after prompt composition. Raw prompts,
+  commands, environment values, and credentials are excluded. Older unversioned events and
+  persisted records remain readable.
+  Shadow no-progress policy is configured under `agent.no_progress` with
+  `error_repeat_threshold` (default `3`, range `2..100`), `success_repeat_threshold` (default `8`,
+  range `2..1000`), `success_no_progress_turns` (default `2`, range `1..100`), and
+  `max_fingerprints` (default `32`, range `1..32`). The effective values are part of the run
+  manifest and `config_digest`. Completed tool attempts are normalized into bounded redacted
+  fingerprints in the existing budget collector; no raw arguments, output, call/thread IDs, or
+  external tool names enter the packet, runtime summary, or compact loop telemetry. Assessment uses
+  only the already-held startup/post-turn repository observations, already-fetched workpad
+  id/schema-marker/update-time/hash state,
+  and current exact-head evidence, adding no Git, Linear, validation, process, or polling path.
+  Symphony also emits versioned `task_outcome` records at authoritative transitions. A hash-only,
+  bounded before/after worktree comparison records material progress even when a preserved
+  workspace was already dirty; unavailable Git probes do not count as change. Only a passed
+  versioned exact-head handoff protocol records accepted handoff. CI, human-review, merge, reopen,
+  and revert states remain unknown unless explicit telemetry reports them; they are never inferred
+  from a normal worker exit or a terminal tracker state. SHA identity correlates downstream delivery
+  evidence even when an external outcome does not carry `run_id`.
+  `mix telemetry.report --from YYYY-MM-DD --to YYYY-MM-DD --json` reports fleet, repository,
+  issue, parent/delegated-thread, phase, failure, gate, review, tool-output, percentile, and quality
+  views without parsing transcripts. Percentiles use the conventional nearest-rank definition.
+  Token totals use each actual thread's greatest cumulative
+  snapshot; cached input and reasoning remain distinct and repeated absolute snapshots are not
+  summed. Routing views include classifier inputs/result/confidence, budget profile/mode, overrides,
+  and exact-candidate review refinements; efficiency views distinguish proposed/applied transitions
+  and compare tokens, time, review findings, CI/human outcomes, and extreme outliers over the
+  requested rolling window (use the prior 30 days for the rollout comparison). Unversioned telemetry
+  JSONL remains readable as schema version 0.
+  The text report calls the legacy JSON `completion_rate` metric **worker-run completion** so it
+  cannot be confused with task delivery.
+  `mix telemetry.regression_candidates` performs a separate offline, bounded dry-run over an exact
+  7-day window (`--days 30` is also supported). It projects only allowlisted compact telemetry into
+  deterministic pending regression candidates; it never reads protocol/session transcripts or
+  promotes a candidate automatically. Export requires an explicit existing private staging
+  directory, and `--verify` accepts only an externally reviewed accepted fixture. See the
+  [offline regression candidate guide](docs/regression-candidates.md).
+  Explicitly opted-in Codex reasoning-effort experiments are default-off and repository-declared.
+  Assignment is deterministic only for a fresh task, is hidden from model prompts, and survives
+  retries/restarts in the existing trusted resume packet. The host kill switch is checked before
+  every turn and permanently suspends that task's assignment at the next safe boundary. Use
+  `mix telemetry.experiment_report --days 7` (or exact `--days 30`) for bounded, descriptive-only
+  repository/task-stratified cohorts. The report treats retries as run exposures rather than
+  repeated trials and makes causal, significance, pairing, and Pass@k claims unavailable. See the
+  [controlled experiment guide](docs/experiments.md).
+- Benign protocol notifications and stdout chunks do not produce one debug-log line each by
+  default. `observability.benign_notification_debug: true` is the short-lived log-level escape
+  hatch; selective gzip raw traces are normally the more complete incident artifact.
+- Prompt events contain per-section IDs, source/version, hashes, byte/token estimates, and
+  reuse/suppression diagnostics, never raw prompt content. For an incident,
+  `observability.prompt_debug: true` emits a bounded debug-log rendering with provenance boundaries;
+  configured secret assignments are redacted and `prompt_debug_max_bytes` caps the rendering.
+  Keep this mode disabled during normal operation.
+- To render a transcript in a human-readable terminal format, run
+  `bin/codex-session-log log/codex_sessions/<session-file>.ndjson`.
+- Compact session-log retention is configured with `observability.session_retention_days` (default
+  30). `mix session_logs.prune --root <codex_sessions-dir>` is always a dry run unless `--apply` is
+  explicit, reports selected file/byte totals, and protects active marker paths. See the
+  [safe rollout and cleanup runbook](docs/operations.md).
 
 ## Web dashboard
 
 The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
+- A historical harness-evaluation cockpit at `/history`, with exact 7- and 30-day choices clamped
+  to configured retention. It uses capped telemetry file/event/run queries and filters by
+  repository, task family, model, prompt version, and configuration digest; filter state remains in
+  the URL. Worker completion, material progress, accepted exact-head handoff, CI/human-review, and
+  merged/reopened/reverted counts are displayed separately, with unobserved outcomes shown as such.
+  Cost remains unavailable unless a numeric cumulative USD value was explicitly emitted.
+  Version 1 shadow `no_progress_loop` evidence is summarized separately as alerts, candidates
+  suppressed by observed progress, unavailable progress decisions, resets, and bounded
+  kind/result/tool-class breakdowns. Replayed alert telemetry is deduplicated by warning id.
+- `/issues/<issue_identifier>` remains live-first. After an issue leaves orchestrator memory, it
+  falls back to bounded historical telemetry when available and renders a clearly historical view
+  without live wait/drain controls or transcript claims.
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+- Active-backend usage cards grouped by provider account scope. Codex duration buckets and Claude
+  Code's named subscription windows are normalized into 5-hour/weekly percentage-used and reset
+  fields when their streams report them. Backends whose agent protocol does not expose subscription
+  limits remain visible as unavailable rather than being reported as zero.
+- Running rows show the orchestrator phase and the latest activity from the component that currently
+  owns progress: implementor events during implementation, reviewer heartbeats during automated
+  review, and gate progress during final validation. Issue detail pages expose the corresponding
+  handoff job identity and age.
+- Running rows and issue detail show a compact shadow no-progress badge/card when a validated active
+  warning exists. It is explicitly advisory and provides no control or automatic action.
 
 ## Project Layout
 

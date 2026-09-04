@@ -4,6 +4,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.Comment
+
+  defmodule UnsetTokenGitHubAuthProvider do
+    @behaviour SymphonyElixir.GitHubAuth
+
+    @impl true
+    def prepare(workspace, _opts) do
+      {:ok,
+       %{
+         env: [
+           {"GH_TOKEN", false},
+           {"GITHUB_ENTERPRISE_TOKEN", false},
+           {"GITHUB_TOKEN", false},
+           {"GH_ENTERPRISE_TOKEN", false}
+         ],
+         repo: "test/example",
+         host: "github.com",
+         auth_root: Path.join(workspace, ".artifacts/github-app-auth"),
+         expires_at: ~U[2099-01-01 00:00:00Z]
+       }}
+    end
+  end
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -54,6 +76,153 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert first_workspace == second_workspace
     assert Path.basename(first_workspace) == "MT_Det"
+  end
+
+  test "workspace hooks remove inherited token variables for GitHub App auth" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-auth-#{System.unique_integer([:positive])}"
+      )
+
+    token_variables = [
+      "GH_TOKEN",
+      "GITHUB_ENTERPRISE_TOKEN",
+      "GITHUB_TOKEN",
+      "GH_ENTERPRISE_TOKEN"
+    ]
+
+    previous_values = Map.new(token_variables, &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      Enum.each(previous_values, fn {name, value} -> restore_env(name, value) end)
+      File.rm_rf(workspace_root)
+    end)
+
+    Enum.each(token_variables, &System.put_env(&1, "inherited-personal-token"))
+
+    Application.put_env(
+      :symphony_elixir,
+      :github_auth_provider,
+      UnsetTokenGitHubAuthProvider
+    )
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOK-AUTH")
+
+    assert {:ok, "unset:unset:unset:unset"} =
+             Workspace.run_session_start_hook(workspace, "MT-HOOK-AUTH", nil,
+               hook_command: "printf '%s:%s:%s:%s' \"${GH_TOKEN-unset}\" \"${GITHUB_ENTERPRISE_TOKEN-unset}\" \"${GITHUB_TOKEN-unset}\" \"${GH_ENTERPRISE_TOKEN-unset}\""
+             )
+  end
+
+  test "workspace publishes and refreshes trusted issue context for hooks and agents" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-issue-context-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        test_worker_limit: 3,
+        heavy_validation_limit: 4
+      )
+
+      issue = %Issue{
+        id: "issue-context-1",
+        identifier: "UDPE-7011",
+        title: "Keep repository gates informed",
+        description: "Original scope",
+        url: "https://linear.app/example/issue/UDPE-7011",
+        state: "In Progress",
+        labels: ["repo:udp-dashboard-v2"],
+        comments: [
+          %Comment{
+            id: "comment-workpad",
+            body: "## Codex Workpad\n\nWaiting for a decision.",
+            author_id: "agent-1",
+            author_name: "UDPAgent",
+            created_at: ~U[2026-07-28 09:31:00Z],
+            updated_at: ~U[2026-07-28 09:32:00Z]
+          }
+        ],
+        comments_truncated: true,
+        updated_at: ~U[2026-07-28 09:30:00Z]
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      context_file = Workspace.issue_context_path(workspace)
+      refute String.starts_with?(context_file, workspace <> "/")
+      assert File.regular?(context_file)
+
+      assert %{
+               "version" => 2,
+               "capturedAt" => captured_at,
+               "issue" => %{
+                 "id" => "issue-context-1",
+                 "identifier" => "UDPE-7011",
+                 "title" => "Keep repository gates informed",
+                 "description" => "Original scope",
+                 "url" => "https://linear.app/example/issue/UDPE-7011",
+                 "state" => "In Progress",
+                 "labels" => ["repo:udp-dashboard-v2"],
+                 "comments" => [
+                   %{
+                     "id" => "comment-workpad",
+                     "body" => "## Codex Workpad\n\nWaiting for a decision.",
+                     "author" => %{"id" => "agent-1", "name" => "UDPAgent"},
+                     "createdAt" => "2026-07-28T09:31:00Z",
+                     "updatedAt" => "2026-07-28T09:32:00Z"
+                   }
+                 ],
+                 "commentsTruncated" => true,
+                 "updatedAt" => "2026-07-28T09:30:00Z"
+               }
+             } = context_file |> File.read!() |> Jason.decode!()
+
+      assert {:ok, _captured_at, 0} = DateTime.from_iso8601(captured_at)
+
+      expected_shared_cache = Path.join(workspace_root, ".symphony-cache")
+      expected_hook_output = "#{context_file}:#{expected_shared_cache}"
+
+      previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+      System.put_env("LINEAR_API_KEY", "must-not-reach-hooks")
+      on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+
+      assert {:ok, ^expected_hook_output} =
+               Workspace.run_session_start_hook(workspace, issue, nil, hook_command: "printf '%s:%s' \"$SYMPHONY_ISSUE_CONTEXT_FILE\" \"$SYMPHONY_SHARED_CACHE_DIR\"")
+
+      updated_issue = %{issue | description: "Updated scope"}
+
+      assert {:ok, "3:4:"} =
+               Workspace.run_before_handoff_hook(workspace, updated_issue, nil,
+                 hook_command: "printf '%s:%s:%s' \"$SYMPHONY_TEST_WORKER_LIMIT\" \"$SYMPHONY_HEAVY_VALIDATION_LIMIT\" \"$LINEAR_API_KEY\""
+               )
+
+      assert get_in(context_file |> File.read!() |> Jason.decode!(), ["issue", "description"]) ==
+               "Updated scope"
+
+      assert :ok =
+               Workspace.persist_handoff_gate_state(workspace, %{
+                 "query" => "mutation DeferredHandoff { issueUpdate { success } }",
+                 "gate" => %{"jobId" => "job-context-1"}
+               })
+
+      assert {:ok, %{"gate" => %{"jobId" => "job-context-1"}}} =
+               Workspace.load_handoff_gate_state(workspace)
+
+      handoff_state_file = Workspace.handoff_gate_state_path(workspace)
+      assert File.exists?(handoff_state_file)
+
+      assert {:ok, _removed} = Workspace.remove(workspace)
+      refute File.exists?(context_file)
+      refute File.exists?(handoff_state_file)
+    after
+      File.rm_rf(workspace_root)
+    end
   end
 
   test "workspace reuses existing issue directory without deleting local changes" do
@@ -305,6 +474,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Issue.label_names(issue) == ["frontend", "infra"]
     assert issue.labels == ["frontend", "infra"]
     refute issue.assigned_to_worker
+
+    assert Enum.map([1, 2, 3, 4, 0, nil, 99], &Issue.dispatch_priority_rank/1) ==
+             [1, 2, 3, 4, 5, 5, 5]
   end
 
   test "linear client normalizes blockers from inverse relations" do
@@ -318,7 +490,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       "branchName" => "mt-1",
       "url" => "https://example.org/issues/MT-1",
       "assignee" => %{
-        "id" => "user-1"
+        "id" => "user-1",
+        "displayName" => "raul",
+        "email" => "raul@pauca.co"
+      },
+      "creator" => %{
+        "id" => "user-9",
+        "displayName" => "someone-else",
+        "email" => "creator@example.org"
       },
       "labels" => %{"nodes" => [%{"name" => "Backend"}]},
       "inverseRelations" => %{
@@ -352,7 +531,62 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.priority == 2
     assert issue.state == "Todo"
     assert issue.assignee_id == "user-1"
+    assert issue.assignee_display_name == "raul"
+    assert issue.assignee_email == "raul@pauca.co"
+    assert issue.creator_id == "user-9"
+    assert issue.creator_display_name == "someone-else"
+    assert issue.creator_email == "creator@example.org"
     assert issue.assigned_to_worker
+  end
+
+  test "linear client flattens grouped labels to <group>:<leaf>" do
+    raw_issue = %{
+      "id" => "issue-grouped",
+      "identifier" => "UDPE-6563",
+      "title" => "Grouped labels",
+      "state" => %{"name" => "In Progress"},
+      "labels" => %{
+        "nodes" => [
+          # ungrouped flat label → bare name
+          %{"name" => "improve-skill", "parent" => nil},
+          # grouped under "repo" → "repo:udp-dashboard-v2"
+          %{"name" => "udp-dashboard-v2", "parent" => %{"name" => "repo"}},
+          # ungrouped → bare name
+          %{"name" => "udpagent"},
+          # grouped under "agent" (leaf already contains a colon) →
+          # "agent:opencode:kimi2.7" — the case that drives backend selection
+          %{"name" => "opencode:kimi2.7", "parent" => %{"name" => "agent"}}
+        ]
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue, nil)
+
+    assert issue.labels == [
+             "improve-skill",
+             "repo:udp-dashboard-v2",
+             "udpagent",
+             "agent:opencode:kimi2.7"
+           ]
+  end
+
+  test "linear client dedupes a grouped label and its legacy flat twin" do
+    raw_issue = %{
+      "id" => "issue-dupe",
+      "identifier" => "UDPE-1",
+      "title" => "Dupe labels",
+      "state" => %{"name" => "Todo"},
+      "labels" => %{
+        "nodes" => [
+          %{"name" => "repo:udp-dashboard-v2", "parent" => nil},
+          %{"name" => "udp-dashboard-v2", "parent" => %{"name" => "repo"}}
+        ]
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue, nil)
+
+    assert issue.labels == ["repo:udp-dashboard-v2"]
   end
 
   test "linear client marks explicitly unassigned issues as not routed to worker" do
@@ -429,10 +663,74 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client fetches a bounded, chronological issue comment snapshot" do
+    graphql_fun = fn query, variables ->
+      send(self(), {:fetch_issue_comments, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => [
+                 %{
+                   "id" => "comment-2",
+                   "body" => "Decision: use option B.",
+                   "createdAt" => "2026-07-29T10:00:00Z",
+                   "updatedAt" => "2026-07-29T10:00:00Z",
+                   "user" => %{"id" => "user-1", "name" => "Product owner"}
+                 },
+                 %{
+                   "id" => "comment-1",
+                   "body" => "## Codex Workpad\n\nBlocked on the product decision.",
+                   "createdAt" => "2026-07-29T09:00:00Z",
+                   "updatedAt" => "2026-07-29T09:30:00Z",
+                   "user" => %{"id" => "agent-1", "name" => "UDPAgent"}
+                 }
+               ],
+               "pageInfo" => %{"hasNextPage" => true}
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:ok, %{comments: [workpad, decision], truncated: true}} =
+             Client.fetch_issue_comments_for_test("issue-1", graphql_fun)
+
+    assert workpad.id == "comment-1"
+    assert workpad.author_name == "UDPAgent"
+    assert decision.id == "comment-2"
+    assert decision.body == "Decision: use option B."
+
+    assert_receive {:fetch_issue_comments, query, %{issueId: "issue-1", first: 50}}
+    assert query =~ "SymphonyLinearIssueComments"
+    assert query =~ "orderBy: updatedAt"
+  end
+
+  test "linear client rejects malformed comments instead of dropping required activity" do
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "data" => %{
+           "issue" => %{
+             "comments" => %{
+               "nodes" => [%{"id" => "comment-without-body"}],
+               "pageInfo" => %{"hasNextPage" => false}
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:error, :linear_invalid_comment} =
+             Client.fetch_issue_comments_for_test("issue-1", graphql_fun)
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert {:error, {:linear_api_status, 400}} =
+        assert {:error, {:linear_api_status, 400, [%{"code" => "BAD_USER_INPUT", "message" => "Variable \"$ids\" got invalid value"}]}} =
                  Client.graphql(
                    "query Viewer { viewer { id } }",
                    %{},
@@ -458,20 +756,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
-  test "orchestrator sorts dispatch by priority then oldest created_at" do
+  test "orchestrator sorts every Linear priority then oldest created_at and identifier" do
     issue_same_priority_older = %Issue{
-      id: "issue-old-high",
+      id: "issue-old-urgent",
       identifier: "MT-200",
-      title: "Old high priority",
+      title: "Old urgent priority",
       state: "Todo",
       priority: 1,
       created_at: ~U[2026-01-01 00:00:00Z]
     }
 
     issue_same_priority_newer = %Issue{
-      id: "issue-new-high",
+      id: "issue-new-urgent",
       identifier: "MT-201",
-      title: "New high priority",
+      title: "New urgent priority",
       state: "Todo",
       priority: 1,
       created_at: ~U[2026-01-02 00:00:00Z]
@@ -480,20 +778,59 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     issue_lower_priority_older = %Issue{
       id: "issue-old-low",
       identifier: "MT-199",
-      title: "Old lower priority",
+      title: "Old high priority",
       state: "Todo",
       priority: 2,
       created_at: ~U[2025-12-01 00:00:00Z]
     }
 
+    medium = %Issue{
+      id: "issue-medium",
+      identifier: "MT-300",
+      title: "Medium",
+      state: "Todo",
+      priority: 3,
+      created_at: ~U[2025-01-01 00:00:00Z]
+    }
+
+    low = %{medium | id: "issue-low", identifier: "MT-400", title: "Low", priority: 4}
+
+    no_priority = %{
+      medium
+      | id: "issue-none",
+        identifier: "MT-500",
+        title: "No priority",
+        priority: nil
+    }
+
+    zero_priority = %{
+      medium
+      | id: "issue-zero",
+        identifier: "MT-501",
+        title: "Zero priority",
+        priority: 0
+    }
+
     sorted =
       Orchestrator.sort_issues_for_dispatch_for_test([
+        zero_priority,
         issue_lower_priority_older,
+        low,
         issue_same_priority_newer,
+        no_priority,
+        medium,
         issue_same_priority_older
       ])
 
-    assert Enum.map(sorted, & &1.identifier) == ["MT-200", "MT-201", "MT-199"]
+    assert Enum.map(sorted, & &1.identifier) == [
+             "MT-200",
+             "MT-201",
+             "MT-199",
+             "MT-300",
+             "MT-400",
+             "MT-500",
+             "MT-501"
+           ]
   end
 
   test "todo issue with non-terminal blocker is not dispatch-eligible" do
@@ -511,6 +848,26 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       title: "Blocked work",
       state: "Todo",
       blocked_by: [%{id: "blocker-1", identifier: "MT-1002", state: "In Progress"}]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "non-todo active issue still respects a non-terminal dependency" do
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "blocked-active",
+      identifier: "MT-1001A",
+      title: "Active but dependency-blocked work",
+      state: "In Progress",
+      blocked_by: [%{id: "blocker-active", identifier: "MT-1002A", state: "In Progress"}]
     }
 
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
@@ -582,6 +939,87 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert skipped_issue.identifier == "MT-1005"
     assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
+  end
+
+  # UDPE-6950: `Ready to Merge` (and the other @review_states_set states) is a
+  # human-actor handoff where the repo prompt forbids the agent from touching
+  # the PR. Dispatching an implementor there wastes ~40 no-op turns and ends in
+  # a false Blocked via mark_blocked_on_giveup(:max_turns_exhausted). The code
+  # guard in candidate_issue?/3 must refuse the pickup even when a host's config
+  # (mis)lists the state as active — so this test deliberately configures it as
+  # active and proves it is still not dispatched.
+  test "Ready to Merge issue with agent labels is not dispatched even when misconfigured as active" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Ready to Merge"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    ready_to_merge_issue = %Issue{
+      id: "rtm-1",
+      identifier: "MT-6950",
+      title: "Approved, waiting on human merge",
+      state: "Ready to Merge",
+      labels: ["agent:claude:opus4.8", "symphony"],
+      assigned_to_worker: true
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(ready_to_merge_issue, state)
+
+    # Control: the same setup still dispatches a genuinely active issue, so the
+    # guard is specific to review/merge states rather than a blanket refusal.
+    in_progress_issue = %{ready_to_merge_issue | id: "ip-1", identifier: "MT-6951", state: "In Progress"}
+    assert Orchestrator.should_dispatch_issue_for_test(in_progress_issue, state)
+  end
+
+  # UDPE-6950: the continuation/retry path revalidates against the tracker via
+  # retry_candidate_issue? (-> candidate_issue?/3) before re-dispatching. A
+  # Ready to Merge issue must be skipped there too, so the do_run_codex_turns
+  # loop can never keep re-running it up to agent.max_turns and demote it to
+  # Blocked. Active_states lists the state so the skip is attributable to the
+  # review-state guard, not to the state simply being non-active.
+  test "dispatch revalidation skips a Ready to Merge issue so the max_turns->Blocked path is unreachable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Ready to Merge"]
+    )
+
+    ready_to_merge_issue = %Issue{
+      id: "rtm-2",
+      identifier: "MT-6952",
+      title: "Approved, waiting on human merge",
+      state: "Ready to Merge",
+      labels: ["agent:claude:opus4.8"],
+      assigned_to_worker: true
+    }
+
+    fetcher = fn ["rtm-2"] -> {:ok, [ready_to_merge_issue]} end
+
+    assert {:skip, %Issue{} = skipped_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(ready_to_merge_issue, fetcher)
+
+    assert skipped_issue.identifier == "MT-6952"
+  end
+
+  test "review_state?/1 identifies the human-actor review/merge states (UDPE-6950)" do
+    for state <- ["Human Review", "In Review", "Merging", "Ready to Merge"] do
+      assert Orchestrator.review_state?(state), "#{state} should be a review state"
+    end
+
+    # Case- and whitespace-insensitive (states arrive normalized elsewhere).
+    assert Orchestrator.review_state?("  ready to merge  ")
+    assert Orchestrator.review_state?("READY TO MERGE")
+
+    # Genuine work states and non-strings are not review states.
+    refute Orchestrator.review_state?("Todo")
+    refute Orchestrator.review_state?("In Progress")
+    refute Orchestrator.review_state?("Rework")
+    refute Orchestrator.review_state?(nil)
   end
 
   test "workspace remove returns error information for missing directory" do
@@ -768,9 +1206,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "excludeSlashTmp" => false
            }
 
-    assert config.codex.turn_timeout_ms == 3_600_000
+    assert config.codex.turn_timeout_ms == 0
+    assert config.acp.prompt_timeout_ms == 0
+    assert config.claude_code.prompt_timeout_ms == 0
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.hooks.before_handoff_timeout_ms == nil
+    assert config.hooks.before_handoff_stale_ms == 120_000
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
@@ -887,32 +1329,315 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
+  test "parses a gc lookback_days override and rejects a non-positive value" do
+    assert {:ok, settings} = Schema.parse(%{"gc" => %{"lookback_days" => 14}})
+    assert settings.gc.lookback_days == 14
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{"gc" => %{"lookback_days" => 0}})
+
+    assert message =~ "lookback_days"
+  end
+
+  test "gc lookback_days defaults to 7 when unset" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.gc.lookback_days == 7
+  end
+
+  test "acp block defaults to safe values when unset" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.acp.command == "opencode acp"
+    assert settings.acp.auto_approve == true
+    assert settings.acp.protocol_version == 1
+    assert settings.acp.withhold_linear_credentials == true
+    assert settings.acp.advertise_fs == false
+    assert settings.acp.advertise_terminal == false
+  end
+
+  test "parses an acp block and runtime settings" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "agent" => %{"backend" => "acp"},
+               "acp" => %{
+                 "command" => "opencode acp",
+                 "auto_approve" => false,
+                 "withhold_linear_credentials" => false,
+                 "read_timeout_ms" => 1234
+               }
+             })
+
+    assert settings.agent.backend == "acp"
+    assert settings.acp.auto_approve == false
+    assert settings.acp.withhold_linear_credentials == false
+    assert settings.acp.read_timeout_ms == 1234
+  end
+
+  test "acp_runtime_settings exposes the acp block as a map" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "acp",
+      acp_command: "opencode acp",
+      acp_auto_approve: false
+    )
+
+    assert {:ok, acp} = Config.acp_runtime_settings()
+    assert acp.command == "opencode acp"
+    assert acp.auto_approve == false
+    assert acp.withhold_linear_credentials == true
+    assert acp.heartbeat_ms == 30_000
+  end
+
+  test "acp.heartbeat_ms defaults to 30s and rejects negative values" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.acp.heartbeat_ms == 30_000
+
+    assert {:ok, custom} = Schema.parse(%{"acp" => %{"heartbeat_ms" => 0}})
+    assert custom.acp.heartbeat_ms == 0
+
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"acp" => %{"heartbeat_ms" => -1}})
+  end
+
+  test "validate! rejects an empty acp command when the acp backend is selected" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"backend" => "acp"}, "acp" => %{"command" => ""}})
+  end
+
+  test "claude_code block defaults to safe values when unset" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.claude_code.command == "claude"
+    assert settings.claude_code.permission_mode == "bypassPermissions"
+    assert settings.claude_code.extra_args == []
+    assert settings.claude_code.withhold_linear_credentials == true
+  end
+
+  test "parses a claude_code block and runtime settings" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "agent" => %{"backend" => "claude_code"},
+               "claude_code" => %{
+                 "command" => "claude",
+                 "model" => "opus",
+                 "permission_mode" => "acceptEdits",
+                 "extra_args" => ["--append-system-prompt", "hi"]
+               }
+             })
+
+    assert settings.agent.backend == "claude_code"
+    assert settings.claude_code.model == "opus"
+    assert settings.claude_code.permission_mode == "acceptEdits"
+    assert settings.claude_code.extra_args == ["--append-system-prompt", "hi"]
+  end
+
+  test "claude_code_runtime_settings exposes the claude_code block as a map" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "claude_code",
+      claude_code_command: "claude",
+      claude_code_model: "opus"
+    )
+
+    assert {:ok, cc} = Config.claude_code_runtime_settings()
+    assert cc.command == "claude"
+    assert cc.model == "opus"
+    assert cc.permission_mode == "bypassPermissions"
+    assert cc.withhold_linear_credentials == true
+  end
+
+  test "backend_stall_timeout_ms/1 resolves per-backend, falling back to codex (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 111_000,
+      acp_stall_timeout_ms: 333_000,
+      claude_code_stall_timeout_ms: 555_000
+    )
+
+    assert Config.backend_stall_timeout_ms("codex") == 111_000
+    assert Config.backend_stall_timeout_ms("acp") == 333_000
+    assert Config.backend_stall_timeout_ms("claude_code") == 555_000
+    # nil (backend not yet reported) and unknown names fall back to codex.
+    assert Config.backend_stall_timeout_ms(nil) == 111_000
+    assert Config.backend_stall_timeout_ms("gemini") == 111_000
+  end
+
+  test "backend_turn_timeout_ms/1 resolves per-backend, falling back to codex (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_turn_timeout_ms: 222_000,
+      acp_prompt_timeout_ms: 444_000,
+      claude_code_prompt_timeout_ms: 666_000
+    )
+
+    assert Config.backend_turn_timeout_ms("codex") == 222_000
+    # ACP/Claude Code expose the turn-timeout equivalent as prompt_timeout_ms.
+    assert Config.backend_turn_timeout_ms("acp") == 444_000
+    assert Config.backend_turn_timeout_ms("claude_code") == 666_000
+    assert Config.backend_turn_timeout_ms(nil) == 222_000
+    assert Config.backend_turn_timeout_ms("gemini") == 222_000
+  end
+
+  test "backend_review_timeout_ms/1 prefers the stall timeout when positive (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 111_000,
+      codex_turn_timeout_ms: 222_000,
+      acp_stall_timeout_ms: 333_000,
+      acp_prompt_timeout_ms: 444_000,
+      claude_code_stall_timeout_ms: 555_000,
+      claude_code_prompt_timeout_ms: 666_000
+    )
+
+    assert Config.backend_review_timeout_ms("codex") == 111_000
+    assert Config.backend_review_timeout_ms("acp") == 333_000
+    assert Config.backend_review_timeout_ms("claude_code") == 555_000
+    assert Config.backend_review_timeout_ms(nil) == 111_000
+    assert Config.backend_review_timeout_ms("gemini") == 111_000
+  end
+
+  test "backend_review_timeout_ms/1 falls back to the turn timeout when stall is 0 (UDPE-6952)" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_stall_timeout_ms: 0,
+      codex_turn_timeout_ms: 222_000,
+      acp_stall_timeout_ms: 0,
+      acp_prompt_timeout_ms: 444_000
+    )
+
+    assert Config.backend_review_timeout_ms("codex") == 222_000
+    assert Config.backend_review_timeout_ms("acp") == 444_000
+    # nil/unknown still resolve through codex (stall 0 -> turn timeout).
+    assert Config.backend_review_timeout_ms(nil) == 222_000
+  end
+
+  test "review_settings/1 bounds repository-owned packet and fresh-thread settings" do
+    workflow = %{
+      config: %{
+        "review" => %{
+          "max_iterations" => 99,
+          "packet_path" => ".review/packet.json",
+          "packet_max_bytes" => 1,
+          # Legacy setting is ignored; the selected model owns its real context window.
+          "context_budget_tokens" => 999_999,
+          "turn_budget" => 12,
+          "turn_timeout_ms" => 10,
+          "tool_output_max_bytes" => 99,
+          "model" => "gpt-review",
+          "reasoning_effort" => "high",
+          "require_pr" => false,
+          "scope_contract_required" => true,
+          "draft_pr_lifecycle" => true
+        }
+      },
+      prompt: "review",
+      prompt_template: "review"
+    }
+
+    settings = Config.review_settings(workflow)
+
+    assert settings.max_iterations == 20
+    assert settings.packet_path == ".review/packet.json"
+    assert settings.packet_max_bytes == 8_192
+    refute Map.has_key?(settings, :context_budget_tokens)
+    assert settings.turn_budget == 1
+    assert settings.turn_timeout_ms == 30_000
+    assert settings.tool_output_max_bytes == 512
+    assert settings.model == "gpt-review"
+    assert settings.reasoning_effort == "high"
+    refute settings.require_pr
+    assert settings.scope_contract_required
+    assert settings.draft_pr_lifecycle
+  end
+
+  test "rejects an unknown claude_code permission_mode" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"claude_code" => %{"permission_mode" => "yolo"}})
+  end
+
+  test "validate! rejects an empty claude_code command when the claude_code backend is selected" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"backend" => "claude_code"}, "claude_code" => %{"command" => ""}})
+  end
+
+  test "agent.label_presets defaults to an empty list" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.agent.label_presets == []
+  end
+
+  test "agent.pre_command defaults to nil and parses when set" do
+    assert {:ok, defaults} = Schema.parse(%{})
+    assert defaults.agent.pre_command == nil
+
+    assert {:ok, settings} =
+             Schema.parse(%{"agent" => %{"pre_command" => ". .artifacts/github-app-auth/session.env"}})
+
+    assert settings.agent.pre_command == ". .artifacts/github-app-auth/session.env"
+  end
+
+  test "parses agent.label_presets with backend+model overrides" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "agent" => %{
+                 "backend" => "codex",
+                 "label_presets" => [
+                   %{"label" => "agent:fast", "backend" => "acp", "model" => "opencode/north-mini-code-free"},
+                   %{"label" => "agent:deep", "backend" => "claude_code", "model" => "opus"},
+                   %{"label" => "agent:codex", "backend" => "codex"}
+                 ]
+               }
+             })
+
+    assert [fast, deep, codex] = settings.agent.label_presets
+    assert fast.label == "agent:fast"
+    assert fast.backend == "acp"
+    assert fast.model == "opencode/north-mini-code-free"
+    assert deep.backend == "claude_code"
+    assert deep.model == "opus"
+    assert codex.backend == "codex"
+    assert codex.model == nil
+  end
+
+  test "rejects a label_preset with an unknown backend" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"label_presets" => [%{"label" => "x", "backend" => "gemini"}]}})
+  end
+
+  test "rejects a label_preset with a blank label" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"label_presets" => [%{"label" => "  ", "backend" => "acp"}]}})
+  end
+
+  test "rejects a label_preset missing its backend" do
+    assert {:error, {:invalid_workflow_config, _message}} =
+             Schema.parse(%{"agent" => %{"label_presets" => [%{"label" => "agent:fast"}]}})
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
+    project_slug_env_var = "SYMP_LINEAR_PROJECT_#{System.unique_integer([:positive])}"
     workspace_root = Path.join("/tmp", "symphony-workspace-root")
     api_key = "resolved-secret"
+    project_slug = "resolved-project"
     codex_bin = Path.join(["~", "bin", "codex"])
 
     previous_workspace_root = System.get_env(workspace_env_var)
     previous_api_key = System.get_env(api_key_env_var)
+    previous_project_slug = System.get_env(project_slug_env_var)
 
     System.put_env(workspace_env_var, workspace_root)
     System.put_env(api_key_env_var, api_key)
+    System.put_env(project_slug_env_var, project_slug)
 
     on_exit(fn ->
       restore_env(workspace_env_var, previous_workspace_root)
       restore_env(api_key_env_var, previous_api_key)
+      restore_env(project_slug_env_var, previous_project_slug)
     end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
+      tracker_project_slug: "$#{project_slug_env_var}",
       workspace_root: "$#{workspace_env_var}",
       codex_command: "#{codex_bin} app-server"
     )
 
     config = Config.settings!()
     assert config.tracker.api_key == api_key
+    assert config.tracker.project_slug == project_slug
     assert config.workspace.root == Path.expand(workspace_root)
     assert config.codex.command == "#{codex_bin} app-server"
   end
@@ -1008,32 +1733,44 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     missing_workspace_env = "SYMP_MISSING_WORKSPACE_#{System.unique_integer([:positive])}"
     empty_secret_env = "SYMP_EMPTY_SECRET_#{System.unique_integer([:positive])}"
     missing_secret_env = "SYMP_MISSING_SECRET_#{System.unique_integer([:positive])}"
+    empty_project_env = "SYMP_EMPTY_PROJECT_#{System.unique_integer([:positive])}"
+    missing_project_env = "SYMP_MISSING_PROJECT_#{System.unique_integer([:positive])}"
 
     previous_missing_workspace_env = System.get_env(missing_workspace_env)
     previous_empty_secret_env = System.get_env(empty_secret_env)
     previous_missing_secret_env = System.get_env(missing_secret_env)
+    previous_empty_project_env = System.get_env(empty_project_env)
+    previous_missing_project_env = System.get_env(missing_project_env)
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    previous_linear_project_slug = System.get_env("LINEAR_PROJECT_SLUG")
 
     System.delete_env(missing_workspace_env)
     System.put_env(empty_secret_env, "")
     System.delete_env(missing_secret_env)
+    System.put_env(empty_project_env, "")
+    System.delete_env(missing_project_env)
     System.put_env("LINEAR_API_KEY", "fallback-linear-token")
+    System.put_env("LINEAR_PROJECT_SLUG", "fallback-linear-project")
 
     on_exit(fn ->
       restore_env(missing_workspace_env, previous_missing_workspace_env)
       restore_env(empty_secret_env, previous_empty_secret_env)
       restore_env(missing_secret_env, previous_missing_secret_env)
+      restore_env(empty_project_env, previous_empty_project_env)
+      restore_env(missing_project_env, previous_missing_project_env)
       restore_env("LINEAR_API_KEY", previous_linear_api_key)
+      restore_env("LINEAR_PROJECT_SLUG", previous_linear_project_slug)
     end)
 
     assert {:ok, settings} =
              Schema.parse(%{
-               tracker: %{api_key: "$#{empty_secret_env}"},
+               tracker: %{api_key: "$#{empty_secret_env}", project_slug: "$#{empty_project_env}"},
                workspace: %{root: "$#{missing_workspace_env}"},
                codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
              })
 
     assert settings.tracker.api_key == nil
+    assert settings.tracker.project_slug == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
 
     assert settings.codex.approval_policy == %{
@@ -1042,11 +1779,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert {:ok, settings} =
              Schema.parse(%{
-               tracker: %{api_key: "$#{missing_secret_env}"},
+               tracker: %{api_key: "$#{missing_secret_env}", project_slug: "$#{missing_project_env}"},
                workspace: %{root: ""}
              })
 
     assert settings.tracker.api_key == "fallback-linear-token"
+    assert settings.tracker.project_slug == "fallback-linear-project"
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
   end
 
