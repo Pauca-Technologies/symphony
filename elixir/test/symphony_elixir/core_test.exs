@@ -1185,6 +1185,89 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.retry_attempts, issue_id)
   end
 
+  test "wait resume is acknowledged when the issue remains active but is dependency-blocked" do
+    previous_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Done"],
+      poll_interval_ms: 30_000
+    )
+
+    issue_id = "issue-wait-resume-blocked"
+    identifier = "MT-7300"
+
+    blocked_issue = %Issue{
+      id: issue_id,
+      identifier: identifier,
+      title: "Resume after dependency",
+      state: "In Progress",
+      labels: [],
+      blocked_by: [%{id: "blocker", identifier: "MT-7301", state: "Backlog"}]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [blocked_issue])
+    SymphonyElixir.WaitWatcher.acknowledge(issue_id)
+
+    orchestrator_name = Module.concat(__MODULE__, :BlockedWaitResumeOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    request = %{
+      condition: %{"type" => "github_actions_recovered", "component" => "Actions"},
+      condition_key: "blocked-wait-resume-condition",
+      reason: "Dependency was expected to complete",
+      min_poll_ms: 60_000,
+      max_poll_ms: 60_000
+    }
+
+    :ok =
+      SymphonyElixir.WaitWatcher.park(%{
+        issue_id: issue_id,
+        identifier: identifier,
+        title: blocked_issue.title,
+        backend: "codex",
+        worker_host: nil,
+        workspace_path: "/tmp/#{identifier}",
+        priority: 1,
+        created_at: DateTime.utc_now(),
+        request: request
+      })
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_issues)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      SymphonyElixir.WaitWatcher.acknowledge(issue_id)
+    end)
+
+    initial_state = :sys.get_state(pid)
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:retry_attempts, %{
+        issue_id => %{
+          attempt: 1,
+          timer_ref: nil,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: identifier,
+          wait_resume_prompt: "The wait condition changed. Resume work."
+        }
+      })
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+
+    refute MapSet.member?(SymphonyElixir.WaitWatcher.issue_ids(), issue_id)
+
+    state = :sys.get_state(pid)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
   test "rate-limited retry lookup honors the tracker delay and preserves wait context" do
     previous_result =
       Application.get_env(:symphony_elixir, :memory_tracker_candidate_issues_result)

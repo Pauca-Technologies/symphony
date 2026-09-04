@@ -2711,7 +2711,7 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, finish_retry_without_dispatch(state, issue_id, metadata)}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -2719,14 +2719,18 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
 
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, finish_retry_without_dispatch(state, issue_id, metadata)}
     end
   end
 
   defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
+    {:noreply, finish_retry_without_dispatch(state, issue_id, metadata)}
+  end
+
+  defp finish_retry_without_dispatch(state, issue_id, metadata) do
     maybe_acknowledge_wait_resume(issue_id, metadata)
-    {:noreply, release_issue_claim(state, issue_id)}
+    release_issue_claim(state, issue_id)
   end
 
   defp maybe_acknowledge_wait_resume(issue_id, %{wait_resume_prompt: prompt})
@@ -2790,6 +2794,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
       Logger.info("Parking retry while backend quota circuit is open: #{issue_context(issue)} backend=#{retry_backend(metadata, issue)}")
 
+      maybe_acknowledge_wait_resume(issue.id, metadata)
       metadata = Map.put(metadata, :issue, issue)
 
       state =
@@ -2808,7 +2813,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     cond do
       !retry_candidate_issue?(issue, terminal_state_set()) ->
-        {:noreply, release_issue_claim(state, issue.id)}
+        {:noreply, finish_retry_without_dispatch(state, issue.id, metadata)}
 
       match?({:queue, _decision}, scheduling) ->
         {:queue, decision} = scheduling
@@ -2871,7 +2876,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:skip, state} ->
         Logger.info("Releasing claim after dispatch revalidation skip: #{issue_context(issue)}")
-        {:noreply, release_issue_claim(state, issue.id)}
+        {:noreply, finish_retry_without_dispatch(state, issue.id, metadata)}
 
       {:error, state} ->
         {:noreply,
