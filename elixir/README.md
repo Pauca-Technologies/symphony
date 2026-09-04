@@ -429,7 +429,10 @@ Notes:
   (or a bounded fallback deadline when no usable reset is supplied), exactly one parked issue is
   admitted as a probe. A successful probe or a newer rate-limit update that positively reports
   available capacity closes the circuit and releases parked issues in FIFO order. Ambiguous errors
-  never open the circuit and continue through the normal bounded per-issue retry path.
+  never open the circuit and continue through the normal bounded per-issue retry path. When an
+  operator adds usage before the reported reset time, **Check usage now** on the dashboard (or
+  `POST /api/v1/quota-circuits/probe` with `{"backend":"codex"}`) schedules that same one-issue
+  controlled probe immediately; it never releases the parked queue without a successful probe.
 - Active quota circuits are checkpointed to `~/.symphony/quota-circuits.json`. This deliberately
   small snapshot preserves outage deadlines and parked issue order across an orchestrator restart;
   it does not persist the general retry queue. Circuit state, reset/probe deadlines, account scope,

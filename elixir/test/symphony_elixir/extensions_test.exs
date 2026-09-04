@@ -110,6 +110,21 @@ defmodule SymphonyElixir.ExtensionsTest do
       action_name = if action == :resume_wait, do: "resumed", else: "cancelled"
       {:reply, {:ok, %{action: action_name, issue_id: "issue-wait", identifier: identifier}}, state}
     end
+
+    def handle_call({:probe_quota, backend, worker_host}, _from, state) do
+      if recipient = Keyword.get(state, :recipient), do: send(recipient, {:probe_quota, backend, worker_host})
+
+      {:reply,
+       {:ok,
+        %{
+          action: "probe_scheduled",
+          backend: backend,
+          account_scope: "local",
+          worker_host: worker_host,
+          next_probe_at: DateTime.utc_now(),
+          parked_issue_count: 2
+        }}, state}
+    end
   end
 
   setup do
@@ -1148,6 +1163,23 @@ defmodule SymphonyElixir.ExtensionsTest do
              |> json_response(200)
 
     assert_receive {:cancel_wait, "MT-WAIT"}
+
+    assert %{
+             "quota_circuit" => %{
+               "action" => "probe_scheduled",
+               "backend" => "codex",
+               "account_scope" => "local",
+               "worker_host" => nil,
+               "parked_issue_count" => 2,
+               "next_probe_at" => next_probe_at
+             }
+           } =
+             build_conn()
+             |> post("/api/v1/quota-circuits/probe", %{"backend" => "codex"})
+             |> json_response(202)
+
+    assert is_binary(next_probe_at)
+    assert_receive {:probe_quota, "codex", nil}
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -1161,6 +1193,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/api/v1/waits/MT-1/resume"), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(get(build_conn(), "/api/v1/quota-circuits/probe"), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(post(build_conn(), "/", %{}), 405) ==
@@ -1205,6 +1240,17 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
 
     assert json_response(post(build_conn(), "/api/v1/waits/MT-1/resume", %{}), 503) ==
+             %{
+               "error" => %{
+                 "code" => "orchestrator_unavailable",
+                 "message" => "Orchestrator is unavailable"
+               }
+             }
+
+    assert json_response(
+             post(build_conn(), "/api/v1/quota-circuits/probe", %{"backend" => "codex"}),
+             503
+           ) ==
              %{
                "error" => %{
                  "code" => "orchestrator_unavailable",
@@ -1303,6 +1349,45 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "61% used"
     assert html =~ "Plan pro"
     assert html =~ "Credits unlimited"
+  end
+
+  test "dashboard can request a controlled quota probe after usage is added" do
+    orchestrator_name = Module.concat(__MODULE__, :QuotaProbeDashboardOrchestrator)
+    now = DateTime.utc_now()
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:quota_circuits, [
+        %{
+          backend: "codex",
+          account_scope: "local",
+          worker_host: nil,
+          provider_limit_id: "premium",
+          state: :open,
+          reason: "usage limit reached",
+          opened_at: now,
+          reset_at: DateTime.add(now, 86_400, :second),
+          next_probe_at: DateTime.add(now, 86_400, :second),
+          next_probe_in_ms: 86_400_000,
+          probe_issue_id: nil,
+          parked_issue_count: 2
+        }
+      ])
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, recipient: self()})
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Provider quota circuits"
+    assert html =~ "2 parked"
+    assert html =~ "Check usage now"
+
+    rendered =
+      render_click(view, "probe-quota", %{"backend" => "codex", "worker-host" => ""})
+
+    assert_receive {:probe_quota, "codex", nil}
+    assert rendered =~ "Check usage now"
   end
 
   test "dashboard liveview keeps the list compact and renders transcript text on the issue page" do

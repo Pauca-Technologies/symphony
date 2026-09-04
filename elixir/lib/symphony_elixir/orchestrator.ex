@@ -2341,6 +2341,17 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp quota_probe_control_payload(circuit) do
+    %{
+      action: "probe_scheduled",
+      backend: circuit.backend,
+      account_scope: circuit.account_scope,
+      worker_host: circuit.worker_host,
+      next_probe_at: circuit.next_probe_at,
+      parked_issue_count: length(circuit.parked)
+    }
+  end
+
   defp complete_issue(%State{} = state, issue_id) do
     # A normal turn completion is the "made progress" signal that resets the
     # consecutive-failure count, so only genuine stuck loops reach max_retries.
@@ -3411,6 +3422,18 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, map()} | {:error, :not_found} | :unavailable
   def cancel_wait(server, identifier), do: wait_control_call(server, {:cancel_wait, identifier})
 
+  @doc "Schedule an immediate controlled probe for an open provider quota circuit."
+  @spec probe_quota(String.t(), String.t() | nil) ::
+          {:ok, map()} | {:error, :not_found | :probe_in_progress | :draining} | :unavailable
+  def probe_quota(backend, worker_host), do: probe_quota(__MODULE__, backend, worker_host)
+
+  @spec probe_quota(GenServer.server(), String.t(), String.t() | nil) ::
+          {:ok, map()} | {:error, :not_found | :probe_in_progress | :draining} | :unavailable
+  def probe_quota(server, backend, worker_host)
+      when is_binary(backend) and (is_binary(worker_host) or is_nil(worker_host)) do
+    wait_control_call(server, {:probe_quota, backend, worker_host})
+  end
+
   defp wait_control_call(server, message) do
     GenServer.call(server, message, 15_000)
   catch
@@ -3554,6 +3577,37 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, :not_found} = error ->
         {:reply, error, state}
+    end
+  end
+
+  def handle_call({:probe_quota, backend, worker_host}, _from, %State{} = state)
+      when is_binary(backend) and (is_binary(worker_host) or is_nil(worker_host)) do
+    circuit_key = quota_circuit_key(backend, worker_host)
+
+    case Map.get(state.quota_circuits, circuit_key) do
+      %{status: :open} when state.draining ->
+        {:reply, {:error, :draining}, state}
+
+      %{status: :open} = circuit ->
+        updated =
+          circuit
+          |> Map.delete(:drain_deferred)
+          |> Map.put(:next_probe_at, DateTime.utc_now())
+
+        state = put_quota_circuit(state, circuit_key, updated)
+        scheduled = Map.fetch!(state.quota_circuits, circuit_key)
+
+        Logger.info("Operator requested provider quota probe backend=#{backend} account_scope=#{scheduled.account_scope} parked_issues=#{length(scheduled.parked)}")
+
+        state = emit_quota_circuit(state, :manual_probe_requested, scheduled)
+        notify_dashboard()
+        {:reply, {:ok, quota_probe_control_payload(scheduled)}, state}
+
+      %{status: :probe} ->
+        {:reply, {:error, :probe_in_progress}, state}
+
+      _ ->
+        {:reply, {:error, :not_found}, state}
     end
   end
 

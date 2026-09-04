@@ -270,6 +270,52 @@ defmodule SymphonyElixir.QuotaCircuitTest do
     assert :ok = Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, worker_pid)
   end
 
+  test "an operator can immediately probe a circuit whose provider reset is still in the future" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hook_before_run: "sleep 30"
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    name = Module.concat(__MODULE__, :ManualProbeOrchestrator)
+    pid = start_orchestrator!(:ManualProbeOrchestrator)
+    Process.sleep(50)
+
+    probe = issue("issue-manual-probe", "MT-MANUAL-PROBE")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [probe])
+
+    future_circuit =
+      circuit(:open, nil, [parked_entry(probe.id, probe.identifier, DateTime.utc_now())])
+      |> Map.put(:next_probe_at, DateTime.add(DateTime.utc_now(), 86_400, :second))
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: %{},
+          claimed: MapSet.new([probe.id]),
+          quota_circuits: %{"codex::local" => future_circuit}
+      }
+    end)
+
+    assert {:ok,
+            %{
+              action: "probe_scheduled",
+              backend: "codex",
+              account_scope: "local",
+              parked_issue_count: 1
+            }} = Orchestrator.probe_quota(name, "codex", nil)
+
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+    assert %{quota_probe: true, pid: worker_pid} = state.running[probe.id]
+    assert %{status: :probe, probe_issue_id: probe_id} = state.quota_circuits["codex::local"]
+    assert probe_id == probe.id
+    assert {:error, :probe_in_progress} = Orchestrator.probe_quota(name, "codex", nil)
+    assert {:error, :not_found} = Orchestrator.probe_quota(name, "claude_code", nil)
+
+    assert :ok = Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, worker_pid)
+  end
+
   test "an existing retry emits suppressed before it is parked by an open circuit" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])

@@ -2371,6 +2371,10 @@ Minimum endpoints:
   - Wakes one parked issue without waiting for its next probe.
 - `POST /api/v1/waits/:issue_identifier/cancel` (extension)
   - Cancels the external wait and returns the active issue to normal scheduling.
+- `POST /api/v1/quota-circuits/probe` (extension)
+  - Accepts `{"backend":"codex","worker_host":null}` and schedules an immediate, controlled
+    one-issue probe for that backend/account circuit. A successful probe releases the remaining
+    parked issues in FIFO order; a failed probe reopens the circuit without fanning out work.
 
 API design notes:
 

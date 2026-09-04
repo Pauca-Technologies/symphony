@@ -48,6 +48,8 @@ defmodule SymphonyElixirWeb.Router do
     match(:*, "/api/v1/waits/:issue_identifier/resume", ObservabilityApiController, :method_not_allowed)
     post("/api/v1/waits/:issue_identifier/cancel", ObservabilityApiController, :cancel_wait)
     match(:*, "/api/v1/waits/:issue_identifier/cancel", ObservabilityApiController, :method_not_allowed)
+    post("/api/v1/quota-circuits/probe", ObservabilityApiController, :probe_quota)
+    match(:*, "/api/v1/quota-circuits/probe", ObservabilityApiController, :method_not_allowed)
     get("/api/v1/:issue_identifier", ObservabilityApiController, :issue)
     match(:*, "/api/v1/:issue_identifier", ObservabilityApiController, :method_not_allowed)
     match(:*, "/*path", ObservabilityApiController, :not_found)

@@ -174,6 +174,18 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec quota_probe_payload(String.t(), String.t() | nil, GenServer.server()) ::
+          {:ok, map()}
+          | {:error, :not_found | :probe_in_progress | :draining | :unavailable}
+  def quota_probe_payload(backend, worker_host, orchestrator)
+      when is_binary(backend) and (is_binary(worker_host) or is_nil(worker_host)) do
+    case Orchestrator.probe_quota(orchestrator, backend, worker_host) do
+      {:ok, payload} -> {:ok, Map.update!(payload, :next_probe_at, &iso8601/1)}
+      {:error, reason} -> {:error, reason}
+      :unavailable -> {:error, :unavailable}
+    end
+  end
+
   defp mode_payload(snapshot) do
     mode = Map.get(snapshot, :mode, %{})
 

@@ -55,6 +55,34 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @spec cancel_wait(Conn.t(), map()) :: Conn.t()
   def cancel_wait(conn, %{"issue_identifier" => identifier}), do: set_wait_mode(conn, :cancel, identifier)
 
+  @spec probe_quota(Conn.t(), map()) :: Conn.t()
+  def probe_quota(conn, %{"backend" => backend} = params) when is_binary(backend) do
+    worker_host = blank_to_nil(params["worker_host"])
+
+    case Presenter.quota_probe_payload(backend, worker_host, orchestrator()) do
+      {:ok, payload} ->
+        conn
+        |> put_status(202)
+        |> json(%{quota_circuit: payload})
+
+      {:error, :not_found} ->
+        error_response(conn, 404, "quota_circuit_not_found", "Provider quota circuit not found")
+
+      {:error, :probe_in_progress} ->
+        error_response(conn, 409, "quota_probe_in_progress", "A provider quota probe is already running")
+
+      {:error, :draining} ->
+        error_response(conn, 409, "orchestrator_draining", "Cancel drain mode before probing provider quota")
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+    end
+  end
+
+  def probe_quota(conn, _params) do
+    error_response(conn, 400, "invalid_request", "A backend is required")
+  end
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")
@@ -109,6 +137,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
         error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
     end
   end
+
+  defp blank_to_nil(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp blank_to_nil(_value), do: nil
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator

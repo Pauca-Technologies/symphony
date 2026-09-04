@@ -74,6 +74,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
     {:noreply, control_wait(socket, :cancel, identifier)}
   end
 
+  def handle_event("probe-quota", %{"backend" => backend} = params, socket) do
+    {:noreply, probe_quota(socket, backend, Map.get(params, "worker-host"))}
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -597,7 +601,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <div>
                 <h2 class="section-title">Provider quota circuits</h2>
                 <p class="section-copy">
-                  Dispatch is parked for the affected backend/account until one controlled probe can run.
+                  Dispatch is parked for the affected backend/account until one controlled probe can run. If you added usage before the provider reset, check now to test one parked issue safely.
                 </p>
               </div>
             </div>
@@ -611,6 +615,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 </span>
                 <span :if={circuit.provider_limit_id} class="metric-detail">Provider limit <%= circuit.provider_limit_id %></span>
                 <span class="metric-detail"><%= circuit.reason %></span>
+                <button
+                  :if={circuit.state == "open"}
+                  type="button"
+                  class="subtle-button"
+                  phx-click="probe-quota"
+                  phx-value-backend={circuit.backend}
+                  phx-value-worker-host={circuit.worker_host}
+                  phx-disable-with="Starting probe…"
+                >
+                  Check usage now
+                </button>
+                <span :if={circuit.state == "probe"} class="metric-detail">Controlled probe running</span>
               </div>
             </div>
           </section>
@@ -1067,6 +1083,34 @@ defmodule SymphonyElixirWeb.DashboardLive do
         put_flash(socket, :error, "Unable to #{action} wait: #{inspect(reason)}")
     end
   end
+
+  defp probe_quota(socket, backend, worker_host) do
+    case Presenter.quota_probe_payload(backend, blank_to_nil(worker_host), orchestrator()) do
+      {:ok, _payload} ->
+        socket
+        |> clear_flash()
+        |> put_flash(:info, "Quota check scheduled for #{backend}; one parked issue will probe availability.")
+        |> reload_current_page()
+
+      {:error, :probe_in_progress} ->
+        put_flash(socket, :info, "A quota check is already running for #{backend}.")
+
+      {:error, :draining} ->
+        put_flash(socket, :error, "Cancel drain mode before checking provider quota.")
+
+      {:error, reason} ->
+        put_flash(socket, :error, "Unable to check provider quota: #{inspect(reason)}")
+    end
+  end
+
+  defp blank_to_nil(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp blank_to_nil(_value), do: nil
 
   defp wait_condition_label(condition) when is_map(condition) do
     type = Map.get(condition, "type", "unknown")
