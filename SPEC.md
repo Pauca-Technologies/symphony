@@ -949,7 +949,9 @@ Backoff formula:
   human input. Classified operational/infrastructure failures MUST keep the issue active and retry
   at capped backoff after crossing the threshold. An implementation MAY move an issue to `Blocked`
   only for a failure class that explicitly requires human action, such as invalid authentication or
-  workflow configuration.
+  workflow configuration. A deterministic review packet that cannot satisfy the repository's hard
+  byte bound SHOULD be classified as non-retryable workflow configuration and may be moved to
+  `Blocked` immediately rather than rerunning the unchanged packet construction.
 
 Retry handling behavior:
 
@@ -1032,14 +1034,15 @@ Part A: Stall detection
   repository rules, risk/lens rationale, exact-head attestations, prior unresolved findings with
   their reviewed SHA, prior approved inspection and attestation coverage, implementation
   risks/skipped proof/evidence, PR-body attachment links, and a bounded follow-up delta.
-- Packet size and reviewer context/tool-output/timeout settings are repository-configurable with a
+- Packet size and reviewer tool-output/timeout settings are repository-configurable with a
   deterministic hard bound and compaction order. Compaction MUST NOT remove access to the complete
   meaningful diff or applicable security/tenant/auth rules. Budget pressure is handled by explicit
   synthesis or a non-approval outcome, never silent candidate reduction. Reviewer attempts use one
   turn; delegated lenses start without parent transcript and receive only their packet slice.
-  The final rendered prompt (repository workflow, packet, and runtime/verdict guards) MUST be
-  checked against a documented conservative token-to-byte ceiling and fail inconclusively when it
-  cannot fit. Successful reviewer tool responses over their configured byte limit MUST compact both
+  The selected reviewer backend/model MUST enforce its actual context window over the final
+  rendered prompt (repository workflow, packet, and runtime/verdict guards); Symphony MUST NOT
+  reject it using an estimated token-to-byte conversion. Successful reviewer tool responses over
+  their configured byte limit MUST compact both
   duplicate text fields with original-size and narrow-query/raw-artifact recovery metadata; failure
   responses MUST remain intact. Reproducible delta-stat prose MUST also be independently bounded.
 - Follow-up reviews receive prior open findings plus the prior-head-to-current-head delta. A
@@ -2422,7 +2425,8 @@ API design notes:
   - Continue reconciliation where possible.
 
 - Worker failures:
-  - Convert to retries with exponential backoff.
+  - Convert operational failures to retries with exponential backoff.
+  - Surface deterministic, human-actionable review-configuration failures without retrying them.
 
 - Tracker candidate-fetch failures:
   - Skip this tick.

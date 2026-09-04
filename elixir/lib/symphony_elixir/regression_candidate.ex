@@ -9,7 +9,7 @@ defmodule SymphonyElixir.RegressionCandidate do
   @max_samples 2
   @max_evidence_per_candidate 10
   @failure_classes ~w(
-    agent_protocol_failure authentication_configuration handoff_reviewer_gate rate_limited
+    agent_protocol_failure authentication_configuration review_configuration handoff_reviewer_gate rate_limited
     response_timeout_or_stall transient_infrastructure usage_quota_limit unknown
   )
   @task_families ~w(simple_direct ui security_tenant data_schema concurrency_liveness broad_architecture)

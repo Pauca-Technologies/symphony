@@ -58,7 +58,6 @@ defmodule SymphonyElixir.ReviewGate do
         verdict_path: .artifacts/symphony-review/verdict.json
         packet_path: .artifacts/symphony-review/packet.v1.json
         packet_max_bytes: 48000            # deterministic hard bound
-        context_budget_tokens: 12000       # packet + review instructions
         turn_budget: 1                     # clamped to one fresh turn
         turn_timeout_ms: 900000
         tool_output_max_bytes: 4000
@@ -73,6 +72,7 @@ defmodule SymphonyElixir.ReviewGate do
 
   alias SymphonyElixir.{
     AgentEfficiency,
+    AgentFailure,
     BaseDrift,
     Cardinality,
     Codex.AppServer,
@@ -92,7 +92,6 @@ defmodule SymphonyElixir.ReviewGate do
 
   @telemetry_event [:symphony_elixir, :gate, :review]
   @max_verdict_attempts 2
-  @context_bytes_per_token 3
 
   @iteration_key {__MODULE__, :iteration}
   @latest_outcome_key {__MODULE__, :latest_outcome}
@@ -437,7 +436,6 @@ defmodule SymphonyElixir.ReviewGate do
         review_context =
           context
           |> Map.put(:packet_result, packet_result)
-          |> Map.put(:packet_builder, packet_builder)
           |> Map.put(:prior_outcome, prior_outcome)
           |> apply_packet_review_route(packet_result)
 
@@ -601,15 +599,6 @@ defmodule SymphonyElixir.ReviewGate do
             handle_review_session_failure(fitted_context, attempt, reason)
         end
 
-      {:packet_error, reason} ->
-        conclude_infrastructure_failure(
-          issue,
-          review_context,
-          attempt,
-          {:review_packet_unavailable, reason},
-          review_context.opts
-        )
-
       {:error, reason} ->
         conclude_inconclusive(
           issue,
@@ -626,82 +615,8 @@ defmodule SymphonyElixir.ReviewGate do
       {:ok, prompt} ->
         {:ok, prompt, review_context}
 
-      {:error, {:review_context_budget_exceeded, actual_bytes, max_bytes} = reason} ->
-        refit_review_packet(
-          review_context,
-          attempt,
-          previous_reason,
-          verdict_path,
-          actual_bytes,
-          max_bytes,
-          reason
-        )
-
       {:error, reason} ->
         {:error, reason}
-    end
-  end
-
-  defp refit_review_packet(
-         review_context,
-         attempt,
-         previous_reason,
-         verdict_path,
-         actual_bytes,
-         max_bytes,
-         original_reason
-       ) do
-    packet_result = Map.fetch!(review_context, :packet_result)
-    prompt_overhead_bytes = actual_bytes - byte_size(packet_result.encoded)
-    available_packet_bytes = max_bytes - prompt_overhead_bytes
-    packet_max_bytes = min(review_context.settings.packet_max_bytes, available_packet_bytes)
-
-    if packet_max_bytes <= 0 or packet_max_bytes >= review_context.settings.packet_max_bytes do
-      {:error, original_reason}
-    else
-      settings = %{review_context.settings | packet_max_bytes: packet_max_bytes}
-
-      case review_context.packet_builder.(
-             review_context.workspace,
-             review_context.issue,
-             review_context.pr,
-             review_context.reviewed_sha,
-             review_context.prior_outcome,
-             settings,
-             review_context.opts
-           ) do
-        {:ok, fitted_packet_result} ->
-          prepare_fitted_review_prompt(
-            review_context,
-            fitted_packet_result,
-            settings,
-            attempt,
-            previous_reason,
-            verdict_path
-          )
-
-        {:error, reason} ->
-          {:packet_error, reason}
-      end
-    end
-  end
-
-  defp prepare_fitted_review_prompt(
-         review_context,
-         fitted_packet_result,
-         settings,
-         attempt,
-         previous_reason,
-         verdict_path
-       ) do
-    fitted_context =
-      review_context
-      |> Map.put(:packet_result, fitted_packet_result)
-      |> Map.put(:settings, settings)
-
-    case render_review_prompt_for_context(fitted_context, attempt, previous_reason, verdict_path) do
-      {:ok, prompt} -> {:ok, prompt, fitted_context}
-      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -733,8 +648,10 @@ defmodule SymphonyElixir.ReviewGate do
     end
   end
 
-  defp retryable_review_session_failure?(reason),
-    do: not review_timeout_or_stall?(reason)
+  defp retryable_review_session_failure?(reason) do
+    failure = AgentFailure.classify({:review_session_failed, reason}, backend: "codex")
+    not review_timeout_or_stall?(reason) and failure.class != :review_configuration
+  end
 
   defp review_timeout_or_stall?(reason) when reason in [:turn_timeout, :turn_stalled], do: true
   defp review_timeout_or_stall?({reason, _details}) when reason in [:turn_timeout, :turn_stalled], do: true
@@ -1151,19 +1068,13 @@ defmodule SymphonyElixir.ReviewGate do
     prompt = add_verdict_reliability_guard(prompt, verdict_path)
     prompt = maybe_add_verdict_retry_instructions(prompt, attempt, previous_reason, verdict_path)
 
-    validate_review_prompt_budget(prompt, settings)
+    validate_review_prompt(prompt)
   rescue
     error -> {:error, Exception.message(error)}
   end
 
-  defp validate_review_prompt_budget(prompt, settings) do
-    max_bytes = settings.context_budget_tokens * @context_bytes_per_token
-
-    cond do
-      String.trim(prompt) == "" -> {:error, :empty_review_prompt}
-      byte_size(prompt) > max_bytes -> {:error, {:review_context_budget_exceeded, byte_size(prompt), max_bytes}}
-      true -> {:ok, prompt}
-    end
+  defp validate_review_prompt(prompt) do
+    if String.trim(prompt) == "", do: {:error, :empty_review_prompt}, else: {:ok, prompt}
   end
 
   defp add_review_packet_contract(prompt, packet_result, settings) do
@@ -1181,14 +1092,14 @@ defmodule SymphonyElixir.ReviewGate do
     #{packet_result.encoded}
     ```
 
-    The packet is bounded to #{settings.packet_max_bytes} bytes and this review has a
-    #{settings.context_budget_tokens}-token context budget (enforced conservatively as at most
-    #{@context_bytes_per_token} rendered UTF-8 bytes per token), #{settings.turn_budget} Codex turn, a
-    #{settings.turn_timeout_ms}ms timeout, and #{settings.tool_output_max_bytes} bytes per successful
-    tool-output summary. Compact successful output as the budget approaches. Never silently truncate
-    or sample the candidate: use the packet's authoritative full-diff commands and independently
-    inspect the complete meaningful change. If evidence is insufficient, request/read the raw
-    artifact or return a non-approval verdict.
+    The packet is bounded to #{settings.packet_max_bytes} bytes. The selected Codex model enforces
+    its actual context window; Symphony does not approximate model tokens from UTF-8 bytes. This
+    review has #{settings.turn_budget} Codex turn, a #{settings.turn_timeout_ms}ms timeout, and
+    #{settings.tool_output_max_bytes} bytes per successful tool-output summary. Compact successful
+    output as the model context fills. Never silently truncate or sample the candidate: use the
+    packet's authoritative full-diff commands and independently inspect the complete meaningful
+    change. If evidence is insufficient, request/read the raw artifact or return a non-approval
+    verdict.
 
     Any delegated lens must start with `fork_turns: "none"` and receive only the packet path, exact
     head, requested lens, budget, and relevant repository-rule paths. Do not fork the parent review
@@ -1937,7 +1848,8 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp conclude_infrastructure_failure(issue, review_context, attempt, reason, opts) do
-    classified = SymphonyElixir.AgentFailure.classify(reason, backend: "codex")
+    classified = AgentFailure.classify(reason, backend: "codex")
+    resume_condition = review_failure_resume_condition(classified)
 
     outcome =
       infrastructure_outcome(
@@ -1945,7 +1857,7 @@ defmodule SymphonyElixir.ReviewGate do
         review_context.iteration,
         review_context.reviewed_sha,
         %{class: classified.class, reason: reason},
-        "Restore reviewer tool/auth/runtime availability, then start a fresh orchestration run and re-attempt review for the candidate SHA.",
+        resume_condition,
         attempt
       )
       |> Map.put(:packet_id, context_packet_id(review_context))
@@ -1955,6 +1867,14 @@ defmodule SymphonyElixir.ReviewGate do
     put_terminal_outcome(issue.id, outcome)
     emit_outcome_telemetry(issue, outcome)
     {:infrastructure_unavailable, outcome}
+  end
+
+  defp review_failure_resume_condition(%AgentFailure{class: :review_configuration}) do
+    "Repair the repository's reviewer workflow or packet bound, then start a fresh orchestration run and re-attempt review for the candidate SHA."
+  end
+
+  defp review_failure_resume_condition(_failure) do
+    "Restore reviewer tool/auth/runtime availability, then start a fresh orchestration run and re-attempt review for the candidate SHA."
   end
 
   defp conclude_reported_infrastructure(

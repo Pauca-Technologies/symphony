@@ -4135,6 +4135,9 @@ defmodule SymphonyElixir.AgentRunner do
         :retries_exhausted ->
           "Symphony exhausted all agent-run retries on this issue."
 
+        :review_configuration ->
+          "Symphony cannot run the repository's automated review because its workflow or bounded review packet is invalid for this candidate."
+
         other ->
           "Symphony stopped working on this issue (reason: #{inspect(other)})."
       end

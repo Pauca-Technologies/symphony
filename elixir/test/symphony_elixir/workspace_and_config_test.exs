@@ -1503,13 +1503,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.backend_review_timeout_ms(nil) == 222_000
   end
 
-  test "review_settings/1 bounds repository-owned packet and fresh-thread budgets" do
+  test "review_settings/1 bounds repository-owned packet and fresh-thread settings" do
     workflow = %{
       config: %{
         "review" => %{
           "max_iterations" => 99,
           "packet_path" => ".review/packet.json",
           "packet_max_bytes" => 1,
+          # Legacy setting is ignored; the selected model owns its real context window.
           "context_budget_tokens" => 999_999,
           "turn_budget" => 12,
           "turn_timeout_ms" => 10,
@@ -1530,7 +1531,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.max_iterations == 20
     assert settings.packet_path == ".review/packet.json"
     assert settings.packet_max_bytes == 8_192
-    assert settings.context_budget_tokens == 65_536
+    refute Map.has_key?(settings, :context_budget_tokens)
     assert settings.turn_budget == 1
     assert settings.turn_timeout_ms == 30_000
     assert settings.tool_output_max_bytes == 512
@@ -1539,15 +1540,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute settings.require_pr
     assert settings.scope_contract_required
     assert settings.draft_pr_lifecycle
-
-    minimum =
-      Config.review_settings(%{
-        config: %{"review" => %{"context_budget_tokens" => 1}},
-        prompt: "review",
-        prompt_template: "review"
-      })
-
-    assert minimum.context_budget_tokens == 6_144
   end
 
   test "rejects an unknown claude_code permission_mode" do

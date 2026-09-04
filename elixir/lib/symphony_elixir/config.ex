@@ -55,7 +55,6 @@ defmodule SymphonyElixir.Config do
           verdict_path: Path.t(),
           packet_path: Path.t(),
           packet_max_bytes: pos_integer(),
-          context_budget_tokens: pos_integer(),
           turn_budget: pos_integer(),
           turn_timeout_ms: pos_integer(),
           tool_output_max_bytes: pos_integer(),
@@ -90,7 +89,6 @@ defmodule SymphonyElixir.Config do
     verdict_path: ".artifacts/symphony-review/verdict.json",
     packet_path: ".artifacts/symphony-review/packet.v1.json",
     packet_max_bytes: 48_000,
-    context_budget_tokens: 12_000,
     turn_budget: 1,
     turn_timeout_ms: 900_000,
     tool_output_max_bytes: 4_000,
@@ -263,10 +261,6 @@ defmodule SymphonyElixir.Config do
     |> Map.put(:verdict_path, non_blank(raw, "verdict_path", @default_review_settings.verdict_path))
     |> Map.put(:packet_path, non_blank(raw, "packet_path", @default_review_settings.packet_path))
     |> Map.put(:packet_max_bytes, bounded_integer(raw, "packet_max_bytes", 8_192, 262_144, 48_000))
-    |> Map.put(
-      :context_budget_tokens,
-      bounded_integer(raw, "context_budget_tokens", 6_144, 65_536, 12_000)
-    )
     |> Map.put(:turn_budget, 1)
     |> Map.put(:turn_timeout_ms, bounded_integer(raw, "turn_timeout_ms", 30_000, 3_600_000, 900_000))
     |> Map.put(

@@ -14,8 +14,6 @@ defmodule SymphonyElixir.ReviewPacket do
   @archive_dir ".artifacts/symphony-review/packets"
   @text_limit 8_000
   @compact_text_limit 1_200
-  @context_bytes_per_token 3
-  @review_prompt_reserve_bytes 10_000
   @delta_stat_limit 2_000
   @mechanical_max_files 12
   @mechanical_max_changed_lines 600
@@ -91,7 +89,6 @@ defmodule SymphonyElixir.ReviewPacket do
       implementation: implementation_context(issue, pr, diff, risk, attestations, opts),
       budgets: %{
         packet_max_bytes: settings.packet_max_bytes,
-        context_budget_tokens: settings.context_budget_tokens,
         turn_budget: settings.turn_budget,
         tool_output_max_bytes: settings.tool_output_max_bytes,
         candidate_reduction_allowed: false
@@ -134,7 +131,7 @@ defmodule SymphonyElixir.ReviewPacket do
         Enum.uniq(links ++ [evidence_relative_path])
       end)
 
-    max_bytes = effective_max_bytes(settings)
+    max_bytes = settings.packet_max_bytes
     packet = packet |> compact_to(max_bytes) |> assign_packet_id()
     encoded = Jason.encode!(packet, pretty: true)
 
@@ -217,19 +214,6 @@ defmodule SymphonyElixir.ReviewPacket do
       checks when is_list(checks) and checks != [] -> checks
       _checks -> [%{"id" => "before_handoff", "status" => "passed"}]
     end
-  end
-
-  defp effective_max_bytes(settings) do
-    # Match ReviewGate's conservative three-byte/token whole-prompt ceiling and
-    # reserve deterministic space for the repository workflow plus guards.
-    min(
-      settings.packet_max_bytes,
-      max(
-        settings.context_budget_tokens * @context_bytes_per_token -
-          @review_prompt_reserve_bytes,
-        8_192
-      )
-    )
   end
 
   defp assign_packet_id(packet) do

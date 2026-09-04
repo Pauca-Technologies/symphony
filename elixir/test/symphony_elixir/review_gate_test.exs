@@ -81,6 +81,8 @@ defmodule SymphonyElixir.ReviewGateTest do
     prompt = "Review {{ issue.identifier }}\n" <> String.duplicate("workflow evidence ", 650)
 
     %{
+      # Kept to prove existing repository workflows remain compatible. Symphony
+      # no longer treats this legacy estimate as a prompt ceiling.
       config: %{"review" => %{"context_budget_tokens" => 12_000, "packet_max_bytes" => 48_000}},
       prompt: prompt,
       prompt_template: prompt
@@ -441,6 +443,22 @@ defmodule SymphonyElixir.ReviewGateTest do
     refute outcome.authoritative
   end
 
+  test "an impossible packet bound is a non-retryable review configuration failure", %{
+    workspace: workspace
+  } do
+    assert {:infrastructure_unavailable, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               review_packet_builder: fn _workspace, _issue, _pr, _reviewed_sha, _prior_outcome, _settings, _opts ->
+                 {:error, {:packet_bound_unachievable, 9_000, 8_192}}
+               end,
+               session_runner: fn _context -> flunk("reviewer must not run without a packet") end,
+               pr_runner: pr_runner()
+             )
+
+    assert outcome.failure_reason.class == :review_configuration
+    assert outcome.resume_condition =~ "reviewer workflow or packet bound"
+  end
+
   test "review reuses the exact pre-hook base decision instead of fetching again", %{
     workspace: workspace
   } do
@@ -537,7 +555,6 @@ defmodule SymphonyElixir.ReviewGateTest do
     workflow =
       review_workflow(%{
         "packet_max_bytes" => 12_000,
-        "context_budget_tokens" => 3_000,
         "turn_budget" => 99,
         "tool_output_max_bytes" => 2_000
       })
@@ -902,6 +919,31 @@ defmodule SymphonyElixir.ReviewGateTest do
       assert outcome.failure_reason.class == unquote(expected_class)
       refute outcome.authoritative
     end
+  end
+
+  test "a model context-window rejection is non-retryable review configuration", %{
+    workspace: workspace
+  } do
+    test_pid = self()
+
+    runner = fn _ctx ->
+      send(test_pid, :context_window_attempt)
+
+      {:error, {:turn_completed_abnormally, %{"turn" => %{"error" => %{"codexErrorInfo" => "contextWindowExceeded"}}}}}
+    end
+
+    assert {:infrastructure_unavailable, outcome} =
+             ReviewGate.run(workspace, issue(), nil, review_workflow(),
+               session_runner: runner,
+               pr_runner: pr_runner(),
+               comment_fn: fn _issue_id, _body -> :ok end
+             )
+
+    assert outcome.attempts == 1
+    assert outcome.failure_reason.class == :review_configuration
+    assert outcome.resume_condition =~ "reviewer workflow or packet bound"
+    assert_received :context_window_attempt
+    refute_received :context_window_attempt
   end
 
   test "does not repeat a full reviewer turn after a timeout", %{workspace: workspace} do
@@ -1313,31 +1355,36 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert message =~ "failure detail"
   end
 
-  test "oversized review workflow fails closed at the final context ceiling", %{
+  test "large review workflow is passed intact to the model instead of rejected by a token estimate", %{
     workspace: workspace
   } do
-    runner = fn _ctx -> flunk("review session must not start over the context ceiling") end
+    test_pid = self()
     huge_prompt = "Review {{ issue.identifier }}\n" <> String.duplicate("workflow evidence ", 20_000)
 
+    runner = fn ctx ->
+      send(test_pid, {:large_review_prompt, byte_size(ctx.prompt)})
+      write_verdict(ctx, %{"verdict" => "approve"})
+      {:ok, %{}}
+    end
+
     workflow = %{
+      # Older repositories may still carry this key. It is intentionally ignored.
       config: %{"review" => %{"context_budget_tokens" => 6_144}},
       prompt: huge_prompt,
       prompt_template: huge_prompt
     }
 
-    assert {:automation_inconclusive, outcome} =
+    assert {:approved, %{authoritative: true}} =
              ReviewGate.run(workspace, issue(), nil, workflow,
                session_runner: runner,
                pr_runner: pr_runner()
              )
 
-    assert {:review_prompt_unavailable, {:review_context_budget_exceeded, actual_bytes, max_bytes}} = outcome.failure_reason
-
-    assert actual_bytes > max_bytes
-    assert max_bytes == 6_144 * 3
+    assert_received {:large_review_prompt, prompt_bytes}
+    assert prompt_bytes > 6_144 * 3
   end
 
-  test "an incident-sized packet is rebuilt to the actual remaining prompt budget", %{
+  test "an incident-sized packet keeps the repository packet bound despite a large workflow", %{
     workspace: workspace
   } do
     test_pid = self()
@@ -1362,40 +1409,14 @@ defmodule SymphonyElixir.ReviewGateTest do
              )
 
     assert_received {:packet_max_bytes, 48_000}
-    assert_received {:packet_max_bytes, fitted_max_bytes}
-    assert fitted_max_bytes < 21_054
-    expected_packet_id = "packet-#{fitted_max_bytes}"
+    refute_received {:packet_max_bytes, _second_build}
+    expected_packet_id = "packet-21054"
     assert_received {:fitted_prompt, prompt_bytes, ^expected_packet_id, "head-7"}
-    assert prompt_bytes <= 36_000
+    assert prompt_bytes > 36_000
     assert outcome.packet_id == expected_packet_id
   end
 
-  test "a packet builder that ignores the tighter budget is refit only once", %{
-    workspace: workspace
-  } do
-    test_pid = self()
-
-    packet_builder = fn workspace, _issue, _pr, reviewed_sha, _prior_outcome, settings, _opts ->
-      send(test_pid, {:ignored_packet_max_bytes, settings.packet_max_bytes})
-      {:ok, synthetic_packet_result(workspace, reviewed_sha, 21_054)}
-    end
-
-    assert {:automation_inconclusive, outcome} =
-             ReviewGate.run(workspace, issue(), nil, budget_pressure_workflow(),
-               review_packet_builder: packet_builder,
-               session_runner: fn _ctx -> flunk("review session must not start over the context ceiling") end,
-               pr_runner: pr_runner()
-             )
-
-    assert {:review_prompt_unavailable, {:review_context_budget_exceeded, actual_bytes, 36_000}} = outcome.failure_reason
-    assert actual_bytes > 36_000
-    assert_received {:ignored_packet_max_bytes, 48_000}
-    assert_received {:ignored_packet_max_bytes, fitted_max_bytes}
-    assert fitted_max_bytes < 21_054
-    refute_received {:ignored_packet_max_bytes, _third_attempt}
-  end
-
-  test "the verdict retry guard can trigger one fresh packet refit", %{
+  test "the verdict retry guard reuses the bounded packet", %{
     workspace: workspace
   } do
     test_pid = self()
@@ -1427,16 +1448,14 @@ defmodule SymphonyElixir.ReviewGateTest do
              )
 
     assert_received {:retry_packet_max_bytes, 48_000}
-    assert_received {:retry_packet_max_bytes, first_fitted_max}
-    assert_received {:retry_packet_max_bytes, second_fitted_max}
-    assert second_fitted_max < first_fitted_max
+    refute_received {:retry_packet_max_bytes, _second_build}
     assert_received {:retry_prompt_bytes, 1, first_prompt_bytes}
     assert_received {:retry_prompt_bytes, 2, second_prompt_bytes}
-    assert first_prompt_bytes <= 36_000
-    assert second_prompt_bytes <= 36_000
+    assert first_prompt_bytes > 36_000
+    assert second_prompt_bytes > first_prompt_bytes
   end
 
-  test "minimum context budget admits a normal packet without truncating the candidate", %{
+  test "minimum packet bound admits a normal packet without truncating the candidate", %{
     workspace: workspace
   } do
     test_pid = self()
@@ -1447,7 +1466,7 @@ defmodule SymphonyElixir.ReviewGateTest do
       {:ok, %{}}
     end
 
-    workflow = review_workflow(%{"context_budget_tokens" => 6_144, "packet_max_bytes" => 8_192})
+    workflow = review_workflow(%{"packet_max_bytes" => 8_192})
 
     assert {:approved, _outcome} =
              ReviewGate.run(workspace, issue(), nil, workflow,
@@ -1456,7 +1475,7 @@ defmodule SymphonyElixir.ReviewGateTest do
              )
 
     assert_received {:minimum_context_prompt, prompt_bytes, packet}
-    assert prompt_bytes <= 6_144 * 3
+    assert prompt_bytes > 0
     assert packet.budgets.candidate_reduction_allowed == false
     assert packet.candidate.head_sha == "head-7"
     assert packet.diff.authoritative_full_diff.pull_request_command == "gh pr diff 7"

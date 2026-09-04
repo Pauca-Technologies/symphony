@@ -409,13 +409,15 @@ Notes:
   running issues absent from that snapshot.
 - Run failures are classified before they reach retry scheduling. Stable classes distinguish agent
   or protocol errors, timeout/stall, transient infrastructure, authentication/configuration,
-  provider rate limits, provider usage/quota limits, and handoff/reviewer/gate failures. The local
-  JSONL telemetry records the failure class and retry-policy action (`scheduled`, `suppressed`,
-  `parked`, or `probed`) rather than requiring operators to parse exception text. A retry blocked
+  deterministic review configuration, provider rate limits, provider usage/quota limits, and
+  handoff/reviewer/gate failures. The local JSONL telemetry records the failure class and
+  retry-policy action (`scheduled`, `suppressed`, `parked`, `probed`, or `blocked`) rather than
+  requiring operators to parse exception text. A retry blocked
   by an open circuit emits `suppressed` immediately before it enters the persistent parked queue.
-  When failures cross `agent.max_retries`, operational failures remain active at capped backoff;
-  only classified authentication/configuration failures are automatically moved to `Blocked` for
-  human action.
+  Deterministic review-configuration failures are moved to `Blocked` immediately instead of
+  retrying unchanged input. When other failures cross `agent.max_retries`, operational failures
+  remain active at capped backoff; only classified authentication/configuration failures are
+  automatically moved to `Blocked` for human action.
 - Agent-requested transitions to `Blocked` require a structured blocker kind and summary. The
   accepted kinds are missing required tool, authentication, permission, or product decision;
   Symphony, reviewer, handoff, CI, and other operational failures remain active for retry.
@@ -681,8 +683,9 @@ Notes:
   approval for the exact candidate SHA and a passing final hook. The approval identity is persisted
   with asynchronous gate state and revalidated after the hook passes. Request changes,
   inconclusive automation and review-budget exhaustion withhold the transition and preserve the
-  latest evidence for human resolution. Reviewer infrastructure and packet-generation failures
-  end the worker attempt and use orchestrator backoff without consuming remediation turns.
+  latest evidence for human resolution. Reviewer infrastructure failures end the worker attempt
+  and use orchestrator backoff without consuming remediation turns. A packet that cannot satisfy
+  its configured deterministic byte bound is a non-retryable review-configuration failure.
   The issue remains claimed in a distinct `handoff_pending_review` lifecycle while that reviewer
   runs, so the completed implementor is not mistaken for a stalled turn. Reviewer events emit a
   minimal, job-scoped heartbeat that refreshes worker activity without replacing implementor
@@ -716,7 +719,6 @@ Notes:
     verdict_path: .artifacts/symphony-review/verdict.json
     packet_path: .artifacts/symphony-review/packet.v1.json
     packet_max_bytes: 48000
-    context_budget_tokens: 12000
     turn_budget: 1
     turn_timeout_ms: 900000
     tool_output_max_bytes: 4000
@@ -726,11 +728,10 @@ Notes:
   ```
 
   Symphony clamps unsafe values and always enforces one Codex turn per fresh reviewer attempt.
-  It enforces the context budget over the final rendered workflow, guards, and packet using a
-  conservative three UTF-8 bytes per configured token. If composition exceeds that ceiling,
-  Symphony rebuilds the reproducible packet once to the exact remaining budget; a prompt that
-  still does not fit is explicitly inconclusive rather than truncated. Successful reviewer
-  dynamic-tool responses larger than
+  `packet_max_bytes` deterministically bounds the reproducible evidence packet, while the selected
+  Codex model enforces its actual context window over the complete rendered prompt. Symphony does
+  not guess token usage from UTF-8 byte length; legacy `context_budget_tokens` entries are ignored.
+  Successful reviewer dynamic-tool responses larger than
   `tool_output_max_bytes` are replaced in both response text fields with a bounded preview plus the
   original size and narrow-query/raw-artifact recovery instructions. Failure responses remain
   intact so diagnostics are never hidden.

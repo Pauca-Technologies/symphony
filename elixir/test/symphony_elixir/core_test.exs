@@ -892,6 +892,66 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.failure_counts, issue_id)
   end
 
+  test "a deterministic review configuration failure is blocked without retrying" do
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    previous_labels = Application.get_env(:symphony_elixir, :memory_tracker_available_labels)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    Application.put_env(:symphony_elixir, :memory_tracker_available_labels, :all)
+
+    issue_id = "issue-invalid-review-configuration"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ReviewConfigurationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+      restore_app_env(:memory_tracker_available_labels, previous_labels)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    issue = %Issue{id: issue_id, identifier: "MT-REVIEW-CONFIG", state: "In Progress", labels: []}
+
+    failure =
+      SymphonyElixir.AgentFailure.classify(
+        {:review_gate_infrastructure, "{:packet_bound_unachievable, 9000, 8192}"},
+        backend: "codex"
+      )
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      retry_attempt: 1,
+      run_failure: failure,
+      started_at: DateTime.utc_now()
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+
+    assert_receive {:memory_tracker_comment, ^issue_id, body}, 1_000
+    assert body =~ "automated review"
+    assert body =~ "packet_bound_unachievable"
+    assert_receive {:memory_tracker_add_label, ^issue_id, "needs-human-input"}, 1_000
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}, 1_000
+
+    state = :sys.get_state(pid)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute Map.has_key?(state.failure_counts, issue_id)
+  end
+
   test "an infrastructure failure stays active at capped backoff after retries are exhausted" do
     previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
     previous_labels = Application.get_env(:symphony_elixir, :memory_tracker_available_labels)

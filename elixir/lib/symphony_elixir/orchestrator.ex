@@ -2536,7 +2536,13 @@ defmodule SymphonyElixir.Orchestrator do
       "Retries exhausted for issue_id=#{issue_id} issue_identifier=#{identifier} after #{retries} retries (max_retries=#{max_retries}); marking Blocked with :retries_exhausted and releasing claim"
     )
 
-    spawn_retries_exhausted_block(giveup_issue(metadata, issue_id, identifier), retries, max_retries, metadata)
+    spawn_human_action_block(giveup_issue(metadata, issue_id, identifier), %{
+      reason: :retries_exhausted,
+      retries: retries,
+      max_retries: max_retries,
+      workspace: metadata[:workspace_path],
+      error: metadata[:error]
+    })
 
     state
     |> drop_retry_attempt(issue_id)
@@ -2545,15 +2551,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Mark a human-actionable failure Blocked off the GenServer loop. The Linear
   # writes are network I/O and best-effort, so they must not block dispatch.
-  defp spawn_retries_exhausted_block(%Issue{} = issue, retries, max_retries, metadata) do
-    context = %{
-      reason: :retries_exhausted,
-      retries: retries,
-      max_retries: max_retries,
-      workspace: metadata[:workspace_path],
-      error: metadata[:error]
-    }
-
+  defp spawn_human_action_block(%Issue{} = issue, context) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.mark_blocked_on_giveup(issue, context)
          end) do
@@ -5130,12 +5128,39 @@ defmodule SymphonyElixir.Orchestrator do
     open_quota_circuit_and_park(state, issue_id, next_attempt, metadata)
   end
 
+  defp handle_typed_run_failure(
+         state,
+         issue_id,
+         next_attempt,
+         %{failure: %AgentFailure{class: :review_configuration}} = metadata,
+         false
+       ) do
+    stop_for_review_configuration(state, issue_id, next_attempt, metadata)
+  end
+
   defp handle_typed_run_failure(state, issue_id, next_attempt, metadata, true) do
     handle_failed_quota_probe(state, issue_id, next_attempt, metadata)
   end
 
   defp handle_typed_run_failure(state, issue_id, next_attempt, metadata, false) do
     schedule_failure_retry(state, issue_id, next_attempt, metadata)
+  end
+
+  defp stop_for_review_configuration(%State{} = state, issue_id, attempt, metadata) do
+    identifier = metadata[:identifier] || issue_id
+
+    Logger.warning("Non-retryable review configuration failure for issue_id=#{issue_id} issue_identifier=#{identifier}; marking Blocked and releasing claim")
+
+    spawn_human_action_block(giveup_issue(metadata, issue_id, identifier), %{
+      reason: :review_configuration,
+      workspace: metadata[:workspace_path],
+      error: metadata[:error]
+    })
+
+    state
+    |> emit_retry_policy(issue_id, metadata, :blocked, attempt, nil)
+    |> drop_retry_attempt(issue_id)
+    |> release_issue_claim(issue_id)
   end
 
   defp open_quota_circuit_and_park(

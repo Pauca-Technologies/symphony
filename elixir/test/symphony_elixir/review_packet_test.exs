@@ -26,7 +26,7 @@ defmodule SymphonyElixir.ReviewPacketTest do
   end
 
   test "first review packet is exact, complete, persisted, and bounded", context do
-    settings = settings(%{"packet_max_bytes" => 24_000, "context_budget_tokens" => 6_000})
+    settings = settings(%{"packet_max_bytes" => 24_000})
     issue = issue("Small implementation summary")
 
     assert {:ok, result} =
@@ -250,7 +250,7 @@ defmodule SymphonyElixir.ReviewPacketTest do
 
   test "oversized issue prose compacts deterministically without reducing candidate access", context do
     huge = String.duplicate("accept every edge case and preserve tenant isolation ", 5_000)
-    settings = settings(%{"packet_max_bytes" => 8_192, "context_budget_tokens" => 2_048})
+    settings = settings(%{"packet_max_bytes" => 8_192})
     issue = issue(huge)
 
     assert {:ok, first} =
@@ -277,7 +277,7 @@ defmodule SymphonyElixir.ReviewPacketTest do
         comments_truncated: true
     }
 
-    settings = settings(%{"packet_max_bytes" => 8_192, "context_budget_tokens" => 2_048})
+    settings = settings(%{"packet_max_bytes" => 8_192})
 
     assert {:ok, result} =
              ReviewPacket.build(

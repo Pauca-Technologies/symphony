@@ -195,7 +195,6 @@ defmodule SymphonyElixir.RunManifest do
     |> Map.take([
       :max_iterations,
       :packet_max_bytes,
-      :context_budget_tokens,
       :turn_budget,
       :turn_timeout_ms,
       :tool_output_max_bytes,

@@ -28,6 +28,7 @@ defmodule SymphonyElixir.AgentFailure do
           | :authentication_configuration
           | :usage_quota_limit
           | :rate_limited
+          | :review_configuration
           | :handoff_reviewer_gate
 
   @type t :: %__MODULE__{
@@ -127,8 +128,8 @@ defmodule SymphonyElixir.AgentFailure do
       timeout_or_stall?(reason) ->
         failure(:response_timeout_or_stall, reason, backend)
 
-      deterministic_packet_bound_failure?(reason) ->
-        failure(:handoff_reviewer_gate, reason, backend)
+      deterministic_review_configuration_failure?(reason) ->
+        failure(:review_configuration, reason, backend)
 
       tagged?(reason, @auth_tags) ->
         failure(:authentication_configuration, reason, backend)
@@ -219,9 +220,12 @@ defmodule SymphonyElixir.AgentFailure do
     tagged?(reason, [:response_timeout, :turn_timeout, :prompt_timeout, :stall, :stalled])
   end
 
-  defp deterministic_packet_bound_failure?(reason) do
+  defp deterministic_review_configuration_failure?(reason) do
     contains_atom?(reason, :packet_bound_unachievable) or
-      contains_internal_marker?(reason, "packet_bound_unachievable")
+      contains_internal_marker?(reason, "packet_bound_unachievable") or
+      ((contains_atom?(reason, :review_gate_infrastructure) or
+          contains_atom?(reason, :review_session_failed)) and
+         contains_internal_marker?(reason, "contextWindowExceeded"))
   end
 
   defp contains_internal_marker?(value, marker) when is_binary(value),
