@@ -72,6 +72,7 @@ defmodule SymphonyElixir.Github.PrReviewSection do
           optional(:url) => String.t() | nil,
           optional(:repository) => String.t() | nil,
           optional(:is_draft) => boolean(),
+          optional(:state) => String.t() | nil,
           optional(:changed_files) => non_neg_integer() | nil
         }
   # (gh args, cwd) -> {output, exit_status}; mirrors Github.ReviewerRequest.
@@ -94,7 +95,7 @@ defmodule SymphonyElixir.Github.PrReviewSection do
     args =
       ["pr", "view"] ++
         explicit_pr_ref_args(opts) ++
-        ["--json", "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"]
+        ["--json", "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft,state"]
 
     case safe_run(runner, args, workspace) do
       {output, 0} -> parse_pr(output)
@@ -108,6 +109,9 @@ defmodule SymphonyElixir.Github.PrReviewSection do
           {:ok, pr()} | {:skip, :no_pr} | {:error, term()}
   def ensure_draft(_workspace, nil, _opts), do: {:skip, :no_pr}
 
+  def ensure_draft(_workspace, %{state: state} = pr, _opts) when state in ["CLOSED", "MERGED"],
+    do: {:error, {:pr_not_open, Map.take(pr, [:number, :state, :repository])}}
+
   def ensure_draft(_workspace, %{is_draft: true} = pr, _opts), do: {:ok, pr}
 
   def ensure_draft(workspace, %{number: number} = pr, opts)
@@ -118,6 +122,9 @@ defmodule SymphonyElixir.Github.PrReviewSection do
   @doc "Move an approved managed PR to ready-for-review and verify its exact head."
   @spec mark_ready(Path.t(), pr() | nil, keyword()) :: {:ok, pr()} | {:error, term()}
   def mark_ready(_workspace, nil, _opts), do: {:error, :no_pr}
+
+  def mark_ready(_workspace, %{state: state} = pr, _opts) when state in ["CLOSED", "MERGED"],
+    do: {:error, {:pr_not_open, Map.take(pr, [:number, :state, :repository])}}
 
   def mark_ready(_workspace, %{is_draft: false} = pr, _opts), do: {:ok, pr}
 
@@ -288,6 +295,7 @@ defmodule SymphonyElixir.Github.PrReviewSection do
            url: string_or_nil(Map.get(decoded, "url")),
            repository: repository_name(Map.get(decoded, "headRepository")),
            is_draft: Map.get(decoded, "isDraft") == true,
+           state: string_or_nil(Map.get(decoded, "state")),
            changed_files: integer_or_nil(Map.get(decoded, "changedFiles"))
          }}
 
@@ -335,8 +343,20 @@ defmodule SymphonyElixir.Github.PrReviewSection do
 
     case safe_run(runner, args, workspace) do
       {_output, 0} -> verify_draft_state(workspace, pr, draft?, opts)
-      {:error, reason} -> {:error, {:pr_draft_state_failed, reason}}
-      {output, code} -> {:error, {:pr_draft_state_failed, code, truncate(output)}}
+      {:error, reason} -> draft_failure(workspace, pr, opts, {:pr_draft_state_failed, reason})
+      {output, code} -> draft_failure(workspace, pr, opts, {:pr_draft_state_failed, code, truncate(output)})
+    end
+  end
+
+  defp draft_failure(workspace, pr, opts, reason) do
+    refresh_opts = opts |> Keyword.delete(:pr_url) |> Keyword.put(:pr_ref, Integer.to_string(pr.number))
+
+    case resolve_pr(workspace, refresh_opts) do
+      {:ok, %{state: state} = refreshed} when state in ["CLOSED", "MERGED"] ->
+        {:error, {:pr_not_open, Map.take(refreshed, [:number, :state, :repository])}}
+
+      _ ->
+        {:error, reason}
     end
   end
 
@@ -347,6 +367,9 @@ defmodule SymphonyElixir.Github.PrReviewSection do
       |> Keyword.put(:pr_ref, Integer.to_string(number))
 
     case resolve_pr(workspace, refresh_opts) do
+      {:ok, %{state: state} = refreshed} when state in ["CLOSED", "MERGED"] ->
+        {:error, {:pr_not_open, Map.take(refreshed, [:number, :state, :repository])}}
+
       {:ok, %{head_oid: ^expected_head, is_draft: ^draft?} = refreshed} ->
         {:ok, refreshed}
 

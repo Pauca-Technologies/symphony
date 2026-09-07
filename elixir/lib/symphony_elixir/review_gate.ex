@@ -82,6 +82,7 @@ defmodule SymphonyElixir.ReviewGate do
     Linear.Client,
     Linear.Issue,
     PromptBuilder,
+    ReviewCheckpoint,
     ReviewOutcome,
     ReviewPacket,
     ReviewTelemetry,
@@ -442,7 +443,7 @@ defmodule SymphonyElixir.ReviewGate do
         if review_context.iteration >= review_context.settings.max_iterations do
           conclude_exhausted_review(review_context)
         else
-          run_iteration(review_context, 1, nil)
+          run_or_resume_review(review_context)
         end
 
       {:error, reason} ->
@@ -454,6 +455,57 @@ defmodule SymphonyElixir.ReviewGate do
           context.opts
         )
     end
+  end
+
+  defp run_or_resume_review(context) do
+    case ReviewCheckpoint.identity(context) do
+      {:ok, identity} ->
+        resume_checkpoint_or_review(context, identity)
+
+      {:error, reason} ->
+        if Keyword.get(context.opts, :review_checkpoint), do: checkpoint_event(context, "invalidated", reason)
+        run_iteration(context, 1, nil)
+    end
+  end
+
+  defp resume_checkpoint_or_review(context, identity) do
+    context = Map.put(context, :checkpoint_identity, identity)
+    checkpoint = Keyword.get(context.opts, :review_checkpoint)
+
+    with {:ok, raw} <- ReviewCheckpoint.lookup(checkpoint, identity),
+         {:ok, verdict} <- decode_verdict(raw, context.reviewed_sha, context.packet_result.packet.packet_id, context.packet_result.packet.diff.mode, context.settings.scope_contract_required) do
+      checkpoint_event(context, "reused", nil)
+      conclude_published_verdict(verdict, context, 1, nil)
+    else
+      {:error, reason} ->
+        if checkpoint, do: checkpoint_event(context, "invalidated", reason)
+        run_iteration(context, 1, nil)
+    end
+  end
+
+  defp persist_review_checkpoint(%{verdict: :approve} = validated, %{checkpoint_identity: identity} = context) do
+    with {:ok, ^identity} <- ReviewCheckpoint.identity(context),
+         {:ok, verdict} <- validated |> Jason.encode!() |> Jason.decode(),
+         {:ok, checkpoint} <- ReviewCheckpoint.build(identity, verdict),
+         :ok <- Keyword.fetch!(context.opts, :review_checkpoint_writer).(checkpoint) do
+      checkpoint_event(context, "saved", nil)
+    else
+      error -> checkpoint_event(context, "save_failed", error)
+    end
+  end
+
+  defp persist_review_checkpoint(_verdict, _context), do: :ok
+
+  defp checkpoint_event(context, action, reason) do
+    Telemetry.emit(:review, %{
+      subtype: "review_delivery",
+      issue_id: context.issue.id,
+      issue_identifier: context.issue.identifier,
+      reviewed_sha: context.reviewed_sha,
+      packet_id: context.packet_result.packet.packet_id,
+      action: action,
+      reason: if(reason, do: inspect(reason), else: nil)
+    })
   end
 
   defp apply_packet_review_route(context, packet_result) do
@@ -710,6 +762,7 @@ defmodule SymphonyElixir.ReviewGate do
        ) do
     case File.rename(staged_verdict_path, verdict_path) do
       :ok ->
+        persist_review_checkpoint(verdict, review_context)
         conclude_published_verdict(verdict, review_context, attempt, telemetry_handle)
 
       {:error, reason} ->
@@ -1063,6 +1116,7 @@ defmodule SymphonyElixir.ReviewGate do
         "\n\n" <> TestWorkerBudget.prompt_section().content
 
     prompt = add_review_packet_contract(prompt, packet_result, settings)
+    prompt = prompt <> "\n\n" <> SymphonyElixir.BehavioralEvidence.review_guidance()
     prompt = add_review_runtime_stability_guard(prompt)
     prompt = add_review_tool_output_guard(prompt)
     prompt = add_verdict_reliability_guard(prompt, verdict_path)
@@ -1262,8 +1316,13 @@ defmodule SymphonyElixir.ReviewGate do
 
   defp read_verdict(verdict_path, expected_sha, expected_packet_id, review_mode, scope_contract_required?) do
     with {:ok, raw} <- File.read(verdict_path),
-         {:ok, decoded} <- Jason.decode(raw),
-         :ok <- reject_interim_verdict(decoded),
+         {:ok, decoded} <- Jason.decode(raw) do
+      decode_verdict(decoded, expected_sha, expected_packet_id, review_mode, scope_contract_required?)
+    end
+  end
+
+  defp decode_verdict(decoded, expected_sha, expected_packet_id, review_mode, scope_contract_required?) do
+    with :ok <- reject_interim_verdict(decoded),
          {:ok, verdict} <- normalize_verdict(decoded),
          :ok <-
            validate_verdict_candidate(
@@ -1870,7 +1929,7 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp review_failure_resume_condition(%AgentFailure{class: :review_configuration}) do
-    "Repair the repository's reviewer workflow or packet bound, then start a fresh orchestration run and re-attempt review for the candidate SHA."
+    "Repair the reported reviewer workflow, packet bound, or Linear follow-up prerequisite (source issue, team, or Backlog state), then resume the issue. Valid delivery checkpoints can reuse the completed assessment."
   end
 
   defp review_failure_resume_condition(_failure) do

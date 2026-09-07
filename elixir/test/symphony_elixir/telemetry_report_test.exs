@@ -3,6 +3,28 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
 
   alias SymphonyElixir.Telemetry.Report
 
+  test "delivery reports keep worker exits separate and show review denominators" do
+    review = %{"event" => "review", "subtype" => "review", "issue_id" => "issue", "reviewed_sha" => "head", "packet_id" => "p", "config_digest" => "policy"}
+
+    events = [
+      %{"event" => "run_start"},
+      %{"event" => "run_end", "outcome" => "error"},
+      Map.merge(review, %{"outcome" => "request_changes", "ts" => "2026-09-01T01:00:00Z"}),
+      Map.merge(review, %{"outcome" => "approved", "ts" => "2026-09-01T02:00:00Z"}),
+      %{"event" => "review", "subtype" => "review_delivery", "action" => "reused"},
+      %{"event" => "wait", "action" => "irrelevant_ref_change"}
+    ]
+
+    report = Report.build(events)
+    assert report.fleet.completion_rate == 1.0
+    assert report.delivery.fleet.worker_runs_completed_normally == 0
+    assert report.delivery.fleet.accepted_handoffs == 0
+    assert report.delivery.fleet.tokens_per_accepted_handoff == nil
+    assert report.delivery.first_substantive_review == %{candidates: 1, accepted: 0, acceptance_rate: 0.0, repeated_candidates: 1}
+    assert report.delivery.review_delivery == %{"reused" => 1}
+    assert report.delivery.irrelevant_ref_changes == 1
+  end
+
   test "aggregates provenance-aware prompt section reuse and suppression" do
     events = [
       %{

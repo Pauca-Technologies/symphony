@@ -35,7 +35,7 @@ defmodule SymphonyElixir.ReviewTelemetryTest do
 
   test "attributes tokens, duration, model, reasoning, and findings to parent and lens threads" do
     issue = %Issue{id: "issue-1", identifier: "UDPE-7158"}
-    packet = %{packet_id: "review-packet-v1-abc", candidate: %{head_sha: "head-1"}}
+    packet = %{packet_id: "review-packet-v1-abc", candidate: %{head_sha: "head-1", repository: %{project: "org/repo"}}}
     test_pid = self()
 
     {handle, callback} =
@@ -47,6 +47,8 @@ defmodule SymphonyElixir.ReviewTelemetryTest do
       model: "gpt-review",
       reasoning_effort: "high"
     })
+
+    assert SymphonyElixir.ReviewTelemetry.finish(nil, :approved) == :ok
 
     # Real app-server notification shape: cumulative usage lives below
     # payload.params.tokenUsage.total, not in top-level message metadata.
@@ -129,6 +131,7 @@ defmodule SymphonyElixir.ReviewTelemetryTest do
     assert parent.model == "gpt-review"
     assert parent.reasoning_effort == "high"
     assert parent.reviewed_sha == "head-1"
+    assert parent.repository == "org/repo"
 
     {lens_measurements, lens} = Map.fetch!(events, "lens")
 

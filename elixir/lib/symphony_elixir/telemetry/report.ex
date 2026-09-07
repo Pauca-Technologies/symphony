@@ -8,6 +8,8 @@ defmodule SymphonyElixir.Telemetry.Report do
   snapshots from inflating fleet, issue, or delegation totals.
   """
 
+  alias SymphonyElixir.Telemetry.Evaluation
+
   @token_keys ~w(input_tokens cached_input_tokens output_tokens reasoning_tokens total_tokens)a
   @zero_tokens Map.new(@token_keys, &{&1, 0})
 
@@ -111,7 +113,9 @@ defmodule SymphonyElixir.Telemetry.Report do
       }
     }
 
-    Map.merge(summary, legacy_aliases(summary))
+    summary
+    |> Map.merge(legacy_aliases(summary))
+    |> Map.put(:delivery, Evaluation.delivery_metrics(events, summary))
   end
 
   @doc "Greatest cumulative counters observed for every actual thread."

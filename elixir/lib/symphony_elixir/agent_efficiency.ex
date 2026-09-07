@@ -30,6 +30,9 @@ defmodule SymphonyElixir.AgentEfficiency do
 
   @type decision :: %{
           mode: String.t(),
+          hygiene_only: boolean(),
+          classification_source: String.t(),
+          fallback_reason: String.t() | nil,
           task_type: String.t(),
           confidence: float(),
           classification: classification(),
@@ -56,9 +59,13 @@ defmodule SymphonyElixir.AgentEfficiency do
         budget_profile(issue, classification, settings)
 
       budget = Map.fetch!(settings.profiles, budget_profile)
+      mode = effective_mode(settings, issue)
 
       decision = %{
-        mode: settings.mode,
+        mode: mode,
+        hygiene_only: settings.hygiene_only,
+        classification_source: if(is_map(route[:classification]), do: "classifier", else: "metadata_fallback"),
+        fallback_reason: fallback_reason(route, classification, selection_reason),
         task_type: classification.task_type,
         confidence: classification.confidence,
         classification: classification,
@@ -71,8 +78,8 @@ defmodule SymphonyElixir.AgentEfficiency do
         override: override,
         capsule_max_bytes: settings.capsule_max_bytes,
         extreme_multiplier: settings.extreme_multiplier,
-        enforced_actions: settings.enforced_actions,
-        enforced: settings.mode == "enforce"
+        enforced_actions: if(pilot_selected?(settings, issue), do: settings.enforced_actions, else: []),
+        enforced: mode == "enforce"
       }
 
       emit_decision(issue, route, decision)
@@ -82,6 +89,8 @@ defmodule SymphonyElixir.AgentEfficiency do
 
   @doc "Apply an enforced efficiency decision to safe reviewer settings."
   @spec review_settings(map(), decision() | nil) :: map()
+  def review_settings(settings, %{hygiene_only: true}), do: settings
+
   def review_settings(
         settings,
         %{enforced: true, budget: budget, task_type: task_type, budget_profile: budget_profile}
@@ -112,6 +121,8 @@ defmodule SymphonyElixir.AgentEfficiency do
 
   @doc "Refine reviewer-only routing from an exact candidate diff without changing the run budget."
   @spec refine_review_decision(decision() | nil, map() | nil) :: decision() | nil
+  def refine_review_decision(%{hygiene_only: true} = decision, _candidate), do: decision
+
   def refine_review_decision(
         %{
           enforced: true,
@@ -150,6 +161,8 @@ defmodule SymphonyElixir.AgentEfficiency do
 
   @doc "Requested lens names for the decision; packet construction adds mandatory risk lenses."
   @spec review_lenses(decision() | nil) :: [String.t()] | nil
+  def review_lenses(%{hygiene_only: true}), do: nil
+
   def review_lenses(%{enforced: true, budget: budget} = decision) do
     selected = Enum.take(budget.review_lenses, budget.reviewer_lenses)
 
@@ -193,6 +206,26 @@ defmodule SymphonyElixir.AgentEfficiency do
       reasons: ["deterministic metadata fallback; classifier result unavailable"],
       inputs: classifier_inputs(issue)
     }
+  end
+
+  defp pilot_selected?(%{enforce_labels: []}, _issue), do: true
+  defp pilot_selected?(%{enforce_labels: labels}, issue), do: Enum.any?(labels, &(&1 in List.wrap(issue.labels)))
+
+  defp effective_mode(%{mode: "enforce", enforce_labels: [_ | _] = labels}, issue) do
+    if Enum.any?(labels, &(&1 in List.wrap(issue.labels))), do: "enforce", else: "shadow"
+  end
+
+  defp effective_mode(settings, _issue), do: settings.mode
+
+  defp fallback_reason(_route, _classification, selection_reason) when selection_reason != "classifier_quality_fallback", do: nil
+
+  defp fallback_reason(route, classification, _selection_reason) do
+    cond do
+      not is_map(route[:classification]) -> "classifier_unavailable"
+      classification.confidence < 0.55 -> "low_confidence"
+      classification.task_type in @high_risk_types -> "high_risk_task"
+      true -> "high_risk_or_ambiguity"
+    end
   end
 
   defp budget_profile(%Issue{labels: labels}, classification, settings) do
@@ -243,6 +276,9 @@ defmodule SymphonyElixir.AgentEfficiency do
       reasoning_effort: route.overrides[:reasoning_effort],
       classifier_inputs: decision.classification.inputs,
       classifier_result: Map.drop(decision.classification, [:inputs]),
+      classification_source: decision.classification_source,
+      fallback_reason: decision.fallback_reason,
+      hygiene_only: decision.hygiene_only,
       classifier_confidence: decision.confidence,
       task_type: decision.task_type,
       budget_profile: decision.budget_profile,

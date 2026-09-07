@@ -177,6 +177,8 @@ defmodule SymphonyElixir.RunManifest do
     %{
       profile: efficiency.budget_profile,
       mode: efficiency.mode,
+      hygiene_only: Map.get(efficiency, :hygiene_only, false),
+      enforced_actions: Map.get(efficiency, :enforced_actions, []),
       selection_reason: efficiency.selection_reason,
       allow_overage: efficiency.budget.allow_overage,
       thresholds: Map.drop(efficiency.budget, [:reviewer_model, :reviewer_reasoning_effort])

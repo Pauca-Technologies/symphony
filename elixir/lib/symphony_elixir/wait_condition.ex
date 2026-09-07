@@ -12,7 +12,7 @@ defmodule SymphonyElixir.WaitCondition do
   @github_status_url "https://www.githubstatus.com/api/v2/summary.json"
   @command_timeout_ms 30_000
   @max_command_output_bytes 2_000_000
-  @condition_types ~w(github_actions_recovered github_pr_checks_changed github_pr_check_changed github_pr_gate_settled git_ref_changed linear_issue_changed)
+  @condition_types ~w(github_actions_recovered github_pr_checks_changed github_pr_check_changed github_pr_gate_settled github_pr_state_changed git_ref_changed linear_issue_changed)
 
   @type request :: %{
           condition: map(),
@@ -110,11 +110,22 @@ defmodule SymphonyElixir.WaitCondition do
 
     with {:ok, output, 0} <- run_command(condition, command),
          [sha | _] <- String.split(String.trim(output), ~r/\s+/, trim: true) do
-      {:ok, %{"sha" => sha}}
+      git_ref_observation(condition, sha)
     else
       {:ok, output, status} -> {:error, {:git_ls_remote_failed, status, String.trim(output)}}
       [] -> {:error, {:git_ref_not_found, condition["ref"]}}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def observe(%{condition: %{"type" => "github_pr_state_changed"} = condition}) do
+    repo_arg = if condition["repository"], do: " --repo " <> shell_escape(condition["repository"]), else: ""
+
+    with {:ok, output, 0} <- run_command(condition, "gh pr view #{condition["pr_number"]} --json state" <> repo_arg),
+         {:ok, %{"state" => state}} when state in ["OPEN", "CLOSED", "MERGED"] <- Jason.decode(output) do
+      {:ok, %{"state" => state}}
+    else
+      _ -> {:error, :pr_state_unavailable}
     end
   end
 
@@ -206,6 +217,12 @@ defmodule SymphonyElixir.WaitCondition do
     end
   end
 
+  def changed?(%{condition: %{"type" => "git_ref_changed", "paths" => [_ | _]}, baseline: baseline}, observation) do
+    is_map(baseline) and is_binary(baseline["paths_fingerprint"]) and
+      is_binary(observation["paths_fingerprint"]) and
+      baseline["paths_fingerprint"] != observation["paths_fingerprint"]
+  end
+
   def changed?(request, observation) when is_map(request) and is_map(observation) do
     baseline = Map.get(request, :baseline) || get_in(request, [:condition, "observed"])
     canonical(observation) != canonical(baseline)
@@ -268,6 +285,7 @@ defmodule SymphonyElixir.WaitCondition do
 
   defp do_normalize_condition("git_ref_changed", condition, context) do
     with {:ok, ref} <- non_blank(value(condition, "ref"), :missing_ref),
+         {:ok, paths} <- normalize_paths(value(condition, "paths")),
          {:ok, workspace} <- context_path(context, :workspace) do
       repository_scope =
         blank_to_nil(value(condition, "repository")) || context[:repository_scope] || workspace
@@ -278,7 +296,8 @@ defmodule SymphonyElixir.WaitCondition do
          "ref" => ref,
          "repository_scope" => repository_scope,
          "workspace" => workspace,
-         "worker_host" => context[:worker_host]
+         "worker_host" => context[:worker_host],
+         "paths" => paths
        }}
     end
   end
@@ -327,6 +346,13 @@ defmodule SymphonyElixir.WaitCondition do
     do_normalize_condition("github_pr_checks_changed", condition, context)
     |> case do
       {:ok, normalized} -> {:ok, Map.put(normalized, "type", "github_pr_gate_settled")}
+      error -> error
+    end
+  end
+
+  defp do_normalize_condition("github_pr_state_changed", condition, context) do
+    case do_normalize_condition("github_pr_checks_changed", condition, context) do
+      {:ok, normalized} -> {:ok, Map.put(normalized, "type", "github_pr_state_changed")}
       error -> error
     end
   end
@@ -472,6 +498,45 @@ defmodule SymphonyElixir.WaitCondition do
     end
   end
 
+  defp git_ref_observation(%{"paths" => [_ | _] = paths} = condition, sha) do
+    if Regex.match?(~r/\A[0-9a-f]{40,64}\z/, sha) do
+      target = shell_escape(sha)
+      # Fetch objects only: never move the worker's branch, index or worktree,
+      # and avoid the shared FETCH_HEAD used by concurrent issue worktrees.
+      command = "git cat-file -e #{target}^{commit} 2>/dev/null || git fetch --quiet --no-tags --no-write-fetch-head origin #{target}"
+      tree_command = "git -c core.quotePath=true --literal-pathspecs ls-tree #{target} -- " <> Enum.map_join(paths, " ", &shell_escape/1)
+
+      with {:ok, _, 0} <- run_command(condition, command),
+           {:ok, tree, 0} <- run_command(condition, tree_command) do
+        {:ok, %{"sha" => sha, "paths_fingerprint" => digest(tree)}}
+      else
+        _ -> {:error, :git_paths_observation_unavailable}
+      end
+    else
+      {:error, :invalid_git_ref_sha}
+    end
+  end
+
+  defp git_ref_observation(_condition, sha), do: {:ok, %{"sha" => sha}}
+
+  defp normalize_paths(nil), do: {:ok, []}
+
+  defp normalize_paths(paths) when is_list(paths) and length(paths) in 1..32 do
+    if Enum.all?(paths, &valid_relative_path?/1),
+      do: {:ok, paths |> Enum.uniq() |> Enum.sort()},
+      else: {:error, :invalid_git_wait_paths}
+  end
+
+  defp normalize_paths(_paths), do: {:error, :invalid_git_wait_paths}
+
+  defp valid_relative_path?(path) when is_binary(path) and byte_size(path) in 1..320 do
+    not String.starts_with?(path, ["/", ":", "-"]) and
+      not Regex.match?(~r/[\x00-\x1f\x7f\\]/, path) and
+      Enum.all?(String.split(path, "/"), &(&1 not in ["", ".", ".."]))
+  end
+
+  defp valid_relative_path?(_path), do: false
+
   defp collect_port(port, deadline, output) when byte_size(output) <= @max_command_output_bytes do
     remaining = max(0, deadline - System.monotonic_time(:millisecond))
 
@@ -543,6 +608,7 @@ defmodule SymphonyElixir.WaitCondition do
   defp key_atom("repository"), do: :repository
   defp key_atom("pr_number"), do: :pr_number
   defp key_atom("ref"), do: :ref
+  defp key_atom("paths"), do: :paths
   defp key_atom("issue_id"), do: :issue_id
   defp key_atom("check_name"), do: :check_name
   defp key_atom("observed"), do: :observed

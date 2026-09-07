@@ -2036,6 +2036,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                "task.activity",
                "repository.workflow",
                "symphony.test_worker_budget",
+               "symphony.behavioral_evidence",
                "symphony.handoff_constraints",
                "continuation.status_resume_packet"
              ]
@@ -3329,6 +3330,129 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "asynchronous handoff gate recovery" do
+    test "delivery retry restores approval across worker processes without new model sessions" do
+      root = Path.join(System.tmp_dir!(), "review-delivery-#{System.unique_integer([:positive])}")
+      workspace = Path.join(root, "UDPE-DELIVERY")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)
+      System.cmd("git", ["init", "--quiet"], cd: workspace)
+      File.write!(Path.join(workspace, "README.md"), "Reviewed candidate")
+      System.cmd("git", ["add", "."], cd: workspace)
+      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "candidate"], cd: workspace)
+      File.write!(Path.join(workspace, ".git/info/exclude"), ".artifacts/\n")
+      {head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+      sha = String.trim(head)
+      issue = %Issue{id: "delivery-issue", identifier: "UDPE-DELIVERY", title: "Deliver reviewed work", state: "In Progress", labels: []}
+      query = "mutation Move { issueUpdate(id: \"delivery-issue\", input: {stateId: \"review\"}) { success } }"
+      assert :ok = Workspace.persist_handoff_gate_state(workspace, %{"phase" => "reviewing", "query" => query, "variables" => %{}, "targetState" => "In Review"})
+      {:ok, ready_attempts} = Agent.start_link(fn -> 0 end)
+      {:ok, delivery_state} = Agent.start_link(fn -> %{draft: true, mutation_attempts: 0} end)
+      test_pid = self()
+      Application.put_env(:symphony_elixir, :turn_count_recipient_for_test, self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :turn_count_recipient_for_test)
+        if Process.alive?(ready_attempts), do: Agent.stop(ready_attempts)
+        if Process.alive?(delivery_state), do: Agent.stop(delivery_state)
+        File.rm_rf(root)
+      end)
+
+      connection = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+
+      pr_runner = fn
+        ["pr", "view" | _], _ ->
+          {Jason.encode!(%{
+             "id" => "PR_1",
+             "number" => 1,
+             "state" => "OPEN",
+             "isDraft" => Agent.get(delivery_state, & &1.draft),
+             "body" => "Scope",
+             "headRefOid" => sha,
+             "baseRefOid" => sha,
+             "headRepository" => %{"nameWithOwner" => "org/repo"}
+           }), 0}
+
+        ["api", "graphql" | _], _ ->
+          {Jason.encode!(%{
+             "data" => %{
+               "node" => %{
+                 "state" => "OPEN",
+                 "headRefOid" => sha,
+                 "baseRefOid" => sha,
+                 "body" => "Scope",
+                 "reviewDecision" => nil,
+                 "comments" => connection,
+                 "reviews" => connection,
+                 "reviewThreads" => connection
+               }
+             }
+           }), 0}
+
+        ["pr", "ready", "1", "--undo"], _ ->
+          Agent.update(delivery_state, &%{&1 | draft: true})
+          {"", 0}
+
+        ["pr", "ready", "1"], _ ->
+          result =
+            Agent.get_and_update(ready_attempts, fn count ->
+              result = if count == 0, do: {"temporary network failure", 1}, else: {"", 0}
+              {result, count + 1}
+            end)
+
+          if elem(result, 1) == 0, do: Agent.update(delivery_state, &%{&1 | draft: false})
+          result
+      end
+
+      reviewer = fn ctx ->
+        send(test_pid, :delivery_reviewer_started)
+
+        File.write!(
+          ctx.verdict_path,
+          Jason.encode!(%{
+            "verdict" => "approve",
+            "summary" => "Verified",
+            "comments" => [],
+            "packet_id" => ctx.packet.packet_id,
+            "reviewed_sha" => sha,
+            "inspected" => ["authoritative full diff"],
+            "attestations" => %{"reused" => [], "rerun" => []},
+            "full_diff_inspected" => true
+          })
+        )
+
+        {:ok, %{}}
+      end
+
+      opts = [
+        agent_backend: {TurnCountingBackend, %{}},
+        issue_context_file: Workspace.issue_context_path(workspace),
+        issue_state_fetcher: fn _ -> {:ok, [issue]} end,
+        per_repo_review_workflow: %{config: %{"review" => %{"draft_pr_lifecycle" => true, "pr_section_enabled" => false}}, prompt_template: "Review {{ issue.identifier }}"},
+        review_opts: [pr_runner: pr_runner, session_runner: reviewer, comment_fn: fn _, _ -> :ok end],
+        handoff_gate_starter: fn _, _, _, _, _ -> :ok end,
+        linear_client: fn ^query, %{}, [] ->
+          attempt = Agent.get_and_update(delivery_state, fn state -> {state.mutation_attempts, %{state | mutation_attempts: state.mutation_attempts + 1}} end)
+          if attempt > 0, do: send(test_pid, :delivery_applied)
+          {:ok, %{"data" => %{"issueUpdate" => %{"success" => attempt > 0}}}}
+        end,
+        max_turns: 1
+      ]
+
+      first = Task.async(fn -> AgentRunner.run_codex_turns_for_test(workspace, issue, nil, opts, nil) end) |> Task.await(15_000)
+      assert {:error, {:review_gate_infrastructure, _}} = first
+      assert_received :delivery_reviewer_started
+      assert {:ok, %{"phase" => "reviewing", "reviewCheckpoint" => %{"verdict" => %{"verdict" => "approve"}}}} = Workspace.load_handoff_gate_state(workspace)
+      assert {:error, {:handoff_gate_infrastructure, _}} = Task.async(fn -> AgentRunner.run_codex_turns_for_test(workspace, issue, nil, opts, nil) end) |> Task.await(15_000)
+      assert {:ok, %{"phase" => "reviewing", "reviewCheckpoint" => %{}}} = Workspace.load_handoff_gate_state(workspace)
+      refute_received :delivery_applied
+      refute_received :delivery_reviewer_started
+      assert :ok = Task.async(fn -> AgentRunner.run_codex_turns_for_test(workspace, issue, nil, opts, nil) end) |> Task.await(15_000)
+      assert_received :delivery_applied
+      refute_received :delivery_reviewer_started
+      refute_received :turn_ran
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+    end
+
     test "retains a blocked recovered-start gate breakdown without claiming exact-head evidence" do
       workspace_root =
         Path.join(System.tmp_dir!(), "symphony-gate-start-blocked-#{System.unique_integer([:positive])}")

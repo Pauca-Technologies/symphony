@@ -118,7 +118,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   }
   @wait_for_description """
-  Park this issue without consuming an agent slot while an external GitHub, git, or current-ticket Linear condition is unchanged. A Linear wait may watch only the current issue's comments/state; use Linear dependency relations for real cross-issue prerequisites, and never park on a tracking follow-up. Never use this for local CPU or memory pressure, other validations, local process or port contention, elapsed-time backoffs, a clock, or a Symphony-owned handoff gate; Symphony persists and polls accepted handoff jobs itself. After a successful call, end the turn; Symphony persists the workspace and resumes exactly once when the external condition changes or a human resumes it.
+  Park this issue without consuming an agent slot while an external GitHub, git, or current-ticket Linear condition is unchanged. For a git prerequisite affecting known files, supply literal repository-relative paths (including relevant configuration paths) so unrelated base commits do not wake the agent. A Linear wait may watch only the current issue's comments/state; use Linear dependency relations for real cross-issue prerequisites, and never park on a tracking follow-up. Never use this for local CPU or memory pressure, other validations, local process or port contention, elapsed-time backoffs, a clock, or a Symphony-owned handoff gate; Symphony persists and polls accepted handoff jobs itself. After a successful call, end the turn; Symphony persists the workspace and resumes exactly once when the external condition changes or a human resumes it.
   """
   @wait_for_input_schema %{
     "type" => "object",
@@ -140,6 +140,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
               "github_pr_checks_changed",
               "github_pr_check_changed",
               "github_pr_gate_settled",
+              "github_pr_state_changed",
               "git_ref_changed",
               "linear_issue_changed"
             ]
@@ -149,6 +150,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           "pr_number" => %{"type" => ["integer", "null"], "minimum" => 1},
           "check_name" => %{"type" => ["string", "null"], "minLength" => 1},
           "ref" => %{"type" => ["string", "null"]},
+          "paths" => %{
+            "type" => ["array", "null"],
+            "minItems" => 1,
+            "maxItems" => 32,
+            "items" => %{"type" => "string", "minLength" => 1, "maxLength" => 320},
+            "description" => "Optional literal relative files or directories for git_ref_changed; wakes only when their remote tree entries change. No globs or traversal."
+          },
           "issue_id" => %{
             "type" => ["string", "null"],
             "description" => "Optional current issue id; cross-issue Linear waits are rejected."

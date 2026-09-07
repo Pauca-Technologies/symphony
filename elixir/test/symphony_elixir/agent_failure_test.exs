@@ -3,6 +3,15 @@ defmodule SymphonyElixir.AgentFailureTest do
 
   alias SymphonyElixir.AgentFailure
 
+  test "closed PR classification requires structured evidence, not prose" do
+    reason = {:managed_pr_draft_failed, {:pr_not_open, %{number: 7, state: "CLOSED", repository: "org/repo"}}}
+    assert %AgentFailure{class: :pull_request_state} = failure = AgentFailure.classify(reason)
+    assert {:ok, %{number: 7, state: "CLOSED"}} = AgentFailure.pull_request_state(failure)
+    assert :error = AgentFailure.pull_request_state("PR is CLOSED")
+    assert :error = AgentFailure.pull_request_state({:pr_not_open, %{number: -1, state: "CLOSED"}})
+    assert :error = AgentFailure.pull_request_state({:pr_not_open, %{number: 7, state: "OPEN"}})
+  end
+
   test "trusts only the exact Codex usage-limit code and extracts an ISO reset" do
     reset_at = DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.truncate(:second)
 

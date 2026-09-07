@@ -20,6 +20,7 @@ defmodule SymphonyElixir.ReviewTelemetry do
 
     Process.put(key(handle), %{
       issue: issue,
+      repository: Telemetry.current_context()[:repository] || get_in(packet, [:candidate, :repository, :project]),
       packet_id: packet.packet_id,
       packet_bytes: packet |> Jason.encode!() |> byte_size(),
       requested_lenses: get_in(packet, [:requested_lenses]) || [],
@@ -50,8 +51,11 @@ defmodule SymphonyElixir.ReviewTelemetry do
   end
 
   @doc "Emit one attributed telemetry event per observed review/lens thread."
-  @spec finish(handle(), atom(), map() | nil) :: :ok
-  def finish(handle, outcome, verdict \\ nil) when is_reference(handle) and is_atom(outcome) do
+  @spec finish(handle() | nil, atom(), map() | nil) :: :ok
+  def finish(handle, outcome, verdict \\ nil)
+  def finish(nil, _outcome, _verdict), do: :ok
+
+  def finish(handle, outcome, verdict) when is_reference(handle) and is_atom(outcome) do
     state = Process.delete(key(handle))
 
     if is_map(state) do
@@ -132,6 +136,7 @@ defmodule SymphonyElixir.ReviewTelemetry do
       subtype: "review_thread",
       issue_id: state.issue.id,
       issue_identifier: state.issue.identifier,
+      repository: state.repository,
       packet_id: state.packet_id,
       reviewed_sha: state.reviewed_sha,
       thread_id: thread_id,

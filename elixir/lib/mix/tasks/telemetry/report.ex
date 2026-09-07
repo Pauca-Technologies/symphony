@@ -45,6 +45,11 @@ defmodule Mix.Tasks.Telemetry.Report do
         "(worker-run completion #{format_rate(fleet.completion_rate)})"
     )
 
+    delivery = summary.delivery.fleet
+    Mix.shell().info("Worker exits: #{delivery.worker_runs_completed_normally} normal; #{fleet.outcomes["error"] || 0} errors")
+    Mix.shell().info("Accepted exact-head handoffs: #{delivery.accepted_handoffs}; downstream outcome unknown: #{delivery.post_handoff.unknown}")
+    Mix.shell().info("Tokens per accepted handoff: #{format_number(delivery.tokens_per_accepted_handoff)}")
+
     Mix.shell().info("Time p50/p90: #{format_duration(fleet.duration_ms_p50)} / #{format_duration(fleet.duration_ms_p90)}")
     Mix.shell().info("Tokens: #{fleet.tokens.total_tokens} total; p50/p90 per thread #{format_number(fleet.tokens_p50)} / #{format_number(fleet.tokens_p90)}")
     Mix.shell().info("  input=#{fleet.tokens.input_tokens} cached_input=#{fleet.tokens.cached_input_tokens} output=#{fleet.tokens.output_tokens} reasoning=#{fleet.tokens.reasoning_tokens}")

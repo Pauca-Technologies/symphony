@@ -11,7 +11,7 @@ defmodule SymphonyElixir.WaitWatcher do
   require Logger
 
   alias SymphonyElixir.Linear.Issue
-  alias SymphonyElixir.{WaitCondition, WaitStore}
+  alias SymphonyElixir.{Telemetry, WaitCondition, WaitStore}
 
   @ready_notify_interval_ms 1_000
   @active_github_checks_max_poll_ms 60_000
@@ -302,6 +302,7 @@ defmodule SymphonyElixir.WaitWatcher do
   end
 
   defp backoff_entry(entry, observation, error) do
+    record_irrelevant_ref_change(entry, observation, error)
     attempt = entry.probe_attempt + 1
 
     exponential_delay_ms =
@@ -315,9 +316,28 @@ defmodule SymphonyElixir.WaitWatcher do
     entry
     |> Map.put(:probe_attempt, attempt)
     |> Map.put(:next_probe_at, DateTime.add(DateTime.utc_now(), delay_ms, :millisecond))
-    |> Map.put(:last_observation, observation || entry.last_observation)
+    |> Map.put(:last_observation, observation || Map.get(entry, :last_observation))
     |> Map.put(:last_error, error)
   end
+
+  defp record_irrelevant_ref_change(entry, %{"sha" => sha} = observation, nil) do
+    previous = Map.get(entry, :last_observation) || Map.get(entry.request, :baseline) || %{}
+    condition = entry.request.condition
+
+    if condition["type"] == "git_ref_changed" and condition["paths"] not in [nil, []] and
+         is_binary(sha) and previous["sha"] != sha and not WaitCondition.changed?(entry.request, observation) do
+      Telemetry.emit(:wait, %{
+        issue_id: entry.issue_id,
+        issue_identifier: entry.identifier,
+        action: "irrelevant_ref_change",
+        condition_key: entry.request.condition_key,
+        watched_paths: length(condition["paths"]),
+        model_wake: false
+      })
+    end
+  end
+
+  defp record_irrelevant_ref_change(_entry, _observation, _error), do: :ok
 
   defp wait_poll_delay_ms(condition, observation, nil, exponential_delay_ms) do
     if active_github_checks?(condition, observation) do

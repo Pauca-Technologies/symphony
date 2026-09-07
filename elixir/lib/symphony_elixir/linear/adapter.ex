@@ -246,26 +246,30 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp follow_up_context(issue_id) do
     with {:ok, response} <- client_module().graphql(@follow_up_context_query, %{issueId: issue_id}),
-         %{"id" => source_id, "team" => %{"id" => team_id}} = issue <-
-           get_in(response, ["data", "issue"]),
-         project_id when is_binary(project_id) <- get_in(issue, ["project", "id"]),
-         state_id when is_binary(state_id) <-
-           get_in(issue, ["team", "states", "nodes", Access.at(0), "id"]) do
+         {:ok, issue} <- follow_up_source(get_in(response, ["data", "issue"])),
+         {:ok, team_id} <- follow_up_required_id(get_in(issue, ["team", "id"]), :team_missing),
+         {:ok, state_id} <-
+           follow_up_required_id(
+             get_in(issue, ["team", "states", "nodes", Access.at(0), "id"]),
+             :backlog_state_missing
+           ) do
       {:ok,
        %{
-         source_id: source_id,
+         source_id: issue["id"],
          source_identifier: issue["identifier"],
          source_url: issue["url"],
          team_id: team_id,
-         project_id: project_id,
+         project_id: get_in(issue, ["project", "id"]),
          state_id: state_id
        }}
-    else
-      {:error, reason} -> {:error, reason}
-      nil -> {:error, :follow_up_context_missing}
-      _ -> {:error, :follow_up_context_missing}
     end
   end
+
+  defp follow_up_source(%{"id" => id} = issue) when is_binary(id) and id != "", do: {:ok, issue}
+  defp follow_up_source(_issue), do: {:error, {:follow_up_configuration, :source_issue_missing}}
+
+  defp follow_up_required_id(id, _reason) when is_binary(id) and id != "", do: {:ok, id}
+  defp follow_up_required_id(_id, reason), do: {:error, {:follow_up_configuration, reason}}
 
   defp create_or_fetch_follow_up(source, context, attributes) do
     title = attribute(attributes, :title)
@@ -274,11 +278,12 @@ defmodule SymphonyElixir.Linear.Adapter do
     input = %{
       id: issue_id,
       teamId: context.team_id,
-      projectId: context.project_id,
       stateId: context.state_id,
       title: title,
       description: follow_up_description(source, attributes)
     }
+
+    input = if is_binary(context.project_id), do: Map.put(input, :projectId, context.project_id), else: input
 
     case client_module().graphql(@create_follow_up_mutation, %{input: input}) do
       {:ok, response} ->

@@ -21,6 +21,7 @@ defmodule SymphonyElixir.QuotaCircuitStore do
     :usage_quota_limit,
     :rate_limited,
     :review_configuration,
+    :pull_request_state,
     :handoff_reviewer_gate
   ]
 

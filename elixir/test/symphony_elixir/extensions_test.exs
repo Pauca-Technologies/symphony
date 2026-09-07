@@ -399,6 +399,95 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert relation_input.type == "related"
   end
 
+  test "linear adapter creates an unlabelled Backlog follow-up without a source project" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "id" => "source-id",
+               "identifier" => "UDPE-1",
+               "url" => "https://linear.example/UDPE-1",
+               "project" => nil,
+               "team" => %{
+                 "id" => "team-id",
+                 "states" => %{"nodes" => [%{"id" => "backlog-id"}]}
+               }
+             }
+           }
+         }},
+        {:ok,
+         %{
+           "data" => %{
+             "issueCreate" => %{
+               "success" => true,
+               "issue" => %{
+                 "id" => "follow-up-id",
+                 "identifier" => "UDPE-2",
+                 "title" => "Extract helper",
+                 "url" => "https://linear.example/UDPE-2"
+               }
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueRelationCreate" => %{"success" => true, "issueRelation" => %{"id" => "relation-id"}}}}}
+      ]
+    )
+
+    source = %Issue{
+      id: "source-id",
+      identifier: "UDPE-1",
+      title: "Current task",
+      url: "https://linear.example/UDPE-1"
+    }
+
+    assert {:ok, %{identifier: "UDPE-2", deduplicated: false}} =
+             Adapter.create_follow_up(source, %{
+               title: "Extract helper",
+               description: "Consolidate the shared behavior.",
+               acceptance_criteria: "Both callers use the shared helper.",
+               evidence: "a.ex and b.ex duplicate the behavior.",
+               depends_on_current: false
+             })
+
+    assert_receive {:graphql_called, context_query, %{issueId: "source-id"}}
+    assert context_query =~ "Backlog"
+
+    assert_receive {:graphql_called, create_query, %{input: input}}
+    assert create_query =~ "issueCreate"
+    assert input.teamId == "team-id"
+    refute Map.has_key?(input, :projectId)
+    assert input.stateId == "backlog-id"
+    refute Map.has_key?(input, :labelIds)
+    refute Map.has_key?(input, :assigneeId)
+    assert input.id =~ ~r/^[0-9a-f-]{36}$/
+
+    assert_receive {:graphql_called, relation_query, %{input: relation_input}}
+    assert relation_query =~ "issueRelationCreate"
+    assert relation_input.issueId == "source-id"
+    assert relation_input.relatedIssueId == "follow-up-id"
+    assert relation_input.type == "related"
+  end
+
+  test "follow-up prerequisites name the missing source, team, or Backlog without creating an issue" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    for {source, reason} <- [
+          {nil, :source_issue_missing},
+          {%{"id" => "source", "team" => nil}, :team_missing},
+          {%{"id" => "source", "team" => %{"id" => "team", "states" => %{"nodes" => []}}}, :backlog_state_missing}
+        ] do
+      Process.put({FakeLinearClient, :graphql_results}, [{:ok, %{"data" => %{"issue" => source}}}])
+      assert {:error, {:follow_up_configuration, ^reason}} = Adapter.create_follow_up(%Issue{id: "source"}, %{})
+      assert_receive {:graphql_called, _, %{issueId: "source"}}
+      refute_received {:graphql_called, _, %{input: _}}
+    end
+  end
+
   test "linear adapter delegates reads and validates mutation responses" do
     Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
 

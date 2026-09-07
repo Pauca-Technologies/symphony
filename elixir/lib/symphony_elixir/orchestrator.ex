@@ -30,6 +30,7 @@ defmodule SymphonyElixir.Orchestrator do
     Telemetry,
     TokenAccounting,
     Tracker,
+    WaitCondition,
     WaitWatcher,
     Workspace,
     WorkspaceGc
@@ -5186,6 +5187,16 @@ defmodule SymphonyElixir.Orchestrator do
          state,
          issue_id,
          next_attempt,
+         %{failure: %AgentFailure{class: :pull_request_state}} = metadata,
+         false
+       ) do
+    park_closed_pull_request(state, issue_id, next_attempt, metadata)
+  end
+
+  defp handle_typed_run_failure(
+         state,
+         issue_id,
+         next_attempt,
          %{failure: %AgentFailure{class: :review_configuration}} = metadata,
          false
        ) do
@@ -5215,6 +5226,30 @@ defmodule SymphonyElixir.Orchestrator do
     |> emit_retry_policy(issue_id, metadata, :blocked, attempt, nil)
     |> drop_retry_attempt(issue_id)
     |> release_issue_claim(issue_id)
+  end
+
+  defp park_closed_pull_request(state, issue_id, attempt, metadata) do
+    issue = giveup_issue(metadata, issue_id, metadata[:identifier] || issue_id)
+
+    with {:ok, pr} <- AgentFailure.pull_request_state(metadata.failure),
+         {:ok, request} <-
+           WaitCondition.normalize(
+             %{
+               "reason" => "The attached PR is #{pr.state}. Reopen it, or replace the attachment and manually resume this wait. No draft/ready mutation can succeed in this state.",
+               "condition" => %{"type" => "github_pr_state_changed", "pr_number" => pr.number, "repository" => pr[:repository]}
+             },
+             %{issue: issue, workspace: metadata[:workspace_path], worker_host: metadata[:worker_host]}
+           ) do
+      # The failing preflight already observed this state authoritatively. Do
+      # not perform network I/O or capture a newer baseline on the scheduler.
+      request = Map.put(request, :baseline, %{"state" => pr.state})
+
+      state
+      |> emit_retry_policy(issue_id, metadata, :parked, attempt, nil)
+      |> park_completed_worker(metadata |> Map.put(:issue, issue) |> Map.put(:wait_request, request))
+    else
+      _ -> schedule_failure_retry(state, issue_id, attempt, metadata)
+    end
   end
 
   defp open_quota_circuit_and_park(

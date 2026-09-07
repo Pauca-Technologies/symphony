@@ -187,7 +187,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
                          "view",
                          "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
                          "--json",
-                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
+                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft,state"
                        ]}
     end
 
@@ -207,7 +207,7 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
                          "pr",
                          "view",
                          "--json",
-                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
+                         "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft,state"
                        ]}
     end
 
@@ -239,6 +239,16 @@ defmodule SymphonyElixir.Github.PrReviewSectionTest do
   end
 
   describe "managed draft lifecycle" do
+    test "closed and merged PRs cannot pass either draft-state shortcut" do
+      for state <- ["CLOSED", "MERGED"], draft? <- [true, false] do
+        pr = %{number: 7, body: "Body", state: state, is_draft: draft?, repository: "org/repo"}
+        opts = [pr_runner: fn _, _ -> flunk("must not mutate a closed or merged PR") end]
+
+        assert {:error, {:pr_not_open, %{number: 7, state: ^state}}} = PrReviewSection.ensure_draft("/tmp", pr, opts)
+        assert {:error, {:pr_not_open, %{number: 7, state: ^state}}} = PrReviewSection.mark_ready("/tmp", pr, opts)
+      end
+    end
+
     test "moves a ready PR to draft and verifies the exact head" do
       test_pid = self()
 

@@ -1571,12 +1571,32 @@ Optional client-side tool extension:
 - Return the GraphQL response or error payload as structured tool output that the model can inspect
   in-session.
 
+Deferred review delivery extension:
+
+- Persist the deferred handoff before starting its review, and preserve a validated approval before
+  delivery side effects. Local workers MAY resume delivery without model sessions only when the
+  complete review packet, base/head, policy, full rules and fresh complete GitHub feedback match.
+- Store approval checkpoints in trusted control state outside the agent workspace. Never trust a
+  workspace verdict as cached approval. Revalidate the verdict contract on reuse; changed, missing,
+  truncated or expired evidence requires fresh review. The reference implementation expires
+  checkpoints after 24 hours and disables reuse for remote workspaces.
+- Required final validation and exact-head handoff checks MUST still run. Preserve deterministic
+  follow-up identities across delivery retries. Follow-ups require a source issue, team and Backlog
+  state; a source project is optional. Missing prerequisites MUST name the missing field.
+
 `wait_for` extension contract:
 
 - Purpose: stop spending model turns while useful work is blocked only on an external state change.
 - The request MUST include a non-empty reason and one typed condition. Standard condition types are
   GitHub Actions component recovery, GitHub PR-check state changes, git-ref SHA changes, Linear
   issue/comment changes.
+- Implementations MAY support PR open/closed/merged state changes and literal path-filtered git-ref
+  waits. A closed/merged PR preflight MUST NOT retry draft/ready mutations against unchanged state.
+  Park it on its observed state; replacing the attached PR requires an explicit wait resume.
+- A path-filtered git wait MUST compare the watched tree entries rather than only the ref SHA.
+  Irrelevant changes MUST NOT wake a model. Fetching objects for inspection MUST preserve the
+  local branch, index, checkout and FETCH_HEAD. The reference implementation bounds paths to
+  1–32 literal relative names of at most 320 bytes, rejecting traversal and control characters.
 - Implementations MUST reject clock-only waits. Agents MUST NOT park for local resource pressure,
   another validation, local process/port contention, or an elapsed-time backoff; independently
   bounded validations may overlap across agents.
@@ -2125,6 +2145,11 @@ defaults derived from recent fleet percentiles rather than one global ceiling. R
 include issue/run total, parent/delegated and per-thread high waters, per-turn growth, uncached/cached
 input, prompt/review-packet/tool-output bytes, elapsed phase time, requested reviewer lenses, and
 review iterations.
+
+An optional `enforce_labels` list MAY restrict enforcement to an explicit cohort, leaving other
+issues in shadow mode. `hygiene_only: true` MUST preserve reviewer settings, lenses and candidate
+review routing while applying allowed context/output controls. Routing provenance SHOULD separate
+classifier availability, low confidence and high-risk fallback reasons.
 
 The execution classifier SHOULD report one of `simple_direct`, `ui`, `security_tenant`,
 `data_schema`, `concurrency_liveness`, or `broad_architecture`, together with confidence, bounded

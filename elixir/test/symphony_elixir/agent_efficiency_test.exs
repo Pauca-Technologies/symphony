@@ -31,6 +31,49 @@ defmodule SymphonyElixir.AgentEfficiencyTest do
     assert settings.profiles["high_risk"].allow_overage
   end
 
+  test "a labeled hygiene-only pilot preserves all reviewer settings and lenses" do
+    workflow = %{
+      config: %{
+        "agent" => %{
+          "efficiency" => %{
+            "mode" => "enforce",
+            "hygiene_only" => true,
+            "enforce_labels" => ["efficiency:pilot"],
+            "enforced_actions" => ["bound_future_tool_output", "fresh_thin_context_delegation_only", "prohibit_full_history_delegation"]
+          }
+        }
+      }
+    }
+
+    route = %{source: :classifier_fallback, profile: "deep", overrides: %{}}
+    assert {:ok, control} = AgentEfficiency.decide(issue([]), route, workflow)
+    refute control.enforced
+    assert control.mode == "shadow"
+    assert control.enforced_actions == []
+    assert {:ok, pilot} = AgentEfficiency.decide(issue(["efficiency:pilot"]), route, workflow)
+    assert pilot.enforced
+    assert pilot.fallback_reason == "classifier_unavailable"
+    assert pilot.classification_source == "metadata_fallback"
+    settings = %{model: "reviewer", reasoning_effort: "xhigh", max_iterations: 3, packet_max_bytes: 48_000}
+    assert AgentEfficiency.review_settings(settings, pilot) == settings
+    assert AgentEfficiency.review_lenses(pilot) == nil
+    assert AgentEfficiency.refine_review_decision(pilot, %{review_class: "mechanical", risk_level: "normal"}) == pilot
+    off = put_in(workflow, [:config, "agent", "efficiency", "mode"], "off")
+    assert {:ok, %{mode: "off", enforced: false}} = AgentEfficiency.decide(issue(["efficiency:pilot"]), route, off)
+  end
+
+  test "hygiene-only enforcement applies only the explicit action allowlist" do
+    state =
+      decision("enforce", 10)
+      |> Map.merge(%{hygiene_only: true, enforced_actions: ["prohibit_full_history_delegation"]})
+      |> put_in([:budget, :per_thread_tokens], 10)
+      |> AgentBudget.new(issue())
+      |> AgentBudget.observe(usage("parent", 15, 10, 5))
+
+    assert Enum.any?(state.pending, &(&1.action == "prohibit_full_history_delegation" and &1.applied))
+    refute Enum.any?(state.pending, &(&1.action != "prohibit_full_history_delegation" and &1.applied))
+  end
+
   test "parses enforce mode and rejects unsafe references" do
     config = %{
       "agent" => %{

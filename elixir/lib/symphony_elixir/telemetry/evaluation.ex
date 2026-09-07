@@ -103,6 +103,41 @@ defmodule SymphonyElixir.Telemetry.Evaluation do
     }
   end
 
+  @doc "Project delivery denominators without rebuilding the underlying token report."
+  @spec delivery_metrics([map()], map()) :: map()
+  def delivery_metrics(events, base) do
+    events = Enum.filter(events, &valid_event?/1)
+    outcomes = normalize_outcomes(events)
+    fleet = fleet_metrics(events, outcomes, base)
+
+    review_candidates =
+      events
+      |> Enum.filter(
+        &(&1["event"] == "review" and &1["subtype"] == "review" and
+            &1["outcome"] in ["approved", "request_changes"] and is_binary(&1["packet_id"]) and is_binary(&1["reviewed_sha"]))
+      )
+      |> Enum.sort_by(&(&1["ts"] || ""))
+      |> Enum.group_by(&{&1["issue_id"] || &1["issue_identifier"], &1["reviewed_sha"], &1["config_digest"]})
+
+    accepted_first = Enum.count(review_candidates, fn {_key, [first | _]} -> first["outcome"] == "approved" end)
+
+    %{
+      fleet: fleet,
+      outcomes: outcomes |> outcome_view(fleet) |> Map.delete(:timeline),
+      first_substantive_review: %{
+        candidates: map_size(review_candidates),
+        accepted: accepted_first,
+        acceptance_rate: rate(accepted_first, map_size(review_candidates)),
+        repeated_candidates: Enum.count(review_candidates, fn {_key, rows} -> length(rows) > 1 end)
+      },
+      irrelevant_ref_changes: Enum.count(events, &(&1["event"] == "wait" and &1["action"] == "irrelevant_ref_change")),
+      review_delivery:
+        events
+        |> Enum.filter(&(&1["event"] == "review" and &1["subtype"] == "review_delivery"))
+        |> Enum.frequencies_by(& &1["action"])
+    }
+  end
+
   @doc "Look up one issue from the most recent retained 30-day compact telemetry window."
   @spec issue(String.t(), keyword()) :: {:ok, map()} | {:error, :issue_not_found}
   def issue(identifier, opts \\ []) when is_binary(identifier) do

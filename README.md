@@ -25,6 +25,13 @@ When enforcement is enabled, a fully inspectable bounded documentation/test-only
 refine a standard reviewer route to the repository's simple profile; explicit overrides,
 quality fallbacks, control files, production paths, and high-risk work retain their original depth.
 
+Validated review approvals can survive a delivery failure in trusted control state. Local workers
+reuse them only while the complete candidate packet, policy, rules and fresh GitHub feedback remain
+identical; final validation and exact-head checks remain mandatory. Closed PRs park on a durable
+state watcher, and git-ref waits can watch specific paths to avoid unrelated model wakes. A labelled
+context/output pilot can preserve every reviewer setting. Delivery reports distinguish normal worker
+exits, accepted handoffs and unknown downstream outcomes.
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
 
 _In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._

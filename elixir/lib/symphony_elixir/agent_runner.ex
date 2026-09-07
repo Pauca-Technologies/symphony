@@ -1386,7 +1386,7 @@ defmodule SymphonyElixir.AgentRunner do
           worker_host,
           codex_update_recipient,
           route.backend,
-          opts,
+          Keyword.put(opts, :efficiency_decision, efficiency),
           issue_state_fetcher
         )
         |> reject_recovered_handoff_infrastructure()
@@ -1986,6 +1986,7 @@ defmodule SymphonyElixir.AgentRunner do
         [
           PromptBuilder.build_section(issue, opts),
           TestWorkerBudget.prompt_section(),
+          SymphonyElixir.BehavioralEvidence.prompt_section(Keyword.get(opts, :efficiency_decision)),
           prompt_section(
             "waiting.resume_event",
             :wait_resume,
@@ -2280,7 +2281,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp store_review_infrastructure_failure(%ReviewOutcome{} = outcome) do
     Process.put(
       @handoff_gate_infrastructure_failure_key,
-      {:review_gate_infrastructure, %{review: ReviewOutcome.to_map(outcome)}}
+      {:review_gate_infrastructure, %{review: ReviewOutcome.to_map(outcome), cause: outcome.failure_reason}}
     )
 
     :ok
@@ -2329,6 +2330,8 @@ defmodule SymphonyElixir.AgentRunner do
       "variables" => Map.get(request, :variables, %{}),
       "targetState" => Map.fetch!(request, :target_state)
     }
+
+    durable = if request[:review_checkpoint], do: Map.put(durable, "reviewCheckpoint", request.review_checkpoint), else: durable
 
     durable =
       case encode_review_approval(Map.get(request, :review_approval)) do
@@ -2460,6 +2463,9 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:ok, durable_request} ->
         case restore_handoff_request(durable_request, workspace, issue, worker_host, opts) do
+          {:ok, %{phase: :reviewing} = request} ->
+            resume_review_delivery(request, recipient, backend, issue_state_fetcher, opts)
+
           {:ok, %{phase: :starting} = request} ->
             Logger.info("handoff.gate resuming durable start #{issue_context(issue)}")
 
@@ -2490,6 +2496,45 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         {:error, {:handoff_gate_recovery_failed, reason}}
+    end
+  end
+
+  defp resume_review_delivery(request, recipient, backend, fetcher, opts) do
+    case refresh_handoff_issue(request.issue, fetcher, opts) do
+      {:continue, issue} ->
+        handoff = Map.put(request, :issue, issue)
+        review_request = Map.put(handoff, :handoff_after_review, handoff)
+        prompt = maybe_run_deferred_review_handoff(review_request, nil, recipient, backend)
+
+        case pop_deferred_handoff_gate() do
+          nil -> {:resume, prompt, issue}
+          pending -> resume_starting_handoff_gate(pending, recipient, backend, fetcher, opts)
+        end
+
+      {:done, issue} ->
+        case Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
+          :ok -> {:completed, issue}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp restore_handoff_request(
+         %{"phase" => "reviewing", "query" => query, "targetState" => target_state} = durable,
+         workspace,
+         issue,
+         worker_host,
+         opts
+       )
+       when is_binary(query) and is_binary(target_state) do
+    with {:ok, request} <- restore_handoff_request_base(durable, workspace, issue, worker_host, opts),
+         true <- is_map(request.review_workflow) do
+      {:ok, Map.put(request, :phase, :reviewing)}
+    else
+      _ -> {:error, :review_workflow_unavailable}
     end
   end
 
@@ -2526,7 +2571,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp restore_handoff_request_base(durable, workspace, issue, worker_host, opts) do
     review_opts =
-      []
+      Keyword.get(opts, :review_opts, [])
+      |> maybe_put(:efficiency_decision, Keyword.get(opts, :efficiency_decision))
       |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
       |> maybe_put(:hook_command, Keyword.get(opts, :per_repo_before_handoff))
 
@@ -2541,6 +2587,7 @@ defmodule SymphonyElixir.AgentRunner do
       before_handoff_timeout_ms: Keyword.get(opts, :per_repo_before_handoff_timeout_ms),
       before_handoff_stale_ms: Keyword.get(opts, :per_repo_before_handoff_stale_ms),
       review_workflow: Keyword.get(opts, :per_repo_review_workflow),
+      review_checkpoint: Map.get(durable, "reviewCheckpoint"),
       review_opts: review_opts,
       linear_client: Keyword.get(opts, :linear_client, &Client.graphql/3)
     }
@@ -2781,6 +2828,9 @@ defmodule SymphonyElixir.AgentRunner do
     remember_gate_verification(gate)
     resume_after_starting_handoff_gate(Map.put(request, :gate, gate), prompt)
   end
+
+  defp finish_starting_handoff_gate(%{review_approval: %{}} = request, recipient, backend),
+    do: apply_passed_handoff_gate(request, recipient, backend)
 
   defp finish_starting_handoff_gate(request, recipient, backend) do
     with :ok <- Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
@@ -3077,11 +3127,10 @@ defmodule SymphonyElixir.AgentRunner do
       )
 
     if current_key == approval.review_key and review_key_sha(current_key) == approval.reviewed_sha do
-      case apply_deferred_review_handoff(request) do
-        nil -> {:completed, request.issue}
-        prompt -> {:resume, prompt, request.issue}
-      end
+      deliver_reviewed_handoff(request)
     else
+      Workspace.clear_handoff_gate_state(request.workspace, request.worker_host)
+
       Logger.warning(
         "review.gate approval changed before handoff #{issue_context(request.issue)} " <>
           "reviewed_key=#{inspect(approval.review_key)} current_key=#{inspect(current_key)}; withholding Linear handoff"
@@ -3089,6 +3138,26 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:resume, deferred_review_head_changed_prompt(request.issue), request.issue}
     end
+  end
+
+  defp deliver_reviewed_handoff(request) do
+    durable = request |> Map.drop([:review_approval, :gate]) |> durable_handoff_request() |> Map.put("phase", "reviewing")
+
+    with :ok <- Workspace.persist_handoff_gate_state(request.workspace, durable, request.worker_host) do
+      finish_reviewed_delivery(request, apply_deferred_review_handoff(request))
+    end
+  end
+
+  defp finish_reviewed_delivery(request, nil) do
+    case Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
+      :ok -> {:completed, request.issue}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp finish_reviewed_delivery(request, prompt) do
+    store_handoff_infrastructure_failure(prompt, %{reason: :tracker_delivery_failed})
+    {:resume, prompt, request.issue}
   end
 
   defp review_key_sha({:pull_request, _issue_id, _pr_identity, head_sha}), do: head_sha
@@ -3115,7 +3184,7 @@ defmodule SymphonyElixir.AgentRunner do
     gate = request.gate
     lifecycle_job_id = owned_job_id || gate.job_id
 
-    with :ok <- Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
+    with :ok <- clear_finished_gate_state(request, outcome) do
       result =
         transition_agent_lifecycle(recipient, request.issue, :implementing, %{
           gate_job_id: lifecycle_job_id,
@@ -3126,6 +3195,9 @@ defmodule SymphonyElixir.AgentRunner do
       result
     end
   end
+
+  defp clear_finished_gate_state(%{review_approval: %{}}, outcome) when outcome in [:passed, :legacy_passed], do: :ok
+  defp clear_finished_gate_state(request, _outcome), do: Workspace.clear_handoff_gate_state(request.workspace, request.worker_host)
 
   defp pending_gate_lifecycle_signature(gate) do
     {
@@ -3231,6 +3303,49 @@ defmodule SymphonyElixir.AgentRunner do
     do: handoff_gate_prompt
 
   defp maybe_run_deferred_review_handoff(%{} = request, _handoff_gate_prompt, recipient, backend) do
+    case prepare_review_delivery(request) do
+      {:ok, prepared} ->
+        do_run_deferred_review_handoff(prepared, recipient, backend)
+
+      {:error, reason} ->
+        prompt = "Review delivery state could not be persisted: #{inspect(reason)}. Retry after restoring control-state storage."
+        store_handoff_infrastructure_failure(prompt, %{reason: reason})
+        prompt
+    end
+  end
+
+  defp prepare_review_delivery(%{handoff_after_review: handoff} = request) when is_map(handoff) do
+    workspace = request.workspace
+    host = Map.get(request, :worker_host)
+    durable = handoff |> durable_handoff_request() |> Map.delete("reviewCheckpoint") |> Map.put("phase", "reviewing")
+
+    with {:ok, existing} <- Workspace.load_handoff_gate_state(workspace, host) do
+      checkpoint = if is_map(existing) and Map.drop(existing, ["reviewCheckpoint"]) == durable, do: existing["reviewCheckpoint"], else: nil
+      durable = if checkpoint, do: Map.put(durable, "reviewCheckpoint", checkpoint), else: durable
+
+      persist_review_delivery_request(request, workspace, host, durable, checkpoint)
+    end
+  end
+
+  defp prepare_review_delivery(request), do: {:ok, request}
+
+  defp persist_review_delivery_request(request, workspace, host, durable, checkpoint) do
+    with :ok <- Workspace.persist_handoff_gate_state(workspace, durable, host) do
+      writer = fn saved ->
+        Workspace.persist_handoff_gate_state(workspace, Map.put(durable, "reviewCheckpoint", saved), host)
+      end
+
+      review_opts =
+        request
+        |> Map.get(:review_opts, [])
+        |> Keyword.put(:review_checkpoint, checkpoint)
+        |> Keyword.put(:review_checkpoint_writer, writer)
+
+      {:ok, Map.put(request, :review_opts, review_opts)}
+    end
+  end
+
+  defp do_run_deferred_review_handoff(%{} = request, recipient, backend) do
     issue = Map.fetch!(request, :issue)
     workspace = Map.fetch!(request, :workspace)
     worker_host = Map.get(request, :worker_host)
@@ -3280,6 +3395,11 @@ defmodule SymphonyElixir.AgentRunner do
 
           {terminal_outcome, review_nonapproval_prompt(issue, review_outcome), review_outcome}
       end
+
+    if Map.has_key?(request, :handoff_after_review) and
+         outcome in [:request_changes, :automation_inconclusive, :budget_exhausted_with_findings] do
+      Workspace.clear_handoff_gate_state(workspace, worker_host)
+    end
 
     remember_review_verification(review_outcome)
 
@@ -3460,6 +3580,8 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp enqueue_reviewed_handoff_gate(handoff_request, review_key, review_outcome) do
+    handoff_request = inherit_review_checkpoint(handoff_request)
+
     request =
       Map.put(handoff_request, :review_approval, %{
         review_key: review_key,
@@ -3475,6 +3597,13 @@ defmodule SymphonyElixir.AgentRunner do
         prompt = pending_gate_error_prompt(request.issue, reason)
         store_handoff_infrastructure_failure(prompt, %{reason: reason})
         {:infrastructure_unavailable, prompt, unavailable}
+    end
+  end
+
+  defp inherit_review_checkpoint(request) do
+    case Workspace.load_handoff_gate_state(request.workspace, Map.get(request, :worker_host)) do
+      {:ok, %{"reviewCheckpoint" => checkpoint}} -> Map.put(request, :review_checkpoint, checkpoint)
+      _ -> request
     end
   end
 
@@ -3602,8 +3731,8 @@ defmodule SymphonyElixir.AgentRunner do
           Logger.info("review.gate deferred handoff applied #{issue_context(issue)}")
           nil
         else
-          Logger.warning("review.gate deferred handoff mutation returned GraphQL errors #{issue_context(issue)}")
-          deferred_handoff_failure_prompt(issue, {:linear_graphql_errors, graphql_errors(response)})
+          Logger.warning("review.gate deferred handoff mutation was not applied #{issue_context(issue)}")
+          deferred_handoff_failure_prompt(issue, {:linear_handoff_not_applied, graphql_errors(response)})
         end
 
       {:error, reason} ->
@@ -3613,7 +3742,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp graphql_success?(response) do
-    graphql_errors(response) == []
+    graphql_errors(response) == [] and get_in(response, ["data", "issueUpdate", "success"]) != false
   end
 
   defp graphql_errors(%{"errors" => errors}) when is_list(errors), do: errors

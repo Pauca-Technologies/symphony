@@ -183,3 +183,16 @@ handoffs.
 - Is this event tied to a Codex session? Include `session_id`.
 - Is the failure reason present and concise?
 - Is the message format consistent with existing lifecycle logs?
+
+## Review delivery and dependency relevance
+
+`review` events with subtype `review_delivery` record `saved`, `reused`, `invalidated`, or
+`save_failed`, with issue identifiers, reviewed SHA, packet id and bounded reason. Changed-input
+reasons identify packet, policy, feedback or rule hashes; never log the checkpoint or raw feedback.
+A reused checkpoint emits no synthetic reviewer thread or token usage. Actual `review_thread` events
+retain the run's repository attribution, falling back to the packet's repository project identity.
+
+`wait` events with action `irrelevant_ref_change` record the condition key and watched-path count
+when a newly observed ref changes outside the requested paths. `model_wake: false` identifies a
+suppressed wake; repeated polls of the same observation do not emit another event. Report these
+separately from completed worker runs and material progress.

@@ -29,6 +29,7 @@ defmodule SymphonyElixir.AgentFailure do
           | :usage_quota_limit
           | :rate_limited
           | :review_configuration
+          | :pull_request_state
           | :handoff_reviewer_gate
 
   @type t :: %__MODULE__{
@@ -122,6 +123,9 @@ defmodule SymphonyElixir.AgentFailure do
 
   defp classify_non_rate_limit_failure(reason, backend) do
     cond do
+      match?({:ok, _pr}, pull_request_state(reason)) ->
+        failure(:pull_request_state, reason, backend)
+
       transient_transport_failure?(reason) ->
         failure(:transient_infrastructure, reason, backend)
 
@@ -144,6 +148,29 @@ defmodule SymphonyElixir.AgentFailure do
         failure(:agent_protocol_failure, reason, backend)
     end
   end
+
+  @doc "Extract a structured closed/merged PR observation without parsing command output."
+  @spec pull_request_state(term()) :: {:ok, map()} | :error
+  def pull_request_state({:pr_not_open, %{number: number, state: state} = pr})
+      when is_integer(number) and number > 0 and state in ["CLOSED", "MERGED"],
+      do: {:ok, Map.take(pr, [:number, :state, :repository])}
+
+  def pull_request_state(%__MODULE__{details: details}), do: pull_request_state(details)
+
+  def pull_request_state(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> pull_request_state()
+
+  def pull_request_state(list) when is_list(list) do
+    Enum.find_value(list, :error, fn value ->
+      case pull_request_state(value) do
+        {:ok, _pr} = result -> result
+        :error -> false
+      end
+    end)
+  end
+
+  def pull_request_state(map) when is_map(map), do: map |> Map.values() |> pull_request_state()
+  def pull_request_state(_reason), do: :error
 
   defp nested_rate_limit({:rate_limited, value})
        when (is_integer(value) and value >= 0) or is_nil(value),
@@ -221,7 +248,9 @@ defmodule SymphonyElixir.AgentFailure do
   end
 
   defp deterministic_review_configuration_failure?(reason) do
-    contains_atom?(reason, :packet_bound_unachievable) or
+    contains_atom?(reason, :follow_up_configuration) or
+      contains_internal_marker?(reason, "follow_up_configuration") or
+      contains_atom?(reason, :packet_bound_unachievable) or
       contains_internal_marker?(reason, "packet_bound_unachievable") or
       ((contains_atom?(reason, :review_gate_infrastructure) or
           contains_atom?(reason, :review_session_failed)) and

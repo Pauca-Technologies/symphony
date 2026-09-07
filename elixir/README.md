@@ -609,6 +609,13 @@ Notes:
   their budgets explicitly while preserving or strengthening reviewer effort, lens coverage, packet
   capacity, and iteration count.
 
+  For a bounded context/output pilot, set `mode: enforce`, `enforce_labels: [efficiency:pilot]`,
+  and `hygiene_only: true`. Only matching issue labels enter enforcement; the rest remain in shadow.
+  `hygiene_only` preserves all reviewer settings and lenses, including exact-candidate routing.
+  Omit `enforce_labels` to retain repository-wide mode behavior. The label list accepts up to ten
+  names of 120 bytes each. Routing telemetry records the classifier source and fallback reason
+  separately, so missing classification can be distinguished from low confidence or high risk.
+
   In `enforce` mode, review routing gets one conservative exact-candidate refinement after the
   handoff packet reads the real diff. A standard review uses the repository's simple reviewer
   profile only when the complete local manifest contains at most 12 files and 600 changed lines,
@@ -713,6 +720,20 @@ Notes:
   production, then start a fresh orchestration run (or attach/update the candidate head). For
   `budget_exhausted_with_findings`, a human must explicitly resolve or accept the recorded findings;
   Symphony never converts the cost limit into automated approval.
+  Deferred review requests are persisted before the reviewer starts. Local workers can checkpoint a
+  validated approval before follow-up creation and PR readiness, preserve tracker-mutation intent,
+  then resume delivery after a process
+  restart without opening another implementor or reviewer session. Reuse requires a clean worktree,
+  the identical complete packet (including base/head, scope and evidence), reviewer policy and full
+  rule hashes, plus a fresh complete GitHub feedback snapshot. Changed inputs, unavailable/truncated
+  feedback, remote workspaces, and checkpoints older than 24 hours require fresh review. Checkpoints
+  live in Symphony's control state outside the agent workspace; ordinary workspace verdict files
+  cannot grant approval. Final validation and the exact-head handoff checks still run.
+  A source project is optional for review follow-ups; missing source issue, team, or Backlog state
+  produces a specific configuration error. A closed or merged PR is parked before draft/ready
+  mutations. Reopening the watched PR wakes the issue; after replacing the attached PR, manually
+  resume the wait so Symphony resolves the replacement.
+
 - Configure bounded review evidence and execution in the `review` front matter of the target
   repository's `WORKFLOW_REVIEW.md`:
 
@@ -965,3 +986,15 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+### Measuring the efficiency pilot
+
+The telemetry report's `delivery` view separates normal/error worker exits, material progress,
+accepted exact-head handoffs, and authoritative downstream outcomes. Missing downstream evidence
+remains unknown, and tokens per accepted handoff is unavailable when there are no accepted handoffs.
+First substantive review acceptance uses unique issue/head/configuration candidates; repeated
+candidate reviews are opportunities to investigate, not proof of redundant review. Review delivery
+records saved/reused/invalidated checkpoints separately from reviewer thread usage, which carries
+repository attribution. `irrelevant_ref_changes` counts path-filtered changes that avoided a model wake.
+Use run-manifest build/configuration identities and comparable task families when comparing cohorts.
+See [the rollout guide](docs/efficiency-rollout.md) for the initial bounded rollout and acceptance checks.

@@ -225,6 +225,8 @@ defmodule SymphonyElixir.AgentBudget do
     }
   end
 
+  defp action_applied?(%{mode: "enforce", hygiene_only: true, enforced_actions: actions}, action), do: action in actions
+
   defp action_applied?(%{mode: "enforce"}, _action), do: true
 
   defp action_applied?(%{mode: "shadow", enforced_actions: actions}, action)

@@ -456,7 +456,7 @@ defmodule SymphonyElixir.ReviewGateTest do
              )
 
     assert outcome.failure_reason.class == :review_configuration
-    assert outcome.resume_condition =~ "reviewer workflow or packet bound"
+    assert outcome.resume_condition =~ "reviewer workflow, packet bound"
   end
 
   test "review reuses the exact pre-hook base decision instead of fetching again", %{
@@ -941,7 +941,7 @@ defmodule SymphonyElixir.ReviewGateTest do
 
     assert outcome.attempts == 1
     assert outcome.failure_reason.class == :review_configuration
-    assert outcome.resume_condition =~ "reviewer workflow or packet bound"
+    assert outcome.resume_condition =~ "reviewer workflow, packet bound"
     assert_received :context_window_attempt
     refute_received :context_window_attempt
   end
@@ -1543,7 +1543,7 @@ defmodule SymphonyElixir.ReviewGateTest do
         "view",
         "https://github.com/Pauca-Technologies/udp-dashboard-v2/pull/1358",
         "--json",
-        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
+        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft,state"
       ],
       _cwd ->
         {Jason.encode!(%{
@@ -1557,7 +1557,7 @@ defmodule SymphonyElixir.ReviewGateTest do
         "pr",
         "view",
         "--json",
-        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft"
+        "id,number,body,url,headRefOid,baseRefOid,baseRefName,changedFiles,headRepository,isDraft,state"
       ],
       _cwd ->
         flunk("must not rely on current branch PR detection when Linear has a PR attachment")

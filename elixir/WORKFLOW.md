@@ -201,8 +201,21 @@ Use `linear_issue` for the current workpad, labels, and workflow transitions. In
   use the typed `linear_issue` `create_follow_up` operation as soon as the title,
   description, acceptance criteria, and evidence are concrete. Do not implement
   the follow-up in the current branch. Symphony creates or returns a deterministic
-  unassigned Backlog issue in the same project without automation labels and links
+  unassigned Backlog issue in the same team and, when present, project without automation labels and links
   it as related, or as blocked by the current issue when `depends_on_current` is true.
+- Map changed behavior to observable acceptance evidence in the workpad. For concurrency defects,
+  include applicable bootstrap, reload/resume, cancellation, stale-client and combined-state cases.
+  For UI work, cover the relevant normal, loading, error and accessibility states. For workflow
+  changes, use production-shaped ownership and boundary cases. Preserve stable review findings.
+- When waiting on a git ref for a specific fix, include `condition.paths` with the relevant literal
+  repository-relative files/directories. Symphony compares those tree entries and ignores unrelated
+  commits without changing the local branch or worktree. Use Linear dependency relations for actual
+  cross-ticket prerequisites. A closed/merged PR produces a durable PR-state wait; reopening it or
+  explicitly resuming after replacing its attachment allows a new preflight.
+- Review delivery can resume from a trusted approval checkpoint when its inputs remain identical.
+  Delivery-only retries reuse valid proof; candidate, scope, policy or feedback changes require a
+  fresh assessment. Missing source/team/Backlog prerequisites are reported precisely; a project is
+  optional for follow-up creation.
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.

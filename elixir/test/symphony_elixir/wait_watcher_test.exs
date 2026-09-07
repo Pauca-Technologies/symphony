@@ -119,6 +119,59 @@ defmodule SymphonyElixir.WaitWatcherTest do
              )
   end
 
+  test "git path waits ignore unrelated commits and reject unsafe or unbounded paths" do
+    context = %{workspace: "/tmp/workspace", issue: %{id: "issue-1"}}
+    args = %{"reason" => "await prerequisite", "condition" => %{"type" => "git_ref_changed", "ref" => "refs/heads/main", "paths" => ["src/test.ts", "package.json", "src/test.ts"]}}
+    assert {:ok, request} = WaitCondition.normalize(args, context)
+    assert request.condition["paths"] == ["package.json", "src/test.ts"]
+    request = %{request | baseline: %{"sha" => "old", "paths_fingerprint" => "same"}}
+    refute WaitCondition.changed?(request, %{"sha" => "new", "paths_fingerprint" => "same"})
+    assert WaitCondition.changed?(request, %{"sha" => "new", "paths_fingerprint" => "changed"})
+    refute WaitCondition.changed?(request, %{"sha" => "new"})
+
+    for paths <- [["../secret"], ["/tmp/secret"], [":(glob)**"], ["a/../b"], ["a\nb"], [""], ["a\\b"], [], List.duplicate("src", 33)] do
+      assert {:error, :invalid_git_wait_paths} = WaitCondition.normalize(put_in(args, ["condition", "paths"], paths), context)
+    end
+  end
+
+  test "git path probes observe the remote tree without changing the local worktree", %{state_path: state_path} do
+    root = Path.dirname(state_path)
+    remote = Path.join(root, "remote")
+    workspace = Path.join(root, "workspace")
+    File.mkdir_p!(remote)
+
+    git = fn args, cwd ->
+      {output, 0} = System.cmd("git", args, cd: cwd, stderr_to_stdout: true)
+      String.trim(output)
+    end
+
+    git.(["init", "-b", "main"], remote)
+    git.(["config", "user.email", "test@example.com"], remote)
+    git.(["config", "user.name", "Test"], remote)
+    File.write!(Path.join(remote, "watched.txt"), "before")
+    git.(["add", "."], remote)
+    git.(["commit", "-m", "baseline"], remote)
+    git.(["clone", remote, workspace], root)
+    original = git.(["rev-parse", "HEAD"], workspace)
+    File.write!(Path.join(workspace, "local.txt"), "preserve me")
+
+    assert {:ok, request} =
+             WaitCondition.normalize(%{"reason" => "wait for fix", "condition" => %{"type" => "git_ref_changed", "ref" => "refs/heads/main", "paths" => ["watched.txt"]}}, %{workspace: workspace})
+
+    assert {:ok, request} = WaitCondition.capture_baseline(request)
+    File.write!(Path.join(remote, "unrelated.txt"), "unrelated")
+    git.(["add", "."], remote)
+    git.(["commit", "-m", "unrelated"], remote)
+    assert {:unchanged, _} = WaitCondition.probe(request)
+    File.rm!(Path.join(remote, "watched.txt"))
+    git.(["add", "."], remote)
+    git.(["commit", "-m", "delete watched file"], remote)
+    assert {:changed, _} = WaitCondition.probe(request)
+    assert git.(["rev-parse", "HEAD"], workspace) == original
+    assert File.read!(Path.join(workspace, "local.txt")) == "preserve me"
+    assert File.read!(Path.join(workspace, "watched.txt")) == "before"
+  end
+
   test "wakes legacy persisted clock waits without accepting new ones" do
     assert {:changed, %{"now" => _now}} =
              WaitCondition.probe(%{

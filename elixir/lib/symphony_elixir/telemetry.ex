@@ -39,6 +39,7 @@ defmodule SymphonyElixir.Telemetry do
           | :quota_circuit
           | :gate
           | :review
+          | :wait
           | :lease
           | :base_drift
           | :quality_outcome

@@ -95,6 +95,8 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
 
   @type t :: %{
           mode: String.t(),
+          hygiene_only: boolean(),
+          enforce_labels: [String.t()],
           enforced_actions: [String.t()],
           capsule_max_bytes: pos_integer(),
           extreme_multiplier: float(),
@@ -119,6 +121,8 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
   defp defaults do
     %{
       mode: "shadow",
+      hygiene_only: false,
+      enforce_labels: [],
       enforced_actions: [],
       capsule_max_bytes: 4_000,
       extreme_multiplier: 2.0,
@@ -132,6 +136,9 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
     mode = value(raw, "mode") || defaults.mode
 
     with :ok <- validate_mode(mode),
+         {:ok, hygiene_only} <- optional_boolean(raw, "hygiene_only", defaults.hygiene_only),
+         {:ok, enforce_labels} <- string_list(raw, "enforce_labels", defaults.enforce_labels),
+         :ok <- validate_enforce_labels(enforce_labels),
          {:ok, enforced_actions} <- enforced_actions(raw, defaults.enforced_actions),
          {:ok, profiles} <- parse_profiles(value(raw, "profiles"), defaults.profiles),
          {:ok, task_profiles} <- parse_task_profiles(value(raw, "task_profiles"), defaults.task_profiles, profiles),
@@ -140,6 +147,8 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
       {:ok,
        %{
          mode: mode,
+         hygiene_only: hygiene_only,
+         enforce_labels: enforce_labels,
          enforced_actions: enforced_actions,
          capsule_max_bytes: capsule_max_bytes,
          extreme_multiplier: extreme_multiplier,
@@ -151,6 +160,12 @@ defmodule SymphonyElixir.Config.AgentEfficiency do
 
   defp validate_mode(mode) when mode in @modes, do: :ok
   defp validate_mode(_mode), do: error("agent.efficiency.mode must be one of: #{Enum.join(@modes, ", ")}")
+
+  defp validate_enforce_labels(labels) do
+    if length(labels) <= 10 and Enum.all?(labels, &(byte_size(&1) in 1..120)),
+      do: :ok,
+      else: error("agent.efficiency.enforce_labels must contain at most 10 non-empty labels of at most 120 bytes")
+  end
 
   defp enforced_actions(map, default) do
     case value(map, "enforced_actions") do

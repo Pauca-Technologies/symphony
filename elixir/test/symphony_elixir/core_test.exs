@@ -892,6 +892,40 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(state.failure_counts, issue_id)
   end
 
+  test "a closed PR failure parks durably instead of retrying another implementation" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", poll_interval_ms: 30_000)
+    issue = %Issue{id: "closed-pr-loop", identifier: "MT-CLOSED", state: "In Progress", labels: []}
+    ref = make_ref()
+    {:ok, pid} = Orchestrator.start_link(name: Module.concat(__MODULE__, :ClosedPrOrchestrator))
+
+    on_exit(fn ->
+      SymphonyElixir.WaitWatcher.acknowledge(issue.id)
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    failure = SymphonyElixir.AgentFailure.classify({:review_gate_infrastructure, %{cause: {:pr_not_open, %{number: 2095, state: "CLOSED", repository: "org/repo"}}}})
+
+    entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      retry_attempt: 1,
+      workspace_path: "/tmp/MT-CLOSED",
+      worker_host: nil,
+      run_failure: failure,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state -> %{state | running: %{issue.id => entry}, claimed: MapSet.new([issue.id])} end)
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    state = :sys.get_state(pid)
+    refute Map.has_key?(state.running, issue.id)
+    refute Map.has_key?(state.retry_attempts, issue.id)
+    assert MapSet.member?(state.claimed, issue.id)
+    assert MapSet.member?(SymphonyElixir.WaitWatcher.issue_ids(), issue.id)
+  end
+
   test "a deterministic review configuration failure is blocked without retrying" do
     previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
     previous_labels = Application.get_env(:symphony_elixir, :memory_tracker_available_labels)
@@ -2622,6 +2656,7 @@ defmodule SymphonyElixir.CoreTest do
                           "task_context",
                           "repository_workflow",
                           "test_worker_budget",
+                          "symphony.behavioral_evidence",
                           "handoff_tool_guidance",
                           "continuation.status_resume_packet"
                         ],
@@ -2835,6 +2870,7 @@ defmodule SymphonyElixir.CoreTest do
                           "task_context",
                           "repository_workflow",
                           "test_worker_budget",
+                          "symphony.behavioral_evidence",
                           "handoff_tool_guidance",
                           "continuation.status_resume_packet"
                         ],
