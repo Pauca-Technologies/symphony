@@ -43,7 +43,20 @@ pathspec magic are not interpreted. Traversal and control characters are rejecte
 fetch commit objects to inspect the remote tree; the checkout, index, branch and FETCH_HEAD are
 preserved. Include every relevant configuration/dependency path or use a concrete PR-check wait;
 incomplete path selection can miss a prerequisite. For a real prerequisite ticket, use Linear's
-blocks relation rather than a cross-issue watcher.
+`blocks_current: true` on typed `linear_issue create_follow_up`, then `linear_dependencies_resolved`
+on the parent ticket. The prerequisite inherits routing/pickup labels and enters Todo only after its
+blocking relation is confirmed. The parent stays parked while blockers are active, with their
+pickup status visible. Existing path waits are not automatically migrated.
+
+Before measuring, inspect `workflow_policy` in each new run manifest. Restarting the host does not
+update an old issue branch's workflow. `stale` means the loaded policy matches the merge base while
+the fetched base changed; `candidate_change` identifies branch edits against an unchanged base;
+`diverged` requires comparison. Sync branch policy through normal review, or explicitly select
+`repos[].efficiency_policy_source: base` for base efficiency settings on new attempts. This opt-in
+preserves hooks, prompts, routing and reviewer policy and fails if base policy is unavailable.
+Telemetry reports expose policy status counts and actual hygiene-only enforcement. Compare these
+with substantive first-review acceptance and tokens per accepted handoff; do not lower model effort
+or concurrency based solely on worker exits or a single stuck issue.
 
 Verify the following on the next cohort:
 

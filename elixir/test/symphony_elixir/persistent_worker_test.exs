@@ -256,6 +256,7 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     packet_runtime = %{
       workspace_path: "/tmp/reconnected-workspace",
+      workflow_policy: %{"status" => "stale", "efficiency_source" => "worktree"},
       resume_packet_id: packet["packet_id"],
       resume_packet_sha256: packet["packet_sha256"],
       resume_packet_ref: "reconnected.json.resume-packet.json",
@@ -292,7 +293,7 @@ defmodule SymphonyElixir.PersistentWorkerTest do
 
     assert_eventually(fn ->
       case Registry.list() do
-        [%{workspace_path: "/tmp/reconnected-workspace", resume_packet_ref: reference}] ->
+        [%{workspace_path: "/tmp/reconnected-workspace", workflow_policy: %{"status" => "stale"}, resume_packet_ref: reference}] ->
           reference == ResumePacket.reference(packet, "reconnected.json.resume-packet.json")
 
         _other ->

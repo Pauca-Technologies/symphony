@@ -553,6 +553,16 @@ Notes:
   `security_tenant`, `data_schema`, `concurrency_liveness`, or `broad_architecture`), confidence,
   bounded input metadata, reasons, and override provenance for efficiency routing.
 
+  Each new attempt compares its loaded workflow and reviewer policy with the fetched base and
+  merge base. Run manifests, telemetry, and the dashboard distinguish `current`, intentional
+  `candidate_change`, `stale`, `diverged`, and `unavailable` policy. The comparison reads immutable
+  git objects, adds no fetch, and preserves the worktree. A running attempt retains its loaded policy.
+  By default, `repos[].efficiency_policy_source: worktree` keeps branch policy authoritative. Set
+  `efficiency_policy_source: base` in host `repos.yaml` to apply only `agent.efficiency` from the
+  fetched base on new attempts. Hooks, implementation/reviewer prompts, routing, and review settings
+  still come from the issue branch. Explicit base selection fails before model routing if the base
+  policy cannot be read or validated; missing comparison data is only diagnostic in worktree mode.
+
   Soft fleet budgets live separately under repository-owned `agent.efficiency`. They default to
   `shadow`, so proposed transitions are observable before prompts change. A repository may allowlist
   the three low-risk context/output-hygiene actions shown below while remaining in shadow mode;
@@ -729,6 +739,19 @@ Notes:
   feedback, remote workspaces, and checkpoints older than 24 hours require fresh review. Checkpoints
   live in Symphony's control state outside the agent workspace; ordinary workspace verdict files
   cannot grant approval. Final validation and the exact-head handoff checks still run.
+  A true prerequisite uses typed `linear_issue create_follow_up` with `blocks_current: true`.
+  Symphony first creates/reuses an unassigned Backlog issue, confirms **new issue blocks current
+  issue**, then adds the source repository and configured automation label IDs and moves it to Todo.
+  Missing routing labels or Todo configuration fail before creation; a failed relation leaves the
+  prerequisite unscheduled. Retries preserve active/terminal state and unrelated labels. Optional
+  discoveries keep the existing Backlog behavior; `depends_on_current: true` expresses the opposite
+  dependency direction. Both flags cannot be true.
+  Park the parent with `linear_dependencies_resolved` on its own issue ID. Host probes show blocker
+  state, assignee, repository and pickup eligibility in the waiting dashboard/API, enriched with
+  actual running/queued/retrying status. Eligibility does not guarantee immediate capacity or
+  assignment eligibility. Only all-terminal blockers or removed relations release the wait;
+  progress, labels, partial responses and failed probes do not. Snapshots and policy diagnostics
+  survive restart. Existing git-path waits retain their condition until explicitly replaced.
   A source project is optional for review follow-ups; missing source issue, team, or Backlog state
   produces a specific configuration error. A closed or merged PR is parked before draft/ready
   mutations. Reopening the watched PR wakes the issue; after replacing the attached PR, manually

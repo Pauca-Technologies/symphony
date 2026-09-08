@@ -62,7 +62,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   }
   """
   @linear_issue_description """
-  Read or update the current Linear issue through typed operations. Use this for activity, the single `## Codex Workpad`, labels, every workflow transition, and separate follow-up issues for valuable discoveries outside current scope. Follow-ups are created unassigned in Backlog, in the same project, without automation labels, and linked deterministically to the current issue. Transitions to review states still run Symphony's before_handoff and automated review gates. Use `linear_graphql` only when no typed operation fits; raw current-issue workflow transitions are rejected.
+  Read or update the current Linear issue through typed operations. Use this for activity, the single `## Codex Workpad`, labels, every workflow transition, and separate follow-up issues outside current scope. For a prerequisite required to finish this ticket, create_follow_up with blocks_current: true establishes new issue -> blocks -> current issue, then adds the configured automation and repository labels and moves the prerequisite to Todo. Optional discoveries remain unassigned in Backlog without automation labels. Both inherit the source team and optional project and use deterministic identities. Transitions to review states still run Symphony's before_handoff and automated review gates. Use `linear_graphql` only when no typed operation fits; raw current-issue workflow transitions are rejected.
   """
   @linear_issue_input_schema %{
     "type" => "object",
@@ -86,6 +86,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "depends_on_current" => %{
         "type" => ["boolean", "null"],
         "description" => "True only when the follow-up cannot start until the current issue is complete."
+      },
+      "blocks_current" => %{
+        "type" => ["boolean", "null"],
+        "description" =>
+          "True only for a prerequisite required to finish the current issue. Creates a blocking relation and schedules the prerequisite in Todo with automation/repository labels. Mutually exclusive with depends_on_current."
       },
       "blocker" => %{
         "type" => ["object", "null"],
@@ -118,7 +123,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   }
   @wait_for_description """
-  Park this issue without consuming an agent slot while an external GitHub, git, or current-ticket Linear condition is unchanged. For a git prerequisite affecting known files, supply literal repository-relative paths (including relevant configuration paths) so unrelated base commits do not wake the agent. A Linear wait may watch only the current issue's comments/state; use Linear dependency relations for real cross-issue prerequisites, and never park on a tracking follow-up. Never use this for local CPU or memory pressure, other validations, local process or port contention, elapsed-time backoffs, a clock, or a Symphony-owned handoff gate; Symphony persists and polls accepted handoff jobs itself. After a successful call, end the turn; Symphony persists the workspace and resumes exactly once when the external condition changes or a human resumes it.
+  Park this issue without consuming an agent slot while an external condition is unchanged. For a real prerequisite, use linear_issue create_follow_up with blocks_current: true, then linear_dependencies_resolved to wait on this issue's explicit blocking relations. This waits until all blockers are terminal or their blocking links are removed, while showing their pickup status; do not wait on optional tracking follow-ups. A Linear wait can otherwise watch only this issue's comments/state. For a git prerequisite affecting known files, supply literal repository-relative paths including relevant configuration paths so unrelated commits do not wake the agent. Never use this for local CPU or memory pressure, other validations, local process or port contention, elapsed-time backoffs, a clock, or a Symphony-owned handoff gate; Symphony polls accepted handoff jobs itself. After a successful call, end the turn; Symphony resumes when the condition changes or a human resumes it.
   """
   @wait_for_input_schema %{
     "type" => "object",
@@ -142,7 +147,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
               "github_pr_gate_settled",
               "github_pr_state_changed",
               "git_ref_changed",
-              "linear_issue_changed"
+              "linear_issue_changed",
+              "linear_dependencies_resolved"
             ]
           },
           "component" => %{"type" => ["string", "null"]},
@@ -274,6 +280,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     create_follow_up = Keyword.get(opts, :tracker_create_follow_up, &Tracker.create_follow_up/2)
 
     with {:ok, title} <- typed_non_blank(arguments, "title", :missing_follow_up_title),
+         :ok <- validate_follow_up_direction(arguments),
          {:ok, description} <-
            typed_non_blank(arguments, "description", :missing_follow_up_description),
          {:ok, acceptance_criteria} <-
@@ -289,7 +296,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
              description: description,
              acceptance_criteria: acceptance_criteria,
              evidence: evidence,
-             depends_on_current: typed_value(arguments, "depends_on_current") == true
+             depends_on_current: typed_value(arguments, "depends_on_current") == true,
+             blocks_current: typed_value(arguments, "blocks_current") == true
            }) do
       success_response(%{
         "status" => "created",
@@ -338,6 +346,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       nil -> failure_response(linear_issue_error({:state_not_found, typed_value(arguments, "state")}))
       {:error, reason} -> failure_response(linear_issue_error(reason))
       other -> failure_response(linear_issue_error({:state_lookup_failed, other}))
+    end
+  end
+
+  defp validate_follow_up_direction(arguments) do
+    flags = Enum.map(["depends_on_current", "blocks_current"], &typed_value(arguments, &1))
+
+    cond do
+      Enum.any?(flags, &(&1 not in [nil, false, true])) -> {:error, :invalid_follow_up_dependency}
+      flags == [true, true] -> {:error, :cyclic_follow_up_dependency}
+      true -> :ok
     end
   end
 

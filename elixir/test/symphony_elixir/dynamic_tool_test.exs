@@ -114,8 +114,9 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert wait_description =~ "without consuming an agent slot"
     assert wait_description =~ "Never use this for local CPU"
     assert wait_description =~ "Symphony-owned handoff gate"
-    assert wait_description =~ "current issue's comments/state"
-    assert wait_description =~ "never park on a tracking follow-up"
+    assert wait_description =~ "this issue's comments/state"
+    assert wait_description =~ "do not wait on optional tracking follow-ups"
+    assert wait_description =~ "linear_dependencies_resolved"
     assert "condition" in wait_schema["required"]
     refute "time" in wait_schema["properties"]["condition"]["properties"]["type"]["enum"]
     refute Map.has_key?(wait_schema["properties"]["condition"]["properties"], "resume_at")
@@ -211,6 +212,35 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                        evidence: "The current diff exposed matching helpers in a.ts and b.ts.",
                        depends_on_current: false
                      }}
+  end
+
+  test "typed prerequisite direction passes through and cycles fail before tracker calls" do
+    issue = %SymphonyElixir.Linear.Issue{id: "source", identifier: "UDPE-1"}
+
+    args = %{
+      "operation" => "create_follow_up",
+      "title" => "Fix prerequisite",
+      "description" => "Stabilize tests.",
+      "acceptance_criteria" => "Tests pass.",
+      "evidence" => "CI failed.",
+      "blocks_current" => true
+    }
+
+    opts = [
+      handoff_gate_context: %{issue: issue},
+      tracker_create_follow_up: fn _, attributes ->
+        send(self(), {:prerequisite, attributes})
+        {:ok, %{id: "new"}}
+      end
+    ]
+
+    assert DynamicTool.execute("linear_issue", args, opts)["success"]
+    assert_received {:prerequisite, %{blocks_current: true, depends_on_current: false}}
+
+    for invalid <- [Map.put(args, "depends_on_current", true), Map.put(args, "blocks_current", "true")] do
+      refute DynamicTool.execute("linear_issue", invalid, opts)["success"]
+      refute_received {:prerequisite, _}
+    end
   end
 
   test "linear_issue resolves typed state transitions before using the gated mutation path" do

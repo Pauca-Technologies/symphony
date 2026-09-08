@@ -2135,6 +2135,30 @@ trials. Symphony supplies no experiment promotion or approval path. Before any o
 decision, a human MUST independently verify the reviewed manifest, retention/window boundaries,
 workspace security, contamination, and material outcome evidence.
 
+### Workflow policy freshness and explicit prerequisites (extension)
+
+Before model routing, implementations MAY compare loaded workflow and reviewer policy with the
+fetched base and merge base. The comparison MUST preserve the checkout and MUST NOT silently
+replace branch policy. It SHOULD distinguish current, intentional candidate changes, stale,
+diverged and unavailable policy, and expose only bounded diagnostic metadata. An explicit host
+`repos[].efficiency_policy_source: base` MAY select base `agent.efficiency` without replacing hooks,
+prompts, routing or reviewer policy. Unavailable or invalid explicitly selected base policy MUST
+stop the attempt before model routing. The default remains worktree policy.
+
+Typed follow-up creation MAY support mutually exclusive `blocks_current` and `depends_on_current`.
+For `blocks_current`, the new issue MUST block the current issue. The host MUST confirm that
+relation before publishing automation/repository labels and scheduling the prerequisite in Todo.
+Configuration must provide an inactive Backlog state, an active Todo state, and unambiguous source
+routing/pickup labels. Creation and retry MUST be idempotent and preserve existing active/terminal
+state and unrelated labels. Optional discoveries retain unassigned Backlog behavior.
+
+A `linear_dependencies_resolved` wait MAY observe the current issue's explicit blockers. It MUST
+remain parked until every blocker is terminal or its relation is removed. Incomplete, truncated,
+failed or mismatched snapshots MUST NOT release the wait. The dashboard SHOULD expose dependency
+state, assignee and routing eligibility, enriched with actual scheduler activity without tracker
+I/O inside the orchestrator. Persisted waits SHOULD retain observations and workflow diagnostics.
+Eligibility alone does not assert available capacity or assignee eligibility.
+
 ### 13.7 Telemetry-Driven Soft Budgets and Routing
 
 Repository workflows MAY configure `agent.efficiency` with `mode` (`off`, `shadow`, or `enforce`),

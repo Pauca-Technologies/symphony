@@ -964,7 +964,20 @@ defmodule SymphonyElixir.ExtensionsTest do
           next_probe_at: DateTime.add(DateTime.utc_now(), 30, :second),
           waiting_seconds: 60,
           probe_attempt: 6,
-          last_observation: nil,
+          workflow_policy: %{"status" => "stale", "differing_sections" => ["agent.efficiency"], "efficiency_source" => "worktree", "remediation" => "Sync the issue branch."},
+          last_observation: %{
+            "dependencies" => [
+              %{
+                "issue_id" => "blocker",
+                "identifier" => "UDPE-7546",
+                "url" => "https://linear.example/UDPE-7546",
+                "state" => "Todo",
+                "dispatch_status" => "eligible_for_pickup",
+                "assignee" => "Alex",
+                "missing_labels" => []
+              }
+            ]
+          },
           last_error: nil
         }
       ])
@@ -979,6 +992,13 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ ~s(href="#waiting-work")
     assert html =~ ~s(id="waiting-work")
     assert html =~ "UDPE-7007"
+    assert html =~ "UDPE-7546"
+    assert html =~ "eligible for pickup"
+    assert html =~ "Alex"
+    assert html =~ "Workflow settings are out of date"
+    assert html =~ "agent.efficiency"
+    payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert [%{"dependencies" => [%{"identifier" => "UDPE-7546"}], "workflow_policy" => %{"status" => "stale"}}] = payload["waiting"]
     assert html =~ "github_actions_recovered: actions"
 
     {running_position, _length} = :binary.match(html, "Active implementors")
@@ -1035,7 +1055,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "backend" => "claude_code",
                    "model" => "claude-opus-4-8",
                    "reasoning_effort" => "xhigh",
-                   "profile" => "deep"
+                   "profile" => "deep",
+                   "workflow_policy" => nil
                  },
                  "session_id" => "thread-http",
                  "turn_count" => 7,
@@ -1128,7 +1149,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                "backend" => "claude_code",
                "model" => "claude-opus-4-8",
                "reasoning_effort" => "xhigh",
-               "profile" => "deep"
+               "profile" => "deep",
+               "workflow_policy" => nil
              },
              "running" => %{
                "worker_host" => nil,
@@ -1137,7 +1159,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "backend" => "claude_code",
                  "model" => "claude-opus-4-8",
                  "reasoning_effort" => "xhigh",
-                 "profile" => "deep"
+                 "profile" => "deep",
+                 "workflow_policy" => nil
                },
                "session_id" => "thread-http",
                "turn_count" => 7,

@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
+  alias SymphonyElixir.{Config, RepoConfig, Router}
   alias SymphonyElixir.Linear.{Client, Comment, Issue}
 
   @follow_up_context_query """
@@ -24,18 +25,67 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @dependencies_query """
+  query SymphonyIssueDependencies($issueId: String!) {
+    issue(id: $issueId) {
+      id state { name }
+      inverseRelations(first: 100) {
+        nodes {
+          type
+          issue {
+            id identifier title url state { name }
+            assignee { displayName }
+            labels(first: 100) {
+              nodes { name parent { name } }
+              pageInfo { hasNextPage }
+            }
+          }
+        }
+        pageInfo { hasNextPage }
+      }
+    }
+  }
+  """
+
   @create_follow_up_mutation """
   mutation SymphonyCreateFollowUp($input: IssueCreateInput!) {
     issueCreate(input: $input) {
       success
-      issue { id identifier title url }
+      issue { id identifier title url state { id name type } labels { nodes { id } } }
     }
   }
   """
 
   @follow_up_lookup_query """
   query SymphonyFollowUpById($issueId: String!) {
-    issue(id: $issueId) { id identifier title url }
+    issue(id: $issueId) { id identifier title url state { id name type } labels { nodes { id } } }
+  }
+  """
+
+  @prerequisite_context_query """
+  query SymphonyPrerequisiteContext($issueId: String!) {
+    issue(id: $issueId) {
+      id identifier url project { id }
+      labels(first: 100) {
+        nodes { id name parent { name } }
+        pageInfo { hasNextPage }
+      }
+      team {
+        id
+        states(filter: {name: {in: ["Backlog", "Todo"]}}, first: 3) {
+          nodes { id name }
+        }
+      }
+    }
+  }
+  """
+
+  @schedule_prerequisite_mutation """
+  mutation SymphonySchedulePrerequisite($issueId: String!, $input: IssueUpdateInput!) {
+    issueUpdate(id: $issueId, input: $input) {
+      success
+      issue { id identifier title url state { id name type } labels { nodes { id } } }
+    }
   }
   """
 
@@ -50,7 +100,7 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @follow_up_relation_lookup_query """
   query SymphonyFollowUpRelationById($relationId: String!) {
-    issueRelation(id: $relationId) { id }
+    issueRelation(id: $relationId) { id type issue { id } relatedIssue { id } }
   }
   """
 
@@ -147,6 +197,13 @@ defmodule SymphonyElixir.Linear.Adapter do
           {:ok, %{comments: [term()], truncated: boolean()}} | {:error, term()}
   def fetch_issue_comments(issue_id), do: client_module().fetch_issue_comments(issue_id)
 
+  @spec fetch_issue_dependencies(String.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_issue_dependencies(issue_id) do
+    with {:ok, response} <- client_module().graphql(@dependencies_query, %{issueId: issue_id}) do
+      SymphonyElixir.DependencyStatus.from_linear(response, issue_id)
+    end
+  end
+
   @spec recently_terminal_issues(pos_integer()) :: {:ok, [term()]} | {:error, term()}
   def recently_terminal_issues(lookback_days),
     do: client_module().recently_terminal_issues(lookback_days)
@@ -166,9 +223,11 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec create_follow_up(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
   def create_follow_up(%Issue{id: issue_id} = source, attributes)
       when is_binary(issue_id) and is_map(attributes) do
-    with {:ok, context} <- follow_up_context(issue_id),
+    with :ok <- validate_follow_up_direction(attributes),
+         {:ok, context} <- follow_up_context(issue_id, attributes),
          {:ok, follow_up, deduplicated?} <- create_or_fetch_follow_up(source, context, attributes),
-         :ok <- ensure_follow_up_relation(source, follow_up, attributes) do
+         :ok <- ensure_follow_up_relation(source, follow_up, attributes),
+         {:ok, follow_up} <- maybe_schedule_prerequisite(follow_up, context) do
       {:ok, Map.put(follow_up, :deduplicated, deduplicated?)}
     end
   end
@@ -244,8 +303,24 @@ defmodule SymphonyElixir.Linear.Adapter do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end
 
-  defp follow_up_context(issue_id) do
-    with {:ok, response} <- client_module().graphql(@follow_up_context_query, %{issueId: issue_id}),
+  defp validate_follow_up_direction(attributes) do
+    flags = Enum.map([:depends_on_current, :blocks_current], &attribute(attributes, &1))
+
+    cond do
+      Enum.any?(flags, &(&1 not in [nil, false, true])) -> {:error, {:follow_up_configuration, :invalid_dependency_direction}}
+      flags == [true, true] -> {:error, {:follow_up_configuration, :cyclic_dependency}}
+      true -> :ok
+    end
+  end
+
+  defp follow_up_context(issue_id, attributes) do
+    if truthy_attribute?(attributes, :blocks_current),
+      do: prerequisite_context(issue_id),
+      else: optional_follow_up_context(issue_id)
+  end
+
+  defp optional_follow_up_context(issue_id) do
+    with {:ok, response} <- follow_up_graphql(@follow_up_context_query, %{issueId: issue_id}),
          {:ok, issue} <- follow_up_source(get_in(response, ["data", "issue"])),
          {:ok, team_id} <- follow_up_required_id(get_in(issue, ["team", "id"]), :team_missing),
          {:ok, state_id} <-
@@ -262,6 +337,124 @@ defmodule SymphonyElixir.Linear.Adapter do
          project_id: get_in(issue, ["project", "id"]),
          state_id: state_id
        }}
+    end
+  end
+
+  defp prerequisite_context(issue_id) do
+    with {:ok, response} <- follow_up_graphql(@prerequisite_context_query, %{issueId: issue_id}),
+         {:ok, issue} <- follow_up_source(get_in(response, ["data", "issue"])),
+         {:ok, team_id} <- follow_up_required_id(get_in(issue, ["team", "id"]), :team_missing),
+         {:ok, backlog_id} <- prerequisite_state(issue, "Backlog", :backlog_state_missing),
+         {:ok, todo_id} <- prerequisite_state(issue, "Todo", :todo_state_missing),
+         :ok <- prerequisite_dispatch_states(),
+         {:ok, label_ids} <- prerequisite_label_ids(issue) do
+      {:ok,
+       %{
+         source_id: issue["id"],
+         source_identifier: issue["identifier"],
+         source_url: issue["url"],
+         team_id: team_id,
+         project_id: get_in(issue, ["project", "id"]),
+         state_id: backlog_id,
+         todo_id: todo_id,
+         prerequisite_label_ids: label_ids
+       }}
+    end
+  end
+
+  defp prerequisite_state(issue, name, reason) do
+    issue
+    |> get_in(["team", "states", "nodes"])
+    |> List.wrap()
+    |> Enum.find_value(fn state -> if state["name"] == name, do: state["id"] end)
+    |> follow_up_required_id(reason)
+  end
+
+  defp prerequisite_dispatch_states do
+    active = Enum.map(Config.settings!().tracker.active_states, &String.downcase/1)
+
+    if "todo" in active and "backlog" not in active,
+      do: :ok,
+      else: {:error, {:follow_up_configuration, :prerequisite_dispatch_states}}
+  end
+
+  defp prerequisite_label_ids(issue) do
+    with true <- get_in(issue, ["labels", "pageInfo", "hasNextPage"]) == false,
+         {:ok, config} <- RepoConfig.load(),
+         labels = get_in(issue, ["labels", "nodes"]) || [],
+         {:ok, repo} <- Router.route(%Issue{labels: Enum.map(labels, &qualified_label_name/1)}, config),
+         {:ok, routing_id} <- source_label_id(labels, repo.label, :repository_label_missing),
+         {:ok, pickup_id} <- source_label_id(labels, config.linear.filter_label, :automation_label_missing) do
+      {:ok, Enum.uniq([routing_id, pickup_id])}
+    else
+      false -> {:error, {:follow_up_configuration, :source_labels_incomplete}}
+      {:skip, _, _} -> {:error, {:follow_up_configuration, :source_repository_unresolved}}
+      {:skip, _} -> {:error, {:follow_up_configuration, :source_repository_unresolved}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp source_label_id(labels, name, reason) when is_binary(name) and name != "" do
+    labels
+    |> Enum.find_value(fn label ->
+      if String.downcase(qualified_label_name(label)) == String.downcase(name), do: label["id"]
+    end)
+    |> follow_up_required_id(reason)
+  end
+
+  defp source_label_id(_labels, _name, reason), do: {:error, {:follow_up_configuration, reason}}
+
+  defp qualified_label_name(%{"name" => name, "parent" => %{"name" => parent}}), do: "#{parent}:#{name}"
+  defp qualified_label_name(%{"name" => name}), do: name
+  defp qualified_label_name(_label), do: ""
+
+  defp maybe_schedule_prerequisite(follow_up, %{prerequisite_label_ids: label_ids} = context) do
+    with state when is_map(state) <- follow_up[:state],
+         type when type in ["backlog", "unstarted", "started", "completed", "canceled"] <- state["type"] do
+      schedule_prerequisite(follow_up, context, label_ids, type)
+    else
+      _ -> {:error, {:follow_up_configuration, :prerequisite_state_unavailable}}
+    end
+  end
+
+  defp maybe_schedule_prerequisite(follow_up, _context), do: {:ok, follow_up}
+
+  defp schedule_prerequisite(follow_up, _context, _label_ids, type) when type in ["completed", "canceled"],
+    do: {:ok, follow_up}
+
+  defp schedule_prerequisite(follow_up, context, label_ids, type) do
+    # Publish pickup labels only after the blocking relation is confirmed. A
+    # retry may add missing labels, but never rewinds active or terminal work.
+    missing_labels = label_ids -- Map.get(follow_up, :label_ids, [])
+    input = %{addedLabelIds: missing_labels}
+    input = if type == "backlog", do: Map.put(input, :stateId, context.todo_id), else: input
+
+    if missing_labels == [] and type != "backlog" do
+      {:ok, follow_up}
+    else
+      case follow_up_graphql(@schedule_prerequisite_mutation, %{issueId: follow_up.id, input: input}) do
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true, "issue" => issue}}}} ->
+          verify_scheduled_prerequisite(issue, follow_up.id, label_ids)
+
+        _ ->
+          {:error, :prerequisite_schedule_failed}
+      end
+    end
+  end
+
+  defp verify_scheduled_prerequisite(issue, issue_id, label_ids) do
+    scheduled = normalize_follow_up(issue)
+
+    if scheduled.id == issue_id and Enum.all?(label_ids, &(&1 in scheduled.label_ids)) and
+         get_in(issue, ["state", "type"]) in ["unstarted", "started", "completed", "canceled"],
+       do: {:ok, scheduled},
+       else: {:error, :prerequisite_schedule_failed}
+  end
+
+  defp follow_up_graphql(query, variables) do
+    case client_module().graphql(query, variables) do
+      {:ok, %{"errors" => errors}} -> {:error, {:linear_graphql_errors, errors}}
+      result -> result
     end
   end
 
@@ -285,7 +478,7 @@ defmodule SymphonyElixir.Linear.Adapter do
 
     input = if is_binary(context.project_id), do: Map.put(input, :projectId, context.project_id), else: input
 
-    case client_module().graphql(@create_follow_up_mutation, %{input: input}) do
+    case follow_up_graphql(@create_follow_up_mutation, %{input: input}) do
       {:ok, response} ->
         case get_in(response, ["data", "issueCreate"]) do
           %{"success" => true, "issue" => issue} -> {:ok, normalize_follow_up(issue), false}
@@ -298,7 +491,7 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   defp fetch_follow_up(issue_id) do
-    with {:ok, response} <- client_module().graphql(@follow_up_lookup_query, %{issueId: issue_id}),
+    with {:ok, response} <- follow_up_graphql(@follow_up_lookup_query, %{issueId: issue_id}),
          %{"id" => _id} = issue <- get_in(response, ["data", "issue"]) do
       {:ok, normalize_follow_up(issue), true}
     else
@@ -308,31 +501,41 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   defp ensure_follow_up_relation(%Issue{id: source_id}, %{id: follow_up_id}, attributes) do
-    relation_type = if truthy_attribute?(attributes, :depends_on_current), do: "blocks", else: "related"
-    relation_id = deterministic_uuid("follow-up-relation:#{relation_type}", source_id, follow_up_id)
+    {issue_id, related_id, relation_type} = follow_up_relation(source_id, follow_up_id, attributes)
+    relation_id = deterministic_uuid("follow-up-relation:#{relation_type}", issue_id, related_id)
 
     input = %{
       id: relation_id,
-      issueId: source_id,
-      relatedIssueId: follow_up_id,
+      issueId: issue_id,
+      relatedIssueId: related_id,
       type: relation_type
     }
 
-    case client_module().graphql(@create_follow_up_relation_mutation, %{input: input}) do
+    case follow_up_graphql(@create_follow_up_relation_mutation, %{input: input}) do
       {:ok, response} ->
         if get_in(response, ["data", "issueRelationCreate", "success"]) == true,
           do: :ok,
-          else: follow_up_relation_exists?(relation_id)
+          else: follow_up_relation_exists?(input)
 
       {:error, _reason} ->
-        follow_up_relation_exists?(relation_id)
+        follow_up_relation_exists?(input)
     end
   end
 
-  defp follow_up_relation_exists?(relation_id) do
+  defp follow_up_relation(source_id, follow_up_id, attributes) do
+    cond do
+      truthy_attribute?(attributes, :blocks_current) -> {follow_up_id, source_id, "blocks"}
+      truthy_attribute?(attributes, :depends_on_current) -> {source_id, follow_up_id, "blocks"}
+      true -> {source_id, follow_up_id, "related"}
+    end
+  end
+
+  defp follow_up_relation_exists?(input) do
     with {:ok, response} <-
-           client_module().graphql(@follow_up_relation_lookup_query, %{relationId: relation_id}),
-         relation when is_map(relation) <- get_in(response, ["data", "issueRelation"]) do
+           follow_up_graphql(@follow_up_relation_lookup_query, %{relationId: input.id}),
+         %{"type" => type, "issue" => %{"id" => source}, "relatedIssue" => %{"id" => target}} <-
+           get_in(response, ["data", "issueRelation"]),
+         true <- type == input.type and source == input.issueId and target == input.relatedIssueId do
       :ok
     else
       {:error, reason} -> {:error, reason}
@@ -365,7 +568,9 @@ defmodule SymphonyElixir.Linear.Adapter do
       id: issue["id"],
       identifier: issue["identifier"],
       title: issue["title"],
-      url: issue["url"]
+      url: issue["url"],
+      state: issue["state"],
+      label_ids: (get_in(issue, ["labels", "nodes"]) || []) |> Enum.map(& &1["id"])
     }
   end
 

@@ -1195,8 +1195,12 @@ defmodule SymphonyElixir.ReviewGate do
     needs a concrete ticket criterion and exact files. Every out-of-scope change must set
     `required_action` to `remove_from_candidate`; never approve while any remain. Put legitimate
     discoveries that do not belong in this candidate in `follow_ups` with a title, description,
-    acceptance criteria, evidence, and `depends_on_current`; Symphony creates those Linear issues
-    after validating this exact-head verdict.
+    acceptance criteria, evidence, `depends_on_current`, and `blocks_current`. Set `blocks_current`
+    true only when that separate work is required to complete this ticket: Symphony links the new
+    issue as blocking this one and schedules it in Todo with the source repository's automation
+    and routing labels. Set `depends_on_current` true only for downstream work that must wait for
+    this ticket. Never set both true. Optional discoveries stay in Backlog. Symphony creates these
+    issues after validating this exact-head verdict; a prerequisite does not waive a failing gate.
     """
     |> String.trim()
   end
@@ -1444,7 +1448,8 @@ defmodule SymphonyElixir.ReviewGate do
     Enum.all?(
       [follow_up.title, follow_up.description, follow_up.acceptance_criteria, follow_up.evidence],
       &present_string?/1
-    ) and is_boolean(follow_up.depends_on_current)
+    ) and is_boolean(follow_up.depends_on_current) and is_boolean(follow_up.blocks_current) and
+      not (follow_up.depends_on_current and follow_up.blocks_current)
   end
 
   defp validate_scope_conclusion_shape(%{conclusion: "conforms"} = assessment) do
@@ -1663,16 +1668,18 @@ defmodule SymphonyElixir.ReviewGate do
     Enum.map(follow_ups, fn follow_up ->
       if is_map(follow_up) do
         depends_on_current = Map.get(follow_up, "depends_on_current")
+        blocks_current = Map.get(follow_up, "blocks_current", false)
 
         %{
           title: string_or_nil(Map.get(follow_up, "title")),
           description: string_or_nil(Map.get(follow_up, "description")),
           acceptance_criteria: string_or_nil(Map.get(follow_up, "acceptance_criteria")),
           evidence: string_or_nil(Map.get(follow_up, "evidence")),
-          depends_on_current: if(is_boolean(depends_on_current), do: depends_on_current)
+          depends_on_current: if(is_boolean(depends_on_current), do: depends_on_current),
+          blocks_current: if(is_boolean(blocks_current), do: blocks_current)
         }
       else
-        %{title: nil, description: nil, acceptance_criteria: nil, evidence: nil, depends_on_current: false}
+        %{title: nil, description: nil, acceptance_criteria: nil, evidence: nil, depends_on_current: false, blocks_current: false}
       end
     end)
   end

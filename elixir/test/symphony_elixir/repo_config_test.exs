@@ -22,6 +22,15 @@ defmodule SymphonyElixir.RepoConfigTest do
     %{path: path}
   end
 
+  test "efficiency policy source defaults to the worktree and requires an explicit valid opt-in", %{path: path} do
+    File.write!(path, "repos:\n  - id: dashboard\n    label: repo:dashboard\n")
+    assert {:ok, %{repos: [%{efficiency_policy_source: "worktree"}]}} = RepoConfig.load()
+    File.write!(path, "repos:\n  - id: dashboard\n    label: repo:dashboard\n    efficiency_policy_source: base\n")
+    assert {:ok, %{repos: [%{efficiency_policy_source: "base"}]}} = RepoConfig.load()
+    File.write!(path, "repos:\n  - id: dashboard\n    label: repo:dashboard\n    efficiency_policy_source: unknown\n")
+    assert {:error, _} = RepoConfig.load()
+  end
+
   describe "load/0" do
     test "returns empty default config when file is absent", %{path: path} do
       File.rm(path)

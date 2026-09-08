@@ -248,7 +248,8 @@ defmodule SymphonyElixir.AgentFailure do
   end
 
   defp deterministic_review_configuration_failure?(reason) do
-    contains_atom?(reason, :follow_up_configuration) or
+    contains_atom?(reason, :workflow_policy_unavailable) or
+      contains_atom?(reason, :follow_up_configuration) or
       contains_internal_marker?(reason, "follow_up_configuration") or
       contains_atom?(reason, :packet_bound_unachievable) or
       contains_internal_marker?(reason, "packet_bound_unachievable") or

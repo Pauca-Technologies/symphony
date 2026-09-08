@@ -109,6 +109,7 @@ defmodule SymphonyElixir.RunManifest do
         worktree_fingerprint_complete: Map.get(repository, :worktree_fingerprint_complete)
       },
       symphony: %{version: OrchestratorVersion.current(), sha: @symphony_sha},
+      workflow_policy: Map.get(context, :workflow_policy),
       workflow: workflow,
       prompt: prompt,
       agent: %{

@@ -196,3 +196,9 @@ retain the run's repository attribution, falling back to the packet's repository
 when a newly observed ref changes outside the requested paths. `model_wake: false` identifies a
 suppressed wake; repeated polls of the same observation do not emit another event. Report these
 separately from completed worker runs and material progress.
+
+Workflow policy comparison emits a `workflow_policy` event before model routing, with run/issue
+context and bounded status, differing section names, revision IDs and digests. Warnings include
+issue and worker context for `stale`, `diverged` or `unavailable` policy. No workflow content, hooks
+or prompts are logged. Run manifests record the comparison and selected efficiency source;
+telemetry reports count statuses and actual hygiene-only enforcement separately from routing mode.

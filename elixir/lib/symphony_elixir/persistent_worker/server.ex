@@ -198,6 +198,7 @@ defmodule SymphonyElixir.PersistentWorker.Server do
     changes =
       %{}
       |> maybe_put_manifest_change(:workspace_path, runtime_info[:workspace_path])
+      |> maybe_put_manifest_change(:workflow_policy, runtime_info[:workflow_policy])
       |> maybe_put_manifest_change(
         :resume_packet_ref,
         ResumePacket.reference_from_runtime_info(runtime_info)

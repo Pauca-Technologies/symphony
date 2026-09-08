@@ -203,6 +203,10 @@ Use `linear_issue` for the current workpad, labels, and workflow transitions. In
   the follow-up in the current branch. Symphony creates or returns a deterministic
   unassigned Backlog issue in the same team and, when present, project without automation labels and links
   it as related, or as blocked by the current issue when `depends_on_current` is true.
+  For a true prerequisite needed to finish this ticket, set `blocks_current: true` instead. Symphony
+  confirms that the new issue blocks this ticket, inherits the source repository and automation
+  labels, then queues it in Todo. Never set both dependency flags. Required routing labels and
+  Backlog/Todo states must exist before creation; retries preserve work already started or finished.
 - Map changed behavior to observable acceptance evidence in the workpad. For concurrency defects,
   include applicable bootstrap, reload/resume, cancellation, stale-client and combined-state cases.
   For UI work, cover the relevant normal, loading, error and accessibility states. For workflow
@@ -210,12 +214,18 @@ Use `linear_issue` for the current workpad, labels, and workflow transitions. In
 - When waiting on a git ref for a specific fix, include `condition.paths` with the relevant literal
   repository-relative files/directories. Symphony compares those tree entries and ignores unrelated
   commits without changing the local branch or worktree. Use Linear dependency relations for actual
-  cross-ticket prerequisites. A closed/merged PR produces a durable PR-state wait; reopening it or
+  cross-ticket prerequisites, then park this ticket with `linear_dependencies_resolved`. The host
+  displays blockers and their pickup status and resumes only after every blocker is terminal or
+  its blocking relation is removed. A closed/merged PR produces a durable PR-state wait; reopening it or
   explicitly resuming after replacing its attachment allows a new preflight.
 - Review delivery can resume from a trusted approval checkpoint when its inputs remain identical.
   Delivery-only retries reuse valid proof; candidate, scope, policy or feedback changes require a
   fresh assessment. Missing source/team/Backlog prerequisites are reported precisely; a project is
   optional for follow-up creation.
+- The host reports loaded workflow drift against the fetched base on new attempts. The default
+  `repos[].efficiency_policy_source: worktree` preserves branch policy. Operators may explicitly
+  select `base` to load only base `agent.efficiency` settings; prompts, hooks and review policy remain
+  branch-owned. This selection requires readable, valid base policy before model routing.
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.

@@ -361,6 +361,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:routing_confidence, runtime_info[:routing_confidence])
           |> maybe_put_runtime_value(:budget_profile, runtime_info[:budget_profile])
           |> maybe_put_runtime_value(:budget_mode, runtime_info[:budget_mode])
+          |> maybe_put_runtime_value(:workflow_policy, runtime_info[:workflow_policy])
           |> maybe_put_runtime_value(:budget_metrics, runtime_info[:budget_metrics])
           |> maybe_put_runtime_value(:budget_transitions, runtime_info[:budget_transitions])
           |> maybe_put_runtime_value(:repository_id, runtime_info[:repository_id])
@@ -2145,6 +2146,7 @@ defmodule SymphonyElixir.Orchestrator do
       title: issue.title,
       issue: issue,
       backend: Map.get(running_entry, :backend),
+      workflow_policy: Map.get(running_entry, :workflow_policy),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       resume_packet_ref: Map.get(running_entry, :resume_packet_ref),
@@ -2267,7 +2269,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp datetime_sort_key(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :microsecond)
   defp datetime_sort_key(_datetime), do: 9_223_372_036_854_775_807
 
-  defp wait_snapshot(now) do
+  defp wait_snapshot(now, state) do
     wait_watcher_snapshot()
     |> Enum.map(fn entry ->
       %{
@@ -2279,6 +2281,7 @@ defmodule SymphonyElixir.Orchestrator do
         condition: entry.request.condition,
         condition_key: entry.request.condition_key,
         backend: entry.backend,
+        workflow_policy: Map.get(entry, :workflow_policy),
         run_id: Map.get(entry, :run_id),
         parent_run_id: Map.get(entry, :parent_run_id),
         retry_id: Map.get(entry, :retry_id),
@@ -2290,12 +2293,32 @@ defmodule SymphonyElixir.Orchestrator do
         next_probe_at: entry.next_probe_at,
         waiting_seconds: running_seconds(entry.parked_at, now),
         probe_attempt: entry.probe_attempt,
-        last_observation: Map.get(entry, :last_observation),
+        last_observation: dependency_activity(Map.get(entry, :last_observation), state),
         last_error: Map.get(entry, :last_error),
         codex_session_logs: Map.get(entry, :codex_session_logs, []),
         recent_codex_transcript_blocks: Map.get(entry, :recent_codex_transcript_blocks, [])
       }
     end)
+  end
+
+  defp dependency_activity(%{"dependencies" => dependencies} = observation, state) when is_list(dependencies) do
+    Map.put(observation, "dependencies", Enum.map(dependencies, &dependency_activity_entry(&1, state)))
+  end
+
+  defp dependency_activity(observation, _state), do: observation
+
+  defp dependency_activity_entry(dependency, state) do
+    id = dependency["issue_id"]
+
+    status =
+      cond do
+        Map.has_key?(state.running, id) -> "running"
+        Map.has_key?(state.queued, id) -> "queued"
+        Map.has_key?(state.retry_attempts, id) -> "retrying"
+        true -> dependency["dispatch_status"]
+      end
+
+    Map.put(dependency, "dispatch_status", status)
   end
 
   defp restored_wait_claims do
@@ -3647,6 +3670,7 @@ defmodule SymphonyElixir.Orchestrator do
           routing_confidence: Map.get(metadata, :routing_confidence),
           budget_profile: Map.get(metadata, :budget_profile),
           budget_mode: Map.get(metadata, :budget_mode),
+          workflow_policy: Map.get(metadata, :workflow_policy),
           budget_metrics: Map.get(metadata, :budget_metrics),
           budget_transitions: Map.get(metadata, :budget_transitions, []),
           repository_id: Map.get(metadata, :repository_id),
@@ -3709,7 +3733,7 @@ defmodule SymphonyElixir.Orchestrator do
       end)
 
     parked = quota_parked_snapshot(state.quota_circuits, now)
-    waiting = wait_snapshot(now)
+    waiting = wait_snapshot(now, state)
 
     queued =
       state.queued

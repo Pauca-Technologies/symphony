@@ -7,12 +7,12 @@ defmodule SymphonyElixir.WaitCondition do
   cannot create unique conditions or trigger immediate wake-up loops.
   """
 
-  alias SymphonyElixir.{AgentTransport, Tracker}
+  alias SymphonyElixir.{AgentTransport, DependencyStatus, Tracker}
 
   @github_status_url "https://www.githubstatus.com/api/v2/summary.json"
   @command_timeout_ms 30_000
   @max_command_output_bytes 2_000_000
-  @condition_types ~w(github_actions_recovered github_pr_checks_changed github_pr_check_changed github_pr_gate_settled github_pr_state_changed git_ref_changed linear_issue_changed)
+  @condition_types ~w(github_actions_recovered github_pr_checks_changed github_pr_check_changed github_pr_gate_settled github_pr_state_changed git_ref_changed linear_issue_changed linear_dependencies_resolved)
 
   @type request :: %{
           condition: map(),
@@ -184,6 +184,12 @@ defmodule SymphonyElixir.WaitCondition do
     end
   end
 
+  def observe(%{condition: %{"type" => "linear_dependencies_resolved", "issue_id" => issue_id}}) do
+    with {:ok, snapshot} <- Tracker.fetch_issue_dependencies(issue_id) do
+      DependencyStatus.observation(snapshot)
+    end
+  end
+
   # Compatibility for timer waits persisted by releases that accepted them. New
   # requests no longer normalize this condition type, but existing entries must
   # still wake instead of becoming stranded during an upgrade.
@@ -204,6 +210,9 @@ defmodule SymphonyElixir.WaitCondition do
   @spec changed?(request(), map()) :: boolean()
   def changed?(%{condition: %{"type" => "github_actions_recovered"}}, observation),
     do: observation["recovery_signal"] != "waiting"
+
+  def changed?(%{condition: %{"type" => "linear_dependencies_resolved"}}, observation),
+    do: observation["resolved"] == true
 
   def changed?(%{condition: %{"type" => "github_pr_gate_settled"}} = request, observation) do
     observation["aggregate"] in ["pass", "fail"] or
@@ -365,6 +374,13 @@ defmodule SymphonyElixir.WaitCondition do
          {:ok, issue_id} <- non_blank(issue_id, :missing_issue_id),
          true <- issue_id == current_issue_id or {:error, :cross_issue_linear_wait_not_allowed} do
       {:ok, %{"type" => "linear_issue_changed", "issue_id" => issue_id}}
+    end
+  end
+
+  defp do_normalize_condition("linear_dependencies_resolved", condition, context) do
+    case do_normalize_condition("linear_issue_changed", condition, context) do
+      {:ok, normalized} -> {:ok, Map.put(normalized, "type", "linear_dependencies_resolved")}
+      error -> error
     end
   end
 
@@ -567,7 +583,7 @@ defmodule SymphonyElixir.WaitCondition do
          %{condition: %{"type" => type}} = request,
          observation
        )
-       when type in ["github_actions_recovered", "github_pr_gate_settled"] do
+       when type in ["github_actions_recovered", "github_pr_gate_settled", "linear_dependencies_resolved"] do
     if changed?(request, observation),
       do: {:error, {:condition_already_satisfied, observation}},
       else: :ok

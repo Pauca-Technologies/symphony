@@ -204,6 +204,9 @@ defmodule SymphonyElixir.AgentRunner do
           |> maybe_put(:review_workflow_source, review_workflow_source(routed_repo, review_workflow))
           |> maybe_put(:automation_opt_in_label, automation_opt_in_label)
           |> maybe_put(:base_drift_ref, routed_repo && routed_repo.base_branch)
+          |> maybe_put(:workflow_path, routed_repo && routed_repo.workflow_path)
+          |> maybe_put(:review_workflow_path, routed_repo && routed_repo.review_workflow_path)
+          |> maybe_put(:efficiency_policy_source, routed_repo && Map.get(routed_repo, :efficiency_policy_source, "worktree"))
 
         try do
           with :ok <-
@@ -1348,7 +1351,8 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
+    with {:ok, opts} <- resolve_workflow_policy(workspace, issue, codex_update_recipient, opts, worker_host),
+         {:ok, route} <- resolve_agent_route(workspace, issue, opts, worker_host),
          {:ok, efficiency} <-
            AgentEfficiency.decide(issue, route, Keyword.get(opts, :per_repo_workflow)) do
       {initial_packet, load_errors} = resume_packet_fallback(workspace, worker_host, opts, issue)
@@ -1443,6 +1447,33 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp resolve_workflow_policy(workspace, issue, recipient, opts, worker_host) do
+    resolver = Keyword.get(opts, :workflow_policy_resolver, &SymphonyElixir.WorkflowPolicy.resolve/4)
+
+    with {:ok, workflow, policy} <-
+           resolver.(
+             workspace,
+             Keyword.get(opts, :per_repo_workflow),
+             Keyword.get(opts, :per_repo_review_workflow),
+             Keyword.put(opts, :worker_host, worker_host)
+           ) do
+      if is_pid(recipient), do: send(recipient, {:worker_runtime_info, issue.id, %{workflow_policy: policy}})
+
+      Telemetry.emit(:workflow_policy, %{
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        repository: Keyword.get(opts, :repository_id),
+        policy: policy
+      })
+
+      if policy["status"] in ["stale", "diverged", "unavailable"] do
+        Logger.warning("Workflow policy comparison #{issue_context(issue)} worker_host=#{inspect(worker_host)} status=#{policy["status"]} efficiency_source=#{policy["efficiency_source"]}")
+      end
+
+      {:ok, opts |> Keyword.put(:per_repo_workflow, workflow) |> Keyword.put(:workflow_policy, policy)}
+    end
+  end
+
   defp emit_run_manifest(workspace, issue, route, efficiency, opts) do
     context = %{
       identity: Telemetry.current_context(),
@@ -1457,6 +1488,7 @@ defmodule SymphonyElixir.AgentRunner do
       review_workflow: Keyword.get(opts, :per_repo_review_workflow),
       workflow_source: Keyword.get(opts, :workflow_source),
       review_workflow_source: Keyword.get(opts, :review_workflow_source),
+      workflow_policy: Keyword.get(opts, :workflow_policy),
       experiment_assignment: Keyword.get(opts, :experiment_assignment)
     }
 
@@ -3970,7 +4002,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     - If useful work cannot continue until an external GitHub, git, or Linear condition changes, call Symphony's `wait_for` tool once and end the turn.
     - Do not spend agent turns repeatedly polling an unchanged external condition. Symphony will persist the wait, free the agent slot, and resume this issue after the condition changes.
-    - A Linear wait may watch only this current ticket's comments or state. Do not park on a follow-up/tracking ticket you created; represent a true prerequisite with Linear's `blocks` relation, while operational reviewer/handoff failures remain active for orchestrator retry.
+    - `linear_issue_changed` watches only this current ticket's comments or state. Do not park on a follow-up/tracking ticket by its ID. For a true prerequisite, use `linear_issue create_follow_up` with `blocks_current: true`; Symphony creates the blocking relation, inherits routing/pickup labels, and queues it in Todo. Then use `linear_dependencies_resolved` on this current issue to wait until every explicit blocker is terminal or removed. Operational reviewer/handoff failures remain active for orchestrator retry.
     - Never call `wait_for` because of local CPU or memory pressure, another validation running, local process or port contention, a desired time delay, or a Symphony-owned handoff job. Symphony polls accepted handoff jobs itself. Continue useful work and run repository validations with the configured per-run worker limit; Symphony intentionally permits validations from multiple agents to overlap.
     """
 

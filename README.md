@@ -132,3 +132,8 @@ help with the setup:
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+The Elixir implementation also exposes loaded workflow freshness and explicit prerequisite status.
+True prerequisite follow-ups establish their blocking relation before receiving routing/pickup
+labels and Todo status; parked parents resume when their explicit blockers resolve. See the
+[Elixir implementation guide](elixir/README.md) for policy-source controls and operational details.

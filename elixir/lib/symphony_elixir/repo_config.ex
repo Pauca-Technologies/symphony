@@ -67,6 +67,7 @@ defmodule SymphonyElixir.RepoConfig do
           repo_url: String.t() | nil,
           workflow_path: String.t(),
           review_workflow_path: String.t(),
+          efficiency_policy_source: String.t(),
           base_branch: String.t(),
           max_concurrent: pos_integer(),
           overlap_policy: String.t(),
@@ -334,7 +335,8 @@ defmodule SymphonyElixir.RepoConfig do
   defp build_repo_entry(entry, index) when is_map(entry) do
     with id when is_binary(id) and id != "" <- Map.get(entry, "id") || {:missing, :id},
          label when is_binary(label) and label != "" <-
-           Map.get(entry, "label") || {:missing, :label} do
+           Map.get(entry, "label") || {:missing, :label},
+         efficiency_source when efficiency_source in ["worktree", "base"] <- Map.get(entry, "efficiency_policy_source", "worktree") do
       repo_url = optional_string(entry, "repo_url")
       workflow_path = string_or_default(entry, "workflow_path", "WORKFLOW.md")
       review_workflow_path = string_or_default(entry, "review_workflow_path", "WORKFLOW_REVIEW.md")
@@ -356,6 +358,7 @@ defmodule SymphonyElixir.RepoConfig do
          repo_url: repo_url,
          workflow_path: workflow_path,
          review_workflow_path: review_workflow_path,
+         efficiency_policy_source: efficiency_source,
          base_branch: base_branch,
          max_concurrent: max_concurrent,
          overlap_policy: overlap_policy,

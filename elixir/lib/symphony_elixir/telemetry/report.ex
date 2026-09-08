@@ -80,6 +80,8 @@ defmodule SymphonyElixir.Telemetry.Report do
         task_types: tally(routing_decisions, "task_type"),
         budget_profiles: tally(routing_decisions, "budget_profile"),
         modes: tally(routing_decisions, "budget_mode"),
+        hygiene_only_enforced: Enum.count(routing_decisions, &(&1["hygiene_only"] == true and &1["enforced"] == true)),
+        workflow_policy_statuses: grouped |> Map.get("workflow_policy", []) |> Enum.map(&(&1["policy"] || %{})) |> tally("status"),
         overrides: Enum.count(routing_decisions, &is_map(&1["override"])),
         review_refinements: length(review_routing_decisions),
         review_profiles: tally(review_routing_decisions, "effective_budget_profile"),

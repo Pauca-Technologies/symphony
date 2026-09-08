@@ -1796,6 +1796,14 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end
   end
 
+  test "an unavailable explicitly selected base policy stops before the backend starts" do
+    Application.put_env(:symphony_elixir, :waiting_backend_recipient, self())
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :waiting_backend_recipient) end)
+    issue = %Issue{id: "policy-failed", identifier: "UDPE-POLICY", state: "In Progress"}
+    assert {:error, _} = AgentRunner.run_codex_turns_for_test(System.tmp_dir!(), issue, self(), [agent_backend: {WaitingBackend, %{}}, efficiency_policy_source: "base"], nil)
+    refute_received {:waiting_prompt, _}
+  end
+
   test "wait_for parks after one turn and emits a durable waiting lifecycle" do
     Application.put_env(:symphony_elixir, :waiting_backend_recipient, self())
     on_exit(fn -> Application.delete_env(:symphony_elixir, :waiting_backend_recipient) end)
@@ -1816,6 +1824,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                self(),
                [
                  agent_backend: {WaitingBackend, %{}},
+                 workflow_policy_resolver: fn _workspace, workflow, _review, _opts -> {:ok, workflow, %{"status" => "stale", "efficiency_source" => "worktree"}} end,
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [issue]} end,
                  issue_comments_fetcher: fn _issue_id ->
                    {:ok, %{comments: [], truncated: false}}
@@ -1834,7 +1843,10 @@ defmodule SymphonyElixir.AgentRunnerTest do
                nil
              )
 
+    assert_receive {:worker_runtime_info, "issue-agent-wait", %{workflow_policy: %{"status" => "stale"}}}
     assert_receive {:waiting_prompt, prompt}
+    assert prompt =~ "linear_dependencies_resolved"
+    assert prompt =~ "blocks_current: true"
     assert prompt =~ "call Symphony's `wait_for` tool once and end the turn"
     assert prompt =~ "Never call `wait_for` because of local CPU"
     assert prompt =~ "Symphony-owned handoff job"

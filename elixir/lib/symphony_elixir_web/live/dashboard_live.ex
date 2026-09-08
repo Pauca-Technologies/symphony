@@ -182,6 +182,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <p :if={@issue_payload.agent.reasoning_effort} class="metric-detail mono">
                 effort <%= @issue_payload.agent.reasoning_effort %><%= if @issue_payload.agent.profile, do: " · #{@issue_payload.agent.profile}" %>
               </p>
+              <.workflow_policy_notice policy={@issue_payload.agent.workflow_policy} />
             </article>
 
             <article class="metric-card">
@@ -252,6 +253,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <div>
                 <span class="field-label">Condition</span>
                 <pre class="code-panel"><%= wait_condition_label(@issue_payload.waiting.condition) %></pre>
+                <.dependency_list dependencies={@issue_payload.waiting.dependencies} />
+                <.workflow_policy_notice policy={@issue_payload.waiting.workflow_policy} />
               </div>
               <div>
                 <span class="field-label">Next probe</span>
@@ -719,6 +722,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           <span :if={entry.agent.reasoning_effort} class="muted agent-model mono">
                             effort <%= entry.agent.reasoning_effort %><%= if entry.agent.profile, do: " · #{entry.agent.profile}" %>
                           </span>
+                          <.workflow_policy_notice policy={entry.agent.workflow_policy} />
                         </div>
                       </td>
                       <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
@@ -791,6 +795,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <td>
                         <div class="detail-stack">
                           <span><%= entry.reason %></span>
+                          <.dependency_list dependencies={entry.dependencies} />
+                          <.workflow_policy_notice policy={entry.workflow_policy} />
                           <span :if={entry.last_error} class="muted">Last probe: <%= entry.last_error %></span>
                         </div>
                       </td>
@@ -1111,6 +1117,49 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp blank_to_nil(_value), do: nil
+
+  defp workflow_policy_notice(assigns) do
+    ~H"""
+    <div :if={is_map(@policy) && @policy["status"] in ["stale", "diverged", "unavailable"]} class="detail-stack workflow-policy-notice">
+      <strong><%= workflow_policy_label(@policy["status"]) %></strong>
+      <span :if={@policy["differing_sections"] not in [nil, []]} class="muted">
+        Differs from fetched base: <%= Enum.join(@policy["differing_sections"], ", ") %>
+      </span>
+      <span class="muted">Efficiency settings from <%= @policy["efficiency_source"] %>.</span>
+      <details :if={@policy["remediation"]}>
+        <summary>How to update</summary>
+        <p><%= @policy["remediation"] %></p>
+      </details>
+    </div>
+    """
+  end
+
+  defp workflow_policy_label("stale"), do: "Workflow settings are out of date"
+  defp workflow_policy_label("diverged"), do: "Workflow changes need comparison"
+  defp workflow_policy_label("unavailable"), do: "Workflow freshness is unknown"
+
+  defp dependency_list(assigns) do
+    ~H"""
+    <ul :if={@dependencies != []} class="dependency-list">
+      <li :for={dependency <- @dependencies}>
+        <a :if={is_binary(dependency["url"]) && safe_href?(dependency["url"])} href={dependency["url"]} rel="noreferrer">
+          <%= dependency["identifier"] || dependency["issue_id"] %>
+        </a>
+        <span :if={!is_binary(dependency["url"]) || !safe_href?(dependency["url"])}><%= dependency["identifier"] || dependency["issue_id"] %></span>
+        — <%= dependency["state"] %> · <%= dependency_status_label(dependency["dispatch_status"]) %>
+        <span :if={dependency["assignee"]}> · <%= dependency["assignee"] %></span>
+        <span :if={dependency["missing_labels"] not in [nil, []]}> · needs <%= Enum.join(dependency["missing_labels"], ", ") %></span>
+      </li>
+    </ul>
+    """
+  end
+
+  defp dependency_status_label("eligible_for_pickup"), do: "eligible for pickup"
+  defp dependency_status_label("not_queued"), do: "not queued for Symphony"
+  defp dependency_status_label("missing_automation_label"), do: "missing pickup label"
+  defp dependency_status_label("missing_repository_label"), do: "missing repository label"
+  defp dependency_status_label("ambiguous_repository"), do: "multiple repository labels"
+  defp dependency_status_label(status), do: status
 
   defp wait_condition_label(condition) when is_map(condition) do
     type = Map.get(condition, "type", "unknown")

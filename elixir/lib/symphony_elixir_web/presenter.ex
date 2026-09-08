@@ -331,6 +331,7 @@ defmodule SymphonyElixirWeb.Presenter do
       condition: entry.condition,
       condition_key: entry.condition_key,
       backend: entry.backend,
+      workflow_policy: Map.get(entry, :workflow_policy),
       worker_host: entry.worker_host,
       workspace_path: entry.workspace_path,
       parked_at: iso8601(entry.parked_at),
@@ -338,6 +339,7 @@ defmodule SymphonyElixirWeb.Presenter do
       waiting_seconds: entry.waiting_seconds,
       probe_attempt: entry.probe_attempt,
       last_observation: entry.last_observation,
+      dependencies: get_in(entry.last_observation || %{}, ["dependencies"]) || [],
       last_error: entry.last_error
     }
   end
@@ -714,7 +716,8 @@ defmodule SymphonyElixirWeb.Presenter do
       backend: blank_to_nil(Map.get(entry, :backend)),
       model: blank_to_nil(Map.get(entry, :model)),
       reasoning_effort: blank_to_nil(Map.get(entry, :reasoning_effort)),
-      profile: blank_to_nil(Map.get(entry, :profile))
+      profile: blank_to_nil(Map.get(entry, :profile)),
+      workflow_policy: Map.get(entry, :workflow_policy)
     }
     |> maybe_put_efficiency(entry)
   end

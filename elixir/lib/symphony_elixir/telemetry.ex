@@ -25,6 +25,7 @@ defmodule SymphonyElixir.Telemetry do
           :run_start
           | :run_end
           | :run_manifest
+          | :workflow_policy
           | :experiment_exposure
           | :experiment_suspended
           | :task_outcome

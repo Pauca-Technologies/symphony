@@ -3,6 +3,19 @@ defmodule SymphonyElixir.Telemetry.ReportTest do
 
   alias SymphonyElixir.Telemetry.Report
 
+  test "reports actual workflow freshness and hygiene enforcement" do
+    report =
+      Report.build([
+        %{"event" => "workflow_policy", "policy" => %{"status" => "stale"}},
+        %{"event" => "workflow_policy", "policy" => %{"status" => "current"}},
+        %{"event" => "routing_decision", "hygiene_only" => true, "enforced" => true},
+        %{"event" => "routing_decision", "hygiene_only" => true, "enforced" => false}
+      ])
+
+    assert report.routing.workflow_policy_statuses == %{"stale" => 1, "current" => 1}
+    assert report.routing.hygiene_only_enforced == 1
+  end
+
   test "delivery reports keep worker exits separate and show review denominators" do
     review = %{"event" => "review", "subtype" => "review", "issue_id" => "issue", "reviewed_sha" => "head", "packet_id" => "p", "config_digest" => "policy"}
 

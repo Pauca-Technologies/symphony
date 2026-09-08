@@ -82,6 +82,10 @@ defmodule SymphonyElixir.Workflow do
     end
   end
 
+  @doc "Parse workflow content read from an immutable repository revision."
+  @spec from_string(String.t()) :: {:ok, loaded_workflow()} | {:error, term()}
+  def from_string(content) when is_binary(content), do: parse(content)
+
   defp parse(content) do
     {front_matter_lines, prompt_lines} = split_front_matter(content)
 

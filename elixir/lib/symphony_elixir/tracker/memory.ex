@@ -71,6 +71,15 @@ defmodule SymphonyElixir.Tracker.Memory do
     {:ok, Application.get_env(:symphony_elixir, :memory_tracker_recently_terminal_issues, [])}
   end
 
+  @spec fetch_issue_dependencies(String.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_issue_dependencies(issue_id) do
+    case fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = issue]} -> {:ok, %{issue_state: issue.state, blockers: issue.blocked_by}}
+      {:ok, []} -> {:error, :dependency_source_missing}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})

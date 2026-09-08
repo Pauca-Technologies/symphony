@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_comments(String.t()) ::
               {:ok, %{comments: [term()], truncated: boolean()}} | {:error, term()}
+  @callback fetch_issue_dependencies(String.t()) :: {:ok, map()} | {:error, term()}
   @callback recently_terminal_issues(pos_integer()) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback create_follow_up(Issue.t(), map()) :: {:ok, map()} | {:error, term()}
@@ -48,6 +49,12 @@ defmodule SymphonyElixir.Tracker do
           {:ok, %{comments: [term()], truncated: boolean()}} | {:error, term()}
   def fetch_issue_comments(issue_id) do
     adapter().fetch_issue_comments(issue_id)
+  end
+
+  @doc "Read a complete bounded snapshot of the current issue's explicit blocking relations."
+  @spec fetch_issue_dependencies(String.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_issue_dependencies(issue_id) do
+    adapter().fetch_issue_dependencies(issue_id)
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
