@@ -63,6 +63,75 @@ defmodule SymphonyElixir.SessionLogMaintenanceTest do
     assert {:error, :enoent} = SessionLogMaintenance.run(Path.join(root, "missing"), 30)
   end
 
+  test "apply lists the directory once and checks each candidate's current marker", %{root: root} do
+    now = 1_800_000_000
+    old_mtime = now - 40 * 86_400
+
+    paths =
+      for name <- ["compact.ndjson", "raw.raw.ndjson.gz", "pending.raw.ndjson.gz.pending"] do
+        create_file(root, name, "old", old_mtime)
+      end
+
+    {result, calls} = trace_file_calls(fn -> SessionLogMaintenance.run(root, 30, now: now, apply: true) end)
+
+    assert {:ok, %{removed_files: 3, failures: []}} = result
+    assert Enum.count(calls, &(&1 == {:ls, [root]})) == 1
+
+    for marker <- ["compact.ndjson.active", "raw.ndjson.active", "pending.ndjson.active"] do
+      assert {:regular?, [Path.join(root, marker)]} in calls
+    end
+
+    refute Enum.any?(paths, &File.exists?/1)
+  end
+
+  test "apply preserves symlink candidates and active raw sidecars", %{root: root} do
+    now = 1_800_000_000
+    old_mtime = now - 40 * 86_400
+    target = create_file(root, "retained.txt", "keep", old_mtime)
+    link = Path.join(root, "symlink.ndjson")
+    File.ln_s!(target, link)
+
+    compact = create_file(root, "live.ndjson", "compact", old_mtime)
+    raw = create_file(root, "live.raw.ndjson.gz", "raw", old_mtime)
+    pending = create_file(root, "live.raw.ndjson.gz.pending", "pending", old_mtime)
+    File.write!(SessionTranscript.active_marker_path(compact), "{}\n")
+
+    assert {:ok, %{removed_files: 0, protected_active_files: 3}} =
+             SessionLogMaintenance.run(root, 30, now: now, apply: true)
+
+    assert Enum.all?([target, link, compact, raw, pending], &File.exists?/1)
+    assert {:ok, %{type: :symlink}} = File.lstat(link)
+  end
+
+  defp trace_file_calls(fun) do
+    tracer = spawn_link(fn -> collect_file_calls([]) end)
+    functions = [{File, :ls, 1}, {File, :regular?, 1}]
+
+    try do
+      Enum.each(functions, &:erlang.trace_pattern(&1, true, [:local]))
+      :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+      result = fun.()
+      :erlang.trace(self(), false, [:call])
+      ref = :erlang.trace_delivered(self())
+      assert_receive {:trace_delivered, _, ^ref}, 1_000
+      send(tracer, {:calls, self()})
+      assert_receive {:file_calls, calls}, 1_000
+      {result, calls}
+    after
+      :erlang.trace(self(), false, [:call])
+      Enum.each(functions, &:erlang.trace_pattern(&1, false, [:local]))
+      send(tracer, :stop)
+    end
+  end
+
+  defp collect_file_calls(calls) do
+    receive do
+      {:trace, _, :call, {File, function, args}} -> collect_file_calls([{function, args} | calls])
+      {:calls, caller} -> send(caller, {:file_calls, Enum.reverse(calls)})
+      :stop -> :ok
+    end
+  end
+
   defp create_file(root, name, content, mtime) do
     path = Path.join(root, name)
     File.write!(path, content)

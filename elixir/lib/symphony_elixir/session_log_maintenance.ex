@@ -94,6 +94,8 @@ defmodule SymphonyElixir.SessionLogMaintenance do
   end
 
   defp apply_plan(plan) do
+    active_paths = MapSet.new(plan.active_paths)
+
     {removed_files, removed_bytes, skipped_active_files, failures} =
       Enum.reduce(plan.candidates, {0, 0, 0, []}, fn candidate, {removed_files, removed_bytes, skipped_active_files, failures} ->
         case eligible_file(candidate.path, plan.cutoff) do
@@ -103,7 +105,7 @@ defmodule SymphonyElixir.SessionLogMaintenance do
           {:ok, current} ->
             remove_revalidated_candidate(
               current,
-              plan,
+              active_paths,
               removed_files,
               removed_bytes,
               skipped_active_files,
@@ -125,15 +127,13 @@ defmodule SymphonyElixir.SessionLogMaintenance do
 
   defp remove_revalidated_candidate(
          candidate,
-         plan,
+         active_paths,
          removed_files,
          removed_bytes,
          skipped_active_files,
          failures
        ) do
-    active_paths = current_active_paths(plan.root, plan.active_paths)
-
-    if protected?(candidate.path, active_paths) do
+    if protected?(candidate.path, active_paths) or File.regular?(compact_path(candidate.path) <> @active_suffix) do
       {removed_files, removed_bytes, skipped_active_files + 1, failures}
     else
       case File.rm(candidate.path) do
@@ -197,16 +197,6 @@ defmodule SymphonyElixir.SessionLogMaintenance do
     |> Enum.map(&compact_path/1)
     |> Kernel.++(marker_paths)
     |> MapSet.new()
-  end
-
-  defp current_active_paths(root, supplied_paths) do
-    marker_paths =
-      case File.ls(root) do
-        {:ok, names} -> active_compact_paths(root, names, [])
-        {:error, _reason} -> MapSet.new()
-      end
-
-    Enum.reduce(supplied_paths, marker_paths, fn path, paths -> MapSet.put(paths, path) end)
   end
 
   defp protected?(path, active_paths), do: MapSet.member?(active_paths, compact_path(path))

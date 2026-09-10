@@ -123,6 +123,10 @@ The maintenance task only considers `.ndjson`, `.raw.ndjson.gz`, and
 associated with an `.active` marker. For a legacy process that predates markers, drain fully or pass
 each known live compact path with repeated `--active-path` options.
 
+Apply checks each candidate's current marker directly, retaining the initially protected paths,
+so cleanup does not rescan the full directory per deletion. For example, a newly present
+`session.ndjson.active` protects both `session.ndjson` and its raw sidecars.
+
 First run the default dry run against the same log root used by the service:
 
 ```bash
