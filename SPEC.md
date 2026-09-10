@@ -456,6 +456,13 @@ Fields:
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
   - Failure aborts the current attempt.
+- `before_review` (multiline shell script string, OPTIONAL)
+  - Runs a cheap synchronous readiness check before automated review, with a fresh, complete
+    issue-comment snapshot. It MUST NOT start aggregate validation or asynchronous jobs.
+  - Exit `2` returns remediation without a reviewer session; unavailable prerequisites and other
+    failures enter infrastructure retry. Omission preserves existing review behavior.
+- `before_review_timeout_ms` (integer, OPTIONAL)
+  - Overrides `hooks.timeout_ms` for the readiness check.
 - `before_handoff` (multiline shell script string, OPTIONAL)
   - Runs before an agent-driven Linear status transition from `In Progress` to a review handoff
     state such as `In Review`.
@@ -701,6 +708,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.after_create`: shell script or null
 - `hooks.session_start`: shell script or null
 - `hooks.before_run`: shell script or null
+- `hooks.before_review`: shell script or null
+- `hooks.before_review_timeout_ms`: positive integer or null; falls back to `hooks.timeout_ms`
 - `hooks.before_handoff`: shell script or null
 - `hooks.before_handoff_timeout_ms`: positive integer or null; falls back to `hooks.timeout_ms`
 - `hooks.before_handoff_stale_ms`: positive integer, default `120000`
@@ -1161,6 +1170,7 @@ Supported hooks:
 - `hooks.after_create`
 - `hooks.session_start`
 - `hooks.before_run`
+- `hooks.before_review`
 - `hooks.before_handoff`
 - `hooks.after_run`
 - `hooks.before_remove`
@@ -1175,15 +1185,15 @@ Execution contract:
   `SYMPHONY_ISSUE_CONTEXT_FILE` to issue lifecycle hooks. The versioned JSON snapshot MUST be
   written outside the agent-writable workspace, MUST NOT contain tracker credentials, and SHOULD
   be refreshed from the same normalized issue and comment activity used to assemble the first turn
-  before session startup and before `hooks.before_handoff`.
+  before session startup, before `hooks.before_review`, and before `hooks.before_handoff`.
 - Expose `SYMPHONY_SHARED_CACHE_DIR` as a host-owned sibling of the issue workspaces. Consumer
   repositories MAY use it only for privacy-bounded caches with explicit immutable identity keys;
   one run MUST NOT inspect, stop, or reap another run through this directory.
 - Durable job polls MUST reuse `hooks.before_handoff` with `SYMPHONY_HANDOFF_GATE_PROTOCOL=1` and
   `SYMPHONY_HANDOFF_GATE_JOB_ID`, without repeated GitHub credential preparation or issue-context
   refresh. Protocol-aware commands SHOULD branch to the durable-job read before normal hook setup.
-- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. `before_handoff` may override each
-  invocation with `hooks.before_handoff_timeout_ms`.
+- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. `before_review` and `before_handoff`
+  may override each invocation with their respective `*_timeout_ms` settings.
 - On timeout, worker stop, or worker exit, terminate the hook's external descendant processes before
   releasing the worker so commands cannot survive as orphaned process trees.
 - Log hook start, failures, and timeouts. Repeated asynchronous pending/running polls SHOULD log at
@@ -1210,9 +1220,17 @@ Execution contract:
   internally by honoring `Retry-After` or using capped exponential backoff;
   they MUST NOT return the issue to an implementor turn. Apply the mutation only after a passed
   report is revalidated for the exact current candidate. Failed or invalidated terminal results
-  clear pending state and resume the implementor once with bounded remediation. Infrastructure
+  clear pending delivery state and resume the implementor once with bounded remediation. An
+  unexpired approval MAY remain as inactive evidence for a later explicit handoff retry, provided
+  candidate, scope, proof, policy, rules and complete fresh feedback are all revalidated. Changes to
+  prior-review presentation metadata alone SHOULD NOT invalidate that approval. Infrastructure
   terminal results clear pending state, fail the worker attempt with a typed infrastructure failure,
   and use orchestrator backoff without consuming an implementor remediation turn.
+- A deferred tracker mutation MUST receive a positive success acknowledgement and confirm the
+  requested issue and target state before reporting delivery. Legacy mutations without a returned
+  issue state MUST use a confirmation query. Unconfirmed delivery preserves the durable request
+  for infrastructure retry. Confirmed delivery ends the worker; a stale active-state read MUST NOT
+  restart implementation or review after that confirmation.
 - For a routed repository with a configured base branch, fetch and revalidate
   that base on the local or SSH worker host that owns the worktree immediately
   before `hooks.before_handoff`. Compute the

@@ -90,6 +90,40 @@ defmodule SymphonyElixir.ReviewCheckpointTest do
     assert {:error, :evidence_unavailable} = ReviewCheckpoint.identity(%{context | opts: Keyword.delete(context.opts, :pr_runner)})
   end
 
+  test "a prior approval changes presentation without invalidating identical review inputs", %{context: context} do
+    packet =
+      Map.merge(context.packet_result.packet, %{
+        packet_id: "first",
+        diff: %{mode: "first_full_diff", manifest: ["app.ts"]},
+        follow_up: %{kind: "first_review"},
+        evidence_status: %{prior_review_sha: nil, missing_artifacts: []},
+        unresolved_findings: []
+      })
+
+    first = %{context | packet_result: %{packet: packet}}
+
+    repeated_packet =
+      packet
+      |> Map.put(:packet_id, "follow-up")
+      |> Map.put(:follow_up, %{kind: "same_head_recheck", prior_summary: "Approved", prior_reviewed_sha: context.reviewed_sha})
+      |> put_in([:evidence_status, :prior_review_sha], context.reviewed_sha)
+      |> put_in([:diff, :mode], "delta_plus_full_candidate_confirmation")
+
+    repeated = %{context | packet_result: %{packet: repeated_packet}}
+    assert {:ok, identity} = ReviewCheckpoint.identity(first)
+    assert {:ok, ^identity} = ReviewCheckpoint.identity(repeated)
+
+    for changed <- [
+          put_in(repeated_packet, [:diff, :mode], "high_risk_final_full_diff"),
+          Map.put(repeated_packet, :unresolved_findings, [%{body: "Missing regression"}]),
+          Map.put(repeated_packet, :validation_attestations, [%{status: "failed"}]),
+          Map.put(repeated_packet, :issue, %{scope_digest: "changed"})
+        ] do
+      assert {:ok, different} = ReviewCheckpoint.identity(%{context | packet_result: %{packet: changed}})
+      refute different == identity
+    end
+  end
+
   test "only bounded, unexpired approvals with identical inputs can resume" do
     identity = %{"packet" => "p", "policy" => "policy", "feedback" => "f", "rules" => "r"}
     verdict = %{"verdict" => "approve"}

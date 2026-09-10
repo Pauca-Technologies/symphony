@@ -63,6 +63,13 @@ hooks:
     if [ -x scripts/hooks/session-start.sh ]; then
       scripts/hooks/session-start.sh
     fi
+  # before_review runs a cheap synchronous readiness check before a reviewer
+  # session. It receives a fresh, complete issue-comment snapshot. Exit 2
+  # returns remediation; other failures enter infrastructure retry. It must
+  # not start aggregate validation or asynchronous jobs.
+  # before_review: |
+  #   scripts/hooks/check-ready-candidate.sh
+  # before_review_timeout_ms: 30000
   # before_handoff runs before a Linear issue moves from In Progress to In Review.
   # In multi-repo mode Symphony first fetches the configured base branch and
   # skips this expensive hook when newer base changes overlap the candidate or
@@ -85,8 +92,9 @@ hooks:
     cd elixir && mise exec -- mix workspace.before_remove
 # Automated-review packet/context/turn budgets are repository-owned. Configure
 # them under `review:` in that target repository's WORKFLOW_REVIEW.md; Symphony
-# always starts a fresh one-turn reviewer before the expensive handoff hook,
-# atomically publishes its final verdict, and requires exact-head approval.
+# starts a fresh one-turn reviewer after readiness and before the expensive
+# handoff hook, unless an unexpired approval matches all current review inputs.
+# It atomically publishes the verdict and requires exact-head approval.
 agent:
   max_concurrent_agents: 10
   # Per-agent test process fan-out; this does not change max_concurrent_agents.

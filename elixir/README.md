@@ -61,6 +61,13 @@ rather than starting a duplicate gate. Poll-only invocations reuse `hooks.before
 durable job ID while skipping repeated GitHub credential preparation and issue-context refresh; the
 repository command should branch to its cheap job-status read before normal handoff setup.
 
+An optional `hooks.before_review` runs a cheap synchronous readiness check before automated review.
+Symphony refreshes the complete issue-comment snapshot first, so a workpad correction made during
+the current turn is visible. Exit `2` returns remediation without starting the reviewer or aggregate
+validation; unavailable comments, timeouts, and other failures enter infrastructure retry. Set
+`hooks.before_review_timeout_ms` to override `hooks.timeout_ms`. Keep expensive validation in
+`before_handoff`, and retain any readiness checks there that also protect non-Symphony callers.
+
 When a target repo provides `WORKFLOW_REVIEW.md`, Symphony runs that review workflow during gated
 `In Progress` to review-state handoffs. The handoff tool call records the requested Linear
 mutation, the active implementor turn closes, and Symphony runs the reviewer before starting the
@@ -68,7 +75,15 @@ expensive `before_handoff` hook. A request-changes verdict therefore avoids that
 entirely. An accepted deferred review returns a successful `deferred_review_started` tool result
 with explicit instructions to end the turn without retrying the mutation. Exact-head approval is
 persisted with a subsequent asynchronous handoff job, survives restart, and is rechecked after the
-gate passes; a changed head requires a fresh review. If the Linear issue has an attached GitHub PR
+gate passes; a changed head requires a fresh review. A failed gate retains the approval as inactive
+evidence, without queuing another handoff. An explicit retry may reuse it only when candidate,
+scope, proof, policy, rules, and fresh GitHub feedback still match. Prior-review presentation metadata
+does not invalidate an approval. Reuse also avoids toggling a ready PR back to draft.
+Delivery requires `issueUpdate.success: true` and confirmation of the requested issue state; old
+durable mutations that selected only `success` use a confirmation query. Unconfirmed delivery stays
+pending for infrastructure retry. A confirmed handoff ends the worker even if a subsequent tracker
+poll would still return the previous active state.
+If the Linear issue has an attached GitHub PR
 URL, the review gate uses that PR directly for the managed review section; otherwise it falls back to
 the current workspace branch's PR. Repositories may return a structured `review_direction` with up
 to three file/line questions and two evidence or verification items. Symphony renders those as

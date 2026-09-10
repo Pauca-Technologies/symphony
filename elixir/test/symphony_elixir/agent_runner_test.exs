@@ -2546,7 +2546,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       # is now explicitly inconclusive and must never be treated as approval.
       linear_client = fn query, variables, _opts ->
         send(test_pid, {:handoff_mutation_applied, query, variables})
-        {:ok, %{"data" => %{}}}
+        confirmed_handoff_response(issue)
       end
 
       # No PR present -> the gate does not spawn a reviewer, but it withholds
@@ -2601,6 +2601,70 @@ defmodule SymphonyElixir.AgentRunnerTest do
   end
 
   describe "deferred review lifecycle" do
+    test "missing readiness fields block before PR resolution or reviewer startup" do
+      root = Path.join(System.tmp_dir!(), "review-readiness-block-#{System.unique_integer([:positive])}")
+      workspace = Path.join(root, "UDPE-NOT-READY")
+      File.mkdir_p!(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)
+      issue = %Issue{id: "not-ready", identifier: "UDPE-NOT-READY", title: "Not ready", state: "In Progress"}
+
+      request = %{
+        query: "mutation Move { issueUpdate { success } }",
+        variables: %{},
+        workspace: workspace,
+        issue: issue,
+        worker_host: nil,
+        review_workflow: %{config: %{}, prompt_template: "Review"},
+        review_opts: [
+          before_review_command: "echo 'candidate sha missing'; exit 2",
+          issue_comments_fetcher: fn _ -> {:ok, %{comments: [], truncated: false}} end,
+          pr_runner: fn _, _ -> flunk("PR resolution must not precede readiness") end,
+          session_runner: fn _ -> flunk("reviewer must not start") end
+        ],
+        linear_client: fn _, _, _ -> flunk("transition must not be applied") end
+      }
+
+      request = Map.put(request, :handoff_after_review, Map.put(request, :target_state, "In Review"))
+      Application.put_env(:symphony_elixir, :deferred_requests_for_test, [request])
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :deferred_requests_for_test)
+        File.rm_rf(root)
+      end)
+
+      assert :ok =
+               AgentRunner.run_codex_turns_for_test(
+                 workspace,
+                 issue,
+                 nil,
+                 [
+                   agent_backend: {DeferredBackend, %{}},
+                   issue_state_fetcher: fn _ -> {:ok, [%{issue | state: "Done"}]} end,
+                   handoff_gate_starter: fn _, _, _, _, _ -> flunk("aggregate validation must not start") end,
+                   max_turns: 1
+                 ],
+                 nil
+               )
+
+      assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
+
+      unavailable = put_in(request.review_opts[:issue_comments_fetcher], fn _ -> {:error, :timeout} end)
+      Application.put_env(:symphony_elixir, :deferred_requests_for_test, [unavailable])
+
+      assert {:error, {:handoff_gate_infrastructure, _}} =
+               AgentRunner.run_codex_turns_for_test(workspace, issue, nil, [agent_backend: {DeferredBackend, %{}}, issue_state_fetcher: fn _ -> {:ok, [issue]} end, max_turns: 2], nil)
+
+      assert {:ok, %{"phase" => "reviewing", "targetState" => "In Review"}} = Workspace.load_handoff_gate_state(workspace)
+    end
+
+    test "a failed gate reuses approval after implementor retry with unchanged review inputs" do
+      exercise_review_retry(false)
+    end
+
+    test "new GitHub feedback invalidates approval retained after a failed gate" do
+      exercise_review_retry(true)
+    end
+
     test "approves the exact head before starting and durably polling the handoff gate" do
       workspace_root =
         Path.join(
@@ -2658,7 +2722,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn query, variables, _opts ->
         send(test_pid, {:reviewed_handoff_applied, query, variables})
-        {:ok, %{"data" => %{}}}
+        confirmed_handoff_response(issue)
       end
 
       review_opts = [
@@ -2736,7 +2800,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                    handoff_gate_starter: starter,
                    handoff_gate_poller: poller,
                    handoff_gate_sleep: fn _milliseconds -> :ok end,
-                   max_turns: 1
+                   max_turns: 2
                  ],
                  nil
                )
@@ -2795,7 +2859,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn query, variables, _opts ->
         send(test_pid, {:unexpected_review_handoff, query, variables})
-        {:ok, %{"data" => %{}}}
+        confirmed_handoff_response(issue)
       end
 
       no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
@@ -2894,7 +2958,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn query, variables, _opts ->
         send(test_pid, {:handoff_mutation_applied, query, variables})
-        {:ok, %{"data" => %{}}}
+        confirmed_handoff_response(issue)
       end
 
       review_runner = fn ctx ->
@@ -3015,7 +3079,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn query, variables, _opts ->
         send(test_pid, {:unexpected_handoff_mutation, query, variables})
-        {:ok, %{"data" => %{}}}
+        confirmed_handoff_response(issue)
       end
 
       review_workflow = %{
@@ -3109,7 +3173,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
         {:ok, %{}}
       end
 
-      linear_client = fn _query, _variables, _opts -> {:ok, %{"data" => %{}}} end
+      linear_client = fn _query, _variables, _opts -> confirmed_handoff_response(issue) end
 
       review_workflow = %{
         config: %{"review" => %{}},
@@ -3240,7 +3304,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       end
 
       no_pr = fn ["pr", "view" | _], _cwd -> {"no pull requests found", 1} end
-      linear_client = fn _query, _variables, _opts -> {:ok, %{"data" => %{}}} end
+      linear_client = fn _query, _variables, _opts -> confirmed_handoff_response(issue) end
 
       review_workflow = %{
         config: %{"review" => %{"require_pr" => false}},
@@ -3401,6 +3465,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
            }), 0}
 
         ["pr", "ready", "1", "--undo"], _ ->
+          send(test_pid, :delivery_pr_returned_to_draft)
           Agent.update(delivery_state, &%{&1 | draft: true})
           {"", 0}
 
@@ -3445,7 +3510,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
         linear_client: fn ^query, %{}, [] ->
           attempt = Agent.get_and_update(delivery_state, fn state -> {state.mutation_attempts, %{state | mutation_attempts: state.mutation_attempts + 1}} end)
           if attempt > 0, do: send(test_pid, :delivery_applied)
-          {:ok, %{"data" => %{"issueUpdate" => %{"success" => attempt > 0}}}}
+          if attempt > 0, do: confirmed_handoff_response(issue), else: {:ok, %{"data" => %{"issueUpdate" => %{"success" => false}}}}
         end,
         max_turns: 1
       ]
@@ -3461,6 +3526,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert :ok = Task.async(fn -> AgentRunner.run_codex_turns_for_test(workspace, issue, nil, opts, nil) end) |> Task.await(15_000)
       assert_received :delivery_applied
       refute_received :delivery_reviewer_started
+      refute_received :delivery_pr_returned_to_draft
       refute_received :turn_ran
       assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
     end
@@ -3591,7 +3657,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn ^query, %{}, [] ->
         send(test_pid, :recovered_gate_handoff_applied)
-        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        confirmed_handoff_response(issue)
       end
 
       state_fetcher = fn ["issue-gate-start-recovery"] -> {:ok, [issue]} end
@@ -3798,7 +3864,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn query, %{}, [] ->
         send(test_pid, {:recovered_handoff_applied, query})
-        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        confirmed_handoff_response(issue)
       end
 
       state_fetcher = fn ["issue-gate-recovery"] -> {:ok, [issue]} end
@@ -3888,7 +3954,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn ^query, %{}, [] ->
         send(test_pid, :durable_gate_handoff_applied_after_refresh)
-        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        confirmed_handoff_response(issue)
       end
 
       assert :ok =
@@ -3994,7 +4060,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       linear_client = fn _query, %{}, [] ->
         send(test_pid, :replacement_gate_handoff_applied)
-        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+        confirmed_handoff_response(issue)
       end
 
       state_fetcher = fn ["issue-gate-replacement"] ->
@@ -4598,5 +4664,123 @@ defmodule SymphonyElixir.AgentRunnerTest do
     }
 
     {issue, workspace_root}
+  end
+
+  defp confirmed_handoff_response(issue) do
+    {:ok, %{"data" => %{"issueUpdate" => %{"success" => true, "issue" => %{"id" => issue.id, "state" => %{"name" => "In Review"}}}}}}
+  end
+
+  defp exercise_review_retry(change_feedback?) do
+    root = Path.join(System.tmp_dir!(), "review-gate-retry-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "UDPE-RETRY")
+    File.mkdir_p!(workspace)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root)
+    System.cmd("git", ["init", "--quiet"], cd: workspace)
+    File.write!(Path.join(workspace, "README.md"), "Reviewed candidate")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "candidate"], cd: workspace)
+    File.write!(Path.join(workspace, ".git/info/exclude"), ".artifacts/\n")
+    {head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+    sha = String.trim(head)
+    issue = %Issue{id: "review-retry", identifier: "UDPE-RETRY", title: "Retry delivery", state: "In Progress"}
+    connection = %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false}}
+    test_pid = self()
+    review_workflow = %{config: %{"review" => %{"draft_pr_lifecycle" => false, "pr_section_enabled" => false}}, prompt_template: "Review {{ issue.identifier }}"}
+
+    pr_runner = fn
+      ["pr", "view" | _], _ ->
+        {Jason.encode!(%{
+           "id" => "PR_retry",
+           "number" => 1,
+           "state" => "OPEN",
+           "isDraft" => false,
+           "body" => "Scope",
+           "headRefOid" => sha,
+           "baseRefOid" => sha,
+           "headRepository" => %{"nameWithOwner" => "org/repo"}
+         }), 0}
+
+      ["api", "graphql" | _], _ ->
+        comments = if Process.get(:retry_feedback_changed), do: %{connection | "nodes" => [%{"id" => "new", "body" => "Check resizing"}]}, else: connection
+
+        {Jason.encode!(%{
+           "data" => %{
+             "node" => %{
+               "state" => "OPEN",
+               "headRefOid" => sha,
+               "baseRefOid" => sha,
+               "body" => "Scope",
+               "reviewDecision" => nil,
+               "comments" => comments,
+               "reviews" => connection,
+               "reviewThreads" => connection
+             }
+           }
+         }), 0}
+    end
+
+    reviewer = fn ctx ->
+      send(test_pid, :retry_reviewer_started)
+      write_review_verdict(ctx, %{"verdict" => "approve", "summary" => "Verified", "comments" => []})
+      {:ok, %{}}
+    end
+
+    review_opts = [pr_runner: pr_runner, session_runner: reviewer, comment_fn: fn _, _ -> :ok end]
+
+    handoff = %{
+      query: "mutation Move { issueUpdate { success } }",
+      variables: %{},
+      workspace: workspace,
+      issue: issue,
+      worker_host: nil,
+      target_state: "In Review",
+      before_handoff_command: nil,
+      before_handoff_timeout_ms: nil,
+      before_handoff_stale_ms: nil,
+      review_workflow: review_workflow,
+      review_opts: review_opts,
+      linear_client: fn _, _, _ -> confirmed_handoff_response(issue) end
+    }
+
+    request = Map.put(handoff, :handoff_after_review, handoff)
+    Application.put_env(:symphony_elixir, :deferred_requests_for_test, [request])
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :deferred_requests_for_test)
+      File.rm_rf(root)
+    end)
+
+    starter = fn _, _, _, _, _ ->
+      packet = workspace |> Path.join(".artifacts/symphony-review/packet.v1.json") |> File.read!() |> Jason.decode!()
+      verdict = workspace |> Path.join(".artifacts/symphony-review/verdict.json") |> File.read!() |> Jason.decode!()
+      assert verdict["packet_id"] == packet["packet_id"]
+      assert verdict["reviewed_sha"] == sha
+      count = Process.get(:retry_gate_count, 0) + 1
+      Process.put(:retry_gate_count, count)
+
+      if count == 1 do
+        Process.put(:retry_feedback_changed, change_feedback?)
+        {:blocked, "Correct the readiness workpad field", []}
+      else
+        :ok
+      end
+    end
+
+    # The tracker keeps returning the old active state. A confirmed mutation
+    # must finish the second turn without creating a third reviewer/agent turn.
+    assert :ok =
+             AgentRunner.run_codex_turns_for_test(
+               workspace,
+               issue,
+               nil,
+               [agent_backend: {DeferredBackend, %{}}, issue_state_fetcher: fn _ -> {:ok, [issue]} end, handoff_gate_starter: starter, max_turns: 3],
+               nil
+             )
+
+    assert Process.get(:retry_gate_count) == 2
+    assert_received :retry_reviewer_started
+    if change_feedback?, do: assert_received(:retry_reviewer_started)
+    refute_received :retry_reviewer_started
+    assert {:ok, nil} = Workspace.load_handoff_gate_state(workspace)
   end
 end

@@ -3,6 +3,48 @@ defmodule SymphonyElixir.HandoffGateTest do
 
   alias SymphonyElixir.HandoffGate
 
+  test "readiness preflight refreshes comments before preparing the hook snapshot" do
+    workspace = temp_workspace!("review-readiness")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
+    issue = issue("MT-READY")
+    comment = %SymphonyElixir.Linear.Comment{id: "workpad", body: "## Codex Workpad\nReady now"}
+
+    opts = [
+      before_review_command: ~s(test -f "$SYMPHONY_ISSUE_CONTEXT_FILE"),
+      issue_comments_fetcher: fn id ->
+        assert id == issue.id
+        {:ok, %{comments: [comment], truncated: false}}
+      end
+    ]
+
+    assert {:ok, refreshed} = HandoffGate.run_before_review(workspace, issue, nil, opts)
+    assert refreshed.comments == [comment]
+    snapshot = workspace |> Workspace.issue_context_path() |> File.read!() |> Jason.decode!()
+    assert get_in(snapshot, ["issue", "comments", Access.at(0), "body"]) == comment.body
+  end
+
+  test "readiness failures distinguish work to repair from unavailable infrastructure" do
+    workspace = temp_workspace!("review-not-ready")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
+    issue = issue("MT-NOT-READY")
+    opts = [issue_comments_fetcher: fn _ -> {:ok, %{comments: [], truncated: false}} end]
+
+    assert {:blocked, prompt} = HandoffGate.run_before_review(workspace, issue, nil, Keyword.put(opts, :before_review_command, "echo 'candidate sha missing'; exit 2"))
+    assert prompt =~ "candidate sha missing"
+    assert {:error, {:before_review_unavailable, _}} = HandoffGate.run_before_review(workspace, issue, nil, Keyword.put(opts, :before_review_command, "exit 1"))
+  end
+
+  test "readiness does not run with incomplete comments or fetch comments when unconfigured" do
+    workspace = temp_workspace!("review-incomplete")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
+    issue = issue("MT-INCOMPLETE")
+    assert {:ok, ^issue} = HandoffGate.run_before_review(workspace, issue, nil)
+    opts = [before_review_command: "touch unexpected", issue_comments_fetcher: fn _ -> {:ok, %{comments: [], truncated: true}} end]
+    assert {:error, :before_review_comments_incomplete} = HandoffGate.run_before_review(workspace, issue, nil, opts)
+    refute File.exists?(Path.join(workspace, "unexpected"))
+    assert {:ok, ^issue} = HandoffGate.run_before_review(workspace, issue, nil, issue_comments_fetcher: fn _ -> flunk("unconfigured preflight must not fetch") end)
+  end
+
   test "handoff transition only matches in-progress review handoffs" do
     assert HandoffGate.handoff_transition?(" In Progress ", "Human Review")
     assert HandoffGate.handoff_transition?("in progress", "In Review")

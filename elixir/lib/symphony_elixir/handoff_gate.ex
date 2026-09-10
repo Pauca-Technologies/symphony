@@ -5,7 +5,7 @@ defmodule SymphonyElixir.HandoffGate do
 
   require Logger
 
-  alias SymphonyElixir.{Config, Linear.Issue, TaskOutcome, Telemetry, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, TaskOutcome, Telemetry, Tracker, Workspace}
 
   @telemetry_event [:symphony_elixir, :gate, :before_handoff]
   @handoff_target_states MapSet.new(["in review", "human review"])
@@ -57,6 +57,56 @@ defmodule SymphonyElixir.HandoffGate do
   end
 
   def handoff_transition?(_current_state, _target_state), do: false
+
+  @doc "Check mechanical readiness before spending a reviewer session or starting aggregate validation."
+  @spec run_before_review(Path.t(), Issue.t(), term(), keyword()) ::
+          {:ok, Issue.t()} | {:blocked, String.t()} | {:error, term()}
+  def run_before_review(workspace, %Issue{} = issue, worker_host, opts \\ []) do
+    settings = Config.settings!().hooks
+    command = Keyword.get(opts, :before_review_command) || settings.before_review
+
+    if is_binary(command) do
+      run_review_preflight(workspace, issue, worker_host, command, opts)
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp run_review_preflight(workspace, issue, worker_host, command, opts) do
+    fetch_comments = Keyword.get(opts, :issue_comments_fetcher, &Tracker.fetch_issue_comments/1)
+    timeout_ms = Keyword.get(opts, :before_review_timeout_ms) || Config.settings!().hooks.before_review_timeout_ms
+
+    case fetch_comments.(issue.id) do
+      {:ok, %{comments: comments, truncated: false}} ->
+        issue = %{issue | comments: comments, comments_truncated: false}
+
+        result = Workspace.run_before_review_hook(workspace, issue, worker_host, hook_command: command, timeout_ms: timeout_ms)
+        finish_review_preflight(result, issue)
+
+      {:ok, _incomplete} ->
+        {:error, :before_review_comments_incomplete}
+
+      {:error, reason} ->
+        {:error, {:before_review_comments_unavailable, reason}}
+    end
+  end
+
+  defp finish_review_preflight(result, issue) do
+    outcome = if match?({:ok, _}, result), do: :passed, else: :failed
+    Telemetry.emit(:gate, %{event: "gate.before_review", issue_id: issue.id, issue_identifier: issue.identifier, outcome: outcome})
+    Logger.info("gate.before_review issue_id=#{issue.id} issue_identifier=#{issue.identifier} outcome=#{outcome}")
+
+    case result do
+      {:ok, _output} ->
+        {:ok, issue}
+
+      {:error, {:workspace_hook_failed, "before_review", 2, output}} ->
+        {:blocked, "Symphony's before_review readiness check blocked automated review.\n\n#{String.trim(output)}"}
+
+      {:error, reason} ->
+        {:error, {:before_review_unavailable, reason}}
+    end
+  end
 
   @spec run_before_handoff(Path.t(), Issue.t(), term(), String.t(), keyword()) :: result()
   def run_before_handoff(workspace, %Issue{} = issue, worker_host, target_state, opts \\ [])

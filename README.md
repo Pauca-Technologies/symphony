@@ -25,9 +25,11 @@ When enforcement is enabled, a fully inspectable bounded documentation/test-only
 refine a standard reviewer route to the repository's simple profile; explicit overrides,
 quality fallbacks, control files, production paths, and high-risk work retain their original depth.
 
-Validated review approvals can survive a delivery failure in trusted control state. Local workers
-reuse them only while the complete candidate packet, policy, rules and fresh GitHub feedback remain
-identical; final validation and exact-head checks remain mandatory. Closed PRs park on a durable
+Cheap repository readiness checks can run before a reviewer starts. Validated review approvals
+survive gate and delivery failures in trusted control state. Local workers reuse them only while
+candidate, scope, proof, policy, rules and fresh GitHub feedback remain identical; retry presentation
+metadata does not require another review. Final validation and exact-head checks remain mandatory,
+and handoff completion requires confirmation of the requested tracker state. Closed PRs park on a durable
 state watcher, and git-ref waits can watch specific paths to avoid unrelated model wakes. A labelled
 context/output pilot can preserve every reviewer setting. Delivery reports distinguish normal worker
 exits, accepted handoffs and unknown downstream outcomes.

@@ -58,6 +58,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   mutation SymphonyTypedIssueTransition($issueId: String!, $stateId: String!) {
     issueUpdate(id: $issueId, input: {stateId: $stateId}) {
       success
+      issue {
+        id
+        state { name }
+      }
     }
   }
   """
@@ -404,6 +408,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          {:ok, response} <- linear_client.(query, variables, []) do
       graphql_response(response)
     else
+      {:before_review_blocked, prompt} ->
+        failure_response(%{"error" => %{"message" => "before_review hook blocked automated review.", "remediation" => prompt}})
+
       {:handoff_blocked, prompt, gates} ->
         failure_response(%{
           "error" => %{
@@ -587,6 +594,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         result =
           request
           |> Map.put(:review_approval, approval)
+          |> Map.put(:issue, approval.issue)
           |> run_resolved_handoff_gate(handoff_opts)
 
         revalidate_inline_review_after_handoff(result, request, approval)
@@ -1064,6 +1072,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp run_inline_review(request) do
+    case HandoffGate.run_before_review(request.workspace, request.issue, request.worker_host, request.review_opts) do
+      {:ok, issue} -> do_run_inline_review(%{request | issue: issue})
+      {:blocked, prompt} -> {:before_review_blocked, prompt}
+      {:error, reason} -> {:handoff_infrastructure_error, "Review readiness is unavailable: #{inspect(reason)}", %{reason: reason}}
+    end
+  end
+
+  defp do_run_inline_review(request) do
     {review_key, pinned_opts} =
       ReviewGate.prepare_review(request.workspace, request.issue, request.review_opts)
 
@@ -1095,6 +1111,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:review_approved,
        %{
          review_key: review_key,
+         issue: request.issue,
          reviewed_sha: review_outcome.reviewed_sha,
          review_opts: pinned_opts,
          review_outcome: review_outcome

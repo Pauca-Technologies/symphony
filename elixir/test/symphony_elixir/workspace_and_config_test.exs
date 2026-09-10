@@ -1211,6 +1211,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.claude_code.prompt_timeout_ms == 0
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.hooks.before_review == nil
+    assert config.hooks.before_review_timeout_ms == nil
     assert config.hooks.before_handoff_timeout_ms == nil
     assert config.hooks.before_handoff_stale_ms == 120_000
 

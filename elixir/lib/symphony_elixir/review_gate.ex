@@ -239,24 +239,8 @@ defmodule SymphonyElixir.ReviewGate do
   end
 
   defp dispatch_review(%{settings: %{draft_pr_lifecycle: true}} = context, {:ok, pr}) do
-    case PrReviewSection.ensure_draft(context.workspace, pr, context.opts) do
-      {:ok, draft_pr} ->
-        context =
-          context
-          |> Map.put(:managed_draft_lifecycle, true)
-          |> put_in([:settings, :draft_pr_lifecycle], false)
-
-        dispatch_review(context, {:ok, draft_pr})
-
-      {:error, reason} ->
-        conclude_infrastructure_failure(
-          context.issue,
-          Map.merge(context, %{pr: pr, reviewed_sha: candidate_sha(context.workspace, pr)}),
-          1,
-          {:managed_pr_draft_failed, reason},
-          context.opts
-        )
-    end
+    context = context |> Map.put(:managed_draft_lifecycle, true) |> put_in([:settings, :draft_pr_lifecycle], false)
+    dispatch_review(context, {:ok, pr})
   end
 
   defp dispatch_review(context, pr_result) do
@@ -473,13 +457,33 @@ defmodule SymphonyElixir.ReviewGate do
     checkpoint = Keyword.get(context.opts, :review_checkpoint)
 
     with {:ok, raw} <- ReviewCheckpoint.lookup(checkpoint, identity),
+         # Identity comparison above proves the review inputs are unchanged.
+         # Bind the reused verdict to this packet's updated follow-up metadata.
+         raw = Map.put(raw, "packet_id", context.packet_result.packet.packet_id),
          {:ok, verdict} <- decode_verdict(raw, context.reviewed_sha, context.packet_result.packet.packet_id, context.packet_result.packet.diff.mode, context.settings.scope_contract_required) do
       checkpoint_event(context, "reused", nil)
-      conclude_published_verdict(verdict, context, 1, nil)
+      publish_reused_verdict(raw, verdict, context)
     else
       {:error, reason} ->
         if checkpoint, do: checkpoint_event(context, "invalidated", reason)
         run_iteration(context, 1, nil)
+    end
+  end
+
+  defp publish_reused_verdict(raw, verdict, context) do
+    path = Path.join(context.workspace, context.settings.verdict_path)
+    staged = staged_verdict_path(path)
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(staged, Jason.encode!(raw), [:exclusive]),
+         :ok <- File.rename(staged, path) do
+      # Keep the original approval age: publishing matching packet metadata
+      # does not extend its lifetime or count as another independent review.
+      conclude_published_verdict(verdict, context, 1, nil)
+    else
+      {:error, reason} ->
+        cleanup_staged_verdict(staged)
+        conclude_infrastructure_failure(context.issue, context, 1, {:verdict_publish_failed, reason}, context.opts)
     end
   end
 
@@ -490,6 +494,7 @@ defmodule SymphonyElixir.ReviewGate do
          :ok <- Keyword.fetch!(context.opts, :review_checkpoint_writer).(checkpoint) do
       checkpoint_event(context, "saved", nil)
     else
+      {:ok, _changed_identity} -> checkpoint_event(context, "invalidated", :inputs_changed_during_review)
       error -> checkpoint_event(context, "save_failed", error)
     end
   end
@@ -593,7 +598,18 @@ defmodule SymphonyElixir.ReviewGate do
     _error -> nil
   end
 
-  defp run_iteration(
+  defp run_iteration(%{managed_draft_lifecycle: true} = context, attempt, previous_reason) do
+    # Reusing a valid approval is a delivery operation. Only a new reviewer
+    # session needs to return the PR to draft and suspend ready-triggered CI.
+    case PrReviewSection.ensure_draft(context.workspace, context.pr, context.opts) do
+      {:ok, draft_pr} -> do_run_iteration(%{context | pr: draft_pr}, attempt, previous_reason)
+      {:error, reason} -> conclude_infrastructure_failure(context.issue, context, attempt, {:managed_pr_draft_failed, reason}, context.opts)
+    end
+  end
+
+  defp run_iteration(context, attempt, previous_reason), do: do_run_iteration(context, attempt, previous_reason)
+
+  defp do_run_iteration(
          %{
            workspace: workspace,
            issue: %Issue{} = issue,

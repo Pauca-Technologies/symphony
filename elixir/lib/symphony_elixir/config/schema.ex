@@ -417,10 +417,12 @@ defmodule SymphonyElixir.Config.Schema do
       field(:after_create, :string)
       field(:session_start, :string)
       field(:before_run, :string)
+      field(:before_review, :string)
       field(:before_handoff, :string)
       field(:after_run, :string)
       field(:before_remove, :string)
       field(:timeout_ms, :integer, default: 60_000)
+      field(:before_review_timeout_ms, :integer)
       field(:before_handoff_timeout_ms, :integer)
       field(:before_handoff_stale_ms, :integer, default: 120_000)
     end
@@ -431,10 +433,12 @@ defmodule SymphonyElixir.Config.Schema do
         :after_create,
         :session_start,
         :before_run,
+        :before_review,
         :before_handoff,
         :after_run,
         :before_remove,
         :timeout_ms,
+        :before_review_timeout_ms,
         :before_handoff_timeout_ms,
         :before_handoff_stale_ms
       ]
@@ -442,6 +446,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(attrs, hook_fields, empty_values: [])
       |> validate_number(:timeout_ms, greater_than: 0)
+      |> validate_number(:before_review_timeout_ms, greater_than: 0)
       |> validate_number(:before_handoff_timeout_ms, greater_than: 0)
       |> validate_number(:before_handoff_stale_ms, greater_than: 0)
     end

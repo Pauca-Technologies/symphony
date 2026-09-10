@@ -36,7 +36,7 @@ defmodule SymphonyElixir.ReviewCheckpoint do
          {:ok, rules} <- rule_digests(context.workspace, Map.get(packet, :repository_rules, [])) do
       {:ok,
        %{
-         "packet" => RunManifest.config_digest(packet),
+         "packet" => RunManifest.config_digest(review_inputs(packet)),
          "policy" => RunManifest.config_digest(%{workflow: context.review_workflow, settings: context.settings, runtime: Config.settings!(), harness: Base.encode16(ReviewGate.module_info(:md5))}),
          "feedback" => RunManifest.config_digest(snapshot),
          "rules" => RunManifest.config_digest(rules)
@@ -46,6 +46,24 @@ defmodule SymphonyElixir.ReviewCheckpoint do
     end
   rescue
     _ -> {:error, :evidence_unavailable}
+  end
+
+  # The previous approval changes the next packet's presentation even when
+  # the candidate, scope, proof, policy and feedback are unchanged. Keep every
+  # substantive input, including unresolved findings and high-risk review mode.
+  defp review_inputs(packet) do
+    packet
+    |> Map.drop([:packet_id, :follow_up])
+    |> Map.update(:evidence_status, %{}, &Map.delete(&1, :prior_review_sha))
+    |> Map.update(:diff, %{}, fn diff ->
+      case Map.get(diff, :mode) do
+        mode when mode in ["first_full_diff", "delta_plus_full_candidate_confirmation"] ->
+          Map.put(diff, :mode, "full_candidate_confirmation")
+
+        _ ->
+          diff
+      end
+    end)
   end
 
   @doc "Match a bounded, unexpired checkpoint against the current review inputs."

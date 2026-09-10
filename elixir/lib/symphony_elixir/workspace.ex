@@ -415,6 +415,25 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc "Run the synchronous readiness check against a freshly prepared issue snapshot."
+  @spec run_before_review_hook(Path.t(), map(), worker_host(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def run_before_review_hook(workspace, issue, worker_host \\ nil, opts \\ []) do
+    command = resolve_hook_command(:before_review, Keyword.get(opts, :hook_command))
+
+    with {:ok, _path} <- prepare_issue_context(workspace, issue, worker_host) do
+      case command do
+        nil ->
+          {:ok, ""}
+
+        command ->
+          run_hook(command, workspace, issue_context(issue), "before_review", worker_host,
+            capture_output: true,
+            timeout_ms: Keyword.get(opts, :timeout_ms)
+          )
+      end
+    end
+  end
+
   @spec run_before_handoff_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def run_before_handoff_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])

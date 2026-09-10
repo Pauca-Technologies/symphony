@@ -21,6 +21,7 @@ defmodule SymphonyElixir.AgentRunner do
     HandoffGate,
     Linear.Client,
     Linear.Comment,
+    Linear.Handoff,
     Linear.Issue,
     Orchestrator,
     PromptBuilder,
@@ -49,6 +50,7 @@ defmodule SymphonyElixir.AgentRunner do
   @handoff_gate_lifecycle_key {__MODULE__, :handoff_gate_lifecycle}
   @deferred_handoff_gate_key {__MODULE__, :deferred_handoff_gate}
   @deferred_review_handoff_key {__MODULE__, :deferred_review_handoff}
+  @confirmed_handoff_key {__MODULE__, :confirmed_handoff}
   @agent_wait_request_key {__MODULE__, :agent_wait_request}
   @resume_packet_verification_key {__MODULE__, :resume_packet_verification}
   @handoff_issue_refresh_retry_base_ms 1_000
@@ -282,6 +284,8 @@ defmodule SymphonyElixir.AgentRunner do
           opts
           |> Keyword.put(:session_start_result, session_start)
           |> Keyword.put(:issue_context_file, Workspace.issue_context_path(workspace))
+          |> maybe_put(:per_repo_before_review, Map.get(repo_hook_opts, :before_review))
+          |> maybe_put(:per_repo_before_review_timeout_ms, Map.get(repo_hook_opts, :before_review_timeout_ms))
           |> maybe_put(:per_repo_before_handoff, Map.get(repo_hook_opts, :before_handoff))
           |> maybe_put(
             :per_repo_before_handoff_timeout_ms,
@@ -457,6 +461,8 @@ defmodule SymphonyElixir.AgentRunner do
       before_run: Map.get(hooks, "before_run"),
       after_run: Map.get(hooks, "after_run"),
       session_start: Map.get(hooks, "session_start"),
+      before_review: Map.get(hooks, "before_review"),
+      before_review_timeout_ms: Map.get(hooks, "before_review_timeout_ms"),
       before_handoff: Map.get(hooks, "before_handoff"),
       before_handoff_timeout_ms: Map.get(hooks, "before_handoff_timeout_ms"),
       before_handoff_stale_ms: Map.get(hooks, "before_handoff_stale_ms"),
@@ -1339,11 +1345,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     Process.delete(@resume_packet_verification_key)
+    Process.delete(@confirmed_handoff_key)
 
     try do
       run_codex_turns_body(workspace, issue, codex_update_recipient, opts, worker_host)
     after
       Process.delete(@resume_packet_verification_key)
+      Process.delete(@confirmed_handoff_key)
     end
   end
 
@@ -1794,7 +1802,7 @@ defmodule SymphonyElixir.AgentRunner do
 
         infrastructure_failure = pop_handoff_infrastructure_failure()
         wait_request = pop_agent_wait_request()
-        continuation = continue_with_issue?(issue, issue_state_fetcher, opts)
+        continuation = continuation_after_handoff(issue, issue_state_fetcher, opts)
         packet_issue = continuation_issue(continuation, issue)
 
         opts =
@@ -1874,6 +1882,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp continuation_issue({_status, %Issue{} = issue}, _fallback), do: issue
   defp continuation_issue(_continuation, issue), do: issue
+
+  defp continuation_after_handoff(issue, issue_state_fetcher, opts) do
+    case Process.delete(@confirmed_handoff_key) do
+      %Issue{id: id} = confirmed when id == issue.id -> {:done, confirmed}
+      _ -> continue_with_issue?(issue, issue_state_fetcher, opts)
+    end
+  end
 
   defp successful_turn_boundary(_continuation, %{}), do: :turn_waiting
   defp successful_turn_boundary({:done, _issue}, _wait_request), do: :turn_terminal
@@ -2210,6 +2225,7 @@ defmodule SymphonyElixir.AgentRunner do
       []
       |> maybe_put(:efficiency_decision, efficiency_decision)
       |> maybe_put(:requested_lenses, AgentEfficiency.review_lenses(efficiency_decision))
+      |> before_review_opts(opts)
       |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
       |> maybe_put(:hook_command, per_repo_before_handoff)
 
@@ -2493,6 +2509,12 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, nil} ->
         :none
 
+      {:ok, %{"phase" => "review_cached"}} ->
+        # An approval retained after a gate failure is evidence, not a queued
+        # transition. Let the implementor repair the gate before requesting
+        # handoff again; ReviewCheckpoint will revalidate all review inputs.
+        :none
+
       {:ok, durable_request} ->
         case restore_handoff_request(durable_request, workspace, issue, worker_host, opts) do
           {:ok, %{phase: :reviewing} = request} ->
@@ -2604,6 +2626,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp restore_handoff_request_base(durable, workspace, issue, worker_host, opts) do
     review_opts =
       Keyword.get(opts, :review_opts, [])
+      |> before_review_opts(opts)
       |> maybe_put(:efficiency_decision, Keyword.get(opts, :efficiency_decision))
       |> maybe_put(:base_drift_ref, Keyword.get(opts, :base_drift_ref))
       |> maybe_put(:hook_command, Keyword.get(opts, :per_repo_before_handoff))
@@ -2871,7 +2894,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp resume_after_starting_handoff_gate(request, prompt) do
-    case Workspace.clear_handoff_gate_state(request.workspace, request.worker_host) do
+    case retain_review_checkpoint(request) do
       :ok -> {:resume, prompt, request.issue}
       {:error, reason} -> {:error, reason}
     end
@@ -3229,7 +3252,19 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp clear_finished_gate_state(%{review_approval: %{}}, outcome) when outcome in [:passed, :legacy_passed], do: :ok
-  defp clear_finished_gate_state(request, _outcome), do: Workspace.clear_handoff_gate_state(request.workspace, request.worker_host)
+  defp clear_finished_gate_state(request, _outcome), do: retain_review_checkpoint(request)
+
+  defp retain_review_checkpoint(%{review_checkpoint: checkpoint} = request) when is_map(checkpoint) do
+    cached =
+      request
+      |> Map.drop([:gate, :review_approval])
+      |> durable_handoff_request()
+      |> Map.put("phase", "review_cached")
+
+    Workspace.persist_handoff_gate_state(request.workspace, cached, request.worker_host)
+  end
+
+  defp retain_review_checkpoint(request), do: Workspace.clear_handoff_gate_state(request.workspace, request.worker_host)
 
   defp pending_gate_lifecycle_signature(gate) do
     {
@@ -3335,14 +3370,40 @@ defmodule SymphonyElixir.AgentRunner do
     do: handoff_gate_prompt
 
   defp maybe_run_deferred_review_handoff(%{} = request, _handoff_gate_prompt, recipient, backend) do
-    case prepare_review_delivery(request) do
-      {:ok, prepared} ->
-        do_run_deferred_review_handoff(prepared, recipient, backend)
+    with {:ok, prepared} <- prepare_review_delivery(request),
+         {:ok, ready_issue} <- HandoffGate.run_before_review(prepared.workspace, prepared.issue, Map.get(prepared, :worker_host), Map.get(prepared, :review_opts, [])) do
+      do_run_deferred_review_handoff(update_review_issue(prepared, ready_issue), recipient, backend)
+    else
+      {:blocked, prompt} ->
+        case retain_review_checkpoint(inherit_review_checkpoint(Map.get(request, :handoff_after_review) || request)) do
+          :ok -> prompt
+          {:error, reason} -> review_readiness_failure(reason)
+        end
 
       {:error, reason} ->
-        prompt = "Review delivery state could not be persisted: #{inspect(reason)}. Retry after restoring control-state storage."
-        store_handoff_infrastructure_failure(prompt, %{reason: reason})
-        prompt
+        review_readiness_failure(reason)
+    end
+  end
+
+  defp review_readiness_failure(reason) do
+    prompt = "Review readiness or delivery state is unavailable: #{inspect(reason)}. Retry after restoring the prerequisite."
+    store_handoff_infrastructure_failure(prompt, %{reason: reason})
+    prompt
+  end
+
+  defp before_review_opts(review_opts, opts) do
+    review_opts
+    |> maybe_put(:before_review_command, Keyword.get(opts, :per_repo_before_review))
+    |> maybe_put(:before_review_timeout_ms, Keyword.get(opts, :per_repo_before_review_timeout_ms))
+    |> maybe_put(:issue_comments_fetcher, Keyword.get(opts, :issue_comments_fetcher))
+  end
+
+  defp update_review_issue(request, issue) do
+    request = Map.put(request, :issue, issue)
+
+    case request[:handoff_after_review] do
+      %{} = handoff -> Map.put(request, :handoff_after_review, Map.put(handoff, :issue, issue))
+      _ -> request
     end
   end
 
@@ -3352,7 +3413,11 @@ defmodule SymphonyElixir.AgentRunner do
     durable = handoff |> durable_handoff_request() |> Map.delete("reviewCheckpoint") |> Map.put("phase", "reviewing")
 
     with {:ok, existing} <- Workspace.load_handoff_gate_state(workspace, host) do
-      checkpoint = if is_map(existing) and Map.drop(existing, ["reviewCheckpoint"]) == durable, do: existing["reviewCheckpoint"], else: nil
+      checkpoint =
+        if is_map(existing) and Map.take(existing, ~w(query variables targetState)) == Map.take(durable, ~w(query variables targetState)),
+          do: existing["reviewCheckpoint"],
+          else: nil
+
       durable = if checkpoint, do: Map.put(durable, "reviewCheckpoint", checkpoint), else: durable
 
       persist_review_delivery_request(request, workspace, host, durable, checkpoint)
@@ -3754,42 +3819,31 @@ defmodule SymphonyElixir.AgentRunner do
     query = Map.fetch!(request, :query)
     variables = Map.get(request, :variables, %{})
     linear_client = Map.fetch!(request, :linear_client)
+    target_state = Map.get(request, :target_state, "In Review")
 
     Logger.info("review.gate deferred approved #{issue_context(issue)}; applying Linear handoff mutation")
 
-    case linear_client.(query, variables, []) do
-      {:ok, response} ->
-        if graphql_success?(response) do
-          Logger.info("review.gate deferred handoff applied #{issue_context(issue)}")
-          nil
-        else
-          Logger.warning("review.gate deferred handoff mutation was not applied #{issue_context(issue)}")
-          deferred_handoff_failure_prompt(issue, {:linear_handoff_not_applied, graphql_errors(response)})
-        end
+    case Handoff.deliver(issue, target_state, query, variables, linear_client) do
+      {:ok, confirmed} ->
+        Process.put(@confirmed_handoff_key, confirmed)
+        Logger.info("review.gate deferred handoff confirmed #{issue_context(issue)} target_state=#{inspect(confirmed.state)}")
+        nil
 
       {:error, reason} ->
-        Logger.warning("review.gate deferred handoff mutation failed #{issue_context(issue)} reason=#{inspect(reason)}")
+        Logger.warning("review.gate deferred handoff unconfirmed #{issue_context(issue)} reason=#{inspect(reason)}")
         deferred_handoff_failure_prompt(issue, reason)
     end
   end
-
-  defp graphql_success?(response) do
-    graphql_errors(response) == [] and get_in(response, ["data", "issueUpdate", "success"]) != false
-  end
-
-  defp graphql_errors(%{"errors" => errors}) when is_list(errors), do: errors
-  defp graphql_errors(%{errors: errors}) when is_list(errors), do: errors
-  defp graphql_errors(_response), do: []
 
   defp deferred_handoff_failure_prompt(%Issue{} = issue, reason) do
     """
     System message:
 
-    The automated reviewer approved the In Progress -> In Review handoff for #{issue.identifier}, but Symphony could not apply the original Linear status mutation after the review completed.
+    The automated reviewer approved the handoff for #{issue.identifier}, but Symphony could not confirm the requested Linear state after the mutation.
 
     Reason: `#{inspect(reason)}`
 
-    Keep the issue in In Progress, inspect the Linear status transition, and re-attempt the handoff with Symphony's `linear_issue` tool using `operation: "transition"`.
+    Symphony retains the delivery request for an infrastructure retry. It will revalidate the approval and retry delivery without an implementor turn.
     """
     |> String.trim()
   end
