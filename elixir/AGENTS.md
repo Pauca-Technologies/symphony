@@ -46,7 +46,12 @@ Validation command:
 mix specs.check
 ```
 
-## PR Requirements
+## Delivery
+
+- For the UDP Symphony fork, commit on the current `udp` branch and push with `git push udp udp`.
+- Do not open a PR unless the human explicitly requests one. The `origin` remote is upstream OpenAI, not the UDP delivery target.
+
+### When a PR is explicitly requested
 
 - PR body must follow `../.github/pull_request_template.md` exactly.
 - Validate PR body locally when needed:
@@ -57,7 +62,7 @@ mix pr_body.check --file /path/to/pr_body.md
 
 ## Docs Update Policy
 
-If behavior/config changes, update docs in the same PR:
+If behavior/config changes, update docs in the same change:
 
 - `../README.md` for project concept and goals.
 - `README.md` for Elixir implementation and run instructions.
