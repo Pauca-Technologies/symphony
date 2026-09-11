@@ -23,14 +23,22 @@ defmodule SymphonyElixir.Application do
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
 
-    children = [
-      {Phoenix.PubSub, name: SymphonyElixir.PubSub},
-      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
-      SymphonyElixir.WorkflowStore,
-      SymphonyElixir.Orchestrator,
-      SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
-    ]
+    children =
+      if persistent_worker_mode?() do
+        [SymphonyElixir.Linear.RateLimit]
+      else
+        [
+          {Phoenix.PubSub, name: SymphonyElixir.PubSub},
+          SymphonyElixirWeb.ObservabilityPubSub,
+          {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+          SymphonyElixir.Linear.RateLimit,
+          SymphonyElixir.WorkflowStore,
+          SymphonyElixir.WaitWatcher,
+          SymphonyElixir.Orchestrator,
+          SymphonyElixir.HttpServer,
+          SymphonyElixir.StatusDashboard
+        ]
+      end
 
     Supervisor.start_link(
       children,
@@ -40,8 +48,25 @@ defmodule SymphonyElixir.Application do
   end
 
   @impl true
+  def prep_stop(state) do
+    unless persistent_worker_mode?() do
+      SymphonyElixir.Shutdown.prepare()
+    end
+
+    state
+  end
+
+  @impl true
   def stop(_state) do
-    SymphonyElixir.StatusDashboard.render_offline_status()
+    unless persistent_worker_mode?() do
+      SymphonyElixir.StatusDashboard.render_offline_status()
+    end
+
     :ok
+  end
+
+  defp persistent_worker_mode? do
+    System.get_env("SYMPHONY_PERSISTENT_WORKER") == "1" or
+      Application.get_env(:symphony_elixir, :persistent_worker_mode, false) == true
   end
 end

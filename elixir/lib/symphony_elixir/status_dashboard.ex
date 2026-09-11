@@ -15,7 +15,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @throughput_graph_window_ms 10 * 60 * 1000
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-  @running_id_width 8
+  @running_id_width 14
   @running_stage_width 14
   @running_pid_width 8
   @running_age_width 12
@@ -314,9 +314,12 @@ defmodule SymphonyElixir.StatusDashboard do
           {:ok,
            %{
              running: running,
+             queued: Map.get(snapshot, :queued, []),
              retrying: retrying,
+             waiting: Map.get(snapshot, :waiting, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
+             quota_circuits: Map.get(snapshot, :quota_circuits, []),
              polling: Map.get(snapshot, :polling)
            }},
           update_token_samples(token_samples, now_ms, total_tokens)
@@ -334,6 +337,7 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
+        quota_circuit_lines = format_quota_circuits(Map.get(snapshot, :quota_circuits, []))
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -341,11 +345,16 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
+        {handoff_sessions, implementing_sessions} = Enum.split_with(running, &handoff_session?/1)
+        waiting = Map.get(snapshot, :waiting, [])
         max_agents = Config.settings!().agent.max_concurrent_agents
         running_event_width = running_event_width(terminal_columns_override)
-        running_rows = format_running_rows(running, running_event_width)
-        running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
+        running_rows = format_running_rows(implementing_sessions, running_event_width)
+        running_to_handoff_spacer = if(implementing_sessions == [], do: [], else: ["│"])
+        handoff_lines = format_handoff_section(handoff_sessions, running_event_width)
         backoff_rows = format_retry_rows(retrying)
+        scheduling_rows = format_scheduling_rows(Map.get(snapshot, :queued, []))
+        waiting_rows = format_waiting_rows(waiting)
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -353,6 +362,8 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
              colorize("#{max_agents}", @ansi_gray),
+           colorize("│ Waiting: ", @ansi_bold) <>
+             colorize("#{length(waiting)}", if(waiting == [], do: @ansi_gray, else: @ansi_orange)),
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
@@ -363,6 +374,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           quota_circuit_lines,
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
@@ -371,7 +383,13 @@ defmodule SymphonyElixir.StatusDashboard do
            running_table_separator_row(running_event_width)
          ] ++
            running_rows ++
-           running_to_backoff_spacer ++
+           running_to_handoff_spacer ++
+           handoff_lines ++
+           [colorize("├─ Repository queue", @ansi_bold), "│"] ++
+           scheduling_rows ++
+           ["│", colorize("├─ Waiting work", @ansi_bold), "│"] ++
+           waiting_rows ++
+           ["│"] ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -559,9 +577,12 @@ defmodule SymphonyElixir.StatusDashboard do
           {:ok,
            %{
              running: running,
+             queued: Map.get(snapshot, :queued, []),
              retrying: retrying,
+             waiting: Map.get(snapshot, :waiting, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
+             quota_circuits: Map.get(snapshot, :quota_circuits, []),
              polling: Map.get(snapshot, :polling)
            }}
 
@@ -586,10 +607,32 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  defp format_handoff_section([], _running_event_width), do: []
+
+  defp format_handoff_section(handoff_sessions, running_event_width) do
+    [
+      colorize("├─ Handoff validation / review", @ansi_bold),
+      "│",
+      running_table_header_row(running_event_width),
+      running_table_separator_row(running_event_width)
+    ] ++ format_running_rows(handoff_sessions, running_event_width) ++ ["│"]
+  end
+
+  defp handoff_session?(entry) do
+    Map.get(entry, :lifecycle_state) in [:handoff_pending_gate, :handoff_pending_review]
+  end
+
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
-    state = running_entry.state || "unknown"
+
+    state =
+      case Map.get(running_entry, :lifecycle_state) do
+        :handoff_pending_gate -> "gate pending"
+        :handoff_pending_review -> "review pending"
+        _ -> running_entry.state || "unknown"
+      end
+
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
@@ -656,6 +699,68 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  defp format_scheduling_rows([]), do: ["│  " <> colorize("No repository-contention waits", @ansi_gray)]
+
+  defp format_scheduling_rows(entries) do
+    Enum.map(entries, fn entry ->
+      paths = entry |> Map.get(:overlap_paths, []) |> Enum.take(4) |> Enum.join(",")
+      base_age = if is_integer(Map.get(entry, :base_age_seconds)), do: " base_age=#{entry.base_age_seconds}s", else: ""
+      base = "│  ⏳ #{entry.identifier} reason=#{entry.reason} repo=#{entry.repository_id || "default"} wait=#{next_in_words(entry.queue_time_ms)}#{base_age}"
+      omitted = Map.get(entry, :suggested_order_omitted, 0)
+      omitted_suffix = if omitted > 0, do: "(+#{omitted})", else: ""
+      order = " order=#{Enum.join(entry.suggested_order || [], "→")}#{omitted_suffix}"
+      if paths == "", do: base <> order, else: base <> " overlap=#{paths}" <> order
+    end)
+  end
+
+  defp format_waiting_rows([]), do: ["│  " <> colorize("No parked external-condition waits", @ansi_gray)]
+
+  defp format_waiting_rows(entries) do
+    entries
+    |> Enum.sort_by(&{Map.get(&1, :next_probe_at), Map.get(&1, :identifier)})
+    |> Enum.map(&format_waiting_summary/1)
+  end
+
+  defp format_waiting_summary(entry) do
+    identifier = Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "unknown"
+    condition = format_wait_condition(Map.get(entry, :condition, %{}))
+    status = Map.get(entry, :status, :waiting)
+    attempt = Map.get(entry, :probe_attempt, 0)
+    waited = Map.get(entry, :waiting_seconds, 0) |> format_runtime_seconds()
+    next_probe = entry |> Map.get(:next_probe_at) |> next_probe_in_words()
+    reason = entry |> Map.get(:reason, "unknown") |> format_inline_text(96)
+    error = format_retry_error(Map.get(entry, :last_error))
+
+    "│  #{colorize("⏸", @ansi_orange)} " <>
+      colorize(identifier, @ansi_cyan) <>
+      " " <>
+      colorize(condition, @ansi_yellow) <>
+      colorize(" status=#{status} wait=#{waited} probe=#{attempt} next=#{next_probe}", @ansi_dim) <>
+      " reason=#{reason}" <>
+      error
+  end
+
+  defp format_wait_condition(condition) when is_map(condition) do
+    type = Map.get(condition, "type", "unknown")
+
+    detail =
+      condition["repository"] || condition["ref"] || condition["component"] ||
+        condition["issue_id"] || condition["resume_at"]
+
+    if detail, do: "#{type}:#{detail}", else: type
+  end
+
+  defp format_wait_condition(_condition), do: "unknown"
+
+  defp next_probe_in_words(%DateTime{} = next_probe_at) do
+    next_probe_at
+    |> DateTime.diff(DateTime.utc_now(), :millisecond)
+    |> max(0)
+    |> next_in_words()
+  end
+
+  defp next_probe_in_words(_next_probe_at), do: "n/a"
+
   defp format_retry_summary(retry_entry) do
     issue_id = retry_entry.issue_id || "unknown"
     identifier = retry_entry.identifier || issue_id
@@ -663,14 +768,36 @@ defmodule SymphonyElixir.StatusDashboard do
     due_in_ms = retry_entry.due_in_ms || 0
     error = format_retry_error(retry_entry.error)
 
-    "│  #{colorize("↻", @ansi_orange)} " <>
+    parked? = Map.get(retry_entry, :status) == :parked
+    marker = if parked?, do: "⏸", else: "↻"
+    timing = if parked?, do: " probe ", else: " in "
+
+    "│  #{colorize(marker, @ansi_orange)} " <>
       colorize("#{identifier}", @ansi_red) <>
       " " <>
       colorize("attempt=#{attempt}", @ansi_yellow) <>
-      colorize(" in ", @ansi_dim) <>
+      colorize(timing, @ansi_dim) <>
       colorize(next_in_words(due_in_ms), @ansi_cyan) <>
       error
   end
+
+  defp format_quota_circuits([]), do: []
+
+  defp format_quota_circuits(circuits) when is_list(circuits) do
+    Enum.map(circuits, fn circuit ->
+      backend = Map.get(circuit, :backend, "unknown")
+      account = Map.get(circuit, :account_scope, "default")
+      state = Map.get(circuit, :state, :open)
+      parked = Map.get(circuit, :parked_issue_count, 0)
+      next_probe = next_in_words(Map.get(circuit, :next_probe_in_ms, 0))
+
+      colorize("│ Quota Circuit: ", @ansi_bold) <>
+        colorize("#{backend}/#{account} #{state}", @ansi_red) <>
+        colorize(" | parked=#{parked} | next_probe=#{next_probe}", @ansi_dim)
+    end)
+  end
+
+  defp format_quota_circuits(_circuits), do: []
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
     secs = div(due_in_ms, 1000)
@@ -681,25 +808,31 @@ defmodule SymphonyElixir.StatusDashboard do
   defp next_in_words(_), do: "n/a"
 
   defp format_retry_error(error) when is_binary(error) do
-    sanitized =
-      error
-      |> String.replace("\\r\\n", " ")
-      |> String.replace("\\r", " ")
-      |> String.replace("\\n", " ")
-      |> String.replace("\r\n", " ")
-      |> String.replace("\r", " ")
-      |> String.replace("\n", " ")
-      |> String.replace(~r/\s+/, " ")
-      |> String.trim()
+    sanitized = format_inline_text(error, 96)
 
     if sanitized == "" do
       ""
     else
-      " " <> colorize("error=#{truncate(sanitized, 96)}", @ansi_dim)
+      " " <> colorize("error=#{sanitized}", @ansi_dim)
     end
   end
 
   defp format_retry_error(_), do: ""
+
+  defp format_inline_text(text, max_length) when is_binary(text) do
+    text
+    |> String.replace("\\r\\n", " ")
+    |> String.replace("\\r", " ")
+    |> String.replace("\\n", " ")
+    |> String.replace("\r\n", " ")
+    |> String.replace("\r", " ")
+    |> String.replace("\n", " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> truncate(max_length)
+  end
+
+  defp format_inline_text(_text, _max_length), do: "unknown"
 
   defp format_runtime_seconds(seconds) when is_integer(seconds) do
     mins = div(seconds, 60)

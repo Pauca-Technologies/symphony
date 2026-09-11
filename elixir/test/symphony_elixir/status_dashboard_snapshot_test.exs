@@ -85,6 +85,33 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("super_busy", render_snapshot(snapshot_data, 1_842.7))
   end
 
+  test "handoff work is rendered below active implementors" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [
+           running_entry(%{identifier: "MT-ACTIVE"}),
+           running_entry(%{
+             identifier: "MT-HANDOFF",
+             lifecycle_state: :handoff_pending_gate,
+             last_codex_event: "turn_completed"
+           })
+         ],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = render_snapshot(snapshot_data, 0.0)
+    {active_index, _length} = :binary.match(rendered, "MT-ACTIVE")
+    {handoff_section_index, _length} = :binary.match(rendered, "Handoff validation / review")
+    {handoff_index, _length} = :binary.match(rendered, "MT-HANDOFF")
+
+    assert active_index < handoff_section_index
+    assert handoff_section_index < handoff_index
+    assert rendered =~ "gate pending"
+  end
+
   test "snapshot fixture: backoff queue pressure" do
     snapshot_data =
       {:ok,

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+
+# OTP exits immediately on terminal SIGINT, before Application.prep_stop/1 can
+# apply Symphony's worker-shutdown policy. Keep the escript in a separate
+# process group and translate Ctrl+C into Symphony's trapped shutdown signal.
+
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+escript_path="${script_dir}/symphony.escript"
+
+if [[ ! -x "${escript_path}" ]]; then
+  printf 'Symphony escript not found or not executable: %s\nRun `mise exec -- mix build` first.\n' "${escript_path}" >&2
+  exit 1
+fi
+
+if command -v setsid >/dev/null 2>&1; then
+  setsid "${escript_path}" "$@" &
+else
+  # Bash job control gives the child its own process group when setsid is not
+  # available, so terminal SIGINT still reaches only this launcher.
+  set -m
+  "${escript_path}" "$@" &
+fi
+
+child_pid=$!
+interrupted=0
+
+forward_shutdown() {
+  interrupted=1
+  printf '\nStopping Symphony gracefully...\n' >&2
+  kill -USR2 "${child_pid}" 2>/dev/null || true
+}
+
+trap forward_shutdown INT TERM
+
+status=0
+
+while kill -0 "${child_pid}" 2>/dev/null; do
+  wait "${child_pid}"
+  status=$?
+done
+
+trap - INT TERM
+
+if (( interrupted )); then
+  exit 130
+else
+  exit "${status}"
+fi
