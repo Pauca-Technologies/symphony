@@ -1182,6 +1182,13 @@ defmodule SymphonyElixir.ReviewGate do
     High-risk `high_risk_final_full_diff` mode additionally requires `full_diff_inspected: true`
     after a final complete base-to-head diff pass following delta reconciliation.
 
+    Write `summary` for the human who requested the work: briefly explain the intended result,
+    what the change actually achieves, and any remaining concern and its practical consequence.
+    For non-approval, recommend the next step or name the decision needed without assuming a
+    scope change is authorized. Use plain language and distinguish a proven fix from a workaround
+    or missing evidence. Keep inspection history, SHAs, and test accounting in their dedicated
+    fields; explain unavoidable technical terms.
+
     #{scope_contract_instructions(settings)}
 
     The final `verdict` must be one of `approve`, `request_changes`, or
@@ -1995,18 +2002,24 @@ defmodule SymphonyElixir.ReviewGate do
     note_once(@budget_noted_key, issue, outcome.outcome, opts, fn ->
       """
       #{@budget_marker}
-      Automated review outcome: `budget_exhausted_with_findings` (not approved).
+      Automated review stopped for #{issue.identifier}: #{issue.title}.
 
+      The changes are not approved. The reviewer still has concerns after #{outcome.iteration} reviews, so Symphony has stopped repeating the review.
+
+      Please record a decision in a Linear comment: explain how the remaining concerns should be addressed, or explicitly accept them and describe any change to the requested scope. A new review is required after that decision and any necessary changes.
+
+      Reviewer's explanation:
+      #{blank_to_placeholder(outcome.summary, "(no summary provided)")}
+
+      Remaining concerns:
+      #{format_comments(outcome.findings)}
+
+      ### Technical review details
+
+      Automated review outcome: `budget_exhausted_with_findings` (not approved).
       Candidate SHA: `#{sha_label(outcome.reviewed_sha)}`
       Change-request passes: #{outcome.iteration} of #{outcome.max_iterations}
       Severity counts: #{format_severity_counts(outcome.severity_counts)}
-
-      Latest reviewer summary:
-      #{blank_to_placeholder(outcome.summary, "(no summary provided)")}
-
-      Unresolved findings:
-      #{format_comments(outcome.findings)}
-
       Resume/escalation condition: #{outcome.resume_condition}
       """
     end)

@@ -767,6 +767,13 @@ defmodule SymphonyElixir.ReviewGateTest do
     assert body =~ "budget_exhausted_with_findings"
     assert body =~ "[major] fix it"
     assert body =~ "start a fresh orchestration run"
+    [brief, details] = String.split(body, "### Technical review details")
+    assert brief =~ "UDPE-1: Thing"
+    assert brief =~ "The changes are not approved."
+    assert brief =~ "record a decision in a Linear comment"
+    assert brief =~ "[major] fix it"
+    assert details =~ "Candidate SHA:"
+    assert details =~ "budget_exhausted_with_findings"
 
     assert {:budget_exhausted_with_findings, repeated} =
              ReviewGate.run(workspace, issue(), nil, review_workflow(), opts)

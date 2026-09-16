@@ -1430,6 +1430,10 @@ client to:
 - Place annotated Markdown artifacts produced by `session_start` after current tracker activity,
   then place the rendered repository workflow after the complete task context. Hook stdout SHOULD
   remain diagnostic output rather than prompt content.
+- Shared human-input guidance SHOULD ask agents to present a self-contained explanation of the
+  problem, known results and uncertainty, a recommended next step with its tradeoff, and one
+  concrete question before technical evidence. Guidance MUST NOT itself authorize scope changes,
+  issue closure, or review bypasses.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
 - Append exactly one `continuation.status_resume_packet` section to every fresh or continuation

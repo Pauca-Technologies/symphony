@@ -2654,6 +2654,7 @@ defmodule SymphonyElixir.CoreTest do
                         prompt_kind: "initial",
                         included_sections: [
                           "task_context",
+                          "symphony.human_input",
                           "repository_workflow",
                           "test_worker_budget",
                           "symphony.behavioral_evidence",
@@ -2868,6 +2869,7 @@ defmodule SymphonyElixir.CoreTest do
                         prompt_kind: "initial",
                         included_sections: [
                           "task_context",
+                          "symphony.human_input",
                           "repository_workflow",
                           "test_worker_budget",
                           "symphony.behavioral_evidence",

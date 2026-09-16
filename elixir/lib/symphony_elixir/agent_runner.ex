@@ -3998,6 +3998,7 @@ defmodule SymphonyElixir.AgentRunner do
           "task.issue",
           "task.startup_artifacts",
           "repository.workflow",
+          "symphony.human_input",
           "symphony.test_worker_budget",
           "symphony.handoff_constraints"
         ]

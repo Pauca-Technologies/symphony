@@ -34,6 +34,7 @@ defmodule SymphonyElixir.TaskContextPrompt do
         :linear
       ),
       section("task.activity", :task_activity, activity_source(issue), activity_section(issue), true, :linear),
+      section("symphony.human_input", :runtime_guidance, "symphony:human_input", human_input_guidance(), true, :symphony),
       section(
         "task.startup_artifacts",
         :startup_artifacts,
@@ -133,6 +134,22 @@ defmodule SymphonyElixir.TaskContextPrompt do
     #{format_attachments(issue.attachment_urls)}
     #{attachment_routing_guidance(issue.attachment_urls)}
     Issue updated at: #{format_datetime(issue.updated_at)}
+    """
+    |> String.trim()
+  end
+
+  defp human_input_guidance do
+    """
+    ## Asking a human for help
+
+    When human input is necessary, write a short, self-contained brief at the top of the existing workpad, before investigation details:
+    - Context: what the user wanted and the concrete problem, in everyday language.
+    - What you found: what you tried, what succeeded, what remains unknown, and why that prevents completion. Distinguish a proven fix from a workaround or better diagnostics.
+    - Recommendation: the next step you recommend and its practical limitation or tradeoff. If there is no defensible recommendation, explain why.
+    - Question: one specific decision or action the human can answer without reading logs or source code. Explain what their answer will allow you to do.
+
+    Offer alternatives only when they are realistic, with their consequences. If evidence has expired, say so; do not ask the human to supply it unless you can identify a plausible source and how to retrieve it. When relevant, explain whether deferring or closing an old report is reasonable, without claiming the bug is fixed. A recommendation does not authorize issue closure.
+    Use short sentences and familiar words. Explain unavoidable technical terms. Put SHAs, file paths, reviewer verdicts, and diagnostic evidence below the brief or behind links. Translate reviewer findings into the decision that matters; do not paste a reviewer report as the question. Do not amend scope or bypass review without the required human decision.
     """
     |> String.trim()
   end

@@ -335,11 +335,12 @@ Use this only when completion is blocked by missing required tools or missing au
 - If useful work can continue only after GitHub Actions recovers, PR checks change, a git ref advances, or this ticket's Linear activity changes, call Symphony's `wait_for` tool once and end the turn. Do not repeatedly poll an unchanged external condition; Symphony will release the agent slot and resume the issue after the condition changes. Cross-issue prerequisites belong in Linear's `blocks` relation; never park on a tracking follow-up created during the run. Never use `wait_for` for local CPU or memory pressure, another validation running, local process or port contention, a time delay, or a Symphony-owned handoff job; Symphony polls accepted handoff jobs itself. Continue useful work and allow independently bounded validations to overlap.
 - Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
 - If a non-GitHub required tool is missing, required non-GitHub auth is unavailable, or a product decision is required, add `needs-human-input` and move the ticket to `Blocked` with a short blocker brief in the workpad that includes:
-  - what is missing,
-  - why it blocks required acceptance/validation,
-  - exact human action needed to unblock.
+  - the user's goal and concrete problem in everyday language,
+  - what was tried, what remains unknown, and why completion needs human input,
+  - a recommended next step with its limitation or tradeoff,
+  - one specific question or action, and what the answer will enable.
 - A `linear_issue` transition that moves an issue to `Blocked` must include a top-level `blocker` object with a concise `summary` and one of these `kind` values: `missing_required_tool`, `missing_authentication`, `missing_permission`, or `product_decision`. Raw `linear_graphql` workflow transitions are rejected. Symphony, reviewer, handoff, CI, and other operational failures are not valid blocker kinds; leave the issue active for orchestrator retry.
-- Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad. The human response belongs in a separate Linear comment; on redispatch, reconcile it into the workpad and remove `needs-human-input` before resuming.
+- Put the brief at the top of the existing workpad, before technical evidence. Follow the shared task context's `Asking a human for help` guidance: explain unfamiliar terms, distinguish fixes from workarounds, and offer only realistic choices. Do not ask for expired evidence without an identifiable source. Do not add extra top-level comments outside the workpad. The human response belongs in a separate Linear comment; on redispatch, reconcile it into the workpad and remove `needs-human-input` before resuming.
 
 ## Step 2: Execution phase (Todo -> In Progress -> Human Review)
 

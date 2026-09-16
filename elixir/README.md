@@ -436,6 +436,13 @@ Notes:
 - Agent-requested transitions to `Blocked` require a structured blocker kind and summary. The
   accepted kinds are missing required tool, authentication, permission, or product decision;
   Symphony, reviewer, handoff, CI, and other operational failures remain active for retry.
+  Shared task-context guidance asks agents to lead human-input requests with the user's goal,
+  what they found or could not establish, a recommendation with its tradeoff, and one concrete
+  question. The brief belongs above technical evidence in the existing workpad and applies even
+  when a repository supplies its own workflow. Review-limit notices likewise lead with the issue,
+  lack of approval, and next action, keeping diagnostic identifiers in technical details.
+  Reviewer summaries are instructed to explain the result and remaining concern in plain language;
+  inspection history and validation accounting belong in the verdict's dedicated fields.
 - An authoritative Codex `usageLimitExceeded` result opens a Codex account quota circuit. The
   account boundary is the execution credential boundary (`local` or the specific SSH worker host),
   so a circuit on one worker does not suppress the same backend on a worker using another account.

@@ -47,6 +47,11 @@ collapsed while human comments and the workpad remain verbatim. Typed current-is
 server-captured wait baselines keep routine tracker writes and external waits out of ad-hoc agent
 GraphQL and polling loops.
 
+Shared communication guidance asks agents to make human-input requests understandable on their own:
+state the problem, explain what remains unknown, recommend a next step with its tradeoff, and ask
+one concrete question before presenting technical evidence. This guidance also applies to routed
+repositories with their own workflows.
+
 Routed repositories can also version issue-aware Codex profiles in their own `WORKFLOW.md`. A small,
 classification-only turn chooses the execution profile from bounded issue context, while
 repositories retain a quality fallback for ambiguous, risky, or failed classifications. The

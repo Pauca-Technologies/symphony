@@ -2046,6 +2046,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
                "task.issue",
                "task.current_metadata",
                "task.activity",
+               "symphony.human_input",
                "repository.workflow",
                "symphony.test_worker_budget",
                "symphony.behavioral_evidence",
@@ -2074,6 +2075,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
       assert Enum.sort(reused_ids) == [
                "repository.workflow",
                "symphony.handoff_constraints",
+               "symphony.human_input",
                "symphony.test_worker_budget",
                "task.current_metadata",
                "task.issue"

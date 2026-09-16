@@ -58,6 +58,7 @@ defmodule SymphonyElixir.TaskContextPromptTest do
     assert prompt =~ "Call `get_sentry_resource` with that exact URL"
     assert prompt =~ "Decision: use option B."
     assert prompt =~ "This issue is marked `needs-human-input`"
+    assert prompt =~ "## Asking a human for help"
     assert prompt =~ "## Startup artifacts generated for this task"
     assert prompt =~ "`docs/agent-workpad/branch/base-status.md` — branch freshness and any required rebase action."
     assert prompt =~ "`docs/agent-workpad/branch/reuse-map.md` — helper index derived from this issue's title and description."
@@ -70,6 +71,10 @@ defmodule SymphonyElixir.TaskContextPromptTest do
 
     assert issue_position < activity_position
     assert activity_position < artifacts_position
+
+    guidance = Enum.find(TaskContextPrompt.sections(issue), &(&1.id == "symphony.human_input"))
+    assert guidance.ownership == :symphony
+    assert guidance.reusable
   end
 
   test "makes an empty activity snapshot explicit and omits absent startup artifacts" do

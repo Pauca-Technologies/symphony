@@ -110,7 +110,7 @@ defmodule SymphonyElixir.PromptComposerTest do
     changed_sections = TaskContextPrompt.sections(changed)
     {reused, changed_sections} = PromptComposer.reused_sections(initial.state, changed_sections)
 
-    assert Enum.map(reused, & &1.id) == ["task.issue", "task.activity"]
+    assert Enum.map(reused, & &1.id) == ["task.issue", "task.activity", "symphony.human_input"]
     assert Enum.map(changed_sections, & &1.id) == ["task.current_metadata"]
     assert hd(changed_sections).content =~ "State: Blocked"
   end
