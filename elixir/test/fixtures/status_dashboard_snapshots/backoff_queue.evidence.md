@@ -1,6 +1,7 @@
 ```text
 ╭─ SYMPHONY STATUS
 │ Agents: 1/10
+│ Waiting: 0
 │ Throughput: 15 tps
 │ Runtime: 45m 0s
 │ Tokens: in 18,000 | out 2,200 | total 20,200
@@ -9,9 +10,17 @@
 │ Next refresh: n/a
 ├─ Running
 │
-│   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  
+│   ID             STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                            
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-│ ● MT-638   retrying       4242     20m 25s / 7      14,200 thre...567890  agent message streaming: waiting on ...
+│ ● MT-638         retrying       4242     20m 25s / 7      14,200 thre...567890  agent message streaming: waiti...
+│
+├─ Repository queue
+│
+│  No repository-contention waits
+│
+├─ Waiting work
+│
+│  No parked external-condition waits
 │
 ├─ Backoff queue
 │

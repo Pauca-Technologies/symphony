@@ -36,7 +36,9 @@ erl_crash.dump
 # IDE folders.
 .idea/
 .vscode/
-/bin/
+/bin/*
+!/bin/codex-session-log
+!/bin/symphony
 
 # Local environment and auth artifacts.
 .env
