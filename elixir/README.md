@@ -248,6 +248,10 @@ or source a shell `session.env`; machine consumers receive explicit `set` and `u
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
+The bundled workflow selects `gpt-6-sol`. In multi-repo deployments, set the model in
+`codex.command` in `~/.symphony/config.yml`, which supplies the host-level settings.
+Repository routing profiles can override the model for individual tasks.
+
 Minimal example:
 
 ```md
@@ -270,7 +274,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex app-server
+  command: codex --model gpt-6-sol app-server
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -547,7 +551,7 @@ Notes:
     routing:
       classifier:
         backend: codex
-        model: gpt-5.6-luna
+        model: gpt-6-luna
         reasoning_effort: max
         timeout_ms: 120000
       default_profile: standard
@@ -555,12 +559,12 @@ Notes:
       profiles:
         standard:
           backend: codex
-          model: gpt-5.6-sol
+          model: gpt-6-sol
           reasoning_effort: high
           description: Clear, bounded work with a straightforward validation path.
         deep:
           backend: codex
-          model: gpt-5.6-sol
+          model: gpt-6-sol
           reasoning_effort: xhigh
           description: Risky, cross-cutting, ambiguous, or architecture-sensitive work.
   ```

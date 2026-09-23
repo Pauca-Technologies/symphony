@@ -585,7 +585,7 @@ defmodule SymphonyElixir.RegressionCandidateTest do
   defp manifest(run, prompt_sha \\ @sha) do
     event("run_manifest", run, %{
       "manifest_version" => 1,
-      "agent" => %{"backend" => "codex", "model" => "gpt-5.6-sol", "reasoning_effort" => "xhigh"},
+      "agent" => %{"backend" => "codex", "model" => "gpt-6-sol", "reasoning_effort" => "xhigh"},
       "task" => %{"type" => "concurrency_liveness"},
       "config_digest" => @sha_b,
       "prompt" => %{"template_sha256" => prompt_sha},

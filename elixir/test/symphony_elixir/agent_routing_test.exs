@@ -70,7 +70,7 @@ defmodule SymphonyElixir.AgentRoutingTest do
         "routing" => %{
           "classifier" => %{
             "backend" => "codex",
-            "model" => "gpt-5.6-luna",
+            "model" => "gpt-6-luna",
             "reasoning_effort" => "max",
             "timeout_ms" => 45_000
           },
@@ -79,13 +79,13 @@ defmodule SymphonyElixir.AgentRoutingTest do
           "profiles" => %{
             "standard" => %{
               "backend" => "codex",
-              "model" => "gpt-5.6-sol",
+              "model" => "gpt-6-sol",
               "reasoning_effort" => "high",
               "description" => "Clear and bounded dashboard work."
             },
             "deep" => %{
               "backend" => "codex",
-              "model" => "gpt-5.6-sol",
+              "model" => "gpt-6-sol",
               "reasoning_effort" => "xhigh",
               "description" => "Risky, cross-cutting, or ambiguous work."
             }
@@ -112,14 +112,14 @@ defmodule SymphonyElixir.AgentRoutingTest do
 
     assert routing.classifier == %{
              backend: "codex",
-             model: "gpt-5.6-luna",
+             model: "gpt-6-luna",
              reasoning_effort: "max",
              timeout_ms: 45_000
            }
 
     assert routing.default_profile == "standard"
     assert routing.fallback_profile == "deep"
-    assert routing.profiles["standard"].model == "gpt-5.6-sol"
+    assert routing.profiles["standard"].model == "gpt-6-sol"
     assert routing.profiles["standard"].reasoning_effort == "high"
     assert routing.profiles["deep"].reasoning_effort == "xhigh"
   end
@@ -194,7 +194,7 @@ defmodule SymphonyElixir.AgentRoutingTest do
 
     assert_received {:classifier_start_session, start_opts}
     assert start_opts[:worker_host] == "worker-a"
-    assert start_opts[:overrides] == %{model: "gpt-5.6-luna", reasoning_effort: "max"}
+    assert start_opts[:overrides] == %{model: "gpt-6-luna", reasoning_effort: "max"}
     assert start_opts[:dynamic_tools] == false
     assert start_opts[:ephemeral] == true
     assert start_opts[:thread_config] == %{"project_doc_max_bytes" => 0}
@@ -285,7 +285,7 @@ defmodule SymphonyElixir.AgentRoutingTest do
               backend: AppServer,
               profile: "deep",
               source: :profile_label,
-              overrides: %{model: "gpt-5.6-sol", reasoning_effort: "xhigh"}
+              overrides: %{model: "gpt-6-sol", reasoning_effort: "xhigh"}
             }} = AgentRouter.resolve("/workspace", issue(["agent:deep"]), workflow, nil, classifier: classifier)
   end
 
@@ -300,7 +300,7 @@ defmodule SymphonyElixir.AgentRoutingTest do
             %{
               profile: "deep",
               source: :ambiguous_profile_labels,
-              overrides: %{model: "gpt-5.6-sol", reasoning_effort: "xhigh"}
+              overrides: %{model: "gpt-6-sol", reasoning_effort: "xhigh"}
             }} =
              AgentRouter.resolve(
                "/workspace",
@@ -355,7 +355,7 @@ defmodule SymphonyElixir.AgentRoutingTest do
             %{
               profile: "standard",
               source: :classifier,
-              overrides: %{model: "gpt-5.6-sol", reasoning_effort: "high"}
+              overrides: %{model: "gpt-6-sol", reasoning_effort: "high"}
             }} = AgentRouter.resolve("/workspace", issue(), workflow, nil, classifier: classifier)
   end
 
@@ -384,7 +384,7 @@ defmodule SymphonyElixir.AgentRoutingTest do
             %{
               profile: "deep",
               source: :classifier_fallback,
-              overrides: %{model: "gpt-5.6-sol", reasoning_effort: "xhigh"}
+              overrides: %{model: "gpt-6-sol", reasoning_effort: "xhigh"}
             }} =
              AgentRouter.resolve("/workspace", issue(), workflow, nil, classifier: failing_classifier)
   end

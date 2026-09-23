@@ -210,7 +210,7 @@ defmodule Mix.Tasks.Telemetry.RegressionCandidatesTest do
       "manifest_version" => 1,
       "ts" => "2026-09-03T00:00:00Z",
       "run_id" => @run,
-      "agent" => %{"backend" => "codex", "model" => "gpt-5.6-sol", "reasoning_effort" => "xhigh"},
+      "agent" => %{"backend" => "codex", "model" => "gpt-6-sol", "reasoning_effort" => "xhigh"},
       "task" => %{"type" => "concurrency_liveness"},
       "config_digest" => @sha_b,
       "prompt" => %{"template_sha256" => @sha, "body" => poison},

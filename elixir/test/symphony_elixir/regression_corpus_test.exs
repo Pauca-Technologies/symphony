@@ -310,7 +310,7 @@ defmodule SymphonyElixir.RegressionCorpusTest do
       "ts" => "2026-09-03T00:00:00Z",
       "run_id" => "123e4567-e89b-12d3-a456-426614174000",
       "manifest_version" => 1,
-      "agent" => %{"backend" => "codex", "model" => "gpt-5.6-sol", "reasoning_effort" => "xhigh"},
+      "agent" => %{"backend" => "codex", "model" => "gpt-6-sol", "reasoning_effort" => "xhigh"},
       "task" => %{"type" => "concurrency_liveness"},
       "config_digest" => String.duplicate("a", 64),
       "prompt" => %{"template_sha256" => String.duplicate("b", 64)}

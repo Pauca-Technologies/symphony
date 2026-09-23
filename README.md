@@ -56,6 +56,8 @@ Routed repositories can also version issue-aware Codex profiles in their own `WO
 classification-only turn chooses the execution profile from bounded issue context, while
 repositories retain a quality fallback for ambiguous, risky, or failed classifications. The
 selected execution model and reasoning effort are visible in Symphony's dashboard.
+The bundled workflow uses GPT-6 Sol; routing examples pair GPT-6 Luna classification with
+GPT-6 Sol execution.
 
 The Elixir implementation isolates each live run in a detached worker process. The orchestrator can
 restart for a deployment and reconnect to those workers without terminating their coding-agent

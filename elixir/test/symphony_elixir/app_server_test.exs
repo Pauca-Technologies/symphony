@@ -253,7 +253,7 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"},"model":"gpt-6-sol","reasoningEffort":"medium"}}'
             ;;
           3)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001"}}}'
@@ -312,7 +312,7 @@ defmodule SymphonyElixir.AppServerTest do
                  AppServer.run(workspace, "Validate supported turn policy", issue,
                    on_message: on_message,
                    issue_context_file: issue_context_file,
-                   overrides: %{model: "gpt-5.6-sol", reasoning_effort: "xhigh"},
+                   overrides: %{model: "gpt-6-sol", reasoning_effort: "xhigh"},
                    reasoning_effort: "low",
                    thread_config: %{"project_doc_max_bytes" => 0},
                    output_schema: output_schema
@@ -322,7 +322,7 @@ defmodule SymphonyElixir.AppServerTest do
                         %{
                           event: :session_started,
                           session_id: "thread-1001-turn-1001",
-                          model: "gpt-5.6-sol",
+                          model: "gpt-6-sol",
                           reasoning_effort: "low"
                         }}
 
@@ -337,7 +337,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
                    |> then(fn payload ->
                      payload["method"] == "thread/start" &&
-                       get_in(payload, ["params", "model"]) == "gpt-5.6-sol" &&
+                       get_in(payload, ["params", "model"]) == "gpt-6-sol" &&
                        get_in(payload, ["params", "config", "project_doc_max_bytes"]) == 0
                    end)
                  else
