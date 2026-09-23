@@ -248,8 +248,8 @@ or source a shell `session.env`; machine consumers receive explicit `set` and `u
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
-The bundled workflow selects `gpt-6-sol`. In multi-repo deployments, set the model in
-`codex.command` in `~/.symphony/config.yml`, which supplies the host-level settings.
+The bundled workflow selects `gpt-6-sol` with `high` reasoning effort. In multi-repo deployments,
+set the model in `codex.command` in `~/.symphony/config.yml`, which supplies the host-level settings.
 Repository routing profiles can override the model for individual tasks.
 
 Minimal example:

@@ -152,7 +152,7 @@ agent:
     success_no_progress_turns: 2 # 1..100 unchanged post-turn boundaries
     max_fingerprints: 32 # 1..32 live/persisted alert latches
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-sol"' --config model_reasoning_effort=xhigh app-server
+  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-sol"' --config model_reasoning_effort=high app-server
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
