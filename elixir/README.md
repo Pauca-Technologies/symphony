@@ -403,6 +403,8 @@ Notes:
   exposes a dedicated Waiting count and row section; the web dashboard adds an above-the-fold
   Waiting badge linked to the detailed rows plus **Resume now** and **Cancel wait**. Cancelling the
   wait returns the issue to normal scheduling rather than abandoning the assigned Linear issue.
+  PR-state waits also wake on head or base revision changes while the PR is open. Closed or merged
+  PRs are observed by state alone, so unrelated base-branch movement does not resume those waits.
   A GitHub Actions recovery wait wakes when the Actions component becomes operational or when every
   active incident affecting Actions formally reaches the `monitoring`/`resolved` phase, allowing one
   controlled retry as soon as GitHub reports mitigation rather than waiting for the component badge.
@@ -459,6 +461,8 @@ Notes:
   operator adds usage before the reported reset time, **Check usage now** on the dashboard (or
   `POST /api/v1/quota-circuits/probe` with `{"backend":"codex"}`) schedules that same one-issue
   controlled probe immediately; it never releases the parked queue without a successful probe.
+  Parked retry rows and issue details also offer **Retry after quota reset** for the same controlled
+  probe. Issue details distinguish the provider quota pause and show the next automatic check.
 - Active quota circuits are checkpointed to `~/.symphony/quota-circuits.json`. This deliberately
   small snapshot preserves outage deadlines and parked issue order across an orchestrator restart;
   it does not persist the general retry queue. Circuit state, reset/probe deadlines, account scope,

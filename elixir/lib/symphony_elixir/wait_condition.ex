@@ -121,9 +121,12 @@ defmodule SymphonyElixir.WaitCondition do
   def observe(%{condition: %{"type" => "github_pr_state_changed"} = condition}) do
     repo_arg = if condition["repository"], do: " --repo " <> shell_escape(condition["repository"]), else: ""
 
-    with {:ok, output, 0} <- run_command(condition, "gh pr view #{condition["pr_number"]} --json state" <> repo_arg),
-         {:ok, %{"state" => state}} when state in ["OPEN", "CLOSED", "MERGED"] <- Jason.decode(output) do
-      {:ok, %{"state" => state}}
+    with {:ok, output, 0} <- run_command(condition, "gh pr view #{condition["pr_number"]} --json state,headRefOid,baseRefOid" <> repo_arg),
+         {:ok, %{"state" => state} = pr} when state in ["OPEN", "CLOSED", "MERGED"] <- Jason.decode(output) do
+      # Closed/merged PR waits concern reopening; movement of the base branch
+      # cannot make draft/ready mutations possible again.
+      fields = if state == "OPEN", do: ["state", "headRefOid", "baseRefOid"], else: ["state"]
+      {:ok, Map.take(pr, fields)}
     else
       _ -> {:error, :pr_state_unavailable}
     end

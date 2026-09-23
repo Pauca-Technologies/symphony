@@ -1615,6 +1615,8 @@ Deferred review delivery extension:
 - Implementations MAY support PR open/closed/merged state changes and literal path-filtered git-ref
   waits. A closed/merged PR preflight MUST NOT retry draft/ready mutations against unchanged state.
   Park it on its observed state; replacing the attached PR requires an explicit wait resume.
+  PR-state waits MAY also observe head and base revisions while the PR is open. Closed/merged
+  PR observations MUST ignore revision movement that leaves the PR state unchanged.
 - A path-filtered git wait MUST compare the watched tree entries rather than only the ref SHA.
   Irrelevant changes MUST NOT wake a model. Fetching objects for inspection MUST preserve the
   local branch, index, checkout and FETCH_HEAD. The reference implementation bounds paths to

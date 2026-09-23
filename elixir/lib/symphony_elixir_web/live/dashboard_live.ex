@@ -157,7 +157,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <%= if @issue_payload.waiting do %>
                     Parked without an agent slot: <%= @issue_payload.waiting.reason %>
                   <% else %>
-                    Active retry window.
+                    <%= if @issue_payload.retry && @issue_payload.retry.status == "parked" do %>
+                      Paused until provider quota is available.
+                    <% else %>
+                      Active retry window.
+                    <% end %>
                   <% end %>
                 <% end %>
               </p>
@@ -232,6 +236,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <%= no_progress_warning_count(@issue_payload.running) %> active
               </span>
             </div>
+          </section>
+
+          <section :if={@issue_payload.retry && @issue_payload.retry.status == "parked"} class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Provider quota pause</h2>
+                <p class="section-copy"><%= @issue_payload.retry.error %></p>
+                <p class="section-copy">Check availability now to retry one paused issue on this account. The remaining issues resume when capacity is confirmed.</p>
+              </div>
+              <.quota_retry_button entry={@issue_payload.retry} />
+            </div>
+            <p class="metric-detail">Next automatic check: <%= full_time(@issue_payload.retry.due_at) %></p>
           </section>
 
           <section :if={@issue_payload.waiting} class="section-card">
@@ -842,6 +858,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <th>Attempt</th>
                       <th>Due at</th>
                       <th>Error</th>
+                      <th>Action</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -870,6 +887,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <% end %>
                       </td>
                       <td><%= entry.error || "n/a" %></td>
+                      <td><.quota_retry_button :if={entry.status == "parked"} entry={entry} /></td>
                     </tr>
                   </tbody>
                 </table>
@@ -879,6 +897,22 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <% end %>
       <% end %>
     </section>
+    """
+  end
+
+  defp quota_retry_button(assigns) do
+    ~H"""
+    <button
+      type="button"
+      class="subtle-button"
+      phx-click="probe-quota"
+      phx-value-backend={@entry.backend}
+      phx-value-worker-host={@entry.worker_host}
+      phx-disable-with="Checking quota…"
+      title="Check provider quota by retrying one paused issue on this account"
+    >
+      Retry after quota reset
+    </button>
     """
   end
 
