@@ -2,6 +2,51 @@ defmodule SymphonyElixir.HandoffGateTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.HandoffGate
+  alias SymphonyElixir.Linear.Client
+
+  test "readiness preflight includes all 80 comments and a workpad beyond the first page" do
+    workspace = temp_workspace!("review-paginated-comments")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace))
+    issue = issue("MT-MANY-COMMENTS")
+
+    comments =
+      for n <- 1..80 do
+        %{
+          "id" => "comment-#{n}",
+          "body" => if(n == 1, do: "## Codex Workpad\nReady candidate", else: "Activity #{n}"),
+          "updatedAt" => DateTime.to_iso8601(DateTime.add(~U[2026-09-01 00:00:00Z], n, :second))
+        }
+      end
+
+    graphql_fun = fn _query, %{issueId: id, first: 50, after: cursor} ->
+      assert id == issue.id
+      send(self(), {:comment_page, cursor})
+
+      {nodes, page_info} =
+        case cursor do
+          nil -> {comments |> Enum.reverse() |> Enum.take(50), %{"hasNextPage" => true, "endCursor" => "older-comments"}}
+          "older-comments" -> {comments |> Enum.take(30) |> Enum.reverse(), %{"hasNextPage" => false}}
+        end
+
+      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes, "pageInfo" => page_info}}}}}
+    end
+
+    opts = [
+      before_review_command: ~s(test -f "$SYMPHONY_ISSUE_CONTEXT_FILE"),
+      issue_comments_fetcher: &Client.fetch_issue_comments_for_test(&1, graphql_fun)
+    ]
+
+    assert {:ok, refreshed} = HandoffGate.run_before_review(workspace, issue, nil, opts)
+    refute refreshed.comments_truncated
+    assert Enum.map(refreshed.comments, & &1.id) == Enum.map(comments, & &1["id"])
+    assert_receive {:comment_page, nil}
+    assert_receive {:comment_page, "older-comments"}
+    refute_receive {:comment_page, _}
+
+    snapshot = workspace |> Workspace.issue_context_path() |> File.read!() |> Jason.decode!()
+    assert length(snapshot["issue"]["comments"]) == 80
+    assert hd(snapshot["issue"]["comments"])["body"] == "## Codex Workpad\nReady candidate"
+  end
 
   test "readiness preflight refreshes comments before preparing the hook snapshot" do
     workspace = temp_workspace!("review-readiness")

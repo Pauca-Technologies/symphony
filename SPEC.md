@@ -1717,8 +1717,9 @@ An implementation MUST support these tracker adapter operations:
    - Used for active-run reconciliation.
 
 4. `fetch_issue_comments(issue_id)`
-   - Used once immediately before an outer agent dispatch to assemble required issue activity.
-   - Returns normalized comments plus a truncation marker.
+   - Used before an outer agent dispatch and review readiness to assemble required issue activity.
+   - Returns normalized comments plus a truncation marker. The Linear implementation retrieves
+     every page and returns `truncated: false` only after completing pagination.
 
 5. `create_follow_up(source_issue, attributes)` when advertised by the runtime
    - Create or return an idempotent typed follow-up using repository/runtime policy.
@@ -1735,9 +1736,11 @@ Linear-specific requirements for `tracker.kind == "linear"`:
 - `tracker.project_slug` maps to Linear project `slugId`
 - Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
 - Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
-- Issue-comment query requests at most `50` comments ordered by `updatedAt`, then presents the
-  captured window chronologically in the first turn.
-- Pagination REQUIRED for candidate issues
+- Issue-comment queries request at most `50` comments per page ordered by `updatedAt`, follow
+  `endCursor` while `hasNextPage` is true, and sort the combined history chronologically.
+  Failed pages or missing, invalid, or repeated continuation cursors MUST fail the fetch rather
+  than report partial history as complete.
+- Pagination REQUIRED for candidate issues and issue comments
 - Page size default: `50`
 - Network timeout: `30000 ms`
 

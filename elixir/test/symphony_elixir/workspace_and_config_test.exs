@@ -663,7 +663,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
-  test "linear client fetches a bounded, chronological issue comment snapshot" do
+  test "linear client fetches a chronological issue comment snapshot" do
     graphql_fun = fn query, variables ->
       send(self(), {:fetch_issue_comments, query, variables})
 
@@ -688,14 +688,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                    "user" => %{"id" => "agent-1", "name" => "UDPAgent"}
                  }
                ],
-               "pageInfo" => %{"hasNextPage" => true}
+               "pageInfo" => %{"hasNextPage" => false}
              }
            }
          }
        }}
     end
 
-    assert {:ok, %{comments: [workpad, decision], truncated: true}} =
+    assert {:ok, %{comments: [workpad, decision], truncated: false}} =
              Client.fetch_issue_comments_for_test("issue-1", graphql_fun)
 
     assert workpad.id == "comment-1"
@@ -703,9 +703,57 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert decision.id == "comment-2"
     assert decision.body == "Decision: use option B."
 
-    assert_receive {:fetch_issue_comments, query, %{issueId: "issue-1", first: 50}}
+    assert_receive {:fetch_issue_comments, query, %{issueId: "issue-1", first: 50, after: nil}}
     assert query =~ "SymphonyLinearIssueComments"
     assert query =~ "orderBy: updatedAt"
+    assert query =~ "after: $after"
+    assert query =~ "endCursor"
+  end
+
+  test "linear comment pagination propagates later page failures instead of returning partial history" do
+    for failure <- [
+          {:error, :linear_unavailable},
+          {:ok, %{"data" => %{"issue" => nil}}},
+          comment_page([%{"id" => "missing-body"}], false, nil)
+        ] do
+      graphql_fun = fn _query, %{after: cursor} ->
+        case cursor do
+          nil -> comment_page([%{"id" => "first", "body" => "first page"}], true, "next")
+          "next" -> failure
+        end
+      end
+
+      assert {:error, reason} = Client.fetch_issue_comments_for_test("issue-1", graphql_fun)
+      assert reason in [:linear_unavailable, :linear_issue_not_found, :linear_invalid_comment]
+    end
+  end
+
+  test "linear comment pagination rejects missing and cyclic cursors" do
+    for cursor <- [nil, "", 42] do
+      assert {:error, :linear_missing_end_cursor} =
+               Client.fetch_issue_comments_for_test("issue-1", fn _, _ -> comment_page([], true, cursor) end)
+    end
+
+    graphql_fun = fn _, %{after: cursor} ->
+      case cursor do
+        nil -> comment_page([], true, "first")
+        "first" -> comment_page([], true, "second")
+        "second" -> comment_page([], true, "first")
+      end
+    end
+
+    assert {:error, :linear_repeated_end_cursor} = Client.fetch_issue_comments_for_test("issue-1", graphql_fun)
+  end
+
+  test "linear comment pagination requires valid completion metadata" do
+    for has_next <- [nil, "false", 0] do
+      assert {:error, :linear_invalid_comments_payload} =
+               Client.fetch_issue_comments_for_test("issue-1", fn _, _ -> comment_page([], has_next, nil) end)
+    end
+  end
+
+  defp comment_page(comments, has_next, cursor) do
+    {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => comments, "pageInfo" => %{"hasNextPage" => has_next, "endCursor" => cursor}}}}}}
   end
 
   test "linear client rejects malformed comments instead of dropping required activity" do

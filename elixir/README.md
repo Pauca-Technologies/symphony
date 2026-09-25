@@ -62,7 +62,9 @@ durable job ID while skipping repeated GitHub credential preparation and issue-c
 repository command should branch to its cheap job-status read before normal handoff setup.
 
 An optional `hooks.before_review` runs a cheap synchronous readiness check before automated review.
-Symphony refreshes the complete issue-comment snapshot first, so a workpad correction made during
+Symphony refreshes the complete issue-comment snapshot first, following Linear cursors in pages of
+50 and sorting the combined history chronologically. Page failures or invalid cursors fail the
+refresh instead of passing partial history to review. This ensures a workpad correction made during
 the current turn is visible. Exit `2` returns remediation without starting the reviewer or aggregate
 validation; unavailable comments, timeouts, and other failures enter infrastructure retry. Set
 `hooks.before_review_timeout_ms` to override `hooks.timeout_ms`. Keep expensive validation in

@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Linear.Client do
   alias SymphonyElixir.{Config, Linear.Comment, Linear.Issue, Linear.RateLimit, Utf8}
 
   @issue_page_size 50
-  @issue_comment_limit 50
+  @issue_comment_page_size 50
   @max_error_body_log_bytes 1_000
 
   @query """
@@ -518,9 +518,9 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   @issue_comments_query """
-  query SymphonyLinearIssueComments($issueId: String!, $first: Int!) {
+  query SymphonyLinearIssueComments($issueId: String!, $first: Int!, $after: String) {
     issue(id: $issueId) {
-      comments(first: $first, orderBy: updatedAt) {
+      comments(first: $first, after: $after, orderBy: updatedAt) {
         nodes {
           id
           body
@@ -533,6 +533,7 @@ defmodule SymphonyElixir.Linear.Client do
         }
         pageInfo {
           hasNextPage
+          endCursor
         }
       }
     }
@@ -1195,10 +1196,35 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp do_fetch_issue_comments(issue_id, graphql_fun)
        when is_binary(issue_id) and is_function(graphql_fun, 2) do
+    do_fetch_issue_comments_page(issue_id, graphql_fun, nil, [], %{})
+  end
+
+  defp do_fetch_issue_comments_page(issue_id, graphql_fun, after_cursor, acc_comments, seen_cursors) do
     with {:ok, body} <-
-           graphql_fun.(@issue_comments_query, %{issueId: issue_id, first: @issue_comment_limit}),
-         {:ok, comments, truncated?} <- decode_issue_comments_response(body) do
-      {:ok, %{comments: comments, truncated: truncated?}}
+           graphql_fun.(@issue_comments_query, %{issueId: issue_id, first: @issue_comment_page_size, after: after_cursor}),
+         {:ok, comments, page_info} <- decode_issue_comments_response(body) do
+      updated_acc = Enum.reverse(comments, acc_comments)
+
+      case next_comment_page_cursor(page_info, seen_cursors) do
+        {:ok, next_cursor} ->
+          do_fetch_issue_comments_page(issue_id, graphql_fun, next_cursor, updated_acc, Map.put(seen_cursors, next_cursor, true))
+
+        :done ->
+          {:ok, %{comments: Enum.sort_by(updated_acc, &comment_sort_key/1), truncated: false}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp next_comment_page_cursor(page_info, seen_cursors) do
+    with {:ok, cursor} <- next_page_cursor(page_info),
+         false <- Map.has_key?(seen_cursors, cursor) do
+      {:ok, cursor}
+    else
+      true -> {:error, :linear_repeated_end_cursor}
+      other -> other
     end
   end
 
@@ -1207,15 +1233,15 @@ defmodule SymphonyElixir.Linear.Client do
            "issue" => %{
              "comments" => %{
                "nodes" => comments,
-               "pageInfo" => %{"hasNextPage" => has_next_page}
+               "pageInfo" => %{"hasNextPage" => has_next_page} = page_info
              }
            }
          }
        })
-       when is_list(comments) do
+       when is_list(comments) and is_boolean(has_next_page) do
     case normalize_comments(comments) do
       {:ok, normalized_comments} ->
-        {:ok, Enum.sort_by(normalized_comments, &comment_sort_key/1), has_next_page == true}
+        {:ok, normalized_comments, %{has_next_page: has_next_page, end_cursor: Map.get(page_info, "endCursor")}}
 
       {:error, reason} ->
         {:error, reason}
