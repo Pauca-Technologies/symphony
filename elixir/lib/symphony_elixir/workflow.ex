@@ -9,8 +9,30 @@ defmodule SymphonyElixir.Workflow do
 
   @spec workflow_file_path() :: Path.t()
   def workflow_file_path do
-    Application.get_env(:symphony_elixir, :workflow_file_path) ||
-      Path.join(File.cwd!(), @workflow_file_name)
+    # Note: in multi-repo mode (~/.symphony/config.yml present), host
+    # config no longer goes through Workflow.current/0 at all — see
+    # `SymphonyElixir.Config.settings/0`. This function only matters for
+    # the legacy single-repo path (no config.yml) and for explicit
+    # callers that want to load a specific workflow file (which is what
+    # `AgentRunner` does to load each consumer repo's per-issue
+    # WORKFLOW.md).
+    cond do
+      override = Application.get_env(:symphony_elixir, :workflow_file_path) ->
+        override
+
+      env = symphony_workflow_env() ->
+        env
+
+      true ->
+        Path.join(File.cwd!(), @workflow_file_name)
+    end
+  end
+
+  defp symphony_workflow_env do
+    case System.get_env("SYMPHONY_WORKFLOW_FILE") do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
   end
 
   @spec set_workflow_file_path(Path.t()) :: :ok
@@ -59,6 +81,10 @@ defmodule SymphonyElixir.Workflow do
         {:error, {:missing_workflow_file, path, reason}}
     end
   end
+
+  @doc "Parse workflow content read from an immutable repository revision."
+  @spec from_string(String.t()) :: {:ok, loaded_workflow()} | {:error, term()}
+  def from_string(content) when is_binary(content), do: parse(content)
 
   defp parse(content) do
     {front_matter_lines, prompt_lines} = split_front_matter(content)

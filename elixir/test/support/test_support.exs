@@ -1,3 +1,19 @@
+defmodule SymphonyElixir.TestGitHubAuthProvider do
+  @behaviour SymphonyElixir.GitHubAuth
+
+  @impl true
+  def prepare(workspace, _opts) do
+    {:ok,
+     %{
+       env: [],
+       repo: "test/example",
+       host: "github.com",
+       auth_root: Path.join(workspace, ".artifacts/github-app-auth"),
+       expires_at: ~U[2099-01-01 00:00:00Z]
+     }}
+  end
+end
+
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
 
@@ -25,6 +41,15 @@ defmodule SymphonyElixir.TestSupport do
         only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
 
       setup do
+        previous_github_auth_provider =
+          Application.get_env(:symphony_elixir, :github_auth_provider)
+
+        Application.put_env(
+          :symphony_elixir,
+          :github_auth_provider,
+          SymphonyElixir.TestGitHubAuthProvider
+        )
+
         workflow_root =
           Path.join(
             System.tmp_dir!(),
@@ -38,11 +63,60 @@ defmodule SymphonyElixir.TestSupport do
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
 
+        # Isolate tests from the host's real ~/.symphony/repos.yaml and
+        # ~/.symphony/telemetry/ — the multi-repo driver (T24/T26) reads
+        # them on every dispatch tick.
+        repo_config_path = Path.join(workflow_root, "repos.yaml")
+        telemetry_dir = Path.join(workflow_root, "telemetry")
+        quota_circuit_state_path = Path.join(workflow_root, "quota-circuits.json")
+        drain_state_path = Path.join(workflow_root, "drain-state.json")
+        shutdown_policy_path = Path.join(workflow_root, "shutdown-policy.json")
+        persistent_worker_registry_root = Path.join(workflow_root, "workers")
+        persistent_worker_log_root = Path.join(workflow_root, "worker-logs")
+        Application.put_env(:symphony_elixir, :repo_config_path, repo_config_path)
+        Application.put_env(:symphony_elixir, :telemetry_dir, telemetry_dir)
+        Application.put_env(:symphony_elixir, :telemetry_enabled, false)
+        Application.put_env(:symphony_elixir, :quota_circuit_state_path, quota_circuit_state_path)
+        Application.put_env(:symphony_elixir, :drain_state_path, drain_state_path)
+        Application.put_env(:symphony_elixir, :shutdown_policy_path, shutdown_policy_path)
+
+        Application.put_env(
+          :symphony_elixir,
+          :persistent_worker_registry_root,
+          persistent_worker_registry_root
+        )
+
+        Application.put_env(:symphony_elixir, :persistent_worker_log_root, persistent_worker_log_root)
+
         on_exit(fn ->
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :memory_tracker_candidate_issues_result)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :memory_tracker_recently_terminal_issues)
+          Application.delete_env(:symphony_elixir, :repo_config_path)
+          Application.delete_env(:symphony_elixir, :telemetry_dir)
+          Application.delete_env(:symphony_elixir, :telemetry_enabled)
+          Application.delete_env(:symphony_elixir, :quota_circuit_state_path)
+          Application.delete_env(:symphony_elixir, :drain_state_path)
+          Application.delete_env(:symphony_elixir, :shutdown_policy_path)
+          Application.delete_env(:symphony_elixir, :worker_shutdown_grace_ms)
+          Application.delete_env(:symphony_elixir, :worker_shutdown_force_timeout_ms)
+          Application.delete_env(:symphony_elixir, :persistent_worker_registry_root)
+          Application.delete_env(:symphony_elixir, :persistent_worker_log_root)
+          Application.put_env(:symphony_elixir, :persistent_workers_enabled, false)
+
+          if previous_github_auth_provider do
+            Application.put_env(
+              :symphony_elixir,
+              :github_auth_provider,
+              previous_github_auth_provider
+            )
+          else
+            Application.delete_env(:symphony_elixir, :github_auth_provider)
+          end
+
           File.rm_rf(workflow_root)
         end)
 
@@ -104,18 +178,43 @@ defmodule SymphonyElixir.TestSupport do
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
+          test_worker_limit: nil,
+          heavy_validation_limit: nil,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
+          max_retries: nil,
           max_concurrent_agents_by_state: %{},
+          agent_backend: nil,
+          agent_pre_command: nil,
+          acp_command: nil,
+          acp_model: nil,
+          acp_auto_approve: nil,
+          acp_protocol_version: nil,
+          acp_withhold_linear_credentials: nil,
+          acp_advertise_fs: nil,
+          acp_advertise_terminal: nil,
+          acp_prompt_timeout_ms: nil,
+          acp_read_timeout_ms: nil,
+          acp_stall_timeout_ms: nil,
+          acp_heartbeat_ms: nil,
+          claude_code_command: nil,
+          claude_code_model: nil,
+          claude_code_permission_mode: nil,
+          claude_code_extra_args: nil,
+          claude_code_prompt_timeout_ms: nil,
+          claude_code_stall_timeout_ms: nil,
+          claude_code_withhold_linear_credentials: nil,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
-          codex_turn_timeout_ms: 3_600_000,
+          codex_turn_timeout_ms: 0,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
           hook_after_create: nil,
+          hook_session_start: nil,
           hook_before_run: nil,
+          hook_before_handoff: nil,
           hook_after_run: nil,
           hook_before_remove: nil,
           hook_timeout_ms: 60_000,
@@ -141,9 +240,32 @@ defmodule SymphonyElixir.TestSupport do
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
+    test_worker_limit = Keyword.get(config, :test_worker_limit)
+    heavy_validation_limit = Keyword.get(config, :heavy_validation_limit)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
+    max_retries = Keyword.get(config, :max_retries)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    agent_backend = Keyword.get(config, :agent_backend)
+    agent_pre_command = Keyword.get(config, :agent_pre_command)
+    acp_command = Keyword.get(config, :acp_command)
+    acp_model = Keyword.get(config, :acp_model)
+    acp_auto_approve = Keyword.get(config, :acp_auto_approve)
+    acp_protocol_version = Keyword.get(config, :acp_protocol_version)
+    acp_withhold_linear_credentials = Keyword.get(config, :acp_withhold_linear_credentials)
+    acp_advertise_fs = Keyword.get(config, :acp_advertise_fs)
+    acp_advertise_terminal = Keyword.get(config, :acp_advertise_terminal)
+    acp_prompt_timeout_ms = Keyword.get(config, :acp_prompt_timeout_ms)
+    acp_read_timeout_ms = Keyword.get(config, :acp_read_timeout_ms)
+    acp_stall_timeout_ms = Keyword.get(config, :acp_stall_timeout_ms)
+    acp_heartbeat_ms = Keyword.get(config, :acp_heartbeat_ms)
+    claude_code_command = Keyword.get(config, :claude_code_command)
+    claude_code_model = Keyword.get(config, :claude_code_model)
+    claude_code_permission_mode = Keyword.get(config, :claude_code_permission_mode)
+    claude_code_extra_args = Keyword.get(config, :claude_code_extra_args)
+    claude_code_prompt_timeout_ms = Keyword.get(config, :claude_code_prompt_timeout_ms)
+    claude_code_stall_timeout_ms = Keyword.get(config, :claude_code_stall_timeout_ms)
+    claude_code_withhold_linear_credentials = Keyword.get(config, :claude_code_withhold_linear_credentials)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -151,8 +273,11 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_withhold_linear_credentials = Keyword.get(config, :codex_withhold_linear_credentials)
     hook_after_create = Keyword.get(config, :hook_after_create)
+    hook_session_start = Keyword.get(config, :hook_session_start)
     hook_before_run = Keyword.get(config, :hook_before_run)
+    hook_before_handoff = Keyword.get(config, :hook_before_handoff)
     hook_after_run = Keyword.get(config, :hook_after_run)
     hook_before_remove = Keyword.get(config, :hook_before_remove)
     hook_timeout_ms = Keyword.get(config, :hook_timeout_ms)
@@ -181,9 +306,37 @@ defmodule SymphonyElixir.TestSupport do
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
+        test_worker_limit && "  test_worker_limit: #{yaml_value(test_worker_limit)}",
+        heavy_validation_limit &&
+          "  heavy_validation_limit: #{yaml_value(heavy_validation_limit)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
+        max_retries && "  max_retries: #{yaml_value(max_retries)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        agent_backend && "  backend: #{yaml_value(agent_backend)}",
+        agent_pre_command && "  pre_command: #{yaml_value(agent_pre_command)}",
+        acp_yaml(
+          command: acp_command,
+          model: acp_model,
+          auto_approve: acp_auto_approve,
+          protocol_version: acp_protocol_version,
+          withhold_linear_credentials: acp_withhold_linear_credentials,
+          advertise_fs: acp_advertise_fs,
+          advertise_terminal: acp_advertise_terminal,
+          prompt_timeout_ms: acp_prompt_timeout_ms,
+          read_timeout_ms: acp_read_timeout_ms,
+          stall_timeout_ms: acp_stall_timeout_ms,
+          heartbeat_ms: acp_heartbeat_ms
+        ),
+        claude_code_yaml(
+          command: claude_code_command,
+          model: claude_code_model,
+          permission_mode: claude_code_permission_mode,
+          extra_args: claude_code_extra_args,
+          prompt_timeout_ms: claude_code_prompt_timeout_ms,
+          stall_timeout_ms: claude_code_stall_timeout_ms,
+          withhold_linear_credentials: claude_code_withhold_linear_credentials
+        ),
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
@@ -192,13 +345,23 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
-        hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
+        codex_withhold_linear_credentials != nil &&
+          "  withhold_linear_credentials: #{yaml_value(codex_withhold_linear_credentials)}",
+        hooks_yaml(
+          hook_after_create,
+          hook_session_start,
+          hook_before_run,
+          hook_before_handoff,
+          hook_after_run,
+          hook_before_remove,
+          hook_timeout_ms
+        ),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
         "---",
         prompt
       ]
-      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.reject(&(&1 in [nil, false, ""]))
 
     Enum.join(sections, "\n") <> "\n"
   end
@@ -225,14 +388,25 @@ defmodule SymphonyElixir.TestSupport do
 
   defp yaml_value(value), do: yaml_value(to_string(value))
 
-  defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
+  defp hooks_yaml(nil, nil, nil, nil, nil, nil, timeout_ms),
+    do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
 
-  defp hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, timeout_ms) do
+  defp hooks_yaml(
+         hook_after_create,
+         hook_session_start,
+         hook_before_run,
+         hook_before_handoff,
+         hook_after_run,
+         hook_before_remove,
+         timeout_ms
+       ) do
     [
       "hooks:",
       "  timeout_ms: #{yaml_value(timeout_ms)}",
       hook_entry("after_create", hook_after_create),
+      hook_entry("session_start", hook_session_start),
       hook_entry("before_run", hook_before_run),
+      hook_entry("before_handoff", hook_before_handoff),
       hook_entry("after_run", hook_after_run),
       hook_entry("before_remove", hook_before_remove)
     ]
@@ -253,6 +427,71 @@ defmodule SymphonyElixir.TestSupport do
     ]
     |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
+  end
+
+  # {field, kind}: `:bool` fields are only emitted when explicitly true/false
+  # (nil means "use the schema default"); `:raw` fields are emitted when present.
+  @acp_yaml_fields [
+    {:command, :raw},
+    {:model, :raw},
+    {:auto_approve, :bool},
+    {:protocol_version, :raw},
+    {:withhold_linear_credentials, :bool},
+    {:advertise_fs, :bool},
+    {:advertise_terminal, :bool},
+    {:prompt_timeout_ms, :raw},
+    {:read_timeout_ms, :raw},
+    {:stall_timeout_ms, :raw},
+    {:heartbeat_ms, :raw}
+  ]
+
+  defp acp_yaml(opts) do
+    entries =
+      Enum.flat_map(@acp_yaml_fields, fn {field, kind} ->
+        value = Keyword.get(opts, field)
+
+        if acp_field_present?(kind, value) do
+          ["  #{field}: #{yaml_value(value)}"]
+        else
+          []
+        end
+      end)
+
+    case entries do
+      [] -> nil
+      lines -> Enum.join(["acp:" | lines], "\n")
+    end
+  end
+
+  defp acp_field_present?(:bool, value), do: is_boolean(value)
+  defp acp_field_present?(:raw, value), do: not is_nil(value)
+
+  @claude_code_yaml_fields [
+    {:command, :raw},
+    {:model, :raw},
+    {:permission_mode, :raw},
+    {:extra_args, :raw},
+    {:prompt_timeout_ms, :raw},
+    {:stall_timeout_ms, :raw},
+    {:withhold_linear_credentials, :bool}
+  ]
+
+  defp claude_code_yaml(opts) do
+    entries =
+      Enum.flat_map(@claude_code_yaml_fields, fn {field, kind} ->
+        value = Keyword.get(opts, field)
+
+        if acp_field_present?(kind, value) do
+          ["  #{field}: #{yaml_value(value)}"]
+        else
+          []
+        end
+      end)
+
+    case entries do
+      [] -> nil
+      lines -> Enum.join(["claude_code:" | lines], "\n")
+    end
   end
 
   defp observability_yaml(enabled, refresh_ms, render_interval_ms) do
